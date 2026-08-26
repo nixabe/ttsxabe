@@ -220,6 +220,11 @@ impl StSet {
         self.shard_of(name)?.tensor_f32(name)
     }
 
+    /// Reads a tensor as raw f16 bits. See [`StFile::tensor_f16`].
+    pub fn tensor_f16(&self, name: &str) -> Result<Vec<u16>, StError> {
+        self.shard_of(name)?.tensor_f16(name)
+    }
+
     /// Reads a tensor as `f32` and asserts its shape.
     pub fn tensor_f32_shaped(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, StError> {
         self.shard_of(name)?.tensor_f32_shaped(name, expected)

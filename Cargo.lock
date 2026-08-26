@@ -1596,6 +1596,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xabe-llama"
+version = "0.0.0"
+dependencies = [
+ "half",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-st",
+]
+
+[[package]]
 name = "xabe-serve"
 version = "0.0.0"
 dependencies = [

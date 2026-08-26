@@ -217,3 +217,82 @@ fn rejects_a_misaligned_data_segment() {
         other => panic!("expected Misaligned, got {other:?}"),
     }
 }
+
+#[test]
+fn narrowing_to_f16_refuses_what_f16_cannot_hold() {
+    // bf16 carries f32's exponent range and f16 does not: bf16 reaches 3.4e38,
+    // f16 stops at 65504. This card has no bf16 at all and f32 would be 52 GB
+    // against a 48 GB card, so the narrowing is mandatory - which makes the
+    // check mandatory too. Saturating silently puts an infinity in one weight
+    // of four hundred million and produces a model that loads without
+    // complaint and speaks nonsense.
+    //
+    // 0x7F00 as bf16 is 2^127, about 1.7e38.
+    let header = r#"{"a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
+    let bytes = [0x80, 0x3F, 0x00, 0x7F];
+    let path = write_file("narrowing_overflow", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    match f.tensor_f16("a") {
+        Err(StError::NotRepresentable { at, value, .. }) => {
+            assert_eq!(at, 1, "the second value is the large one");
+            assert!(value > 1e38, "{value:e}");
+        }
+        other => panic!("expected NotRepresentable, got {other:?}"),
+    }
+}
+
+#[test]
+fn narrowing_to_f16_lets_underflow_through_and_says_so() {
+    // The asymmetry is deliberate. A weight of 1e-9 rounding to zero
+    // contributes nothing either way; an infinity poisons every product it
+    // touches. 0x3080 as bf16 is about 9.3e-10, well under f16's smallest
+    // subnormal of 6e-8.
+    let header = r#"{"a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
+    let bytes = [0x80, 0x3F, 0x80, 0x30];
+    let path = write_file("narrowing_underflow", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    let got = f.tensor_f16("a").expect("narrow");
+    assert_eq!(got[0], half::f16::from_f32(1.0).to_bits());
+    assert_eq!(got[1], 0, "flushed to zero rather than refused");
+}
+
+#[test]
+fn narrowing_an_f16_tensor_copies_its_bits_unchanged() {
+    // No conversion means no rounding and no way to fail. Reading it back
+    // through f32 would round twice and is the obvious thing to have written.
+    let header = r#"{"a":{"dtype":"F16","shape":[3],"data_offsets":[0,6]}}"#;
+    // 1.0, -2.0, and the smallest subnormal - which a round trip through f32
+    // preserves, but only because f32 is wider. The point is that nothing
+    // converts it at all.
+    let bytes = [0x00, 0x3C, 0x00, 0xC0, 0x01, 0x00];
+    let path = write_file("narrowing_identity", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    assert_eq!(
+        f.tensor_f16("a").expect("narrow"),
+        vec![0x3C00, 0xC000, 0x0001]
+    );
+}
+
+#[test]
+fn narrowing_an_f32_tensor_rounds_to_nearest_even() {
+    // The same rounding the CUDA staging does, so a weight narrowed here and
+    // one narrowed by the kernel are the same bits. 2049 is exactly between
+    // two f16 values - the spacing is 2 up there - and ties go to even.
+    let header = r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2049.0f32.to_le_bytes());
+    bytes.extend_from_slice(&2051.0f32.to_le_bytes());
+    let path = write_file("narrowing_round", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    let got: Vec<f32> = f
+        .tensor_f16("a")
+        .expect("narrow")
+        .into_iter()
+        .map(|b| f32::from(half::f16::from_bits(b)))
+        .collect();
+    assert_eq!(got, vec![2048.0, 2052.0], "ties to even, both directions");
+}

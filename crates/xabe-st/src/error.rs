@@ -115,6 +115,24 @@ pub enum StError {
         dtype: &'static str,
     },
 
+    /// A value the narrower format cannot hold.
+    ///
+    /// bf16 carries f32's exponent range and f16 does not: bf16 reaches
+    /// 3.4e38, f16 stops at 65504. Converting one to the other is therefore
+    /// not always possible, and the failure mode if it is done anyway is the
+    /// worst kind - an infinity in one weight of four hundred million, a model
+    /// that loads without complaint and produces fluent nonsense. This card
+    /// has no bf16 at all, so the conversion is mandatory and so is the check.
+    #[error("{name}[{at}] is {value:e}, which f16 cannot hold")]
+    NotRepresentable {
+        /// The offending tensor.
+        name: String,
+        /// Index of the first value that overflowed.
+        at: usize,
+        /// The value, at full width.
+        value: f32,
+    },
+
     /// A tensor the schema expected is not in the file.
     #[error("{file} holds tensor {name}, which the index does not mention")]
     UnindexedTensor {

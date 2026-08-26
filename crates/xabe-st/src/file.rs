@@ -338,6 +338,68 @@ impl StFile {
         }
     }
 
+    /// Reads a tensor as raw f16 bits, refusing values f16 cannot hold.
+    ///
+    /// This is the conversion the translator needs and the ASR does not: the
+    /// 13 B checkpoint is bf16, this card has no bf16, and f32 would be 52 GB
+    /// against a 48 GB card. So f16 is not a choice, it is the only width the
+    /// model fits in.
+    ///
+    /// # Why the check is not optional
+    ///
+    /// bf16 carries f32's exponent range - up to 3.4e38 - and f16 stops at
+    /// 65504. Saturating silently would put an infinity in one weight of four
+    /// hundred million and produce a model that loads without complaint and
+    /// speaks nonsense. Refusing by name, with the index and the value, turns
+    /// that into a load error.
+    ///
+    /// Underflow is *not* refused, and the asymmetry is deliberate: a weight
+    /// of 1e-9 rounding to zero contributes nothing either way, where an
+    /// infinity poisons every product it touches. The count is logged so that
+    /// a checkpoint full of them is visible rather than merely tolerated.
+    pub fn tensor_f16(&self, name: &str) -> Result<Vec<u16>, StError> {
+        let info = self.require(name)?;
+        let bytes =
+            &self.map[self.data_start + info.start as usize..self.data_start + info.end as usize];
+
+        // An F16 file needs no conversion at all, and so cannot fail.
+        if info.dtype == Dtype::F16 {
+            return Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes(*b))
+                .collect());
+        }
+
+        let wide = self.widen(info);
+        let mut out = Vec::with_capacity(wide.len());
+        let mut flushed = 0usize;
+        for (at, &v) in wide.iter().enumerate() {
+            let h = half::f16::from_f32(v);
+            if v.is_finite() && !h.is_finite() {
+                return Err(StError::NotRepresentable {
+                    name: name.to_string(),
+                    at,
+                    value: v,
+                });
+            }
+            if v != 0.0 && h == half::f16::ZERO {
+                flushed += 1;
+            }
+            out.push(h.to_bits());
+        }
+        if flushed > 0 {
+            tracing::debug!(
+                tensor = name,
+                flushed,
+                of = out.len(),
+                "values below f16's smallest subnormal became zero",
+            );
+        }
+        Ok(out)
+    }
+
     /// Borrows a tensor and asserts its shape.
     ///
     /// Weight loading goes through this so a checkpoint of the wrong geometry
