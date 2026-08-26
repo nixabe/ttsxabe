@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xabe-st",
+    "crates/xabe-vits",
+    "crates/xabe-dsp",
+    "crates/xabe-tts",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nixabe/ttsxabe"
+authors = ["ttsxabe contributors"]
+
+[workspace.dependencies]
+xabe-st = { path = "crates/xabe-st" }
+xabe-vits = { path = "crates/xabe-vits" }
+xabe-dsp = { path = "crates/xabe-dsp" }
+
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+memmap2 = "0.9"
+half = "2"
+rustc-hash = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# The differential harness runs the whole reference forward pass thousands of
+# times; a plain debug build makes that a coffee break rather than a test run.
+[profile.dev.package."*"]
+opt-level = 2
