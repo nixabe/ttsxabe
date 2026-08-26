@@ -17,10 +17,12 @@
 
 mod config;
 mod error;
+mod tokenizer;
 mod weights;
 
 pub use config::VitsConfig;
-pub use error::{ConfigError, WeightError};
+pub use error::{ConfigError, TokenizerError, WeightError};
+pub use tokenizer::Tokenizer;
 pub use weights::{
     Conv, DdsConv, Decoder, DurationFlow, DurationPredictor, EncoderLayer, FlowBlock, Norm,
     ResBlock, TextEncoder, VitsWeights, WaveNetLayer, WnConv,

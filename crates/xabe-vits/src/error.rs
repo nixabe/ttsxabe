@@ -80,3 +80,56 @@ pub enum WeightError {
     #[error(transparent)]
     Container(#[from] StError),
 }
+
+/// A tokenizer could not be loaded, or is configured in a way this
+/// implementation does not support.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenizerError {
+    /// `vocab.json` or `tokenizer_config.json` could not be read.
+    #[error("cannot read {path}: {source}")]
+    Io {
+        /// The file that could not be read.
+        path: std::path::PathBuf,
+        /// The underlying operating-system error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// One of the two JSON files is malformed.
+    #[error("{path} is not valid JSON: {source}")]
+    Parse {
+        /// The file that could not be parsed.
+        path: std::path::PathBuf,
+        /// The underlying deserialisation error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// One of the two JSON files is valid JSON but not an object.
+    #[error("{path} is valid JSON but not an object")]
+    NotAnObject {
+        /// The offending file.
+        path: std::path::PathBuf,
+    },
+
+    /// A vocabulary entry's value is not an integer id.
+    #[error("vocabulary entry {token} does not map to an integer id")]
+    BadVocabEntry {
+        /// The offending token.
+        token: String,
+    },
+
+    /// No token has id 0. The blank inserted between symbols is defined as
+    /// "whatever token id 0 is", so a vocabulary without one cannot be used.
+    #[error("no token has id 0, so there is no blank to intersperse")]
+    NoBlank,
+
+    /// The tokenizer config asks for a preprocessing step this implementation
+    /// does not have. Failing is deliberate: silently skipping phonemisation
+    /// would produce fluent-sounding nonsense rather than an error.
+    #[error("this tokenizer requires {what}, which is not implemented")]
+    Unsupported {
+        /// The unsupported setting's name.
+        what: &'static str,
+    },
+}

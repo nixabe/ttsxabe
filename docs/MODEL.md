@@ -76,6 +76,29 @@ synthesised and round-tripped through Breeze-ASR-26:
 
 So: **feed it POJ, replace `ⁿ` with `nn`, change nothing else.**
 
+## Tokenisation
+
+The whole tokeniser is: lower-case, drop everything outside the 48-symbol
+vocabulary, intersperse token 0 between every pair of symbols and at both ends.
+No subword model, no phonemiser, no romaniser. Its difficulty is entirely in
+what it does *silently*.
+
+- **Input must be NFC.** The vocabulary holds precomposed `í` (U+00ED) but not
+  combining acute (U+0301), so decomposed input loses every tone mark: `lí`
+  becomes `li`. Tones are lexical in this language, so that is a different
+  word, not a blemish - and nothing reports it. Meanwhile U+030D (entering
+  tone) and U+0358 (the o-dot) have no precomposed form and *are* in the
+  vocabulary, so NFC is exactly right: it composes the vowel diacritics and
+  leaves those two combining.
+- **Punctuation is deleted, not honoured.** A comma is not a pause. It ceases
+  to exist, along with the phrasing it implied.
+- **`<unk>` is unreachable.** It is an added token, so the normaliser preserves
+  the literal five characters and the filter then keeps `unk` and drops the
+  angle brackets. No input can emit the unknown id - which is just as well,
+  since it is 48, one past the end of a 48-row embedding table.
+- **Empty input produces no symbols, not a lone blank.** The natural reading of
+  "intersperse a blank" would give `[0]`; the reference gives `[]`.
+
 ## Weight layout notes
 
 Convolutions are stored `[out_channels, in_channels, kernel]`. The decoder's
