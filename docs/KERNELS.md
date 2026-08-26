@@ -16,10 +16,10 @@ exists.
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` |  | `xabe-tts` duration |
 | transposed conv1d | decoder upsamplers | | | |
 | leaky ReLU | decoder | | | |
-| WaveNet residual block | flow coupling, posterior | | | |
-| affine coupling | flow | | | |
+| WaveNet residual block | flow coupling, posterior | `xabe-tts` flow::wavenet |  | `xabe-tts` flow |
+| affine coupling | flow | `xabe-tts` flow_reverse |  | `xabe-tts` flow |
 | stochastic duration flow | duration predictor | `xabe_dsp::spline_inverse` |  | `xabe-tts` duration |
-| length regulation / attention expansion | prior → frames | | | |
+| length regulation / attention expansion | prior → frames | `xabe-tts` expand_prior |  | `xabe-tts` prior |
 | HiFi-GAN resblock (MRF) | decoder | | | |
 | tanh output | decoder | | | |
 

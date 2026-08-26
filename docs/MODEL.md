@@ -99,6 +99,18 @@ what it does *silently*.
 - **Empty input produces no symbols, not a lone blank.** The natural reading of
   "intersperse a blank" would give `[0]`; the reference gives `[]`.
 
+## `torch.flip` on the channel axis
+
+Both the duration predictor and the prior flow call `torch.flip(x, [1])`
+between coupling blocks. It reverses the **whole** channel axis: for
+`[1, 192, T]` the output channel order is 191, 190, ... 0.
+
+It is tempting to read it as "swap the two halves", because that is what a
+coupling flow conceptually wants and because it is *exactly right* for the
+duration predictor - which has two channels, where reversing and swapping are
+the same operation. At the flow's 192 channels they are not, and the mistake
+costs 30,134 of 30,144 values while breaking no shape.
+
 ## Weight layout notes
 
 Convolutions are stored `[out_channels, in_channels, kernel]`. The decoder's

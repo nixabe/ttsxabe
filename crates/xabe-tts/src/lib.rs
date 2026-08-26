@@ -9,7 +9,11 @@
 //! is finished and `docs/ORACLE.md` for what it is being checked against.
 
 mod duration;
+mod flow;
+mod prior;
 mod text_encoder;
 
 pub use duration::duration_predictor;
+pub use flow::flow_reverse;
+pub use prior::{Prior, expand_prior};
 pub use text_encoder::{EncoderOutput, text_encoder};

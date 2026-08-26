@@ -30,7 +30,9 @@
 //! languages is not something to assume - and it is also what will let the CLI
 //! offer a reproducible `--seed`.
 
-use xabe_dsp::{conv1d, depthwise_conv1d, gelu, layer_norm, spline_inverse, transpose};
+use xabe_dsp::{
+    conv1d, depthwise_conv1d, flip_channels, gelu, layer_norm, spline_inverse, transpose,
+};
 use xabe_vits::{DdsConv, DurationFlow, DurationPredictor, VitsConfig};
 
 /// Epsilon in the depthwise stack's layer norms.
@@ -86,11 +88,10 @@ pub fn duration_predictor(
     let mut z: Vec<f32> = noise.iter().map(|v| v * cfg.noise_scale_duration).collect();
 
     for &i in &reverse_order(w.flows.len()) {
-        // The flip is *before* each block, and it is a channel swap: the two
-        // channels of `z` trade places so that each block conditions on the
-        // half the previous one transformed.
-        let (a, b) = z.split_at(t);
-        z = b.iter().chain(a).copied().collect();
+        // The flip is *before* each block. It reverses the channel axis, which
+        // at two channels is a swap - see `flip_channels`, where the difference
+        // matters.
+        z = flip_channels(&z, 2, t);
         apply_reverse(&mut z, t, &w.flows[i], &cond, cfg);
     }
 

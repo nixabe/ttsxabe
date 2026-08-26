@@ -24,6 +24,7 @@ mod linear;
 mod norm;
 mod spline;
 mod tensor;
+mod weight_norm;
 
 pub use activation::{leaky_relu, relu, softmax_rows};
 pub use attention::self_attention;
@@ -32,4 +33,5 @@ pub use erf::{erf, gelu};
 pub use linear::linear;
 pub use norm::layer_norm;
 pub use spline::spline_inverse;
-pub use tensor::transpose;
+pub use tensor::{flip_channels, transpose};
+pub use weight_norm::{fuse_weight_norm, gated_activation};
