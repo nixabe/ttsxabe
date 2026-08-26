@@ -8,11 +8,13 @@
 //! PyTorch oracle before the next is started. See `docs/MILESTONES.md` for what
 //! is finished and `docs/ORACLE.md` for what it is being checked against.
 
+mod decoder;
 mod duration;
 mod flow;
 mod prior;
 mod text_encoder;
 
+pub use decoder::decoder;
 pub use duration::duration_predictor;
 pub use flow::flow_reverse;
 pub use prior::{Prior, expand_prior};

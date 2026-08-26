@@ -14,14 +14,14 @@ exists.
 | conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
 | conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` |  | `xabe-tts` duration |
-| transposed conv1d | decoder upsamplers | | | |
-| leaky ReLU | decoder | | | |
+| transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` |  | `xabe-tts` decoder |
+| leaky ReLU | decoder | `xabe_dsp::leaky_relu` |  | `xabe-tts` decoder |
 | WaveNet residual block | flow coupling, posterior | `xabe-tts` flow::wavenet |  | `xabe-tts` flow |
 | affine coupling | flow | `xabe-tts` flow_reverse |  | `xabe-tts` flow |
 | stochastic duration flow | duration predictor | `xabe_dsp::spline_inverse` |  | `xabe-tts` duration |
 | length regulation / attention expansion | prior → frames | `xabe-tts` expand_prior |  | `xabe-tts` prior |
-| HiFi-GAN resblock (MRF) | decoder | | | |
-| tanh output | decoder | | | |
+| HiFi-GAN resblock (MRF) | decoder | `xabe-tts` decoder::resblock |  | `xabe-tts` decoder |
+| tanh output | decoder | `xabe-tts` decoder |  | `xabe-tts` decoder |
 
 ## Also implemented
 

@@ -99,6 +99,17 @@ what it does *silently*.
 - **Empty input produces no symbols, not a lone blank.** The natural reading of
   "intersperse a blank" would give `[0]`; the reference gives `[]`.
 
+## The decoder's last leaky ReLU has a different slope
+
+Every leaky ReLU in the HiFi-GAN decoder takes `config.leaky_relu_slope`, which
+is 0.1 - except the last, immediately before `conv_post`, where the reference
+writes `nn.functional.leaky_relu(hidden_states)` with no slope argument and so
+gets PyTorch's default of **0.01**.
+
+Deliberate or not upstream, it is what produced these weights, so it is what
+correct means. Using 0.1 there changes only the negative half of one
+activation: audible as a slight roughness, invisible to every shape check.
+
 ## `torch.flip` on the channel axis
 
 Both the duration predictor and the prior flow call `torch.flip(x, [1])`
