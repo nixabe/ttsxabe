@@ -23,7 +23,7 @@ mod segment;
 mod weights;
 
 pub use error::VadError;
-pub use forward::{Vad, reflect_pad};
+pub use forward::Vad;
 pub use segment::{Segment, SegmentParams, segments};
 pub use weights::{
     BINS, Conv, ENCODER, GATES, HIDDEN, PAD, STFT_HOP, STFT_KERNEL, STFT_ROWS, VadWeights, WINDOW,

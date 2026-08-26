@@ -11,6 +11,7 @@ members = [
     "crates/xabe-engine",
     "crates/xabe-serve",
     "crates/xabe-vad",
+    "crates/xabe-whisper",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ xabe-tts = { path = "crates/xabe-tts" }
 xabe-audio = { path = "crates/xabe-audio" }
 xabe-serve = { path = "crates/xabe-serve" }
 xabe-vad = { path = "crates/xabe-vad" }
+xabe-whisper = { path = "crates/xabe-whisper" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"

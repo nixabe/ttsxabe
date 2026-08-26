@@ -11,10 +11,12 @@
 //! reached by any of the others without pointing a dependency edge the wrong
 //! way. See `docs/ARCHITECTURE.md` for the one-way rule this is obeying.
 //!
-//! Start at [`wav`].
+//! Start at [`wav`], or at [`mel_power`] for the ASR frontend.
 
 mod error;
+mod mel;
 mod wav;
 
 pub use error::AudioError;
+pub use mel::{MelConfig, hann, mel_filters, mel_power};
 pub use wav::{Wav, Wav16, parse_wav, read_wav, wav_bytes, wav_from_pcm16, write_wav};

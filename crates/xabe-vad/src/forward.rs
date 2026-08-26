@@ -26,7 +26,7 @@
 use crate::weights::{
     BINS, GATES, HIDDEN, PAD, STFT_HOP, STFT_KERNEL, STFT_ROWS, VadWeights, WINDOW,
 };
-use xabe_dsp::conv1d_strided;
+use xabe_dsp::{conv1d_strided, reflect_pad};
 
 /// A detector, holding the recurrent state between frames.
 #[derive(Debug)]
@@ -209,22 +209,6 @@ impl Vad {
         }
         sigmoid(acc)
     }
-}
-
-/// Mirrors `pad` samples from each end, excluding the edge sample itself.
-///
-/// `[a b c d]` with `pad = 2` becomes `[c b | a b c d | c b]`. This is
-/// `torch.nn.functional.pad(mode="reflect")` and `ggml_pad_reflect_1d`.
-pub fn reflect_pad(x: &[f32], pad: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(x.len() + 2 * pad);
-    for i in 0..pad {
-        out.push(x[pad - i]);
-    }
-    out.extend_from_slice(x);
-    for i in 0..pad {
-        out.push(x[x.len() - 2 - i]);
-    }
-    out
 }
 
 /// The logistic function.

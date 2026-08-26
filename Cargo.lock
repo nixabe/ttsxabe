@@ -1529,6 +1529,7 @@ name = "xabe-audio"
 version = "0.0.0"
 dependencies = [
  "thiserror",
+ "xabe-dsp",
 ]
 
 [[package]]
@@ -1644,6 +1645,20 @@ dependencies = [
  "thiserror",
  "tracing",
  "xabe-golden",
+ "xabe-st",
+]
+
+[[package]]
+name = "xabe-whisper"
+version = "0.0.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-audio",
+ "xabe-dsp",
  "xabe-st",
 ]
 

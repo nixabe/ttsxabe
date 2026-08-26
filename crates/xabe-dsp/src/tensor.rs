@@ -33,3 +33,28 @@ pub fn flip_channels(x: &[f32], ch: usize, t: usize) -> Vec<f32> {
     }
     out
 }
+
+/// Reflects `pad` samples off each end, excluding the endpoints themselves.
+///
+/// This is `torch.nn.functional.pad(mode="reflect")`, which is what both
+/// `torch.stft(center=True)` and Silero's frontend use. The endpoints are not
+/// repeated - the left pad starts at `x[pad]` and walks *down* to `x[1]` - and
+/// getting that wrong shifts every frame by one sample, which reads as a model
+/// that is slightly and inexplicably worse rather than as a bug.
+///
+/// # Panics
+///
+/// If `pad >= x.len()`, the point at which the reflection runs off the far end
+/// and the operation stops being defined.
+pub fn reflect_pad(x: &[f32], pad: usize) -> Vec<f32> {
+    assert!(
+        pad < x.len(),
+        "reflecting {pad} off a signal of {}",
+        x.len()
+    );
+    let mut out = Vec::with_capacity(x.len() + 2 * pad);
+    out.extend((1..=pad).rev().map(|i| x[i]));
+    out.extend_from_slice(x);
+    out.extend((1..=pad).map(|i| x[x.len() - 1 - i]));
+    out
+}
