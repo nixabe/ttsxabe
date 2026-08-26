@@ -55,8 +55,14 @@ everything used to test it.
 
 No ML framework. No `candle`, `tch`, `ort`, `ndarray`, or bindings to
 whisper.cpp or llama.cpp. If one appears, it needs an argument in a commit body.
-No `sentencepiece` or `tokenizers` crate either: both tokenizers are written by
-hand and tested against captured outputs.
+No `sentencepiece` or `tokenizers` crate either: all three tokenizers are
+written by hand and tested against captured outputs. That decision reaches
+further than it looks for the translator, whose `tokenizer.model` is a
+SentencePiece `ModelProto` — a protobuf. Rather than take `prost` or `protobuf`
+and a build step to read one file, `xabe-llama` carries a ~65-line wire reader
+that walks the fields it needs and skips the rest by wire type. A protobuf
+crate would have been correct and would have been more code, more build, and a
+generated-source directory, for a format this workspace reads exactly once.
 
 ## Build profiles
 

@@ -60,6 +60,24 @@ The encoder is 2.26 TFLOP for a 30-second window, so 173 ms is 13.1 TFLOP/s -
 card's 99 TFLOP/s f16 tensor-core peak. Note that the window is fixed: a 2.67 s
 clip and a 29 s one cost the same encoder.
 
+### Translator
+
+**Not measured, deliberately.** The translator has no timing table here because
+it is not on the reply path: `DIRECT_TAIGI=1` is the pipeline's default and was
+itself chosen on a measurement — 3.8 s end-to-end against 1.6 s with the
+translator bypassed. Benchmarking a stage that does not run, against a
+`llama-server` that also does not run, would produce a number nobody can act
+on.
+
+What is known: the weights are 26.5 GB at f16, and the three-test oracle binary
+takes 113 s end to end on one card with most of that a single load — which is
+why those tests share one `OnceLock<Mutex<_>>` instance rather than loading per
+test. Three concurrent loads is 80 GB and an out-of-memory that reads like a
+broken loader. If the translator ever returns to the
+reply path, the measurement to take is decode tokens per second against
+`llama-server` on the f16 GGUF, alternated in pairs on the same card, exactly
+as the ASR is measured above.
+
 This section holds the current numbers and nothing else. When a measurement
 supersedes a cell, replace the cell — never append a dated note, a before/after
 delta, or an "improved from X" narrative. The change story belongs in the commit

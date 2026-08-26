@@ -15,11 +15,16 @@ against the ASR's 0 ms and the LLM's ~120 ms to first clause. That is finished
 and measured: 1.24× faster than PyTorch, stage-by-stage against a captured
 oracle.
 
-**The scope has since widened, by decision.** The engine is becoming every
-stage of the pipeline except the chat LLM, which stays in llama.cpp: ASR
-(Whisper large-v2 fine-tune), voice activity detection (Silero), the
-Mandarin-to-Taigi translator's loader, turn-taking and the web front end, all
-in one binary with per-stage flags. `docs/MILESTONES.md` has the phases.
+**The scope has since widened, by decision.** The engine is every stage of the
+pipeline except the chat LLM, which stays in llama.cpp: ASR (Whisper large-v2
+fine-tune), voice activity detection (Silero), Mandarin-to-Taigi translation
+(Llama-2 13 B), turn-taking and the web front end, all in one binary with
+per-stage flags. `docs/MILESTONES.md` has the phases.
+
+The translator was planned as a loader only, because `DIRECT_TAIGI=1` takes it
+out of the reply path. The loader proved the geometry, the forward pass was
+built on the kernels that were already there, and it matches both references —
+so the plan's "optional" is spent rather than pending.
 
 An earlier version of this file said porting Whisper or the LLM here was
 explicitly out of scope. That was the right rule while the synthesiser was
@@ -29,12 +34,16 @@ anything.
 
 ## Current standing
 
-The synthesiser is finished: end-to-end CUDA agreement with the captured oracle
-at 1.2e-5, and 1.24× faster than the PyTorch reference on interleaved medians.
-That number and every other comparison belong in `docs/BENCHMARKS.md` and
-nowhere else.
+Five stages are finished: the synthesiser, the serving layer, voice activity
+detection, speech recognition and Mandarin-to-Taigi translation. CosyVoice is
+scoped and not started — `docs/MILESTONES.md` has the state of every item, and
+is the file to read before starting work rather than this paragraph.
 
-Nothing else has been measured, because nothing else has been built.
+Two standings are worth knowing here because they are easy to assume wrongly.
+The synthesiser is 1.24x faster than the PyTorch reference on interleaved
+medians. The ASR is **0.55x** against `whisper-server` — a stated milestone that
+is not met, recorded as a miss. Those numbers and every other comparison belong
+in `docs/BENCHMARKS.md` and nowhere else.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.
@@ -75,20 +84,29 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 
 | Crate | Owns | Depends on |
 | --- | --- | --- |
-| `xabe-st` | safetensors container parsing, mmap, tensor addressing | — |
-| `xabe-audio` | WAV containers, sample handling, framing | — |
-| `xabe-vits` | model config, weight schema, shape validation | `xabe-st` |
-| `xabe-dsp` | CPU reference kernels + differential compare harness | `xabe-vits` |
-| `xabe-cuda` | CUDA kernels and the device handle | — |
-| `xabe-tts` | the VITS forward pass and its API | all of the above |
-| `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
-| `xabe-engine` | flags, stage wiring, orchestration, the binary | all |
+| `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
+| `xabe-dsp` | CPU reference kernels + differential compare harness | — |
+| `xabe-golden` | reading captures and comparing tensors | — |
+| `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |
+| `xabe-cuda` | CUDA kernels and the device handle | `xabe-dsp` |
+| `xabe-vits` | VITS config, weight schema, shape validation | `xabe-st`, `xabe-golden` |
+| `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | `xabe-st`, `xabe-dsp`, `xabe-audio` |
+| `xabe-llama` | Llama geometry, weight schema, SentencePiece | `xabe-st` |
+| `xabe-vad` | Silero geometry, weights and forward pass | `xabe-st`, `xabe-dsp`, `xabe-audio` |
+| `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-golden` |
+| `xabe-asr` | the Whisper forward pass and greedy decoding | `xabe-whisper`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-audio` |
+| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | `xabe-llama`, `xabe-cuda`, `xabe-st` |
+| `xabe-serve` | HTTP, WebSocket, the page, the conversation | `xabe-audio` |
+| `xabe-engine` | flags, stage wiring, orchestration, the binary | every stage crate |
 
-| `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
+The pattern to keep: each model is **two** crates, one that says what the
+tensors are and refuses to do arithmetic, and one that runs them. `xabe-vits` to
+`xabe-tts`, `xabe-whisper` to `xabe-asr`, `xabe-llama` to `xabe-translate`. A
+geometry crate that grows a matmul has broken the rule.
 
-Crates that the plan adds and that do not exist yet: `xabe-whisper` (phase 4),
-`xabe-llama` (phase 5a). Their flags exist already and fail with the phase they
-are waiting on.
+`xabe-asr` and `xabe-translate` are CUDA-only and have no scalar twin of the
+whole model - see `docs/ARCHITECTURE.md` for why, which is arithmetic rather
+than taste. Their individual kernels still have twins and differential tests.
 
 ## House style
 

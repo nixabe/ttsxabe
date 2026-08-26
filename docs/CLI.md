@@ -105,7 +105,13 @@ startup log announce `device=cuda:0` for a stage running on the CPU.
 Every rejection names the flag that caused it and happens *before* any
 checkpoint is opened, so a mistyped topology costs a millisecond rather than
 six gigabytes of reads. The order is: resolve the stages, decide what the run
-does, refuse the stages that are not built yet, then work.
+does, refuse a stage asked to run somewhere it cannot, then work.
+
+There used to be a fourth thing in that list — refusing stages the plan had not
+built yet, each error naming the phase to wait for. Every stage is built now, so
+the only refusal left is `--vad-url`, and it says the VAD runs in process rather
+than naming a phase. A permanent limit and a pending one should not read the
+same; someone told to wait for phase 3 would wait forever.
 
 | | |
 | --- | --- |
@@ -126,22 +132,22 @@ does, refuse the stages that are not built yet, then work.
 `--vad-model --in clip.wav` is *accepted*: over a file the VAD is a tool that
 prints segments, and only when served is it a gate that needs something to gate.
 
-### Stages that are not built yet
+### Stages that refuse a device
 
-The flag surface is complete ahead of the stages behind it. `--translator-model`
-parses and validates, then fails with the phase that builds it. That ordering
-is deliberate: the topology is the part worth settling first, and a flag that
-parses and then silently does nothing is worse than one that says what it is
-waiting on.
+Every stage in the table below is built. What is left of the older wording here
+is the part that still applies: three stages refuse a device rather than
+accepting it and doing something else.
 
-Two stages refuse a device rather than accepting it and doing something else.
 The VAD has no CUDA implementation and is not going to: 15 tensors and a
 millisecond of work, where the transfer would cost more than the arithmetic.
 The ASR has no CPU implementation for the mirror-image reason: one 30-second
 window is 2.2 TFLOP through the encoder, which the scalar kernels would take
-twenty minutes to do. Both would otherwise be a flag that is accepted and then
-quietly means something else - which is exactly how the startup log once came
-to announce `device=cuda:0` for a stage running on the CPU.
+twenty minutes to do. The translator refuses the CPU for that reason and a
+second one - a scalar path would hold its 26.5 GB of f16 weights as 53 GB of
+f32, which no card here has. All three would otherwise be a flag that is
+accepted and then quietly means something else - which is exactly how the
+startup log once came to announce `device=cuda:0` for a stage running on the
+CPU.
 
 | stage | status |
 | --- | --- |
@@ -151,7 +157,7 @@ to announce `device=cuda:0` for a stage running on the CPU.
 | `--vad-model` | works, CPU only |
 | `--vad-url` | never: the VAD is a millisecond of CPU, so a round trip would cost more than the work |
 | `--asr-model` | works, CUDA only |
-| `--translator-model` | phase 5a |
+| `--translator-model` | works, CUDA only |
 
 ## What `--serve` publishes
 

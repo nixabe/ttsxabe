@@ -122,34 +122,187 @@ it is asserted directly rather than captured.
 
 | # | State | Done |
 | --- | --- | --- |
-| 18 | `xabe-st` reads F16 and BF16, converting BF16 → F16 with a tested range check | |
+| 18 | `xabe-st` reads F16 and BF16, converting BF16 → F16 with a tested range check | ✅ |
+| 19 | All 363 tensors of the 13 B bind and shape-check, with a parameter-count test | ✅ |
+| 20 | SentencePiece matches the reference tokenizer on a captured corpus | ✅ |
 
-Item 18 is partly done already: phase 3 needed F16 because the Silero
-checkpoint turned out to be one. What remains is BF16 and the range check.
-| 19 | All 363 tensors of the 13 B bind and shape-check, with a parameter-count test | |
-| 20 | SentencePiece matches the reference tokenizer on a captured corpus | |
+Item 18 was half done before this phase started: phase 3 needed F16 because
+the Silero checkpoint turned out to be one. What this phase added is
+`tensor_f16`, which takes F32, F16 or BF16 and always returns f16 — F16 copied
+bit for bit, the other two rounded to nearest even. The range check is not a
+clamp: an input that would round to an infinity is **refused** by name and
+index, because the failure mode being defended against is a model that loads
+and then speaks nonsense. Underflow to a subnormal or to zero is counted and
+logged instead of refused, since that is what the arithmetic does anyway.
+
+Nothing was read to bind the 363 tensors. `LlamaWeights` holds a `Bound { name,
+shape, dtype }` per tensor and checks each shape against the config before any
+bytes move, so a geometry mistake fails at bind rather than as a wrong number
+40 layers later. The parameter count comes out at 13,261,870,080 against the
+checkpoint's own inventory.
+
+Two findings from item 20. The tokenizer is a hand-written protobuf reader —
+`tokenizer.model` is a SentencePiece `ModelProto` and the workspace takes no
+protobuf dependency — and it reads only the two fields it needs, skipping the
+rest by wire type. And `config.json` says `vocab_size` 56024 while the
+tokenizer holds 56020 pieces: the four extra rows are real, allocated, trained
+embedding rows that no piece maps to. The loader binds the 56024 and the
+tokenizer refuses to emit an id above 56019, which is the only combination
+that is both faithful to the checkpoint and safe to sample from.
 
 ### Phase 5b — translator inference, optional
 
 `DIRECT_TAIGI=1` is the pipeline's default and takes the translator out of the
-reply path entirely — measured 3.8 s → 1.6 s — so this is deferred behind a
-decision to be taken once phase 5a proves the geometry is understood.
+reply path entirely — measured 3.8 s → 1.6 s. It was built anyway, because
+phase 5a proved the geometry and the remaining work was the forward pass this
+workspace's kernels already covered.
 
 | # | State | Done |
 | --- | --- | --- |
-| 21 | The Llama-2 forward pass matches a captured oracle, per layer | |
-| 22 | Translations match llama-server's at `temperature = 0` | |
+| 21 | The Llama-2 forward pass matches a captured oracle, per layer | ✅ |
+| 22 | Translations match llama-server's at `temperature = 0` | ✅ |
+
+Item 22 is met with one disagreement, and the disagreement was chased rather
+than tolerated. Seven of eight prompts are character-identical to
+llama-server; the eighth, `你食飽未 [HAN]`, differs by a trailing `？`. The
+🤗 oracle was then captured for that exact prompt at f32 and answers `你食飽未`
+— agreeing with this engine, so llama-server is the one that diverges.
+`docs/ORACLE.md` records why that is possible at all: llama-server reuses a KV
+prefix across requests, so it is not request-independent even at temperature 0.
+
+Getting to 7/8 needed llama.cpp's `penalize_nl = false`, which is a default and
+not a flag anyone sets: the newline is exempt from the repetition penalty.
+Without that exemption four of the eight prompts grew a trailing `。`. Worst
+per-layer error across the corpus is 7.9e-4 in the final norm against a 3.0e-3
+gate.
 
 ### Phase 6 — CosyVoice
 
 | # | State | Done |
 | --- | --- | --- |
-| 23 | Scoped separately: 4 sub-models across 3 formats, larger than the ASR port | |
+| 23 | Scoped, against the checkpoint on disk rather than the plan's estimate | ✅ |
+
+The plan said "4 sub-models across 3 formats, larger than the ASR port". Only
+the middle claim survives reading the files. It is **five** sub-models, and it
+is *not* larger than the ASR port in parameters — 1.24 B against Whisper's
+1.54 B. It is larger in every other way that matters, which is why the estimate
+was right for the wrong reason and worth correcting anyway.
+
+| sub-model | file | format | params | on the per-request path |
+| --- | --- | --- | --- | --- |
+| text-to-speech-token LM | `llm.pt` | pickle | 642 M | yes |
+| flow matching, DiT estimator | `flow.pt` | pickle | 332 M | yes |
+| HiFT vocoder | `hift.pt` | pickle | 20.8 M | yes |
+| speech tokenizer | `speech_tokenizer_v3.onnx` | ONNX | 242 M | **no** |
+| speaker embedding, CAMPPlus | `campplus.onnx` | ONNX | 6.9 M | **no** |
+
+All three `.pt` files are float32 throughout. `flow.decoder.estimator.fp32.onnx`
+is a redundant export of `flow.pt`'s estimator and is not a sixth model.
+`CosyVoice-BlankEN/model.safetensors` is not a sixth model either: `llm.pt`
+carries its own fine-tuned copy of every one of those weights, so that directory
+is needed for the **tokenizer alone** — `vocab.json` and `merges.txt`, a Qwen2
+byte-level BPE over 151,936 pieces.
+
+#### The two ONNX models are not on the critical path, and that is the lever
+
+The live daemon calls `add_zero_shot_spk` **once at startup** and caches the
+result, because both ONNX models fall back to CPU here — onnxruntime's CUDA
+provider wants `libcudnn.so.8`, which this host does not have. So per request
+they do not run at all. What they produce is two tensors for a fixed reference
+clip: a speech-token sequence and a 192-dimensional speaker embedding.
+
+That means the ONNX half can be **captured rather than ported** for a first
+working version — the same reference wav, the same two tensors, written once to
+a file — and porting them becomes a later item about supporting a *new* voice
+rather than a prerequisite for any audio at all. It also inverts the usual
+argument: a Rust port of these two would be faster than what runs today, since
+what runs today is CPU onnxruntime, but it would be faster at something that
+happens once.
+
+#### What each remaining piece actually is
+
+**The LM** is a Qwen2-0.5B fine-tune: 24 layers, hidden 896, intermediate 4864,
+14 query heads against **2 key/value heads**, `rope_theta` 1e6, RMS-norm eps
+1e-6, and biases on q/k/v. `xabe-llama` currently *refuses* GQA by name, so this
+is the item that makes that refusal into an implementation. On top of the
+backbone sit `speech_embedding` and `llm_decoder`, both 6761x896 — 6561 speech
+tokens plus 200 task and control tokens.
+
+Sampling is **not greedy**. It is `ras_sampling` — repetition-aware, top-p 0.8,
+top-k 25, window 10, `tau_r` 0.1 — which makes this the first stochastic decode
+in the workspace, and the first place an oracle comparison needs a pinned RNG on
+both sides rather than a fixed answer.
+
+**The flow** is a conditional flow-matching decoder around a DiT: dim 1024,
+depth 22, 16 heads of 64, feed-forward 2048, AdaLN-Zero (the 6144x1024
+modulation projection), rotary embeddings, and a grouped convolutional
+positional embedding. It runs an Euler solver on a cosine schedule with
+classifier-free guidance at 0.7, which is why the ONNX export takes a batch of
+**2** — conditional and unconditional in one pass. Every solver step is a full
+22-layer forward, so the step count multiplies the cost of the largest thing
+here.
+
+**The vocoder** is a causal HiFi-GAN with three novelties this workspace has not
+built. Its activations are **Snake**, not leaky ReLU — `x + sin²(αx)/α` with a
+learned per-channel α, 72 of them. Its output head is an **iSTFT**: `conv_post`
+emits 18 channels, which is magnitude and phase over the 9 bins of a 16-point
+transform, so `xabe_dsp::Fft` needs an inverse it does not have. And it is
+driven by an **NSF harmonic source** — F0 predicted by a small conv net, then 8
+harmonics — which is a second signal path merged into the upsampler, not a
+decoration.
+
+164 of its 328 tensors are `parametrizations.weight.original0/1` pairs: **weight
+norm**, unfused, exactly the trap that `xabe-vits`'s parameter-count test caught
+once already. It is the one thing in this phase this project has been bitten by
+before.
+
+#### The container problem, and the precedent for it
+
+`.pt` is a pickle in a ZIP. `xabe-st` reads safetensors and nothing else, and
+teaching a Rust workspace to execute pickle opcodes to read three weight files
+would be a genuinely bad trade. The precedent is phase 3: Silero was
+legacy-ggml and was converted by a `tools/` script into safetensors, once,
+outside the engine. Three more conversions is the same move, and it is also
+where the dtype is decided — per sub-model, not once. The LM and the DiT want
+f16 for the same reason everything else on this card does. The vocoder probably
+does not: `docs/BENCHMARKS.md` already records fp16 being rejected upstream in
+VITS's flow and decoder, and a HiFi-GAN with an iSTFT head is the same kind of
+arithmetic. 20.8 M parameters is not worth the risk of finding out by ear.
+
+#### Proposed items
+
+Not started. Ordered so that 24-29 produce audio for the one cached reference
+speaker, and only 30 is about supporting a new voice.
+
+| # | item |
+| --- | --- |
+| 24 | `tools/` converts `llm.pt`, `flow.pt` and `hift.pt` to safetensors; geometry and all 951 tensors typed and shape-checked |
+| 25 | `xabe-llama` grows GQA and q/k/v biases; the Qwen2 backbone matches a captured oracle per layer |
+| 26 | Qwen2 byte-level BPE matches the reference tokenizer, and `ras_sampling` reproduces the reference under a pinned RNG |
+| 27 | The DiT estimator matches per layer; the Euler/CFG solver matches the reference mel |
+| 28 | Snake, iSTFT and the NSF source land in `xabe-dsp`/`xabe-cuda` with differential tests; the vocoder matches the reference waveform |
+| 29 | End to end from cached speaker tensors: `--tts-model` selects CosyVoice, Han text in, 24 kHz audio out |
+| 30 | The speech tokenizer and CAMPPlus ported from ONNX, so a new reference voice needs no Python |
+
+Items 24-29 are the ASR port's shape with a different model. Item 30 is a
+different kind of work — deriving a network from an ONNX graph rather than from
+reference source — and is the one that should be re-scoped when it is reached
+rather than estimated now.
 
 ## What the numbering does not cover
 
 Batching and streaming synthesis are still deliberately absent. They are
 answers to questions this project has not asked yet.
+
+Streaming has a caveat now that phase 6 is scoped, and it is worth writing down
+before someone reaches item 29 and is surprised. The Python CosyVoice backend
+*does* stream — `inference_instruct2(stream=True)` yields audio as the flow
+solver produces it, and `gateway.py` plays it as it arrives. Items 24-30 above
+describe a non-streaming port: text in, one waveform out. That is the right
+first target, because a chunked flow decoder that is subtly wrong sounds like a
+chunked flow decoder that is subtly right. But it is a *reduction* against the
+service being replaced, not parity with it, and closing it is its own item that
+has not been written.
 
 Serving *was* on that list, on the grounds that the pipeline upstream already
 had an HTTP surface that worked. That is retracted in phase 2: the engine is

@@ -31,7 +31,8 @@ configuration of the same flags, not a different program.
       ├── xabe-vad      Silero geometry, weights and forward pass
       ├── xabe-asr      the Whisper forward pass, CUDA only
       ├── xabe-whisper  Whisper geometry, weight schema, BPE, mel
-      ├── xabe-llama    Llama geometry, weight schema, SentencePiece  [phase 5a]
+      ├── xabe-translate the Llama-2 forward pass, CUDA only
+      ├── xabe-llama    Llama geometry, weight schema, SentencePiece
       ├── xabe-tts      the VITS forward pass and synthesis API
       ├── xabe-audio    WAV, mel spectrogram, PCM framing
       ├── xabe-vits     config, weight schema, shape validation
@@ -50,9 +51,10 @@ needs.
 
 The ASR is split the way the TTS is: `xabe-whisper` says what the tensors are
 and refuses to do arithmetic, `xabe-asr` runs them. The difference is that
-`xabe-asr` has no CPU twin - see below.
+`xabe-asr` has no CPU twin - see below. The translator repeats the split
+exactly, `xabe-llama` to `xabe-translate`, and for the same reason.
 
-## Why the ASR has no CPU path
+## Why the ASR and the translator have no CPU path
 
 Every other model in this engine runs both ways: a scalar version in
 `xabe-dsp` that is written to be read against the reference, and a CUDA version
@@ -62,10 +64,15 @@ and the scalar kernels run at something under 2 GFLOP/s - twenty minutes an
 utterance. That is not a slow option; it is a fictional one, and shipping it
 would be shipping something nobody can use.
 
-So `--asr-device cpu` is refused at preflight by name, the mirror of the rule
-that refuses `--vad-device 0`. The kernels the ASR is built from still have
-their scalar twins and their differential tests; it is only the assembly of
-them that is checked against the captured oracle directly instead.
+The translator is worse, and for a second reason on top of the first. Its
+weights are 26.5 GB at f16 and a scalar path would have to hold them as f32,
+which is 53 GB — more than this machine's cards have and more than most hosts
+would want resident. So both stages carry `Kind::has_cpu() == false` and both
+`--asr-device cpu` and `--translator-device cpu` are refused at preflight by
+name, the mirror of the rule that refuses `--vad-device 0`. The kernels these
+stages are built from still have their scalar twins and their differential
+tests; it is only the assembly of them that is checked against the captured
+oracle directly instead.
 
 ## How a model reaches the serving layer
 
@@ -124,6 +131,8 @@ crates above it.
 | `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
 | `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | doing model arithmetic |
 | `xabe-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
+| `xabe-llama` | Llama geometry, weight schema, SentencePiece | doing model arithmetic |
+| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | running anywhere but a card |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 

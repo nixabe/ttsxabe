@@ -33,6 +33,9 @@ exists.
 | head split, merge and transpose | ASR attention | (index formula, in the test) | `split_heads`, `split_heads_t`, `merge_heads` | `xabe-cuda` kernels |
 | causal mask | ASR decoder self-attention | (index formula, in the test) | `causal_mask` | `xabe-cuda` kernels |
 | round to f16 | ASR weights and KV cache | `half::f16::from_f32` | `pack_f16` | `xabe-cuda` kernels |
+| RMS norm | translator, every layer twice | `xabe_dsp::rms_norm` | `rms_norm` | `xabe-cuda` kernels |
+| SiLU, and SiLU-gated multiply | translator MLP | `xabe_dsp::silu`, `silu_mul` | `silu_mul` | `xabe-cuda` kernels |
+| rotary position embedding | translator attention | `xabe_dsp::rope` | `rope` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -218,3 +221,22 @@ with constant-input error growing monotonically 3.2e-2 at 8K to 7.3e-1 at 131K.
 Rescale cadence does not help. So `m16n8k8.f32...f32` is the shape used, and the
 operand rounding it does cost is measured rather than assumed: 6.5e-5 of full
 scale on a k=1280 contraction.
+
+## The three kernels the translator added
+
+They are small and none of them needed a design decision, with one exception
+that cost an afternoon.
+
+`rope` first used `__sincosf`, the hardware approximation. It matched at low
+positions and drifted to 6e-4 by position 4095, because `__sincosf` performs
+**no argument reduction** - at 4095 radians the argument is thousands of times
+larger than the range the instruction is accurate over. Switching to `sincosf`,
+`powf` and `expf` fixed it, and the residual 2.3e-4 that remains is not a bug
+to chase: `inv_freq` differs from the reference by one ulp, and one ulp times
+4095 radians *is* 2e-4. The tolerance says so out loud -
+`1e-5 + first as f32 * f32::EPSILON` - rather than being a round number picked
+to make the test pass.
+
+The scalar twin computes `inv_freq` in **f32**, deliberately, even though f64
+would be more accurate. The reference computes it in f32. A twin that is more
+accurate than the thing it is checking is not a twin.

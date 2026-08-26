@@ -12,9 +12,9 @@ decided by flags, and each stage is satisfied either locally
 (`--<stage>-model`) or by another process over HTTP (`--<stage>-url`) — so the
 same binary is a monolith, a single-stage worker, or anything between.
 
-Finished: the synthesiser, the serving layer, voice activity detection and
-speech recognition. In progress: the translator. `docs/MILESTONES.md` has the
-phases and `docs/CLI.md` the flag surface.
+Finished: the synthesiser, the serving layer, voice activity detection, speech
+recognition and Mandarin-to-Taigi translation. Remaining: CosyVoice.
+`docs/MILESTONES.md` has the phases and `docs/CLI.md` the flag surface.
 
 ## Why this exists
 
@@ -75,8 +75,12 @@ identical transcripts. That was a stated milestone and it is not met;
 `docs/BENCHMARKS.md` computes what closing the gap would take rather than
 restating the target.
 
-The translator loader is not built yet. Its flags are, and they fail naming the
-phase that builds them.
+The translator is a Llama-2 13 B, all 363 tensors bound and shape-checked
+before a byte is read, BF16 converted to f16 at load because Turing has no
+bf16, and a hand-written SentencePiece tokenizer. Its output matches
+`llama-server`'s on seven of eight fixed prompts at `temperature = 0`; on the
+eighth, the float32 🤗 oracle agrees with *this* engine, so llama-server is the
+one that diverges. `docs/ORACLE.md` says why that can happen at all.
 
 | crate | state |
 | --- | --- |
@@ -91,6 +95,8 @@ phase that builds them.
 | `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
 | `xabe-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
 | `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
+| `xabe-llama` | Llama geometry, 363 tensors, SentencePiece from `tokenizer.model` |
+| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:
@@ -174,7 +180,7 @@ The synthesiser speaks Taigi from Pe̍h-ōe-jī romanisation. It does not do
 grapheme-to-phoneme conversion and does not know what Han characters are - text
 made only of them tokenises to nothing and is refused rather than returned as
 silence. Producing POJ from Mandarin is the translator's job, and the
-translator is phase 5.
+translator is a separate stage with its own model and its own flag.
 
 The chat model is out of scope permanently and is reachable only as
 `--llm-url`. There is no `--llm-model`.

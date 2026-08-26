@@ -338,3 +338,97 @@ empty one, on some utterances and not others.
 2.2 TFLOP for one encoder pass against scalar kernels that run at something
 under 2 GFLOP/s. `--asr-device cpu` is refused at preflight rather than
 accepted and then taking twenty minutes. See `docs/ARCHITECTURE.md`.
+
+---
+
+# Llama-2, `Taigi-Llama-2-Translator-13B`
+
+A Llama-2 13 B fine-tune that translates between Mandarin, Han-script Taigi and
+POJ. 363 tensors, 13,261,870,080 parameters, BF16 on disk.
+
+## Geometry
+
+| | |
+| --- | --- |
+| hidden size | 5120 |
+| layers | 40 |
+| attention heads | 40, head dim 128 |
+| key/value heads | 40 — **no** grouped-query attention |
+| intermediate size | 13824 |
+| RMS norm epsilon | 1e-5 |
+| RoPE theta | 10000 |
+| vocabulary | 56,024 in the config, 56,020 in the tokenizer |
+| tied embeddings | no — `lm_head` is its own 5120×56024 tensor |
+
+The config is checked rather than trusted. `LlamaConfig::check` refuses an
+architecture that is not `LlamaForCausalLM`, a hidden size that is not divisible
+by the head count, and — for now — any checkpoint with fewer key/value heads
+than query heads, because this engine has never run a GQA model and a silently
+wrong head mapping is exactly the failure this project keeps trying to make
+impossible.
+
+## BF16 on a card with no bf16
+
+Turing has fp16 tensor cores and no bf16 at all, so the weights are converted
+once at load. F32 would be 53 GB, which is more than any card here has; f16 is
+26.5 GB and fits. The conversion is `xabe-st`'s `tensor_f16`, and its behaviour
+at the edges is a decision, not an accident: a value that would round to an
+infinity is **refused** by tensor name and element index, while an underflow to
+a subnormal or to zero is counted and logged. Saturating quietly is how you get
+a model that loads and then speaks nonsense.
+
+## Four vocabulary rows no token maps to
+
+`config.json` says 56024 and `tokenizer.model` holds 56020 pieces. Both are
+right: the extra four rows are real, allocated, trained parameters that the
+tokenizer has no piece for. So the loader binds 56024 rows — anything else
+fails the parameter count — and the tokenizer refuses to emit an id above
+56019. That combination is faithful to the checkpoint *and* safe to sample from;
+truncating the embedding would break the count, and letting the tokenizer reach
+the extra rows would produce ids nothing can decode.
+
+## RoPE pairs halves, not neighbours
+
+🤗's implementation rotates element `i` against element `i + head_dim/2`. The
+original paper, and most from-scratch implementations, pair `2i` with `2i+1`.
+The two are a permutation apart and both "work" in the sense of training a
+model, but a checkpoint is trained under one of them and reading it under the
+other produces fluent nonsense rather than an error. This is the halves
+convention because that is what the checkpoint was trained with.
+
+## Where the attention scale goes, again
+
+Whisper scales the *query* before the product and uses a softmax scale of 1.
+Llama scales the *scores* after it. The algebra is identical and the rounding is
+not, so each convention is copied where it belongs rather than unified. Whisper
+is documented as being sensitive to the ordering; nothing says Llama is, and the
+point of matching an oracle is that you do not have to find out.
+
+## The newline is exempt from the repetition penalty
+
+llama.cpp has a `penalize_nl` parameter that defaults to **false**, which means
+almost nobody sets it and almost nobody knows it is there. With the newline
+penalised, four of eight fixed prompts grew a trailing `。`; with it exempt,
+seven of eight are character-identical to llama-server. The penalty itself is
+llama.cpp's asymmetric form — divide a positive logit, multiply a negative one —
+over the last 64 tokens at 1.1.
+
+## The prompt template is exact
+
+```
+[TRANS]
+{source}
+[/TRANS]
+[{target}]
+```
+
+with BOS prepended, stopping at `[/` or `\n[`. `target` is `POJ`, `HAN` or `HL`.
+The template comes from the model card and the whitespace is load-bearing: this
+is a fine-tune, not an instruction model, and it has no fallback behaviour for a
+prompt shaped differently.
+
+## There is no CPU implementation
+
+`--translator-device cpu` is refused at preflight. See
+`docs/ARCHITECTURE.md` — 40 layers of 13 B at under 2 GFLOP/s is not a slow
+option, and the f32 weights would not fit anyway.

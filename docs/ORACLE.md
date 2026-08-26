@@ -244,3 +244,74 @@ it in f64 and round once, with no reduction anywhere for an ordering to
 disagree about. The capture is kept as the test. Shipping it as an asset would
 have added a file that can go missing, go stale, or silently be the `htk`
 variant instead of `slaney`.
+
+---
+
+# The translator oracle
+
+The translator is the only stage with **two** references, because there are two
+different questions to answer and one reference each.
+
+| reference | what it says |
+| --- | --- |
+| 🤗 `LlamaForCausalLM`, CPU, float32, one thread | what the arithmetic *should* be |
+| `llama-server` on the f16 GGUF of the same weights | what the pipeline runs *today* |
+
+The first is the oracle in this document's sense: per-layer taps, exact
+comparison, a gate on the numbers. The second is the thing being replaced, so
+agreeing with it is the actual product claim. Having both is what let the one
+disagreement be resolved instead of tolerated.
+
+## Capturing
+
+```sh
+python tools/oracle/capture_llama.py --model models/translator/taigi-llama2-13b \
+    --out .golden/translator/trans --src 今天天氣很好 --tgt POJ
+python tools/oracle/capture_llama_tokenizer.py \
+    --model models/translator/taigi-llama2-13b --out .golden/translator/tokenizer.json
+python tools/oracle/capture_llama_server.py --url http://127.0.0.1:8081 \
+    --out .golden/translator/llama_server.json
+```
+
+`capture_llama.py` writes the prompt ids, the embedding, the first four decoder
+block outputs, the final norm, the logits and a greedy continuation, with a
+`manifest.json`. Three prompts are captured — one per target script — because a
+POJ answer and a Han answer take different paths through the vocabulary.
+
+`torch.set_num_threads(1)`, for the same reason as the ASR: f32 reduction order
+is not thread-invariant.
+
+`capture_llama_server.py` sends `gateway.py`'s request body unchanged —
+template, `temperature: 0`, `repeat_penalty: 1.1`, `n_predict: 256`, stops
+`["[/", "\n["]`. A comparison against a differently configured server is not a
+comparison.
+
+## `llama-server` is not request-independent
+
+This is the finding worth carrying. Seven of eight prompts matched and the
+eighth, `你食飽未` to Han, did not: llama-server answers `你食飽未？` and this
+engine answers `你食飽未`. Capturing the float32 🤗 oracle for that exact prompt
+settled it — 🤗 answers `你食飽未`, agreeing with this engine.
+
+So llama-server is the one that diverges, and the mechanism is not mysterious:
+it **reuses a KV prefix across requests**. The same prompt at temperature 0 can
+therefore produce different output depending on what was asked before it, which
+means a captured llama-server transcript is a record of one server's history and
+not a function of its input. That is exactly why it is the cross-check and 🤗 is
+the oracle — the same relationship `whisper-server` has with 🤗 Whisper, arrived
+at from the opposite direction.
+
+## Two identical error values that were not a bug
+
+Two different prompts reported the same maximum per-layer error to every digit,
+which looked like a tap wired to the wrong tensor. It was not: the maximum lands
+in the `<s>` row, and `<s>` is the same input in both prompts. A number that
+repeats is worth checking and is not automatically wrong.
+
+## A capture that was deleted rather than kept
+
+`decode_with_timestamps` is not the only reference behaviour that turned out to
+be a bug. The rule that came out of both: when the reference is wrong, do not
+capture it. Assert the intended behaviour directly, in the test, with the reason
+attached — a capture is a record of what the reference does, and enshrining a
+defect in one makes it permanent and invisible.
