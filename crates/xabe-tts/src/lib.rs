@@ -15,6 +15,7 @@ mod prior;
 mod rng;
 mod synthesize;
 mod text_encoder;
+mod wav;
 
 pub use decoder::decoder;
 pub use duration::duration_predictor;
@@ -23,3 +24,4 @@ pub use prior::{Prior, expand_prior};
 pub use rng::Rng;
 pub use synthesize::{Prepared, Prosody, SynthesisError, Synthesizer};
 pub use text_encoder::{EncoderOutput, text_encoder};
+pub use wav::{wav_bytes, write_wav};

@@ -67,20 +67,47 @@ impl Synthesizer {
     /// Loads a model directory: `model.safetensors`, `config.json`,
     /// `vocab.json` and `tokenizer_config.json`.
     pub fn open(dir: &Path) -> Result<Self, SynthesisError> {
-        let cfg = VitsConfig::from_json_path(dir.join("config.json"))?;
-        let tok = Tokenizer::load(dir)?;
-        let file = StFile::open(dir.join("model.safetensors"))?;
+        Self::open_files(
+            &dir.join("model.safetensors"),
+            &dir.join("config.json"),
+            dir,
+        )
+    }
+
+    /// Loads a model from individually addressed files.
+    ///
+    /// The CLI needs this because it lets `--config` point somewhere other than
+    /// beside the checkpoint; the tokenizer's two JSON files are still taken
+    /// from one directory, since they are meaningless apart.
+    pub fn open_files(
+        model: &Path,
+        config: &Path,
+        tokenizer_dir: &Path,
+    ) -> Result<Self, SynthesisError> {
+        let cfg = VitsConfig::from_json_path(config)?;
+        let tok = Tokenizer::load(tokenizer_dir)?;
+        let file = StFile::open(model)?;
         // Bound once here purely to fail early: a checkpoint that does not
         // match its config should be rejected at open, not on the first
         // synthesis.
         VitsWeights::load(&file, &cfg)?;
-        tracing::info!(dir = %dir.display(), "loaded model");
+        tracing::info!(model = %model.display(), "loaded model");
         Ok(Self { file, cfg, tok })
     }
 
     /// The model's geometry.
     pub fn config(&self) -> &VitsConfig {
         &self.cfg
+    }
+
+    /// The model's geometry, for the handful of sampling parameters the CLI
+    /// exposes as overrides.
+    ///
+    /// Only `noise_scale`, `noise_scale_duration` and `speaking_rate` are
+    /// meaningful to change - they are temperatures and a rate, not geometry.
+    /// Changing anything else here would contradict the checkpoint.
+    pub fn config_mut(&mut self) -> &mut VitsConfig {
+        &mut self.cfg
     }
 
     /// The model's tokenizer.

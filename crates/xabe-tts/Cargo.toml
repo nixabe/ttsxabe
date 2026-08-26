@@ -10,8 +10,14 @@ authors.workspace = true
 xabe-dsp.workspace = true
 xabe-st.workspace = true
 xabe-vits.workspace = true
+clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 xabe-golden.workspace = true
+
+[[bin]]
+name = "xabe-tts"
+path = "src/main.rs"

@@ -1,7 +1,7 @@
 # Command surface
 
-**Planned. `xabe-tts` has no binary yet.** This is the shape it is being built
-toward, recorded so the flags are designed once rather than accreted.
+`xabe-tts` builds a binary. Everything below works except `--device`, which
+arrives with the CUDA milestones - until then synthesis is CPU only.
 
 ## `xabe-tts`
 
@@ -21,11 +21,36 @@ xabe-tts --model model.safetensors --config config.json \
 | `--noise-scale` | | 0.667 | prior temperature |
 | `--noise-scale-duration` | | 0.8 | duration temperature |
 | `--speaking-rate` | | 1.0 | duration multiplier |
-| `--device` | `XABE_TTS_DEVICE` | `auto` | `cpu`, `cuda:N`, `auto` |
+| `--device` | `XABE_TTS_DEVICE` | `auto` | `cpu`, `cuda:N`, `auto` - *not yet implemented* |
 | `--log-level` | `RUST_LOG` | `info` | `info`, `debug`, `trace` |
 
 `--seed` defaults to a fixed value rather than to entropy. Reproducible by
 default is the right posture for something whose output is hard to check.
+
+## What it currently costs
+
+The reference kernels are scalar on purpose (see
+[ARCHITECTURE.md](ARCHITECTURE.md)), so the CPU path is slow: 2.67 s of audio
+takes about 120 s, roughly 45x slower than real time, nearly all of it in the
+decoder. That is the number the CUDA milestones have to beat, and it is
+deliberately not being optimised before then.
+
+## Verifying the output
+
+Numerical agreement with the oracle says the arithmetic is right; it does not
+say the file is speech. The check that does is an ASR round trip - synthesise,
+then transcribe with a model that was never involved in producing it:
+
+```sh
+xabe-tts --model .../model.safetensors \
+         --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
+curl -s -F file=@hello.wav -F language=zh http://127.0.0.1:8080/inference
+# {"text":"你好 今天天氣很好\n"}
+```
+
+That is the meaning of the POJ input, recovered from the audio by
+Breeze-ASR-26. It is the only test here that can tell correct audio from
+plausible audio, which matters when the language is one you cannot judge by ear.
 
 ## Conventions borrowed from `llmxabe`
 
