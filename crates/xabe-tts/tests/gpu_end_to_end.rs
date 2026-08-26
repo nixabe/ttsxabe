@@ -38,7 +38,7 @@ fn find_snapshot() -> Option<PathBuf> {
 
 /// Which device to use. GPU 2 on this host runs somebody else's job.
 fn ordinal() -> usize {
-    std::env::var("XABE_TTS_DEVICE")
+    std::env::var("XABE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

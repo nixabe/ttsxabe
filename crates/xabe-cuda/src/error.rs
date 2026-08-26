@@ -36,12 +36,18 @@ pub enum CudaError {
         source: cudarc::driver::DriverError,
     },
 
-    /// A contraction length the tensor-core instruction cannot express.
+    /// A contraction length the matmul's staging cannot address.
     ///
-    /// `m16n8k8` steps the contraction in eights. Padding a ragged one to the
-    /// next multiple would work and would hide a caller that has miscomputed a
-    /// shape, which in this workspace is the more likely of the two.
-    #[error("contraction length {k} is not a multiple of 8")]
+    /// This once said "not a multiple of 8", on the theory that `m16n8k8`
+    /// steps the contraction in eights. That was wrong about its own kernel:
+    /// the staging loop zero-extends a short trip and the instruction
+    /// accumulates the zeros, so any length is arithmetically fine. The real
+    /// constraint is narrower and comes from elsewhere - the tile is staged
+    /// with `float2` loads at offset `row * k + kk` with `kk` even, so an odd
+    /// `k` makes every row after the first misaligned. Attention contracts
+    /// over 1500 encoder positions, which is even and is not a multiple of 8;
+    /// the old check would have refused the model's own arithmetic.
+    #[error("contraction length {k} is odd, and the tile is staged in pairs")]
     RaggedContraction {
         /// The length asked for.
         k: usize,

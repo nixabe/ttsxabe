@@ -86,3 +86,18 @@ cargo test --workspace --release
 Release, always. The reference kernels run the full forward pass thousands of
 times; a debug build turns a test run into a coffee break, which is why
 `profile.dev.package."*"` is set to `opt-level = 2` for dependencies too.
+
+### Choosing a card
+
+```sh
+XABE_TEST_DEVICE=2 cargo test --workspace --release
+```
+
+`XABE_TEST_DEVICE` and not `XABE_TTS_DEVICE`. The second is the engine's
+`--tts-device` env twin, so exporting it to steer a test run also reaches into
+`xabe-engine`'s flag tests, which then assert their defaults against whichever
+card someone happened to pick. That cost eight failing tests once, all of them
+looking like a broken flag parser.
+
+Check `nvidia-smi` before choosing - this host is shared, and the tests will
+happily allocate on a card that is already running somebody's training job.

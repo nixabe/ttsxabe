@@ -59,6 +59,39 @@ impl std::fmt::Debug for Gpu {
 /// know which side of it a shape falls on.
 pub const GEMV_MAX_M: usize = 16;
 
+/// How a batched matmul steps between its products.
+///
+/// Three separate strides because attention needs two different shapes from
+/// the same call: the score matrices step `tq*head_dim` through the queries
+/// and `tk*head_dim` through the keys, and the contexts step `tq*tk` through
+/// the probabilities. One stride would fit neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Batch {
+    /// How many independent products.
+    pub count: usize,
+    /// Elements between consecutive left operands.
+    pub a: usize,
+    /// Elements between consecutive right operands.
+    pub w: usize,
+    /// Elements between consecutive outputs.
+    pub out: usize,
+}
+
+impl Batch {
+    /// One product, which is what [`Gpu::gemm`] is.
+    ///
+    /// The strides are never read at `count == 1`, but naming the output size
+    /// keeps them meaningful rather than arbitrary.
+    pub fn single(out: usize) -> Self {
+        Self {
+            count: 1,
+            a: 0,
+            w: 0,
+            out,
+        }
+    }
+}
+
 const NAMES: &[&str] = &[
     "conv1d",
     "conv1d_short",
@@ -86,6 +119,11 @@ const NAMES: &[&str] = &[
     "attention_scores",
     "attention_context",
     "expand_prior",
+    "im2col",
+    "split_heads",
+    "split_heads_t",
+    "merge_heads",
+    "causal_mask",
 ];
 
 impl Gpu {
@@ -445,9 +483,8 @@ impl Gpu {
     /// enough not to care - the choice is per call site, which is why both
     /// exist rather than one replacing the other.
     ///
-    /// `k` must be a multiple of 8, which the instruction fixes. Whisper's
-    /// contractions are 1280 and 5120, so this is a check rather than a
-    /// limitation; padding a ragged contraction silently would be worse.
+    /// `k` must be even - see [`CudaError::RaggedContraction`] for why that,
+    /// and not the multiple of 8 the instruction might suggest.
     pub fn gemm(
         &self,
         a: &CudaSlice<f32>,
@@ -457,74 +494,77 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        if !k.is_multiple_of(8) {
-            return Err(CudaError::RaggedContraction { k });
-        }
-        if m <= GEMV_MAX_M {
-            return self.gemv(a, w, bias, m, k, n);
-        }
-        let mut out = self.zeros(m * n)?;
-        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
-        let null: u64 = 0;
-        let f = self.func("gemm");
-        let mut lb = self.stream.launch_builder(f);
-        lb.arg(a).arg(w);
-        match bias {
-            Some(v) => lb.arg(v),
-            None => lb.arg(&null),
-        };
-        lb.arg(&mut out).arg(&mi).arg(&ki).arg(&ni);
-
-        // 128 rows of `a` and 128 of `w` per block, across 8 warps. The tile is
-        // chosen by global traffic rather than by shared capacity - see the
-        // derivation in kernels.rs, which is also why these three numbers must
-        // move together with GEMM_MT, GEMM_NT and GEMM_WARPS.
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
-            block_dim: (32, 8, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: the grid covers every (m, n) exactly once, `out` is m*n
-        // elements, and every global read and write inside the kernel is bounds
-        // checked against m, k and n.
-        launched("gemm", unsafe { lb.launch(cfg) })?;
-        Ok(out)
+        self.gemm_batched(a, w, bias, Batch::single(m * n), m, k, n)
     }
 
-    /// The same product for a handful of rows, one warp per output channel.
+    /// A batch of independent products, one per `blockIdx.z`.
     ///
-    /// Reached through [`Gpu::gemm`] rather than called directly, so a caller
-    /// never has to know which shape it has. It is **exact f32** - no tensor
-    /// cores, so no operand rounding - which means precision here is a function
-    /// of `m`. See [`GEMV_MAX_M`].
-    fn gemv(
+    /// Attention is twenty of these per layer - one score matrix and one
+    /// context per head - and the strides differ between the two, so they are
+    /// arguments rather than a shape convention. Everything else is
+    /// [`Gpu::gemm`], including the choice between the two kernels.
+    // Shapes are arguments, not types - the same convention as the `xabe-dsp`
+    // twins these mirror. Bundling m, k and n into a descriptor would satisfy
+    // the lint and make every call site say less about what it is doing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched(
         &self,
         a: &CudaSlice<f32>,
         w: &CudaSlice<f32>,
         bias: Option<&CudaSlice<f32>>,
+        batch: Batch,
         m: usize,
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(m * n)?;
+        if !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        let mut out = self.zeros(batch.count * m * n)?;
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let (sa, sw, so) = (batch.a as i64, batch.w as i64, batch.out as i64);
         let null: u64 = 0;
-        let f = self.func("gemv");
+
+        // 128 rows of `a` and 128 of `w` per block, across 8 warps, or one warp
+        // per output channel when there are too few rows to fill a tile. The
+        // tile is chosen by global traffic rather than by shared capacity - see
+        // the derivation in kernels.rs, which is also why those three numbers
+        // must move together with GEMM_MT, GEMM_NT and GEMM_WARPS.
+        let small = m <= GEMV_MAX_M;
+        let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
         lb.arg(a).arg(w);
         match bias {
             Some(v) => lb.arg(v),
             None => lb.arg(&null),
         };
-        lb.arg(&mut out).arg(&mi).arg(&ki).arg(&ni);
+        lb.arg(&mut out)
+            .arg(&mi)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&sa)
+            .arg(&sw)
+            .arg(&so);
+
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (n.div_ceil(8) as u32, m as u32, 1),
+            grid_dim: if small {
+                (n.div_ceil(8) as u32, m as u32, batch.count as u32)
+            } else {
+                (
+                    n.div_ceil(128) as u32,
+                    m.div_ceil(128) as u32,
+                    batch.count as u32,
+                )
+            },
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: one warp per (row, col), both bounds checked in the kernel;
-        // `out` is m*n elements and every lane writes at most one of them.
-        launched("gemv", unsafe { lb.launch(cfg) })?;
+        // SAFETY: the grid covers every (batch, m, n) exactly once, `out` is
+        // batch*m*n elements, and every global read and write inside the kernel
+        // is bounds checked against m, k and n.
+        launched(if small { "gemv" } else { "gemm" }, unsafe {
+            lb.launch(cfg)
+        })?;
         Ok(out)
     }
 
@@ -849,6 +889,125 @@ impl Gpu {
             lb.launch(Self::flat(t * embed))
         })?;
         Ok(out)
+    }
+
+    /// Lays a convolution out as a matrix: `[t, in_ch]` to `[out_t, in_ch*k]`.
+    ///
+    /// Whisper's encoder stem is two width-3 convolutions over 3000 positions
+    /// at 80 and then 1280 channels. As convolutions they would want a kernel
+    /// tuned for channel counts two orders of magnitude past what the VITS
+    /// decoder's is written for; as `im2col` then [`Gpu::gemm`] they are two of
+    /// the products this card is fastest at, and this gather is the only new
+    /// code. Returns the matrix and `out_t`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn im2col(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        in_ch: usize,
+        k: usize,
+        stride: usize,
+        pad: usize,
+    ) -> Result<(CudaSlice<f32>, usize), CudaError> {
+        let out_t = (t + 2 * pad - k) / stride + 1;
+        let cols = in_ch * k;
+        let mut out = self.zeros(out_t * cols)?;
+        let (a, b_, c, d, e, g) = (
+            t as i32,
+            in_ch as i32,
+            k as i32,
+            stride as i32,
+            pad as i32,
+            out_t as i32,
+        );
+        let f = self.func("im2col");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(&mut out)
+            .arg(&a)
+            .arg(&b_)
+            .arg(&c)
+            .arg(&d)
+            .arg(&e)
+            .arg(&g);
+        launched("im2col", unsafe { lb.launch(Self::flat(out_t * cols)) })?;
+        Ok((out, out_t))
+    }
+
+    /// `[t, heads*head_dim]` to `[heads, t, head_dim]`.
+    pub fn split_heads(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        self.reshape_heads("split_heads", x, t, heads, head_dim)
+    }
+
+    /// `[t, heads*head_dim]` to `[heads, head_dim, t]`.
+    ///
+    /// The value tensor's layout, because the context product reads it down
+    /// its time axis and [`Gpu::gemm`] takes its right operand as `[n, k]`.
+    pub fn split_heads_t(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        self.reshape_heads("split_heads_t", x, t, heads, head_dim)
+    }
+
+    /// `[heads, t, head_dim]` back to `[t, heads*head_dim]`.
+    pub fn merge_heads(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        self.reshape_heads("merge_heads", x, t, heads, head_dim)
+    }
+
+    /// The body of the three head permutations, which differ only in kernel.
+    fn reshape_heads(
+        &self,
+        name: &'static str,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let n = t * heads * head_dim;
+        let mut out = self.zeros(n)?;
+        let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&a).arg(&b_).arg(&c);
+        launched(name, unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
+    }
+
+    /// Sets a batch of score matrices to negative infinity above the diagonal.
+    ///
+    /// `offset` is how many cached keys precede the queries. Decoding one
+    /// token at a time makes the mask a no-op, which is why getting `offset`
+    /// wrong survives until something feeds the decoder two tokens at once.
+    pub fn causal_mask(
+        &self,
+        scores: &mut CudaSlice<f32>,
+        batch: usize,
+        tq: usize,
+        tk: usize,
+        offset: usize,
+    ) -> Result<(), CudaError> {
+        let n = batch * tq * tk;
+        let (a, b_, c, d) = (batch as i32, tq as i32, tk as i32, offset as i32);
+        let f = self.func("causal_mask");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(scores).arg(&a).arg(&b_).arg(&c).arg(&d);
+        launched("causal_mask", unsafe { lb.launch(Self::flat(n)) })
     }
 
     /// Length regulation and prior sampling. Mirrors [`xabe_tts`'s

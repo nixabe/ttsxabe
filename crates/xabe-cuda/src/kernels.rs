@@ -133,7 +133,8 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     const float* __restrict__ w,
     const float* __restrict__ bias,
     float* __restrict__ out,
-    int m, int k, int n)
+    int m, int k, int n,
+    long sa, long sw, long so)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -141,6 +142,14 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     if (col >= n || row >= m) {
         return;
     }
+
+    // One independent product per blockIdx.z, at a fixed stride in each
+    // operand. Attention is twenty of these per layer and the alternative is
+    // twenty launches; the strides are separate arguments because a batched
+    // score matrix and a batched context share no single stride.
+    a   += (size_t)blockIdx.z * sa;
+    w   += (size_t)blockIdx.z * sw;
+    out += (size_t)blockIdx.z * so;
 
     const float* av = a + (size_t)row * k;
     const float* wv = w + (size_t)col * k;
@@ -157,15 +166,22 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     }
 }
 
+
 extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     const float* __restrict__ a,
     const float* __restrict__ w,
     const float* __restrict__ bias,
     float* __restrict__ out,
-    int m, int k, int n)
+    int m, int k, int n,
+    long sa, long sw, long so)
 {
     __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
     __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
+
+    // See the note in `gemv`: blockIdx.z selects one product of a batch.
+    a   += (size_t)blockIdx.z * sa;
+    w   += (size_t)blockIdx.z * sw;
+    out += (size_t)blockIdx.z * so;
 
     const int lane = threadIdx.x;          // 0..31
     const int warp = threadIdx.y;          // 0..GEMM_WARPS-1
@@ -768,4 +784,121 @@ __global__ void expand_prior(
 }
 
 }
+// ------------------------------------------------------------------ whisper
+
+// Convolution rewritten as a matrix, so it can use the tensor cores.
+//
+// Whisper's encoder stem is two convolutions of width 3 over 3000 positions,
+// 80 to 1280 channels and then 1280 to 1280 at stride 2. Written as a
+// convolution they would want a kernel tuned for a channel count two orders of
+// magnitude past what the VITS decoder's is written for. Written as
+// `im2col` + `gemm` they are two of the products this card is fastest at, and
+// the only new code is this gather.
+//
+// `x` is [t, in_ch] - time major, the transformer layout - and the output is
+// [out_t, in_ch * k], which is exactly the contraction a weight stored as
+// [out_ch, in_ch, k] wants. Positions off either end read as zero, which is
+// what padding means; a clamp would repeat the first frame instead.
+extern "C" __global__ void im2col(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int t, int in_ch, int k, int stride, int pad, int out_t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int cols = in_ch * k;
+    if (i >= out_t * cols) {
+        return;
+    }
+    int ti = i / cols;
+    int r  = i % cols;
+    int c  = r / k;
+    int kk = r % k;
+    int src = ti * stride + kk - pad;
+    out[i] = (src >= 0 && src < t) ? x[(size_t)src * in_ch + c] : 0.0f;
+}
+
+// [t, heads * head_dim] -> [heads, t, head_dim].
+//
+// Attention is a batch of small products, one per head, and every one of them
+// wants its head contiguous. The projections produce the heads interleaved,
+// so somebody has to move them; doing it in one pass here is cheaper than
+// teaching the matmul a stride it would pay for on every tile.
+extern "C" __global__ void split_heads(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int t, int heads, int head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = heads * head_dim;
+    if (i >= t * d) {
+        return;
+    }
+    int ti = i / d;
+    int h  = (i % d) / head_dim;
+    int j  = i % head_dim;
+    out[((size_t)h * t + ti) * head_dim + j] = x[i];
+}
+
+// [t, heads * head_dim] -> [heads, head_dim, t], the transpose of the above.
+//
+// The value tensor is the one operand read down its time axis: the context is
+// `probs [tq, tk] x V [tk, head_dim]`, and the matmul takes its right operand
+// as [n, k]. So V arrives already transposed rather than being transposed
+// again inside the product.
+extern "C" __global__ void split_heads_t(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int t, int heads, int head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = heads * head_dim;
+    if (i >= t * d) {
+        return;
+    }
+    int ti = i / d;
+    int h  = (i % d) / head_dim;
+    int j  = i % head_dim;
+    out[((size_t)h * head_dim + j) * t + ti] = x[i];
+}
+
+// [heads, t, head_dim] -> [t, heads * head_dim]. The inverse of `split_heads`.
+extern "C" __global__ void merge_heads(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int t, int heads, int head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = heads * head_dim;
+    if (i >= t * d) {
+        return;
+    }
+    int ti = i / d;
+    int h  = (i % d) / head_dim;
+    int j  = i % head_dim;
+    out[i] = x[((size_t)h * t + ti) * head_dim + j];
+}
+
+// Masks a batch of score matrices so a query cannot see a later key.
+//
+// `offset` is how many cached keys precede the queries: with a KV cache the
+// query at index `i` is really at position `offset + i`, and masking without
+// it would hide the entire cache. Decoding one token at a time makes the mask
+// a no-op, which is exactly why the bug survives until something feeds the
+// decoder two tokens at once.
+extern "C" __global__ void causal_mask(
+    float* __restrict__ scores,
+    int batch, int tq, int tk, int offset)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * tq * tk) {
+        return;
+    }
+    int j  = i % tk;
+    int qi = (i / tk) % tq;
+    if (j > qi + offset) {
+        // NVRTC has no <math.h>, so INFINITY is not reliably a macro here.
+        scores[i] = __int_as_float(0xff800000);
+    }
+}
+
 "#;

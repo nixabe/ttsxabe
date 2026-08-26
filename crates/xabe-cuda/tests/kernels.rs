@@ -87,9 +87,15 @@ fn gpu() -> Option<Gpu> {
     }
 }
 
-/// Which device to use. GPU 2 on this host runs somebody else's job.
+/// Which device to use. Check `nvidia-smi` first - do not clobber other
+/// people's jobs.
+///
+/// `XABE_TEST_DEVICE` and not `XABE_TTS_DEVICE`: the latter is the engine's
+/// `--tts-device` env twin, and setting it to steer a test run also reaches
+/// into `xabe-engine`'s flag tests, which then assert against the card someone
+/// happened to pick. That cost eight failing tests once.
 fn ordinal() -> usize {
-    std::env::var("XABE_TTS_DEVICE")
+    std::env::var("XABE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
@@ -485,6 +491,22 @@ fn assert_close_gemm(name: &str, want: &[f32], got: &[f32]) {
     );
 }
 
+/// The scalar product `gemm` should agree with, fed the operands it will
+/// actually see.
+///
+/// Which reference depends on which kernel the shape dispatches to: at or
+/// below `GEMV_MAX_M` rows the path is exact f32, above it the operands are
+/// rounded to f16 first. Getting this wrong measures the rounding rather than
+/// the kernel, which is a mistake this file has already made once.
+fn reference_gemm(a: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+    let (a, w) = (&a[..m * k], &w[..n * k]);
+    if m <= xabe_cuda::GEMV_MAX_M {
+        xabe_dsp::linear(a, m, k, w, None, n)
+    } else {
+        xabe_dsp::linear(&through_f16(a), m, k, &through_f16(w), None, n)
+    }
+}
+
 #[test]
 fn gemm_matches_the_scalar_linear_at_every_awkward_shape() {
     let Some(g) = gpu() else { return };
@@ -563,10 +585,16 @@ fn gemm_without_a_bias_adds_nothing() {
 }
 
 #[test]
-fn gemm_refuses_a_contraction_the_instruction_cannot_step() {
+fn gemm_refuses_an_odd_contraction_and_accepts_every_even_one() {
     let Some(g) = gpu() else { return };
-    // m16n8k8 steps k in eights. Padding silently would hide a caller that has
-    // miscomputed a shape, which is the likelier of the two failures here.
+    // This test used to assert "not a multiple of 8", on the theory that
+    // m16n8k8 steps k in eights. That was wrong about the kernel: the staging
+    // loop zero-extends a short trip and the instruction accumulates the
+    // zeros. The real constraint is the `float2` staging load at offset
+    // `row * k + kk` with `kk` even, which an odd `k` misaligns from the
+    // second row on. It matters: attention contracts over 1500 encoder
+    // positions, which is even and is not a multiple of 8, and the old check
+    // would have refused the model's own arithmetic.
     let err = g
         .gemm(
             &g.upload(&seq(4 * 7, 1)).expect("upload"),
@@ -577,7 +605,65 @@ fn gemm_refuses_a_contraction_the_instruction_cannot_step() {
             8,
         )
         .unwrap_err();
-    assert!(err.to_string().contains("multiple of 8"), "{err}");
+    assert!(err.to_string().contains("odd"), "{err}");
+
+    // And the lengths that are even but not multiples of 8 must work, on both
+    // the tiled and the scalar path.
+    for k in [2usize, 6, 30, 1500] {
+        for m in [4usize, 100] {
+            let n = 10;
+            let (a, w) = (seq(m * k, 1), seq(n * k, 2));
+            let want = reference_gemm(&a, m, k, &w, n);
+            let got = g
+                .download(
+                    &g.gemm(
+                        &g.upload(&a).expect("upload"),
+                        &g.upload(&w).expect("upload"),
+                        None,
+                        m,
+                        k,
+                        n,
+                    )
+                    .expect("gemm"),
+                )
+                .expect("download");
+            assert_close_gemm(&format!("gemm k={k} m={m}"), &want, &got);
+        }
+    }
+}
+
+#[test]
+fn a_batched_product_is_the_same_as_running_each_one_alone() {
+    let Some(g) = gpu() else { return };
+    // Attention is the only caller, and it batches over heads with three
+    // different strides. A batch that reads the same operand every time would
+    // pass a shape check and produce twenty copies of head zero.
+    let (batch, m, k, n) = (5usize, 40usize, 32usize, 24usize);
+    let a = seq(batch * m * k, 3);
+    let w = seq(batch * n * k, 4);
+    let got = g
+        .download(
+            &g.gemm_batched(
+                &g.upload(&a).expect("upload"),
+                &g.upload(&w).expect("upload"),
+                None,
+                xabe_cuda::Batch {
+                    count: batch,
+                    a: m * k,
+                    w: n * k,
+                    out: m * n,
+                },
+                m,
+                k,
+                n,
+            )
+            .expect("gemm_batched"),
+        )
+        .expect("download");
+    for b in 0..batch {
+        let want = reference_gemm(&a[b * m * k..], m, k, &w[b * n * k..], n);
+        assert_close_gemm(&format!("batch {b}"), &want, &got[b * m * n..][..m * n]);
+    }
 }
 
 #[test]
@@ -668,4 +754,135 @@ fn f16_operands_cost_six_parts_in_a_hundred_thousand_of_full_scale() {
         relative_to_scale < 2e-3,
         "f16 operand rounding costs {relative_to_scale:.3e} of full scale",
     );
+}
+
+// ------------------------------------------------------------------ whisper
+//
+// These four have no `xabe-dsp` twin, and deliberately not: three are pure
+// index permutations and the fourth is a comparison, so their "reference" is
+// the index formula itself. Written out beside the assertion it can be read
+// against the kernel; exported as a library function nothing else calls it
+// would only be the same formula, further away.
+
+#[test]
+fn im2col_then_gemm_is_a_convolution() {
+    let Some(g) = gpu() else { return };
+    // Whisper's stem, at both its strides. The reference is the scalar
+    // convolution the rest of the workspace uses, which takes its input
+    // channel-major - so the test transposes, and a layout mistake in either
+    // direction shows up as a diff rather than as a plausible spectrogram.
+    for &(in_ch, out_ch, t, k, stride, pad) in &[
+        (8usize, 12usize, 20usize, 3usize, 1usize, 1usize),
+        (12, 12, 20, 3, 2, 1),
+    ] {
+        let x_tc = seq(t * in_ch, 21); // [t, in_ch], the transformer layout
+        let w = seq(out_ch * in_ch * k, 22); // [out_ch, in_ch, k]
+
+        // `im2col` only gathers, so rounding the input before the convolution
+        // is the same as rounding the gathered matrix - which is what the
+        // tiled matmul will do to it. Below GEMV_MAX_M rows the path is exact
+        // instead, and the reference has to follow; see `reference_gemm`.
+        let out_t = (t + 2 * pad - k) / stride + 1;
+        let (x_ref, w_ref) = if out_t <= xabe_cuda::GEMV_MAX_M {
+            (x_tc.clone(), w.clone())
+        } else {
+            (through_f16(&x_tc), through_f16(&w))
+        };
+        let x_ct = xabe_dsp::transpose(&x_ref, t, in_ch); // [in_ch, t]
+        let want_ct = xabe_dsp::conv1d_strided(
+            &x_ct, in_ch, t, &w_ref, None, out_ch, k, stride, pad, pad, 1,
+        );
+        assert_eq!(want_ct.len(), out_ch * out_t, "out_t");
+        let want = xabe_dsp::transpose(&want_ct, out_ch, out_t); // [out_t, out_ch]
+
+        let (col, got_t) = g
+            .im2col(&g.upload(&x_tc).expect("upload"), t, in_ch, k, stride, pad)
+            .expect("im2col");
+        assert_eq!(got_t, out_t, "out_t from the kernel");
+        let got = g
+            .download(
+                &g.gemm(
+                    &col,
+                    &g.upload(&w).expect("upload"),
+                    None,
+                    out_t,
+                    in_ch * k,
+                    out_ch,
+                )
+                .expect("gemm"),
+            )
+            .expect("download");
+        assert_close_gemm(&format!("conv stride {stride}"), &want, &got);
+    }
+}
+
+#[test]
+fn the_head_permutations_are_each_other() {
+    let Some(g) = gpu() else { return };
+    let (t, heads, hd) = (7usize, 4usize, 6usize);
+    let x = seq(t * heads * hd, 31);
+    let dev = g.upload(&x).expect("upload");
+
+    let split = g
+        .download(&g.split_heads(&dev, t, heads, hd).expect("split"))
+        .expect("download");
+    for ti in 0..t {
+        for h in 0..heads {
+            for j in 0..hd {
+                assert_eq!(
+                    split[(h * t + ti) * hd + j],
+                    x[ti * heads * hd + h * hd + j]
+                );
+            }
+        }
+    }
+
+    let split_t = g
+        .download(&g.split_heads_t(&dev, t, heads, hd).expect("split_t"))
+        .expect("download");
+    for ti in 0..t {
+        for h in 0..heads {
+            for j in 0..hd {
+                assert_eq!(
+                    split_t[(h * hd + j) * t + ti],
+                    x[ti * heads * hd + h * hd + j]
+                );
+            }
+        }
+    }
+
+    // And `merge_heads` undoes `split_heads`, which is the property the
+    // forward pass actually relies on.
+    let round = g
+        .download(
+            &g.merge_heads(&g.upload(&split).expect("upload"), t, heads, hd)
+                .expect("merge"),
+        )
+        .expect("download");
+    assert_eq!(round, x);
+}
+
+#[test]
+fn the_causal_mask_hides_the_future_and_nothing_else() {
+    let Some(g) = gpu() else { return };
+    let (batch, tq, tk, offset) = (2usize, 3usize, 5usize, 2usize);
+    let scores = vec![1.0f32; batch * tq * tk];
+    let mut dev = g.upload(&scores).expect("upload");
+    g.causal_mask(&mut dev, batch, tq, tk, offset)
+        .expect("causal_mask");
+    let got = g.download(&dev).expect("download");
+    for b in 0..batch {
+        for q in 0..tq {
+            for j in 0..tk {
+                let v = got[(b * tq + q) * tk + j];
+                // With `offset` keys already cached, query `q` really sits at
+                // position `q + offset` and may see every key up to it.
+                if j > q + offset {
+                    assert!(v.is_infinite() && v < 0.0, "b{b} q{q} j{j} = {v}");
+                } else {
+                    assert_eq!(v, 1.0, "b{b} q{q} j{j}");
+                }
+            }
+        }
+    }
 }
