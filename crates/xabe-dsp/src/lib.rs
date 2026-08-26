@@ -1,1 +1,31 @@
-//! placeholder
+//! Scalar reference kernels.
+//!
+//! Every function here is written to be read against 🤗 Transformers'
+//! `modeling_vits.py` line by line. They are the definition of correct that the
+//! CUDA kernels will be tested against, so they optimise for being *evidently*
+//! correct rather than for throughput: no blocking, no unrolling, no fused
+//! anything. A clever reference is a reference you cannot trust.
+//!
+//! Two conventions run through the whole crate:
+//!
+//! - **Shapes are arguments, not types.** Every function takes flat `&[f32]`
+//!   plus explicit dimensions. Encoding shapes in the type system would be
+//!   pleasant right up to the point where the duration predictor reshapes a
+//!   tensor four times in six lines.
+//! - **Layout is named at the call site.** `[T, C]` for transformer-shaped
+//!   data, `[C, T]` for convolution-shaped. The reference permutes between them
+//!   constantly and silently; here the permutes are visible.
+
+mod activation;
+mod attention;
+mod conv;
+mod linear;
+mod norm;
+mod tensor;
+
+pub use activation::{leaky_relu, relu, softmax_rows};
+pub use attention::self_attention;
+pub use conv::{conv1d, same_padding};
+pub use linear::linear;
+pub use norm::layer_norm;
+pub use tensor::transpose;

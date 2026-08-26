@@ -6,6 +6,15 @@ use xabe_st::StError;
 /// implementation does not support.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// The feed-forward activation is not one this implementation has. Checked
+    /// rather than assumed: a different activation changes every output while
+    /// breaking no shape.
+    #[error("hidden_act is {act}, but only relu is implemented")]
+    UnsupportedActivation {
+        /// The activation the config asked for.
+        act: String,
+    },
+
     /// The file could not be opened.
     #[error("cannot read config {path}: {source}")]
     Io {

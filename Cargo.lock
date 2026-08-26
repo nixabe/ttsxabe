@@ -300,6 +300,10 @@ version = "0.0.0"
 dependencies = [
  "thiserror",
  "tracing",
+ "xabe-dsp",
+ "xabe-golden",
+ "xabe-st",
+ "xabe-vits",
 ]
 
 [[package]]

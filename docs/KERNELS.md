@@ -8,11 +8,11 @@ exists.
 
 | kernel | used by | reference | CUDA | differential |
 | --- | --- | --- | --- | --- |
-| embedding lookup | text encoder | | | |
-| layer norm | text encoder | | | |
-| relative-position self-attention | text encoder (window 4) | | | |
-| conv1d, kernel 3 | text encoder FFN | | | |
-| conv1d, general | flow, duration predictor, decoder | | | |
+| embedding lookup | text encoder | `xabe-dsp` (inline) |  | `xabe-tts` text_encoder |
+| layer norm | text encoder | `xabe_dsp::layer_norm` |  | `xabe-tts` text_encoder |
+| relative-position self-attention | text encoder (window 4) | `xabe_dsp::self_attention` |  | `xabe-dsp` relative_position + `xabe-tts` |
+| conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
+| conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
 | depthwise-separable conv | duration predictor | | | |
 | transposed conv1d | decoder upsamplers | | | |
 | leaky ReLU | decoder | | | |

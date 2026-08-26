@@ -62,6 +62,15 @@ pub struct VitsConfig {
     pub duration_predictor_num_flows: usize,
     /// Half-width of the relative attention window.
     pub window_size: usize,
+    /// Epsilon added inside every layer norm's square root.
+    ///
+    /// Defaulted rather than required because older configs omit it, and the
+    /// reference's own default is the value every published checkpoint uses.
+    #[serde(default = "default_layer_norm_eps")]
+    pub layer_norm_eps: f32,
+    /// Activation in the text encoder's feed-forward.
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
     /// Temperature applied to the prior when sampling.
     pub noise_scale: f32,
     /// Temperature applied to the duration predictor when sampling.
@@ -97,6 +106,14 @@ impl VitsConfig {
     /// Called by both constructors. Everything downstream indexes on the
     /// invariants established here, so this is the only place they are checked.
     fn validate(&self) -> Result<(), ConfigError> {
+        // A different activation would change every output while breaking no
+        // shape, so it is checked rather than assumed.
+        if self.hidden_act != "relu" {
+            return Err(ConfigError::UnsupportedActivation {
+                act: self.hidden_act.clone(),
+            });
+        }
+
         for (field, v) in [
             ("hidden_size", self.hidden_size),
             ("num_hidden_layers", self.num_hidden_layers),
@@ -196,4 +213,14 @@ impl VitsConfig {
     pub fn flow_half(&self) -> usize {
         self.flow_size / 2
     }
+}
+
+/// The reference's layer-norm epsilon.
+fn default_layer_norm_eps() -> f32 {
+    1e-5
+}
+
+/// The activation every published MMS-TTS checkpoint uses.
+fn default_hidden_act() -> String {
+    "relu".to_string()
 }
