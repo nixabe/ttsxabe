@@ -184,9 +184,41 @@ pub fn speak_remote(url: &str, text: &str, out: &Path) -> Result<(), EngineError
     Ok(())
 }
 
-/// Transcribes a file through another process and prints the transcript.
-pub fn transcribe_remote(args: &Args, url: &str, input: &Path) -> Result<(), EngineError> {
-    let wav = if input.as_os_str() == "-" {
+/// Transcribes a file in this process and prints the transcript.
+pub fn transcribe(
+    args: &Args,
+    path: &Path,
+    device: Device,
+    input: &Path,
+) -> Result<(), EngineError> {
+    // `Kind::has_cpu` refuses `--asr-device cpu` at preflight.
+    let Device::Cuda(ordinal) = device else {
+        unreachable!("--asr-device cpu is refused when the stages resolve");
+    };
+    let audio = xabe_audio::parse_wav(&read_input(input)?)?;
+    if audio.sample_rate != 16_000 {
+        return Err(EngineError::SampleRate {
+            found: audio.sample_rate,
+            wanted: 16_000,
+        });
+    }
+    tracing::debug!(
+        seconds = format!("{:.2}", audio.seconds()),
+        rate = audio.sample_rate,
+        "read audio",
+    );
+
+    let model = xabe_asr::AsrModel::open(path, ordinal)?;
+    let text = model.transcribe(&audio.samples, &args.asr_lang)?;
+    // The transcript is the tool's output, so it goes to stdout at INFO - the
+    // level that appears by default - not to a log the caller has to enable.
+    tracing::info!("{text}");
+    Ok(())
+}
+
+/// Reads a file, or standard input when the path is `-`.
+fn read_input(input: &Path) -> Result<Vec<u8>, EngineError> {
+    if input.as_os_str() == "-" {
         let mut buf = Vec::new();
         std::io::stdin()
             .read_to_end(&mut buf)
@@ -195,14 +227,18 @@ pub fn transcribe_remote(args: &Args, url: &str, input: &Path) -> Result<(), Eng
                 path: "stdin".into(),
                 source,
             })?;
-        buf
-    } else {
-        std::fs::read(input).map_err(|source| EngineError::Io {
-            what: "reading",
-            path: input.display().to_string(),
-            source,
-        })?
-    };
+        return Ok(buf);
+    }
+    std::fs::read(input).map_err(|source| EngineError::Io {
+        what: "reading",
+        path: input.display().to_string(),
+        source,
+    })
+}
+
+/// Transcribes a file through another process and prints the transcript.
+pub fn transcribe_remote(args: &Args, url: &str, input: &Path) -> Result<(), EngineError> {
+    let wav = read_input(input)?;
     // Parsed before sending so a file that is not audio fails here, naming the
     // problem, rather than as an opaque error from the other process.
     let parsed = xabe_audio::parse_wav(&wav)?;

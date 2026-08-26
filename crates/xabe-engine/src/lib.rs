@@ -75,10 +75,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         },
         Action::Transcribe { input } => match &stages.asr {
             Stage::Remote { url } => tts::transcribe_remote(args, url, &input),
-            Stage::Local { .. } => Err(EngineError::NotImplemented {
-                stage: Kind::Asr,
-                phase: "4",
-            }),
+            Stage::Local { path, device } => tts::transcribe(args, path, *device, &input),
             Stage::Off => unreachable!("Action::Transcribe needs an ASR stage"),
         },
         Action::Segment { input } => match &stages.vad {
@@ -136,12 +133,7 @@ fn unbuilt(stages: &Stages) -> Result<(), EngineError> {
             Stage::Local { .. } => match kind {
                 Kind::Tts => {}
                 Kind::Vad => {}
-                Kind::Asr => {
-                    return Err(EngineError::NotImplemented {
-                        stage: kind,
-                        phase: "4",
-                    });
-                }
+                Kind::Asr => {}
                 Kind::Translator => {
                     return Err(EngineError::NotImplemented {
                         stage: kind,

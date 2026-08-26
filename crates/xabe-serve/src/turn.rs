@@ -27,7 +27,7 @@
 use crate::client::{Upstream, translate_body};
 use crate::config::Role;
 use crate::error::ServeError;
-use crate::state::{AppState, SynthesisJob, TtsBackend};
+use crate::state::{AppState, AsrBackend, SynthesisJob, TtsBackend};
 use crate::text::{Chunker, sanitize_asr};
 use crate::wire::{ClientMessage, ServerMessage, TtsChunk};
 use axum::extract::ws::{Message, WebSocket};
@@ -276,7 +276,7 @@ async fn collect(
 /// of the answer.
 async fn gate_then_transcribe(
     state: &AppState,
-    asr: &Upstream,
+    asr: &AsrBackend,
     pcm_b64: &str,
     rate: u32,
     lang: &str,

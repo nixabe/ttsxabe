@@ -7,6 +7,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+xabe-asr.workspace = true
 xabe-audio.workspace = true
 xabe-serve.workspace = true
 xabe-vad.workspace = true
@@ -22,3 +23,7 @@ base64.workspace = true
 [[bin]]
 name = "xabe-engine"
 path = "src/main.rs"
+
+[[bin]]
+name = "xabe-asr-bench"
+path = "src/bin/asr_bench.rs"

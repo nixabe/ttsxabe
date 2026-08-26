@@ -2,7 +2,7 @@
 
 use crate::AsrError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
 use xabe_st::StSet;
 use xabe_whisper::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, Frontend, GenerationConfig, LayerNorm, Linear,
@@ -14,8 +14,16 @@ use xabe_whisper::{
 const EPS: f32 = 1e-5;
 
 /// A projection, on the device.
+///
+/// The weight is stored as f16. That is not a precision decision taken lightly
+/// and it is barely a decision at all on the tiled path: the matmul rounds an
+/// F32 weight to f16 on the way into shared memory on every trip, so storing
+/// F32 bought exactly nothing and cost twice the global traffic. It *is* a
+/// real decision on the decode shapes, where the scalar path would otherwise
+/// accumulate the weight exactly - and that is measured, in `oracle.rs` and in
+/// the transcripts, rather than assumed.
 struct GLinear {
-    w: CudaSlice<f32>,
+    w: CudaSlice<u16>,
     b: Option<CudaSlice<f32>>,
     in_dim: usize,
     out_dim: usize,
@@ -59,7 +67,7 @@ struct GDecoderLayer {
 struct GConv {
     /// `[out_ch, in_ch * k]` - the same bytes as `[out_ch, in_ch, k]`, which is
     /// exactly the contraction `im2col` produces.
-    w: CudaSlice<f32>,
+    w: CudaSlice<u16>,
     b: CudaSlice<f32>,
     in_ch: usize,
     out_ch: usize,
@@ -89,8 +97,17 @@ pub struct AsrModel {
     enc_pos: CudaSlice<f32>,
     enc_layers: Vec<GEncoderLayer>,
     enc_ln: GNorm,
-    /// `[vocab, d_model]`, also the output projection - Whisper ties them.
+    /// `[vocab, d_model]`, for the embedding lookup.
+    ///
+    /// Kept at full precision because it is *read*, not multiplied: a token's
+    /// vector goes straight into the residual stream, where rounding it would
+    /// perturb the input rather than the arithmetic.
     embed_tokens: CudaSlice<f32>,
+    /// The same table as the tied output projection, rounded once.
+    ///
+    /// 133 MB against 265, and the decoder reads all of it for every token it
+    /// emits - which at one token a step is pure bandwidth.
+    embed_logits: CudaSlice<u16>,
     dec_pos: CudaSlice<f32>,
     dec_layers: Vec<GDecoderLayer>,
     dec_ln: GNorm,
@@ -106,9 +123,10 @@ pub struct Cache {
     /// Per layer, `[len, d_model]`, capacity `max_target_positions`.
     self_k: Vec<CudaSlice<f32>>,
     self_v: Vec<CudaSlice<f32>>,
-    /// Per layer, `[heads, 1500, head_dim]` and `[heads, head_dim, 1500]`.
-    cross_k: Vec<CudaSlice<f32>>,
-    cross_v: Vec<CudaSlice<f32>>,
+    /// Per layer, `[heads, 1500, head_dim]` and `[heads, head_dim, 1500]`,
+    /// packed - every decode step reads all of both.
+    cross_k: Vec<CudaSlice<u16>>,
+    cross_v: Vec<CudaSlice<u16>>,
     /// How many tokens the self-attention halves hold.
     len: usize,
 }
@@ -137,9 +155,10 @@ impl AsrModel {
         let st = StSet::open(dir)?;
         let w = WhisperWeights::load(&st, &cfg)?;
         let up = |x: &[f32]| gpu.upload(x);
+        let up16 = |x: &[f32]| gpu.upload_f16(x);
         let lin = |l: &Linear| -> Result<GLinear, AsrError> {
             Ok(GLinear {
-                w: up(l.weight)?,
+                w: up16(l.weight)?,
                 b: l.bias.map(up).transpose()?,
                 in_dim: l.in_dim,
                 out_dim: l.out_dim,
@@ -161,7 +180,7 @@ impl AsrModel {
         };
         let cnv = |c: &Conv1d| -> Result<GConv, AsrError> {
             Ok(GConv {
-                w: up(c.weight)?,
+                w: up16(c.weight)?,
                 b: up(c.bias)?,
                 in_ch: c.in_ch,
                 out_ch: c.out_ch,
@@ -216,6 +235,7 @@ impl AsrModel {
             enc_layers,
             enc_ln: nrm(&w.enc_ln)?,
             embed_tokens: up(w.embed_tokens)?,
+            embed_logits: up16(w.embed_tokens)?,
             dec_pos: up(w.dec_pos)?,
             dec_layers,
             dec_ln: nrm(&w.dec_ln)?,
@@ -257,14 +277,25 @@ impl AsrModel {
     /// One projection.
     fn project(
         &self,
-        x: &CudaSlice<f32>,
+        x: Operand<'_>,
         l: &GLinear,
         rows: usize,
     ) -> Result<CudaSlice<f32>, AsrError> {
-        Ok(self
-            .gpu
-            .gemm(x, &l.w, l.b.as_ref(), rows, l.in_dim, l.out_dim)?)
+        Ok(self.gpu.gemm_batched(
+            x,
+            Operand::F16(&l.w),
+            l.b.as_ref(),
+            Batch::single(rows * l.out_dim),
+            rows,
+            l.in_dim,
+            l.out_dim,
+        )?)
     }
+
+    // Activations stay F32 on the way in. Rounding them first was implemented
+    // and measured: 5 ms of 256, because the tiles a projection re-reads
+    // already fit in this card's 6 MB L2, so the halved traffic was traffic
+    // that never reached memory. See docs/BENCHMARKS.md.
 
     /// One layer normalisation, over rows of `d_model`.
     fn norm(&self, x: &CudaSlice<f32>, n: &GNorm, rows: usize) -> Result<CudaSlice<f32>, AsrError> {
@@ -284,9 +315,9 @@ impl AsrModel {
     #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
-        q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        q: Operand<'_>,
+        k: Operand<'_>,
+        v: Operand<'_>,
         tq: usize,
         tk: usize,
         heads: usize,
@@ -314,7 +345,12 @@ impl AsrModel {
         }
         self.gpu.softmax_rows(&mut scores, heads * tq, tk)?;
         let ctx = self.gpu.gemm_batched(
-            &scores,
+            // The probabilities are *not* converted. They are read exactly
+            // once - the context product has a single column tile at
+            // `head_dim` 64 - so a conversion pass would cost 270 MB to save
+            // 90. Every other operand here is read a dozen times, which is
+            // what makes the trade go the other way for them.
+            Operand::F32(&scores),
             v,
             None,
             Batch {
@@ -340,7 +376,7 @@ impl AsrModel {
     /// is copied where it belongs rather than moved somewhere tidier.
     fn queries(
         &self,
-        x: &CudaSlice<f32>,
+        x: Operand<'_>,
         a: &GAttention,
         t: usize,
         heads: usize,
@@ -362,9 +398,9 @@ impl AsrModel {
         t: usize,
     ) -> Result<(), AsrError> {
         let x = self.norm(h, ln, t)?;
-        let mut inner = self.project(&x, fc1, t)?;
+        let mut inner = self.project(Operand::F32(&x), fc1, t)?;
         self.gpu.gelu(&mut inner, t * fc1.out_dim)?;
-        let out = self.project(&inner, fc2, t)?;
+        let out = self.project(Operand::F32(&inner), fc2, t)?;
         self.gpu.add_inplace(h, &out, t * self.cfg.d_model)?;
         Ok(())
     }
@@ -403,9 +439,15 @@ impl AsrModel {
             // Width 3 with one of padding on each side: "same" at stride 1, and
             // exactly half the frames at stride 2.
             let (col, out_t) = self.gpu.im2col(&h, t, c.in_ch, c.k, c.stride, 1)?;
-            h = self
-                .gpu
-                .gemm(&col, &c.w, Some(&c.b), out_t, c.in_ch * c.k, c.out_ch)?;
+            h = self.gpu.gemm_batched(
+                Operand::F32(&col),
+                Operand::F16(&c.w),
+                Some(&c.b),
+                Batch::single(out_t * c.out_ch),
+                out_t,
+                c.in_ch * c.k,
+                c.out_ch,
+            )?;
             self.gpu.gelu(&mut h, out_t * c.out_ch)?;
         }
 
@@ -413,18 +455,32 @@ impl AsrModel {
         self.gpu.add_inplace(&mut h, &self.enc_pos, t * d)?;
 
         let mut tapped = Vec::with_capacity(taps);
+        let hd = d / heads;
         for (i, l) in self.enc_layers.iter().enumerate() {
             let x = self.norm(&h, &l.attn_ln, t)?;
-            let q = self.queries(&x, &l.attn, t, heads)?;
-            let hd = d / heads;
-            let k = self
-                .gpu
-                .split_heads(&self.project(&x, &l.attn.k, t)?, t, heads, hd)?;
-            let v = self
-                .gpu
-                .split_heads_t(&self.project(&x, &l.attn.v, t)?, t, heads, hd)?;
-            let ctx = self.attend(&q, &k, &v, t, t, heads, false)?;
-            let out = self.project(&ctx, &l.attn.out, t)?;
+            let q = self.queries(Operand::F32(&x), &l.attn, t, heads)?;
+            let k = self.gpu.split_heads(
+                &self.project(Operand::F32(&x), &l.attn.k, t)?,
+                t,
+                heads,
+                hd,
+            )?;
+            let v = self.gpu.split_heads_t(
+                &self.project(Operand::F32(&x), &l.attn.v, t)?,
+                t,
+                heads,
+                hd,
+            )?;
+            let ctx = self.attend(
+                Operand::F32(&q),
+                Operand::F32(&k),
+                Operand::F32(&v),
+                t,
+                t,
+                heads,
+                false,
+            )?;
+            let out = self.project(Operand::F32(&ctx), &l.attn.out, t)?;
             self.gpu.add_inplace(&mut h, &out, t * d)?;
 
             self.feed_forward(&mut h, &l.ffn_ln, &l.fc1, &l.fc2, t)?;
@@ -442,23 +498,28 @@ impl AsrModel {
         let (hd, t) = (d / heads, self.cfg.max_source_positions);
         let mut cross_k = Vec::with_capacity(self.dec_layers.len());
         let mut cross_v = Vec::with_capacity(self.dec_layers.len());
+
         // The encoder's output is read *raw*. `encoder_attn_layer_norm` belongs
         // to the decoder's own stream and is applied to the queries in
         // `decode`; normalising the keys and values with it as well would be
         // an easy symmetry to assume and is not what the reference does.
         for l in &self.dec_layers {
-            cross_k.push(self.gpu.split_heads(
-                &self.project(encoded, &l.cross.k, t)?,
+            let k = self.gpu.split_heads(
+                &self.project(Operand::F32(encoded), &l.cross.k, t)?,
                 t,
                 heads,
                 hd,
-            )?);
-            cross_v.push(self.gpu.split_heads_t(
-                &self.project(encoded, &l.cross.v, t)?,
+            )?;
+            let v = self.gpu.split_heads_t(
+                &self.project(Operand::F32(encoded), &l.cross.v, t)?,
                 t,
                 heads,
                 hd,
-            )?);
+            )?;
+            // Stored packed: every decode step reads all 32 layers of both, so
+            // this is 160 MB of traffic a token rather than 320.
+            cross_k.push(self.gpu.to_f16(&k, t * d)?);
+            cross_v.push(self.gpu.to_f16(&v, t * d)?);
         }
         Ok(Cache {
             self_k: Vec::new(),
@@ -510,9 +571,9 @@ impl AsrModel {
         let mut tapped = Vec::with_capacity(taps);
         for (i, l) in self.dec_layers.iter().enumerate() {
             let x = self.norm(&h, &l.attn_ln, n)?;
-            let q = self.queries(&x, &l.attn, n, heads)?;
-            let k_new = self.project(&x, &l.attn.k, n)?;
-            let v_new = self.project(&x, &l.attn.v, n)?;
+            let q = self.queries(Operand::F32(&x), &l.attn, n, heads)?;
+            let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
+            let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
 
             // The cache holds `[t, d_model]` and is split per step. Keeping it
             // already split would save the permutation and cost an append that
@@ -535,25 +596,33 @@ impl AsrModel {
             let tk = past + n;
             let k = self.gpu.split_heads(&cache.self_k[i], tk, heads, hd)?;
             let v = self.gpu.split_heads_t(&cache.self_v[i], tk, heads, hd)?;
-            let ctx = self.attend(&q, &k, &v, n, tk, heads, true)?;
-            let out = self.project(&ctx, &l.attn.out, n)?;
+            let ctx = self.attend(
+                Operand::F32(&q),
+                Operand::F32(&k),
+                Operand::F32(&v),
+                n,
+                tk,
+                heads,
+                true,
+            )?;
+            let out = self.project(Operand::F32(&ctx), &l.attn.out, n)?;
             self.gpu.add_inplace(&mut h, &out, n * d)?;
 
             // Cross-attention. Only the queries come from the decoder; the
             // keys and values were built once from the encoder's output, which
             // is what makes a decode step cheap.
             let x = self.norm(&h, &l.cross_ln, n)?;
-            let q = self.queries(&x, &l.cross, n, heads)?;
+            let q = self.queries(Operand::F32(&x), &l.cross, n, heads)?;
             let ctx = self.attend(
-                &q,
-                &cache.cross_k[i],
-                &cache.cross_v[i],
+                Operand::F32(&q),
+                Operand::F16(&cache.cross_k[i]),
+                Operand::F16(&cache.cross_v[i]),
                 n,
                 enc_t,
                 heads,
                 false,
             )?;
-            let out = self.project(&ctx, &l.cross.out, n)?;
+            let out = self.project(Operand::F32(&ctx), &l.cross.out, n)?;
             self.gpu.add_inplace(&mut h, &out, n * d)?;
 
             self.feed_forward(&mut h, &l.ffn_ln, &l.fc1, &l.fc2, n)?;
@@ -573,8 +642,15 @@ impl AsrModel {
         // The output projection is the token embedding, transposed. Whisper
         // ties them, so there is no second matrix to bind or to upload.
         Ok((
-            self.gpu
-                .gemm(&h, &self.embed_tokens, None, n, d, self.cfg.vocab_size)?,
+            self.gpu.gemm_batched(
+                Operand::F32(&h),
+                Operand::F16(&self.embed_logits),
+                None,
+                Batch::single(n * self.cfg.vocab_size),
+                n,
+                d,
+                self.cfg.vocab_size,
+            )?,
             tapped,
         ))
     }

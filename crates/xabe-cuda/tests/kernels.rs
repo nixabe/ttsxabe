@@ -14,7 +14,7 @@
 //! error rather than failing to link, so this file compiles and runs on a
 //! machine with no CUDA at all.
 
-use xabe_cuda::Gpu;
+use xabe_cuda::{Batch, Gpu, Operand};
 
 /// Absolute floor, for values near zero.
 const ATOL: f32 = 1e-5;
@@ -631,10 +631,10 @@ fn a_batched_product_is_the_same_as_running_each_one_alone() {
     let got = g
         .download(
             &g.gemm_batched(
-                &g.upload(&a).expect("upload"),
-                &g.upload(&w).expect("upload"),
+                Operand::F32(&g.upload(&a).expect("upload")),
+                Operand::F32(&g.upload(&w).expect("upload")),
                 None,
-                xabe_cuda::Batch {
+                Batch {
                     count: batch,
                     a: m * k,
                     w: n * k,
@@ -872,4 +872,123 @@ fn the_causal_mask_hides_the_future_and_nothing_else() {
             }
         }
     }
+}
+
+#[test]
+fn an_f16_operand_is_what_the_tiled_kernel_would_have_made_of_an_f32_one() {
+    let Some(g) = gpu() else { return };
+    // The claim this rests on: `gemm_pack` rounds an F32 operand to f16
+    // round-to-nearest-even on the way into shared memory, and
+    // `half::f16::from_f32` does the same rounding on the host, so the two
+    // paths stage the same 32 bits. If that is true the results are
+    // *bit-identical*, not merely close - which is a far stronger check than a
+    // tolerance, and it is the reason storing a weight as f16 is a bandwidth
+    // decision rather than a precision one.
+    let (m, k, n) = (100usize, 64usize, 70usize);
+    let a = seq(m * k, 41);
+    let w = seq(n * k, 42);
+    let bias = seq(n, 43);
+    let (ad, wd) = (g.upload(&a).expect("upload"), g.upload(&w).expect("upload"));
+    let bd = g.upload(&bias).expect("upload");
+    let (ah, wh) = (
+        g.upload_f16(&a).expect("upload"),
+        g.upload_f16(&w).expect("upload"),
+    );
+
+    let f32_f32 = g
+        .download(&g.gemm(&ad, &wd, Some(&bd), m, k, n).expect("gemm"))
+        .expect("download");
+    for (name, a_op, w_op) in [
+        ("f32 x f16", Operand::F32(&ad), Operand::F16(&wh)),
+        ("f16 x f32", Operand::F16(&ah), Operand::F32(&wd)),
+        ("f16 x f16", Operand::F16(&ah), Operand::F16(&wh)),
+    ] {
+        let got = g
+            .download(
+                &g.gemm_batched(a_op, w_op, Some(&bd), Batch::single(m * n), m, k, n)
+                    .expect("gemm_batched"),
+            )
+            .expect("download");
+        assert_eq!(got, f32_f32, "{name} disagreed with the F32 staging");
+    }
+
+    // The scalar path is a different claim: it accumulates an F32 operand
+    // exactly, so packing one there really does change the arithmetic. Close,
+    // not identical, and worth saying out loud rather than discovering.
+    let rows = xabe_cuda::GEMV_MAX_M;
+    let a = seq(rows * k, 44);
+    let (ad, ah) = (
+        g.upload(&a).expect("upload"),
+        g.upload_f16(&a).expect("upload"),
+    );
+    let exact = g
+        .download(&g.gemm(&ad, &wd, None, rows, k, n).expect("gemm"))
+        .expect("download");
+    let packed = g
+        .download(
+            &g.gemm_batched(
+                Operand::F16(&ah),
+                Operand::F16(&wh),
+                None,
+                Batch::single(rows * n),
+                rows,
+                k,
+                n,
+            )
+            .expect("gemm_batched"),
+        )
+        .expect("download");
+    assert_ne!(
+        exact, packed,
+        "the scalar path is supposed to be exact in F32"
+    );
+    // How far apart, measured rather than asserted loosely: 3.5e-4 relative
+    // over a 64-long contraction. That is the cost of rounding an operand the
+    // scalar path would otherwise have accumulated exactly, and it is why
+    // `Operand` is a type the caller chooses rather than something the upload
+    // decides. `GEMM_RTOL` is not the right bound here - it is calibrated for
+    // two f16-staged paths agreeing with each other.
+    let worst = exact
+        .iter()
+        .zip(&packed)
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1e-3))
+        .fold(0.0f32, f32::max);
+    assert!(worst < 1e-3, "gemv packed: {worst:e} relative");
+}
+
+#[test]
+fn packing_on_the_device_and_on_the_host_agree() {
+    let Some(g) = gpu() else { return };
+    // `to_f16` uses `cvt.rn.f16.f32`; `upload_f16` uses `half::f16::from_f32`.
+    // Both are round-to-nearest-even, and a tensor rounded on either side has
+    // to be the same bits or the test above proves nothing.
+    let x = seq(1000, 51);
+    let host = g.upload_f16(&x).expect("upload");
+    let device = g
+        .to_f16(&g.upload(&x).expect("upload"), x.len())
+        .expect("to_f16");
+    let read = |s: &xabe_cuda::CudaSlice<u16>| -> Vec<u16> { g.download_u16(s).expect("download") };
+    assert_eq!(read(&host), read(&device));
+}
+
+#[test]
+fn an_odd_contraction_with_a_packed_operand_is_refused() {
+    let Some(g) = gpu() else { return };
+    // The F32 path takes any length. This one cannot: two halves to a word
+    // puts the boundary inside one. Every contraction in a transformer is
+    // even, so this is a check rather than a limitation - but a silent wrong
+    // answer here would look like a model that had been trained badly.
+    let (m, k, n) = (4usize, 7usize, 8usize);
+    let e = g
+        .gemm_batched(
+            Operand::F16(&g.upload_f16(&seq(m * k, 61)).expect("upload")),
+            Operand::F32(&g.upload(&seq(n * k, 62)).expect("upload")),
+            None,
+            Batch::single(m * n),
+            m,
+            k,
+            n,
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("odd"), "{e}");
 }

@@ -59,6 +59,34 @@ impl std::fmt::Debug for Gpu {
 /// know which side of it a shape falls on.
 pub const GEMV_MAX_M: usize = 16;
 
+/// One side of a matmul, in whichever precision it is stored.
+///
+/// The tiled kernel rounds *both* operands to f16 on the way into shared
+/// memory, on every trip. So storing either side as F32 buys no accuracy at
+/// all and costs twice the global traffic - and global traffic is what this
+/// kernel is limited by. [`Operand::F16`] is the same arithmetic at half the
+/// bytes, and it halves what a large model occupies on the card as well.
+///
+/// The scalar path *is* different: it accumulates an F32 operand exactly and
+/// rounds an f16 one. That is a real precision decision on the decode shapes,
+/// and it is the caller's to make - which is why this is a type rather than
+/// something [`Gpu::upload`] decides.
+#[derive(Debug, Clone, Copy)]
+pub enum Operand<'a> {
+    /// Full precision, as it comes out of the checkpoint.
+    F32(&'a CudaSlice<f32>),
+    /// Rounded once. Two halves to a 32-bit word, so the contraction must be
+    /// even - every one in a transformer is.
+    F16(&'a CudaSlice<u16>),
+}
+
+impl Operand<'_> {
+    /// Whether this side is packed, as the kernel's flag.
+    fn half(self) -> i32 {
+        i32::from(matches!(self, Operand::F16(_)))
+    }
+}
+
 /// How a batched matmul steps between its products.
 ///
 /// Three separate strides because attention needs two different shapes from
@@ -72,6 +100,9 @@ pub struct Batch {
     /// Elements between consecutive left operands.
     pub a: usize,
     /// Elements between consecutive right operands.
+    ///
+    /// Counted in elements of the logical matrix in both precisions, so a
+    /// caller does not have to know which one it handed over.
     pub w: usize,
     /// Elements between consecutive outputs.
     pub out: usize,
@@ -120,6 +151,7 @@ const NAMES: &[&str] = &[
     "attention_context",
     "expand_prior",
     "im2col",
+    "pack_f16",
     "split_heads",
     "split_heads_t",
     "merge_heads",
@@ -209,12 +241,68 @@ impl Gpu {
             })
     }
 
+    /// Copies a packed tensor back, as raw halves.
+    ///
+    /// For tests: the only claim worth making about an f16 tensor is which
+    /// bits it holds, and a comparison in f32 would hide a rounding-mode
+    /// disagreement behind a conversion.
+    pub fn download_u16(&self, x: &CudaSlice<u16>) -> Result<Vec<u16>, CudaError> {
+        self.stream
+            .clone_dtoh(x)
+            .map_err(|source| CudaError::Driver {
+                what: "downloading",
+                source,
+            })
+    }
+
     /// Allocates a zeroed device buffer.
     pub fn zeros(&self, n: usize) -> Result<CudaSlice<f32>, CudaError> {
         self.stream
             .alloc_zeros::<f32>(n)
             .map_err(|source| CudaError::Driver {
                 what: "allocating",
+                source,
+            })
+    }
+
+    /// Allocates without zeroing.
+    ///
+    /// # Safety
+    ///
+    /// The contents are whatever the last owner of that memory left there.
+    /// Only sound when the kernel that follows writes every element - which is
+    /// worth checking rather than assuming: a tiled kernel that predicates its
+    /// stores can leave the ragged edge of a tile untouched, and the resulting
+    /// garbage is *plausible* garbage, because it is somebody else's
+    /// activations.
+    ///
+    /// Used where the alternative is a real cost: one attention score matrix
+    /// is 45 M floats, and zeroing it 32 times is 5.7 GB of writes that the
+    /// matmul immediately overwrites.
+    pub unsafe fn uninit(&self, n: usize) -> Result<CudaSlice<f32>, CudaError> {
+        // SAFETY: the caller has promised every element is written before it is
+        // read. That promise is what this function's own safety comment is
+        // about; there is nothing further to check here.
+        unsafe { self.stream.alloc::<f32>(n) }.map_err(|source| CudaError::Driver {
+            what: "allocating",
+            source,
+        })
+    }
+
+    /// Copies a slice to the device as f16, rounding once.
+    ///
+    /// Round-to-nearest-even on the host, which is what `cvt.rn.f16.f32`
+    /// does - so a weight uploaded this way is bit-identical to what the
+    /// tiled kernel would have produced from the F32 original.
+    pub fn upload_f16(&self, x: &[f32]) -> Result<CudaSlice<u16>, CudaError> {
+        let packed: Vec<u16> = x
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        self.stream
+            .clone_htod(&packed)
+            .map_err(|source| CudaError::Driver {
+                what: "uploading f16 weights",
                 source,
             })
     }
@@ -496,7 +584,15 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        self.gemm_batched(a, w, bias, Batch::single(m * n), m, k, n)
+        self.gemm_batched(
+            Operand::F32(a),
+            Operand::F32(w),
+            bias,
+            Batch::single(m * n),
+            m,
+            k,
+            n,
+        )
     }
 
     /// A batch of independent products, one per `blockIdx.z`.
@@ -511,17 +607,25 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_batched(
         &self,
-        a: &CudaSlice<f32>,
-        w: &CudaSlice<f32>,
+        a: Operand<'_>,
+        w: Operand<'_>,
         bias: Option<&CudaSlice<f32>>,
         batch: Batch,
         m: usize,
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(batch.count * m * n)?;
+        if (a.half() == 1 || w.half() == 1) && !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        // SAFETY: both kernels write every element of the tile they own, with
+        // the predication covering exactly the (m, n) range - see the store
+        // loop in kernels.rs, and `every_output_element_is_written_exactly_once`
+        // in the tests, which is the check this relies on.
+        let mut out = unsafe { self.uninit(batch.count * m * n) }?;
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
         let (sa, sw, so) = (batch.a as i64, batch.w as i64, batch.out as i64);
+        let (a_half, w_half) = (a.half(), w.half());
         let null: u64 = 0;
 
         // 128 rows of `a` and 128 of `w` per block, across 8 warps, or one warp
@@ -532,7 +636,14 @@ impl Gpu {
         let small = m <= GEMV_MAX_M;
         let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(a).arg(w);
+        match a {
+            Operand::F32(v) => lb.arg(v),
+            Operand::F16(v) => lb.arg(v),
+        };
+        match w {
+            Operand::F32(v) => lb.arg(v),
+            Operand::F16(v) => lb.arg(v),
+        };
         match bias {
             Some(v) => lb.arg(v),
             None => lb.arg(&null),
@@ -543,7 +654,9 @@ impl Gpu {
             .arg(&ni)
             .arg(&sa)
             .arg(&sw)
-            .arg(&so);
+            .arg(&so)
+            .arg(&a_half)
+            .arg(&w_half);
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: if small {
@@ -931,6 +1044,28 @@ impl Gpu {
             .arg(&g);
         launched("im2col", unsafe { lb.launch(Self::flat(out_t * cols)) })?;
         Ok((out, out_t))
+    }
+
+    /// Rounds a tensor to f16 on the device, so the matmul reads half of it.
+    ///
+    /// Worth a pass of its own when the result is read many times: a
+    /// projection's input is re-read once per column tile - twelve times at
+    /// encoder width - so converting it once trades one pass for eleven halved
+    /// ones.
+    pub fn to_f16(&self, x: &CudaSlice<f32>, n: usize) -> Result<CudaSlice<u16>, CudaError> {
+        let mut out = self
+            .stream
+            .alloc_zeros::<u16>(n)
+            .map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
+        let len = n as i32;
+        let f = self.func("pack_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&len);
+        launched("pack_f16", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
     }
 
     /// `[t, heads*head_dim]` to `[heads, t, head_dim]`.

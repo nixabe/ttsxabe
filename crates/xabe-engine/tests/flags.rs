@@ -76,6 +76,33 @@ fn a_device_with_no_stage_at_all_is_refused() {
 }
 
 #[test]
+fn a_gpu_only_stage_refuses_the_cpu_rather_than_taking_twenty_minutes() {
+    // The mirror of the VAD's rule, for the mirror-image reason. One
+    // 30-second window is about 2.2 TFLOP through Whisper's encoder alone, and
+    // the scalar kernels run at something under 2 GFLOP/s - twenty minutes an
+    // utterance, which is not a slow option but a fictional one.
+    let e = stages(&["--asr-model", "/a", "--asr-device", "cpu", "--in", "c.wav"]).unwrap_err();
+    assert_eq!(e, xabe_engine::StageError::GpuOnly(xabe_engine::Kind::Asr));
+
+    // A card is accepted, and is also what happens with no device flag.
+    let ok = stages(&["--asr-model", "/a", "--asr-device", "1", "--in", "c.wav"]);
+    assert!(ok.is_ok(), "{ok:?}");
+    match stages(&["--asr-model", "/a", "--in", "c.wav"])
+        .expect("stages")
+        .asr
+    {
+        xabe_engine::Stage::Local { device, .. } => {
+            assert_eq!(
+                device,
+                xabe_engine::Device::Cuda(0),
+                "and it is the default"
+            );
+        }
+        other => panic!("expected Local, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_cpu_only_stage_refuses_a_card_rather_than_quietly_ignoring_it() {
     // The VAD has no CUDA implementation and is not going to: 15 tensors and a
     // millisecond of work, where the transfer would cost more than the

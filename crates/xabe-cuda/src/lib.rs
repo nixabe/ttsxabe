@@ -26,6 +26,6 @@ mod error;
 mod kernels;
 
 pub use cudarc::driver::CudaSlice;
-pub use device::{Batch, GEMV_MAX_M, Gpu};
+pub use device::{Batch, GEMV_MAX_M, Gpu, Operand};
 pub use error::CudaError;
 pub use kernels::SOURCE;

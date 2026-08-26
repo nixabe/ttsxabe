@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use xabe_serve::{
-    AppState, GatewayConfig, Inner, SpeechSpan, SynthesisJob, TtsBackend, Upstream, VadJob,
+    AppState, AsrBackend, GatewayConfig, Inner, SpeechSpan, SynthesisJob, TranscribeJob,
+    TtsBackend, Upstream, VadJob,
 };
 
 /// How many synthesis jobs may wait before the caller blocks.
@@ -82,13 +83,8 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     }
 
     let asr = match &stages.asr {
-        Stage::Remote { url } => Some(Upstream::new(url)?),
-        Stage::Local { .. } => {
-            return Err(EngineError::NotImplemented {
-                stage: crate::stage::Kind::Asr,
-                phase: "4",
-            });
-        }
+        Stage::Remote { url } => Some(AsrBackend::Remote(Upstream::new(url)?)),
+        Stage::Local { path, device } => Some(AsrBackend::Local(spawn_transcriber(path, *device)?)),
         Stage::Off => None,
     };
 
@@ -203,6 +199,69 @@ fn spawn_detector(path: &std::path::Path) -> Result<mpsc::Sender<VadJob>, Engine
 }
 
 /// Starts the synthesiser thread and returns the queue that feeds it.
+/// Starts the transcriber thread and returns its work queue.
+///
+/// One OS thread, started before the listener binds, exactly as the
+/// synthesiser is: a forward pass this size must not run on a tokio executor
+/// thread, where it would block every other socket for the duration.
+///
+/// The clip arrives as a WAV and must already be 16 kHz. That is not a new
+/// requirement - the VAD in front of this has always assumed it, silently -
+/// and the server tells the browser which rate to send in `/api/config`. It is
+/// checked here rather than resampled because a resampler good enough for an
+/// ASR is a real piece of work, and one that is not good enough is a
+/// transcript that is quietly worse.
+fn spawn_transcriber(
+    path: &std::path::Path,
+    device: Device,
+) -> Result<mpsc::Sender<TranscribeJob>, EngineError> {
+    // `Kind::has_cpu` refuses `--asr-device cpu` at preflight, so by here the
+    // device is a card.
+    let Device::Cuda(ordinal) = device else {
+        unreachable!("--asr-device cpu is refused when the stages resolve");
+    };
+    // Opened on the calling thread, so a bad checkpoint fails preflight rather
+    // than at the first turn - by which time a user is waiting.
+    let model = xabe_asr::AsrModel::open(path, ordinal)?;
+
+    let (tx, mut rx) = mpsc::channel::<TranscribeJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-asr".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                let _ = job
+                    .reply
+                    .send(transcribe_one(&model, &job.wav, &job.language));
+            }
+            tracing::debug!("transcriber thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the transcriber thread",
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(tx)
+}
+
+/// One transcription, with its failures turned into a message the caller can
+/// put in front of a user.
+fn transcribe_one(
+    model: &xabe_asr::AsrModel,
+    wav: &[u8],
+    language: &str,
+) -> Result<String, String> {
+    let audio = xabe_audio::parse_wav(wav).map_err(|e| e.to_string())?;
+    if audio.sample_rate != 16_000 {
+        return Err(format!(
+            "the clip is {} Hz; this stage wants 16000",
+            audio.sample_rate
+        ));
+    }
+    model
+        .transcribe(&audio.samples, language)
+        .map_err(|e| e.to_string())
+}
+
 fn spawn_synthesiser(
     args: &Args,
     path: &std::path::Path,

@@ -3,6 +3,19 @@
 /// Something went wrong talking to the device.
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
+    /// An odd contraction with an f16 weight, which packs two to a word.
+    ///
+    /// The F32 path takes any length - see the history in
+    /// `gemm_accepts_every_contraction_length`. This one cannot: an f16 weight
+    /// is addressed as 32-bit words, so an odd `k` would put the boundary in
+    /// the middle of one. Every contraction in a transformer is even, so this
+    /// is a check rather than a limitation.
+    #[error("contraction length {k} is odd, and an f16 weight packs two to a word")]
+    RaggedContraction {
+        /// The length asked for.
+        k: usize,
+    },
+
     /// No usable CUDA device, or the driver could not be loaded.
     ///
     /// This is the variant every caller should be prepared for: the driver is

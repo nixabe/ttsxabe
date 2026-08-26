@@ -54,6 +54,78 @@ pub struct VadJob {
 /// The sending half of a local detector's work queue.
 pub type LocalVad = mpsc::Sender<VadJob>;
 
+/// One request to transcribe, and where the text should go.
+///
+/// The request carries a WAV rather than samples, so that a local stage and a
+/// delegated one are handed exactly the same thing. The alternative - samples
+/// for one, a container for the other - is two code paths that agree until the
+/// day one of them is given a clip the other would have rejected.
+#[derive(Debug)]
+pub struct TranscribeJob {
+    /// A 16 kHz mono WAV.
+    pub wav: Vec<u8>,
+    /// The language to force, as a Whisper language code.
+    pub language: String,
+    /// The transcript, or a message describing why there is none.
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
+/// The sending half of a local transcriber's work queue.
+pub type LocalAsr = mpsc::Sender<TranscribeJob>;
+
+/// Where speech-to-text lives.
+#[derive(Clone)]
+pub enum AsrBackend {
+    /// In this process, behind a work queue.
+    Local(LocalAsr),
+    /// In another process.
+    Remote(Upstream),
+}
+
+impl std::fmt::Debug for AsrBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsrBackend::Local(_) => f.write_str("local"),
+            AsrBackend::Remote(u) => write!(f, "remote({})", u.base()),
+        }
+    }
+}
+
+impl AsrBackend {
+    /// Transcribes a WAV, wherever the model happens to be.
+    pub async fn transcribe(
+        &self,
+        wav: Vec<u8>,
+        language: &str,
+    ) -> Result<String, crate::ServeError> {
+        match self {
+            AsrBackend::Remote(u) => u.transcribe(wav, language).await,
+            AsrBackend::Local(tx) => {
+                let (reply, done) = tokio::sync::oneshot::channel();
+                tx.send(TranscribeJob {
+                    wav,
+                    language: language.to_string(),
+                    reply,
+                })
+                .await
+                .map_err(|_| crate::ServeError::Upstream {
+                    stage: "asr",
+                    message: "the local transcriber stopped".into(),
+                })?;
+                done.await
+                    .map_err(|_| crate::ServeError::Upstream {
+                        stage: "asr",
+                        message: "the local transcriber dropped the job".into(),
+                    })?
+                    .map_err(|message| crate::ServeError::Upstream {
+                        stage: "asr",
+                        message,
+                    })
+            }
+        }
+    }
+}
+
 /// Where a TTS engine lives.
 #[derive(Clone)]
 pub enum TtsBackend {
@@ -81,7 +153,7 @@ pub struct Inner {
     /// Prompt, thresholds and engine names.
     pub config: GatewayConfig,
     /// Speech to text, if this process can reach one.
-    pub asr: Option<Upstream>,
+    pub asr: Option<AsrBackend>,
     /// Voice activity detection, if this process runs one.
     ///
     /// Always local: the VAD is 15 tensors and a millisecond of CPU, so

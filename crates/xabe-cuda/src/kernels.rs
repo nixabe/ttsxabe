@@ -99,6 +99,26 @@ __device__ __forceinline__ unsigned gemm_pack(float lo, float hi) {
     return r;
 }
 
+// One float to one half, round to nearest even - the same rounding
+// `gemm_pack` does, so a tensor converted here and one staged from F32 are the
+// same bits.
+__device__ __forceinline__ unsigned short f32_to_f16(float v) {
+    unsigned short r;
+    asm("{ .reg .f16 x; cvt.rn.f16.f32 x, %1; mov.b16 %0, x; }" : "=h"(r) : "f"(v));
+    return r;
+}
+
+// The inverse, for the scalar path. `gemm_pack`'s output and a pair of halves
+// stored contiguously are the same 32 bits, which is the whole reason an f16
+// weight needs no conversion at all on the tiled path.
+__device__ __forceinline__ void gemm_unpack(unsigned p, float& lo, float& hi) {
+    asm("{ .reg .f16 x, y;\n"
+        "  mov.b32 {x, y}, %2;\n"
+        "  cvt.f32.f16 %0, x;\n"
+        "  cvt.f32.f16 %1, y; }"
+        : "=f"(lo), "=f"(hi) : "r"(p));
+}
+
 __device__ __forceinline__ void gemm_mma_step(
     float& d0, float& d1, float& d2, float& d3,
     unsigned a0, unsigned a1, unsigned b0)
@@ -128,13 +148,18 @@ __device__ __forceinline__ void gemm_mma_step(
 
 #define GEMV_WARPS 8
 
+// `w` is either `const float*` or a packed `const __half*`, selected by
+// `w_half`. The strides `sa`, `sw` and `so` count elements of the logical
+// matrix in both cases, so a caller does not have to know which precision it
+// handed over.
 extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
-    const float* __restrict__ a,
-    const float* __restrict__ w,
+    const void* __restrict__ a,
+    const void* __restrict__ w,
     const float* __restrict__ bias,
     float* __restrict__ out,
     int m, int k, int n,
-    long sa, long sw, long so)
+    long sa, long sw, long so,
+    int a_half, int w_half)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -147,15 +172,43 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     // operand. Attention is twenty of these per layer and the alternative is
     // twenty launches; the strides are separate arguments because a batched
     // score matrix and a batched context share no single stride.
-    a   += (size_t)blockIdx.z * sa;
-    w   += (size_t)blockIdx.z * sw;
     out += (size_t)blockIdx.z * so;
 
-    const float* av = a + (size_t)row * k;
-    const float* wv = w + (size_t)col * k;
+    // The activation is one row, broadcast across the whole grid, so it stays
+    // in cache and its precision costs nothing in bandwidth. `a_half` is
+    // accepted for symmetry with the tiled kernel and unpacked the same way.
+    const float* af = (const float*)a + (size_t)blockIdx.z * sa + (size_t)row * k;
+    const unsigned* ahr =
+        (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1) + (size_t)row * (k >> 1);
     float acc = 0.0f;
-    for (int i = lane; i < k; i += 32) {
-        acc += av[i] * wv[i];
+    if (w_half) {
+        // Two halves to a word, and `k` is even whenever a weight is stored
+        // this way - every contraction in the model is.
+        const int kh = k >> 1;
+        const unsigned* wv = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1)
+                           + (size_t)col * kh;
+        for (int i = lane; i < kh; i += 32) {
+            float lo, hi, alo, ahi;
+            gemm_unpack(wv[i], lo, hi);
+            if (a_half) {
+                gemm_unpack(ahr[i], alo, ahi);
+            } else {
+                alo = af[2 * i];
+                ahi = af[2 * i + 1];
+            }
+            acc += alo * lo + ahi * hi;
+        }
+    } else {
+        const float* wv = (const float*)w + (size_t)blockIdx.z * sw + (size_t)col * k;
+        for (int i = lane; i < k; i += 32) {
+            float av = a_half ? 0.0f : af[i];
+            if (a_half) {
+                float lo, hi;
+                gemm_unpack(ahr[i >> 1], lo, hi);
+                av = (i & 1) ? hi : lo;
+            }
+            acc += av * wv[i];
+        }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -168,20 +221,23 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
 
 
 extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
-    const float* __restrict__ a,
-    const float* __restrict__ w,
+    const void* __restrict__ a,
+    const void* __restrict__ w,
     const float* __restrict__ bias,
     float* __restrict__ out,
     int m, int k, int n,
-    long sa, long sw, long so)
+    long sa, long sw, long so,
+    int a_half, int w_half)
 {
     __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
     __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
 
     // See the note in `gemv`: blockIdx.z selects one product of a batch.
-    a   += (size_t)blockIdx.z * sa;
-    w   += (size_t)blockIdx.z * sw;
     out += (size_t)blockIdx.z * so;
+    const float*    af = (const float*)a    + (size_t)blockIdx.z * sa;
+    const unsigned* ah = (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1);
+    const float*    wf = (const float*)w    + (size_t)blockIdx.z * sw;
+    const unsigned* wh = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1);
 
     const int lane = threadIdx.x;          // 0..31
     const int warp = threadIdx.y;          // 0..GEMM_WARPS-1
@@ -224,37 +280,63 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             int row = i / (GEMM_KC / 2);
             int j   = i % (GEMM_KC / 2);
             int kk  = kc + 2 * j;
-            float lo = 0.0f, hi = 0.0f;
-            if (m0 + row < m) {
-                const float* src = a + (size_t)(m0 + row) * k + kk;
-                if (whole) {
-                    float2 v = *reinterpret_cast<const float2*>(src);
-                    lo = v.x;
-                    hi = v.y;
-                } else {
-                    if (kk     < k) lo = src[0];
-                    if (kk + 1 < k) hi = src[1];
+            unsigned packed = 0;
+            if (a_half) {
+                const int kh = k >> 1;
+                const int aj = (kc >> 1) + j;
+                if (m0 + row < m && aj < kh) {
+                    packed = ah[(size_t)(m0 + row) * kh + aj];
                 }
+            } else {
+                float lo = 0.0f, hi = 0.0f;
+                if (m0 + row < m) {
+                    const float* src = af + (size_t)(m0 + row) * k + kk;
+                    if (whole) {
+                        float2 v = *reinterpret_cast<const float2*>(src);
+                        lo = v.x;
+                        hi = v.y;
+                    } else {
+                        if (kk     < k) lo = src[0];
+                        if (kk + 1 < k) hi = src[1];
+                    }
+                }
+                packed = gemm_pack(lo, hi);
             }
-            as[row * GEMM_WSTRIDE + j] = gemm_pack(lo, hi);
+            as[row * GEMM_WSTRIDE + j] = packed;
         }
         for (int i = tid; i < GEMM_NT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
             int row = i / (GEMM_KC / 2);
             int j   = i % (GEMM_KC / 2);
             int kk  = kc + 2 * j;
-            float lo = 0.0f, hi = 0.0f;
-            if (n0 + row < n) {
-                const float* src = w + (size_t)(n0 + row) * k + kk;
-                if (whole) {
-                    float2 v = *reinterpret_cast<const float2*>(src);
-                    lo = v.x;
-                    hi = v.y;
-                } else {
-                    if (kk     < k) lo = src[0];
-                    if (kk + 1 < k) hi = src[1];
+            unsigned packed = 0;
+            if (w_half) {
+                // No conversion at all. `gemm_pack` produces {f16(lo), f16(hi)}
+                // in one b32, and two halves stored contiguously little-endian
+                // are those same 32 bits - so an f16 weight is staged with a
+                // plain 32-bit load. Half the global traffic of the F32 path
+                // for arithmetic that was identical anyway, because the F32
+                // path rounds to f16 here regardless.
+                const int kh = k >> 1;
+                const int wj = (kc >> 1) + j;
+                if (n0 + row < n && wj < kh) {
+                    packed = wh[(size_t)(n0 + row) * kh + wj];
                 }
+            } else {
+                float lo = 0.0f, hi = 0.0f;
+                if (n0 + row < n) {
+                    const float* src = wf + (size_t)(n0 + row) * k + kk;
+                    if (whole) {
+                        float2 v = *reinterpret_cast<const float2*>(src);
+                        lo = v.x;
+                        hi = v.y;
+                    } else {
+                        if (kk     < k) lo = src[0];
+                        if (kk + 1 < k) hi = src[1];
+                    }
+                }
+                packed = gemm_pack(lo, hi);
             }
-            bs[row * GEMM_WSTRIDE + j] = gemm_pack(lo, hi);
+            bs[row * GEMM_WSTRIDE + j] = packed;
         }
         __syncthreads();
 
@@ -893,6 +975,19 @@ extern "C" __global__ void merge_heads(
 // it would hide the entire cache. Decoding one token at a time makes the mask
 // a no-op, which is exactly why the bug survives until something feeds the
 // decoder two tokens at once.
+// One tensor from f32 to packed f16, so the matmul can read half the bytes.
+extern "C" __global__ void pack_f16(
+    const float* __restrict__ x,
+    unsigned short* __restrict__ out,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    out[i] = f32_to_f16(x[i]);
+}
+
 extern "C" __global__ void causal_mask(
     float* __restrict__ scores,
     int batch, int tq, int tk, int offset)

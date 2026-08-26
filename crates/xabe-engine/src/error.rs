@@ -68,4 +68,20 @@ pub enum EngineError {
         /// The underlying failure.
         source: std::io::Error,
     },
+    /// A clip at a rate this engine's own ASR does not resample from.
+    ///
+    /// A resampler good enough for an ASR is a real piece of work, and one
+    /// that is not good enough is a transcript that is quietly worse. So the
+    /// rate is a requirement rather than something silently fixed.
+    #[error("the clip is {found} Hz; this stage wants {wanted}")]
+    SampleRate {
+        /// What the file declares.
+        found: u32,
+        /// What the stage needs.
+        wanted: u32,
+    },
+
+    /// The ASR stage failed.
+    #[error(transparent)]
+    Asr(#[from] xabe_asr::AsrError),
 }

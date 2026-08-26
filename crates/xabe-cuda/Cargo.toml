@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 cudarc.workspace = true
+half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

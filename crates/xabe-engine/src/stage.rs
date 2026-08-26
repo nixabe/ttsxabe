@@ -45,6 +45,18 @@ impl Kind {
         !matches!(self, Kind::Vad)
     }
 
+    /// Whether this stage has a CPU implementation at all.
+    ///
+    /// The ASR does not. One 30-second window is about 2.2 TFLOP through the
+    /// encoder alone, and the scalar kernels run at something under 2 GFLOP/s -
+    /// twenty minutes an utterance, which is not a slow option but a fictional
+    /// one. The mirror of [`Kind::has_cuda`], and for the mirror-image reason:
+    /// accepting `--asr-device cpu` and then taking twenty minutes is worse
+    /// than saying so at preflight.
+    pub fn has_cpu(self) -> bool {
+        !matches!(self, Kind::Asr)
+    }
+
     /// Where this stage runs when no device is named.
     pub fn default_device(self) -> Device {
         if self.has_cuda() {
@@ -177,6 +189,10 @@ pub enum StageError {
     #[error("--{0}-device must be `cpu`; the {0} stage has no CUDA implementation")]
     CpuOnly(Kind),
 
+    /// The CPU was asked for by a stage that only runs on a card.
+    #[error("--{0}-device must be a CUDA device ordinal; the {0} stage has no CPU implementation")]
+    GpuOnly(Kind),
+
     /// Voice activity detection with nothing to gate and nothing to read.
     ///
     /// VAD alone is meaningful over `--in`, where it prints segments. Served,
@@ -271,6 +287,9 @@ fn one(kind: Kind, r: &Requested) -> Result<Stage, StageError> {
             };
             if device != Device::Cpu && !kind.has_cuda() {
                 return Err(StageError::CpuOnly(kind));
+            }
+            if device == Device::Cpu && !kind.has_cpu() {
+                return Err(StageError::GpuOnly(kind));
             }
             Ok(Stage::Local {
                 path: path.clone(),
