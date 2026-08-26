@@ -10,6 +10,7 @@ authors.workspace = true
 xabe-audio.workspace = true
 xabe-dsp.workspace = true
 xabe-st.workspace = true
+regex.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

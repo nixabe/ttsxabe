@@ -21,11 +21,13 @@
 mod config;
 mod error;
 mod frontend;
+mod tokenizer;
 mod weights;
 
 pub use config::WhisperConfig;
 pub use error::WhisperError;
 pub use frontend::{DYNAMIC_RANGE, F_MAX, Frontend};
+pub use tokenizer::{Tokenizer, pre_tokenize};
 pub use weights::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, LayerNorm, Linear, WhisperWeights,
 };

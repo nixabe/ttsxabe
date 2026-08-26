@@ -1652,6 +1652,7 @@ dependencies = [
 name = "xabe-whisper"
 version = "0.0.0"
 dependencies = [
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",
