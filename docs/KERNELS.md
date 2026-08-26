@@ -85,3 +85,79 @@ four times. Moving it would cost more in launches and transfers than it saves.
 `xabe-dsp` kernels are written to be read against the PyTorch source line by
 line. They are not vectorised, not blocked, and not clever. A reference you have
 to reason about is not a reference.
+
+## The matmul, added for the ASR
+
+| kernel | used by | CPU twin | notes |
+| --- | --- | --- | --- |
+| `gemm` | encoder and decoder projections | `xabe_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
+| `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
+
+`Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
+not have the same precision, which is why the constant is public: a test that
+compares against a reference has to know which side of it a shape falls on.
+
+### What the tensor-core path is worth
+
+Medians of 20, one Quadro RTX 8000, against the one-thread-per-output `linear`:
+
+| shape | what it is | `gemm` | `linear` | | |
+| --- | --- | --- | --- | --- | --- |
+| 1500x1280x1280 | encoder q/k/v/o | 0.21 ms | 37.6 ms | 182x | 23.8 TFLOP/s |
+| 1500x1280x5120 | encoder mlp up | 0.94 ms | 151.4 ms | 161x | 20.9 TFLOP/s |
+| 1500x5120x1280 | encoder mlp down | 0.83 ms | 151.6 ms | 183x | 23.7 TFLOP/s |
+| 1x1280x1280 | decode projection | 0.02 ms | 0.23 ms | 12x | — |
+| 1x1280x51864 | decode output head | 0.45 ms | 1.83 ms | 4x | 590 GB/s |
+
+The output head is bandwidth-bound and running at 88% of the card's 672 GB/s,
+which is about as good as a GEMV gets.
+
+### Why the tile is 128x128
+
+Chosen by arithmetic first and confirmed by measurement. A block reads the whole
+contraction for `MT` rows of the activations and `NT` rows of the weights, and
+does `2*MT*NT*k` flops with them - so it performs `2*MT*NT/(MT+NT)` flops per
+float it reads. At 64x32 that is 43, capping the kernel near 7 TFLOP/s against
+672 GB/s. At 128x128 it is 128, capping it near 21, which is where it measures.
+
+The sweep, all at KC=32 unless stated, TFLOP/s for (q/k/v/o, mlp up, mlp down):
+
+| warps | MT | NT | KC | | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | 128 | 128 | 32 | **23.6** | **21.3** | **24.1** |
+| 8 | 128 | 64 | 32 | 16.6 | 17.0 | 16.4 |
+| 8 | 64 | 128 | 32 | 14.6 | 17.5 | 15.1 |
+| 8 | 128 | 128 | 64 | 18.9 | 17.9 | 19.3 |
+| 4 | 64 | 64 | 32 | 21.0 | 14.4 | 20.4 |
+| 8 | 256 | 64 | 32 | 20.1 | 18.5 | 18.8 |
+| 8 | 64 | 64 | 64 | 19.5 | 14.6 | 18.7 |
+
+### WHY NOT
+
+- **Do not time a GPU kernel by downloading its result.** The first version of
+  `bench-gemm` called `download` to force the queue to drain, and for the wider
+  shapes the PCIe copy was *most* of the measurement: 1500x5120 floats is 31 MB,
+  about 5 ms at 6 GB/s, against a kernel that runs in under one. Every number in
+  the first sweep was the bus, which is why the tile appeared not to matter -
+  all seven configurations "measured" 2.9 to 3.5 TFLOP/s. `synchronize`.
+- **KC=64 is slower than KC=32**, at every tile shape tried. More contraction
+  per staging trip is fewer barriers and also a larger shared footprint; the
+  second wins here.
+
+### Reachability at sm_75
+
+Only two MMA shapes assemble on this card: `m8n8k16.s32.s8.s8.s32` and
+`m16n8k8.f32.f16.f16.f32`. `m16n8k16` is accepted by NVRTC and then rejected by
+ptxas - **NVRTC success is not evidence of reachability**. That constraint, the
+fragment layouts, and the shared-memory stride argument are adapted from
+`llmxabe`, which has been running them on this hardware.
+
+### Why f32 accumulation is not caution
+
+fp16 *operands* are safe; fp16 *accumulation* is not. `llmxabe` records the
+measurement: on IID-random data fp16 accumulation looks safe at every depth with
+26-30x headroom, and it then broke an adversarial differential test by 209x,
+with constant-input error growing monotonically 3.2e-2 at 8K to 7.3e-1 at 131K.
+Rescale cadence does not help. So `m16n8k8.f32...f32` is the shape used, and the
+operand rounding it does cost is measured rather than assumed: 6.5e-5 of full
+scale on a k=1280 contraction.

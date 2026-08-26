@@ -18,6 +18,270 @@
 
 /// All device code, as one translation unit.
 pub const SOURCE: &str = r#"
+
+// ------------------------------------------------------------------- matmul
+//
+// A tiled matrix multiply on the tensor cores, for the transformer stages.
+//
+// `out[m][n] = sum_k a[m][k] * w[n][k]`, which is a linear layer with weights
+// stored `[out, in]` - so `a` is row-major and `w` is column-major from the
+// instruction's point of view, and `mma.sync.aligned.m16n8k8.row.col` is
+// exactly that shape with no transpose anywhere.
+//
+// Why the tensor cores rather than a scalar fp32 tile: measured on this card,
+// scalar fp32 runs at 17.9 TFLOP/s and `m16n8k8` at 99. The encoder is 32
+// layers of 1500x1280x1280 and 1500x1280x5120, about 1.9 TFLOP in total, so
+// the difference is the difference between a usable ASR and an unusable one.
+//
+// **Only two MMA shapes are reachable at sm_75**: `m8n8k16.s32.s8.s8.s32` and
+// `m16n8k8.f32.f16.f16.f32`. `m16n8k16` assembles under NVRTC and is then
+// rejected by ptxas - NVRTC success is not evidence of reachability. That, the
+// fragment layouts below and the shared-memory stride argument are adapted from
+// `llmxabe`, which has been running them on this card; see docs/KERNELS.md.
+//
+// **Operands are f16, accumulation is f32.** That is a precision decision, not
+// an oversight: fp16 *accumulation* looks safe on random data at every depth
+// and then breaks on adversarial input by two orders of magnitude, growing
+// monotonically with the contraction length. The operand rounding this does
+// cost is what the differential test against `xabe_dsp::linear` measures.
+
+#define GEMM_WARPS 8
+#define GEMM_MT    128     // rows of `a` per block
+#define GEMM_NT    128     // rows of `w` per block
+#define GEMM_KC    32      // contraction staged per trip
+#define GEMM_MSTEPS (GEMM_MT / 16)
+#define GEMM_KSTEPS (GEMM_KC / 8)
+#define GEMM_NPW   (GEMM_NT / (GEMM_WARPS * 8))   // 8-wide n tiles per warp
+
+// The block tile is chosen by *global* traffic, not by shared-memory capacity.
+//
+// A block reads the whole contraction for GEMM_MT rows of `a` and GEMM_NT rows
+// of `w`, and does 2*MT*NT*k flops with them, so it performs
+// `2*MT*NT/(MT+NT)` flops per float it reads. At 64x32 that is 43, and against
+// 672 GB/s it caps the kernel at about 7 TFLOP/s - which is exactly where the
+// first version measured. At 128x128 it is 128, capping it near 21.
+//
+// Measured on one Quadro RTX 8000, medians of 20, at 1500x1280x1280:
+//
+//   64x32,  4 warps    1.60 ms    3.1 TFLOP/s
+//   128x128, 8 warps   see docs/BENCHMARKS.md
+//
+// This is why the tile is not a tuning knob to be swept blindly: the first
+// arrangement was three times off the bandwidth its shape implied, and the
+// arithmetic said so before any measurement did.
+
+// Shared rows are addressed as 32-bit words, because a fragment load is two
+// halves at a time and the k index of a fragment is always even.
+//
+// The stride carries four words of padding beyond the KC/2 a row needs, and
+// that padding is the whole point. A fragment load has lane `l` read row
+// `l >> 2` at word `l & 3`, so consecutive groups of four lanes are one row
+// apart. With no padding at KC=32 the stride is 16 words, the eight groups
+// land on banks {0,16,0,16,...}, and the load is four-way conflicted.
+//
+// Four words of padding fixes it at both tile depths that matter, which is why
+// it is `+ 4` rather than a number chosen for one of them:
+//
+//   KC=32 -> stride 20 -> groups at banks 0,20,8,28,16,4,24,12
+//   KC=64 -> stride 36 -> groups at banks 0,4,8,12,16,20,24,28
+//
+// Either way the eight groups of four cover all 32 banks exactly once, so the
+// load is conflict-free.
+#define GEMM_WSTRIDE (GEMM_KC / 2 + 4)
+
+// NVRTC has no include path, so <cuda_fp16.h> is unreachable and every
+// conversion is inline PTX. Packs two floats into one b32 as {lo, hi}, which is
+// the order a fragment register wants: the low half is the smaller k.
+__device__ __forceinline__ unsigned gemm_pack(float lo, float hi) {
+    unsigned r;
+    asm("{ .reg .f16 x, y; cvt.rn.f16.f32 x, %1; cvt.rn.f16.f32 y, %2; mov.b32 %0, {x, y}; }"
+        : "=r"(r) : "f"(lo), "f"(hi));
+    return r;
+}
+
+__device__ __forceinline__ void gemm_mma_step(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned a0, unsigned a1, unsigned b0)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// The same product when there is only a handful of rows.
+//
+// `m16n8k8` has a 16-row M dimension, so at one token the tiled kernel fills
+// one row of 128 and throws the rest away - measured 0.02 TFLOP/s against 23.8
+// at encoder width. Decode is exactly that shape, one token at a time, tens of
+// thousands of times per utterance, so it gets its own kernel rather than a
+// tolerance for the waste.
+//
+// One warp per output channel, striding the contraction and reducing across
+// the lanes. The weight reads are coalesced - lane `l` reads `w[col][l]` - and
+// the activation row is broadcast, so it stays in cache across the whole grid.
+//
+// This path is **exact f32**: there are no tensor cores involved and so no
+// operand rounding. That makes precision a function of shape, which is worth
+// knowing rather than hiding - see `GEMV_MAX_M`.
+
+#define GEMV_WARPS 8
+
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
+    const float* __restrict__ a,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int m, int k, int n)
+{
+    const int lane = threadIdx.x;
+    const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
+    const int row  = blockIdx.y;
+    if (col >= n || row >= m) {
+        return;
+    }
+
+    const float* av = a + (size_t)row * k;
+    const float* wv = w + (size_t)col * k;
+    float acc = 0.0f;
+    for (int i = lane; i < k; i += 32) {
+        acc += av[i] * wv[i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (lane == 0) {
+        out[(size_t)row * n + col] = acc + (bias ? bias[col] : 0.0f);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
+    const float* __restrict__ a,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int m, int k, int n)
+{
+    __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
+    __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
+
+    const int lane = threadIdx.x;          // 0..31
+    const int warp = threadIdx.y;          // 0..GEMM_WARPS-1
+    const int tid  = warp * 32 + lane;
+    const int g    = lane >> 2;            // groupID
+    const int tg   = lane & 3;             // threadID_in_group
+
+    const int m0 = blockIdx.y * GEMM_MT;
+    const int n0 = blockIdx.x * GEMM_NT;
+
+    float acc[GEMM_MSTEPS][GEMM_NPW][4];
+    #pragma unroll
+    for (int i = 0; i < GEMM_MSTEPS; ++i) {
+        #pragma unroll
+        for (int j = 0; j < GEMM_NPW; ++j) {
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+        }
+    }
+
+    for (int kc = 0; kc < k; kc += GEMM_KC) {
+        // Stage both tiles as f16. Out-of-range rows and columns are zeroed
+        // rather than clamped: a zero contributes nothing to the dot product,
+        // where a clamped duplicate would contribute the wrong thing.
+        //
+        // The pair of floats is read as one `float2` on the common path. Two
+        // scalar loads is two memory transactions where one would do, and the
+        // staging is on the critical path of every trip - the scalar fallback
+        // exists only for the ragged tail, where the second float is past the
+        // end of the contraction.
+        const bool whole = (kc + GEMM_KC <= k);
+        for (int i = tid; i < GEMM_MT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
+            int row = i / (GEMM_KC / 2);
+            int j   = i % (GEMM_KC / 2);
+            int kk  = kc + 2 * j;
+            float lo = 0.0f, hi = 0.0f;
+            if (m0 + row < m) {
+                const float* src = a + (size_t)(m0 + row) * k + kk;
+                if (whole) {
+                    float2 v = *reinterpret_cast<const float2*>(src);
+                    lo = v.x;
+                    hi = v.y;
+                } else {
+                    if (kk     < k) lo = src[0];
+                    if (kk + 1 < k) hi = src[1];
+                }
+            }
+            as[row * GEMM_WSTRIDE + j] = gemm_pack(lo, hi);
+        }
+        for (int i = tid; i < GEMM_NT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
+            int row = i / (GEMM_KC / 2);
+            int j   = i % (GEMM_KC / 2);
+            int kk  = kc + 2 * j;
+            float lo = 0.0f, hi = 0.0f;
+            if (n0 + row < n) {
+                const float* src = w + (size_t)(n0 + row) * k + kk;
+                if (whole) {
+                    float2 v = *reinterpret_cast<const float2*>(src);
+                    lo = v.x;
+                    hi = v.y;
+                } else {
+                    if (kk     < k) lo = src[0];
+                    if (kk + 1 < k) hi = src[1];
+                }
+            }
+            bs[row * GEMM_WSTRIDE + j] = gemm_pack(lo, hi);
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int ks = 0; ks < GEMM_KSTEPS; ++ks) {
+            // Each B fragment is reused across every m tile and each A fragment
+            // across every n tile, so one shared load feeds several
+            // instructions. That reuse is what keeps this off the shared-load
+            // limit once the global one has been raised.
+            unsigned b0[GEMM_NPW];
+            #pragma unroll
+            for (int nt = 0; nt < GEMM_NPW; ++nt) {
+                b0[nt] = bs[((warp * GEMM_NPW + nt) * 8 + g) * GEMM_WSTRIDE + 4 * ks + tg];
+            }
+            #pragma unroll
+            for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
+                unsigned a0 = as[(16 * ms + g)     * GEMM_WSTRIDE + 4 * ks + tg];
+                unsigned a1 = as[(16 * ms + g + 8) * GEMM_WSTRIDE + 4 * ks + tg];
+                #pragma unroll
+                for (int nt = 0; nt < GEMM_NPW; ++nt) {
+                    gemm_mma_step(acc[ms][nt][0], acc[ms][nt][1],
+                                  acc[ms][nt][2], acc[ms][nt][3], a0, a1, b0[nt]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // D is 16x8: d0 is row `g` column `2*tg`, d2 is row `g+8`. The lane's `g`
+    // means the N index when loading B and the M index when storing D; that is
+    // the instruction redistributing, not a mistake.
+    #pragma unroll
+    for (int nt = 0; nt < GEMM_NPW; ++nt) {
+        const int col0 = n0 + (warp * GEMM_NPW + nt) * 8 + 2 * tg;
+        const float bias0 = (bias && col0     < n) ? bias[col0]     : 0.0f;
+        const float bias1 = (bias && col0 + 1 < n) ? bias[col0 + 1] : 0.0f;
+        #pragma unroll
+        for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
+            int row0 = m0 + 16 * ms + g;
+            int row1 = row0 + 8;
+            if (row0 < m) {
+                if (col0     < n) out[(size_t)row0 * n + col0]     = acc[ms][nt][0] + bias0;
+                if (col0 + 1 < n) out[(size_t)row0 * n + col0 + 1] = acc[ms][nt][1] + bias1;
+            }
+            if (row1 < m) {
+                if (col0     < n) out[(size_t)row1 * n + col0]     = acc[ms][nt][2] + bias0;
+                if (col0 + 1 < n) out[(size_t)row1 * n + col0 + 1] = acc[ms][nt][3] + bias1;
+            }
+        }
+    }
+}
 // ---------------------------------------------------------------- convolution
 
 // Cross-correlation over time. `w` is [out_ch, in_ch, k].

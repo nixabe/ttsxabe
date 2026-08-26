@@ -46,12 +46,27 @@ impl std::fmt::Debug for Gpu {
 }
 
 /// Every kernel in [`SOURCE`], looked up once at load.
+/// Rows at or below which [`Gpu::gemm`] takes the exact scalar path.
+///
+/// The tensor-core kernel's M dimension is 16 rows wide and its block tile is
+/// 128, so at one token it fills 1/128 of the tile: measured 0.02 TFLOP/s
+/// against 23.8 at encoder width. Sixteen is where the tiled kernel first has a
+/// whole instruction's worth of rows to work with.
+///
+/// The two paths do not have the same precision - the scalar one is exact f32
+/// and the tiled one rounds its operands to f16 - so this constant is exported
+/// rather than hidden. A test that compares `gemm` against a reference has to
+/// know which side of it a shape falls on.
+pub const GEMV_MAX_M: usize = 16;
+
 const NAMES: &[&str] = &[
     "conv1d",
     "conv1d_short",
     "depthwise_conv1d",
     "transposed_conv1d",
     "linear",
+    "gemm",
+    "gemv",
     "layer_norm",
     "softmax_rows",
     "act_relu",
@@ -418,6 +433,98 @@ impl Gpu {
         };
         lb.arg(&mut out).arg(&a).arg(&b_).arg(&c);
         launched("linear", unsafe { lb.launch(Self::flat(rows * out_c)) })?;
+        Ok(out)
+    }
+
+    /// `out[m][n] = sum_k a[m][k] * w[n][k]`, on the tensor cores.
+    ///
+    /// The same contract as [`Gpu::linear`] and a different implementation:
+    /// this one stages both operands as f16 and accumulates in f32, which is
+    /// worth 17.9 to 99 TFLOP/s on this card and costs one rounding of each
+    /// operand. `linear` stays for the places that want exact f32 and are small
+    /// enough not to care - the choice is per call site, which is why both
+    /// exist rather than one replacing the other.
+    ///
+    /// `k` must be a multiple of 8, which the instruction fixes. Whisper's
+    /// contractions are 1280 and 5120, so this is a check rather than a
+    /// limitation; padding a ragged contraction silently would be worse.
+    pub fn gemm(
+        &self,
+        a: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if !k.is_multiple_of(8) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        if m <= GEMV_MAX_M {
+            return self.gemv(a, w, bias, m, k, n);
+        }
+        let mut out = self.zeros(m * n)?;
+        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let null: u64 = 0;
+        let f = self.func("gemm");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(w);
+        match bias {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(&mut out).arg(&mi).arg(&ki).arg(&ni);
+
+        // 128 rows of `a` and 128 of `w` per block, across 8 warps. The tile is
+        // chosen by global traffic rather than by shared capacity - see the
+        // derivation in kernels.rs, which is also why these three numbers must
+        // move together with GEMM_MT, GEMM_NT and GEMM_WARPS.
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the grid covers every (m, n) exactly once, `out` is m*n
+        // elements, and every global read and write inside the kernel is bounds
+        // checked against m, k and n.
+        launched("gemm", unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
+    /// The same product for a handful of rows, one warp per output channel.
+    ///
+    /// Reached through [`Gpu::gemm`] rather than called directly, so a caller
+    /// never has to know which shape it has. It is **exact f32** - no tensor
+    /// cores, so no operand rounding - which means precision here is a function
+    /// of `m`. See [`GEMV_MAX_M`].
+    fn gemv(
+        &self,
+        a: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let mut out = self.zeros(m * n)?;
+        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let null: u64 = 0;
+        let f = self.func("gemv");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(w);
+        match bias {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(&mut out).arg(&mi).arg(&ki).arg(&ni);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n.div_ceil(8) as u32, m as u32, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one warp per (row, col), both bounds checked in the kernel;
+        // `out` is m*n elements and every lane writes at most one of them.
+        launched("gemv", unsafe { lb.launch(cfg) })?;
         Ok(out)
     }
 

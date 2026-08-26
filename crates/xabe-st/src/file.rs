@@ -55,7 +55,7 @@ impl Dtype {
     }
 
     /// Width of one element in bytes.
-    const fn width(self) -> u64 {
+    pub const fn width(self) -> u64 {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,

@@ -11,6 +11,12 @@ authors.workspace = true
 cudarc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+half.workspace = true
 xabe-dsp.workspace = true
+
+[[bin]]
+name = "bench-gemm"
+path = "src/bin/bench_gemm.rs"

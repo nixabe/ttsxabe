@@ -433,3 +433,239 @@ fn the_elementwise_kernels_match() {
     g.scale_inplace(&mut d, n, 1.0 / 3.0).unwrap();
     assert_close("scale_inplace", &want, &g.download(&d).unwrap());
 }
+
+// ---------------------------------------------------------------------- gemm
+
+/// Rounds a slice through f16, so the reference sees what the kernel sees.
+///
+/// This is the whole trick that makes a tensor-core kernel testable. `gemm`
+/// rounds both operands to f16 before multiplying; a reference fed the original
+/// f32 values is measuring that rounding, not the kernel, and no tolerance can
+/// separate the two. Feeding the reference the same rounded values leaves only
+/// accumulation order, which is what a differential test is supposed to judge.
+fn through_f16(x: &[f32]) -> Vec<f32> {
+    x.iter()
+        .map(|v| f32::from(half::f16::from_f32(*v)))
+        .collect()
+}
+
+/// Gate for `gemm` against a reference fed the same f16-rounded operands.
+///
+/// Both sides now compute the same products; only the summation order differs,
+/// and the accumulator is f32 on both. Measured worst across the shapes below
+/// is 1.2e-6 relative.
+const GEMM_RTOL: f32 = 1e-4;
+
+/// Absolute floor, for outputs near zero where relative error is meaningless.
+const GEMM_ATOL: f32 = 1e-4;
+
+fn assert_close_gemm(name: &str, want: &[f32], got: &[f32]) {
+    assert_eq!(want.len(), got.len(), "{name}: length");
+    let mut worst_rel = 0.0f32;
+    let mut at = 0;
+    let mut over = 0;
+    for (i, (a, b)) in want.iter().zip(got).enumerate() {
+        let d = (a - b).abs();
+        if d > GEMM_ATOL + GEMM_RTOL * a.abs() {
+            over += 1;
+        }
+        let rel = d / a.abs().max(1e-3);
+        if rel > worst_rel {
+            worst_rel = rel;
+            at = i;
+        }
+    }
+    assert!(
+        over == 0,
+        "{name}: {over}/{} values out of tolerance; worst relative {worst_rel:.3e} \
+         at [{at}], cpu {} vs gpu {}",
+        want.len(),
+        want[at],
+        got[at],
+    );
+}
+
+#[test]
+fn gemm_matches_the_scalar_linear_at_every_awkward_shape() {
+    let Some(g) = gpu() else { return };
+
+    // The shapes that matter, plus the ones that break tiling. 64x32 is the
+    // block tile, so anything not a multiple of it exercises the predication:
+    // a partial m tile, a partial n tile, and both at once.
+    let shapes: &[(usize, usize, usize)] = &[
+        (16, 8, 8),         // one instruction's worth, and the dispatch boundary
+        (17, 8, 8),         // one row past it, so both kernels are exercised
+        (1, 1280, 1280),    // a single token: the decode shape
+        (64, 32, 32),       // exactly one block tile
+        (65, 32, 32),       // one row into the next m tile
+        (64, 32, 33),       // one column into the next n tile
+        (63, 40, 31),       // partial in both, and k not a multiple of 32
+        (7, 1280, 51),      // nothing lines up with anything
+        (1500, 1280, 1280), // the encoder's self-attention projections
+    ];
+
+    for &(m, k, n) in shapes {
+        let name = format!("gemm {m}x{k}x{n}");
+        let a = seq(m * k, 1);
+        let w = seq(n * k, 2);
+        let bias = seq(n, 3);
+
+        // Which reference depends on which kernel `gemm` will dispatch to, and
+        // that is a property of the shape. At or below GEMV_MAX_M rows it takes
+        // the exact scalar path, so the reference must be exact too; above it
+        // the operands are rounded to f16 and the reference has to see the same
+        // values or it is measuring the rounding rather than the kernel.
+        let (a_ref, w_ref) = if m <= xabe_cuda::GEMV_MAX_M {
+            (a.clone(), w.clone())
+        } else {
+            (through_f16(&a), through_f16(&w))
+        };
+        let want = xabe_dsp::linear(&a_ref, m, k, &w_ref, Some(&bias), n);
+        let got = g
+            .download(
+                &g.gemm(
+                    &g.upload(&a).expect("upload a"),
+                    &g.upload(&w).expect("upload w"),
+                    Some(&g.upload(&bias).expect("upload bias")),
+                    m,
+                    k,
+                    n,
+                )
+                .expect("gemm"),
+            )
+            .expect("download");
+        assert_close_gemm(&name, &want, &got);
+    }
+}
+
+#[test]
+fn gemm_without_a_bias_adds_nothing() {
+    let Some(g) = gpu() else { return };
+    let (m, k, n) = (64, 64, 32);
+    let a = seq(m * k, 11);
+    let w = seq(n * k, 12);
+
+    let want = xabe_dsp::linear(&through_f16(&a), m, k, &through_f16(&w), None, n);
+    let got = g
+        .download(
+            &g.gemm(
+                &g.upload(&a).expect("upload"),
+                &g.upload(&w).expect("upload"),
+                None,
+                m,
+                k,
+                n,
+            )
+            .expect("gemm"),
+        )
+        .expect("download");
+    assert_close_gemm("gemm no bias", &want, &got);
+}
+
+#[test]
+fn gemm_refuses_a_contraction_the_instruction_cannot_step() {
+    let Some(g) = gpu() else { return };
+    // m16n8k8 steps k in eights. Padding silently would hide a caller that has
+    // miscomputed a shape, which is the likelier of the two failures here.
+    let err = g
+        .gemm(
+            &g.upload(&seq(4 * 7, 1)).expect("upload"),
+            &g.upload(&seq(8 * 7, 2)).expect("upload"),
+            None,
+            4,
+            7,
+            8,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("multiple of 8"), "{err}");
+}
+
+#[test]
+fn every_output_element_is_written_exactly_once() {
+    let Some(g) = gpu() else { return };
+    // A tiling bug that writes an element twice is invisible when the second
+    // write has the same value. Ones against ones makes every output equal the
+    // contraction length, so a double-add reads 2k and a skipped tile reads 0 -
+    // both obvious, where a random-input test would show neither.
+    let (m, k, n) = (100, 64, 70);
+    let a = vec![1.0f32; m * k];
+    let w = vec![1.0f32; n * k];
+    let got = g
+        .download(
+            &g.gemm(
+                &g.upload(&a).expect("upload"),
+                &g.upload(&w).expect("upload"),
+                None,
+                m,
+                k,
+                n,
+            )
+            .expect("gemm"),
+        )
+        .expect("download");
+
+    assert_eq!(got.len(), m * n);
+    for (i, v) in got.iter().enumerate() {
+        assert!(
+            (v - k as f32).abs() < 1e-3,
+            "output[{i}] is {v}, not {k}: the tiling covers it {} times",
+            v / k as f32,
+        );
+    }
+}
+
+#[test]
+fn f16_operands_cost_six_parts_in_a_hundred_thousand_of_full_scale() {
+    let Some(g) = gpu() else { return };
+
+    // The test above proves the kernel computes what it set out to compute.
+    // This one measures what that choice costs against exact f32, because a
+    // caller deciding between `gemm` and `linear` needs the number rather than
+    // a promise - and because a regression that silently widened it would
+    // otherwise pass.
+    //
+    // The error is proportional to the magnitude of the *terms*, not of the
+    // result: each product carries about 2^-11 of relative error before any
+    // summation, and a k-term sum accumulates them as a random walk. So a
+    // heavily cancelled output - a small number that is the difference of large
+    // ones - has a large relative error and a perfectly ordinary absolute one.
+    // Gating on relative error alone fails there, and it failed there first.
+    let (m, k, n) = (256, 1280, 256);
+    let a = seq(m * k, 21);
+    let w = seq(n * k, 22);
+
+    let exact = xabe_dsp::linear(&a, m, k, &w, None, n);
+    let got = g
+        .download(
+            &g.gemm(
+                &g.upload(&a).expect("upload"),
+                &g.upload(&w).expect("upload"),
+                None,
+                m,
+                k,
+                n,
+            )
+            .expect("gemm"),
+        )
+        .expect("download");
+
+    let scale = exact.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let worst = exact
+        .iter()
+        .zip(&got)
+        .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+
+    // Measured: worst absolute 4.1e-1 against a peak output of 6.4e3, so
+    // 6.5e-5 of full scale on a k=1280 contraction. The gate is 2e-3, about
+    // thirty times the measurement - loose enough not to flap on a different
+    // card, tight enough that losing another factor of ten would fail.
+    let relative_to_scale = worst / scale;
+    eprintln!(
+        "f16 operands cost {worst:.3e} absolute, {relative_to_scale:.3e} of a \
+         full scale of {scale:.3e}, at k={k}",
+    );
+    assert!(
+        relative_to_scale < 2e-3,
+        "f16 operand rounding costs {relative_to_scale:.3e} of full scale",
+    );
+}

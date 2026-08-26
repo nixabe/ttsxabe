@@ -116,6 +116,28 @@ pub enum StError {
     },
 
     /// A tensor the schema expected is not in the file.
+    #[error("{file} holds tensor {name}, which the index does not mention")]
+    UnindexedTensor {
+        /// The tensor that nothing points at.
+        name: String,
+        /// The shard it was found in.
+        file: String,
+    },
+
+    /// The index's declared total does not match the shards.
+    ///
+    /// Almost always shards from two different exports in one directory, which
+    /// loads without complaint and produces a model that is subtly not the one
+    /// that was published.
+    #[error("the index declares {declared} bytes of tensors but the shards hold {actual}")]
+    SizeDisagreement {
+        /// What `metadata.total_size` says.
+        declared: u64,
+        /// What the shards actually contain.
+        actual: u64,
+    },
+
+    /// A tensor the schema expected is not in the file.
     #[error("no tensor named {name}")]
     MissingTensor {
         /// The name that was requested.

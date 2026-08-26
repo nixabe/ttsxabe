@@ -35,4 +35,15 @@ pub enum CudaError {
         #[source]
         source: cudarc::driver::DriverError,
     },
+
+    /// A contraction length the tensor-core instruction cannot express.
+    ///
+    /// `m16n8k8` steps the contraction in eights. Padding a ragged one to the
+    /// next multiple would work and would hide a caller that has miscomputed a
+    /// shape, which in this workspace is the more likely of the two.
+    #[error("contraction length {k} is not a multiple of 8")]
+    RaggedContraction {
+        /// The length asked for.
+        k: usize,
+    },
 }

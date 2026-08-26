@@ -1536,8 +1536,10 @@ name = "xabe-cuda"
 version = "0.0.0"
 dependencies = [
  "cudarc",
+ "half",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "xabe-dsp",
 ]
 

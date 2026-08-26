@@ -84,8 +84,8 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 
 | # | State | Done |
 | --- | --- | --- |
-| 9 | `xabe-st` reads sharded checkpoints via `model.safetensors.index.json` | |
-| 10 | A real tiled GEMM in `xabe-cuda` | |
+| 9 | `xabe-st` reads sharded checkpoints via `model.safetensors.index.json` | ✅ |
+| 10 | A real tiled GEMM in `xabe-cuda` | ✅ |
 | 11 | The mel frontend matches `WhisperFeatureExtractor` | |
 | 12 | Whisper geometry and weight schema, 1259 tensors, shape-checked at bind | |
 | 13 | Byte-level BPE matches the reference tokenizer exactly | |
