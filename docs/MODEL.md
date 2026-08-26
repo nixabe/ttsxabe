@@ -154,3 +154,80 @@ Assuming either rule holds everywhere fails loudly — `MissingTensor:
 decoder.upsampler.0.weight_v` in one direction, a silently wrong kernel in the
 other. `conv_post` additionally has **no bias**; the `Conv` type carries
 `Option<&[f32]>` for that one tensor alone.
+
+---
+
+# Silero VAD, v5.1.2
+
+Fifteen tensors, 884 KB, and the only thing standing between the pipeline and
+an assistant that answers sentences the ASR invented. It is not optional: on
+digital silence Breeze-ASR-26 produced `我…`, on faint hiss `我現在在醫院`, on
+room noise `(我會陪你一起走)`.
+
+## Geometry
+
+```
+frame[512]  (32 ms at 16 kHz, one probability out)
+  reflect-pad 64 each end                       → [640]
+  conv1d, 258 kernels of 256, hop 128           → [258, 4]
+  sqrt(re² + im²) over the two halves of 258    → [129, 4]
+  conv 129→128, k3 s1 p1, ReLU                  → [128, 4]
+  conv 128→64,  k3 s2 p1, ReLU                  → [64, 2]
+  conv 64→64,   k3 s2 p1, ReLU                  → [64, 1]
+  conv 64→128,  k3 s1 p1, ReLU                  → [128, 1]
+  LSTM cell, hidden 128, gates i f g o          → [128]
+  ReLU, dot with 128 weights, + bias, sigmoid   → one probability
+```
+
+The STFT is a convolution: the basis is 129 cosines followed by 129 sines,
+each already multiplied by the analysis window, so a plain convolution gives
+the real and imaginary parts and the magnitude is one `sqrt` per bin.
+
+**The LSTM state carries across frames.** That is what makes this a detector
+rather than a classifier — the probability for one 32 ms frame depends on
+everything before it — and it is why `Vad::reset` is required between
+independent clips rather than merely tidy.
+
+**Gate order is i, f, g, o.** PyTorch's stacking, and not the only convention in
+use. Getting it wrong produces a detector that runs, converges to
+plausible-looking probabilities, and is wrong everywhere.
+
+## The checkpoint is F16, and that matters
+
+The convolutions and the STFT basis are stored half precision; only the biases
+are F32. This was not in the plan — it was found by converting the file — and it
+is why `xabe-st` grew F16 and BF16 support ahead of phase 5a.
+
+It also explains the whole of the disagreement with the reference. whisper.cpp
+runs ggml's F16 kernels, which round the **activations** to half precision at
+the input of every convolution. This implementation widens the weights once at
+load and keeps activations in f32. Rounding this implementation's conv inputs
+through f16 as an experiment drops the worst disagreement across the corpus
+from **6.8e-3 to 1.8e-4**, a 37× reduction, which locates the difference
+entirely in that one choice.
+
+F32 is kept. It is the more accurate of the two, it is what upstream Silero
+computes in, and the experiment shows the reference's extra error is ggml's
+storage format rather than anything about the model. What is asserted instead is
+the property the pipeline depends on: **every one of the 926 frames in the
+corpus lands on the same side of both thresholds as the reference**, and every
+segment on every clip matches.
+
+## Two divergences from upstream Silero, both whisper.cpp's
+
+1. **`n_context` is parsed and ignored.** Upstream prepends 64 *real* samples of
+   the previous frame; whisper.cpp substitutes a symmetric reflective pad. This
+   follows whisper.cpp, because whisper.cpp produced every threshold in the
+   pipeline and matching Python instead would invalidate the tuning.
+2. **The segmenter has two rules upstream does not**: adjacent segments closer
+   than 200 ms are merged, and a second minimum-duration sweep runs after that
+   merge. Both are in `xabe-vad::segments`, marked where they appear.
+
+## Segmenter constants
+
+| | | |
+| --- | --- | --- |
+| `neg_threshold` | `max(threshold - 0.15, 0.01)` | hysteresis; one threshold chops a turn up at every unvoiced consonant |
+| `min_silence_at_max_speech` | 98 ms | where a segment *could* be split if it overruns — a different question from whether it has ended |
+| merge gap | 200 ms | whisper.cpp's; without it one sentence arrives as several ASR requests |
+| second min-duration sweep | — | whisper.cpp's; the first sweep can pass a short segment the merge then fails to absorb |

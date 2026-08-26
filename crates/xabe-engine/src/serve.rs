@@ -21,7 +21,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use xabe_serve::{AppState, GatewayConfig, Inner, SynthesisJob, TtsBackend, Upstream};
+use xabe_serve::{
+    AppState, GatewayConfig, Inner, SpeechSpan, SynthesisJob, TtsBackend, Upstream, VadJob,
+};
 
 /// How many synthesis jobs may wait before the caller blocks.
 ///
@@ -111,6 +113,19 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         None => None,
     };
 
+    let vad = match &stages.vad {
+        Stage::Local { path, .. } => Some(spawn_detector(path)?),
+        // Always local. The VAD is 15 tensors and a millisecond of CPU, so a
+        // round trip would cost more than the work.
+        Stage::Remote { .. } => {
+            return Err(EngineError::NotImplemented {
+                stage: crate::stage::Kind::Vad,
+                phase: "3",
+            });
+        }
+        Stage::Off => None,
+    };
+
     let mut tts: BTreeMap<String, TtsBackend> = BTreeMap::new();
     match &stages.tts {
         Stage::Local { path, device } => {
@@ -140,12 +155,51 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     Ok(AppState(Arc::new(Inner {
         config,
         asr,
+        vad,
         llm,
         translator,
         translator_target: args.translator_target.clone(),
         tts,
         page: xabe_serve::PAGE,
     })))
+}
+
+/// Starts the detector thread and returns the queue that feeds it.
+///
+/// Its own thread for the same reason as the synthesiser: the forward pass is
+/// blocking, and the detector is stateful, so one worker also guarantees that
+/// two clips can never interleave through the same LSTM.
+fn spawn_detector(path: &std::path::Path) -> Result<mpsc::Sender<VadJob>, EngineError> {
+    let mut vad = xabe_vad::open(path)?;
+    let (tx, mut rx) = mpsc::channel::<VadJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-vad".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                // Reset first, not last. A clip that arrives after a panic or a
+                // dropped reply would otherwise start with the previous clip's
+                // memory of what was being said.
+                vad.reset();
+                let probs = vad.probabilities(&job.samples);
+                let spans = xabe_vad::segments(&probs, xabe_vad::SegmentParams::default())
+                    .into_iter()
+                    .map(|s| SpeechSpan {
+                        start: s.start.min(job.samples.len()),
+                        end: s.end.min(job.samples.len()),
+                    })
+                    .collect();
+                // The receiver going away means the turn was abandoned, which
+                // is the prefetch-cancel path and entirely normal.
+                let _ = job.reply.send(spans);
+            }
+            tracing::debug!("detector thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the detector thread",
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(tx)
 }
 
 /// Starts the synthesiser thread and returns the queue that feeds it.

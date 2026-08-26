@@ -160,16 +160,14 @@ async fn handle(
                 // follows will say so, once, rather than on every pause.
                 return Turn::Continue;
             };
-            match wav_of(&pcm, rate) {
-                Ok(wav) => {
-                    let lang = state.config.asr_lang.clone();
-                    prefetch.insert(
-                        id,
-                        tokio::spawn(async move { asr.transcribe(wav, &lang).await }),
-                    );
-                }
-                Err(e) => tracing::warn!(%e, "prefetch frame carried unusable audio"),
-            }
+            let lang = state.config.asr_lang.clone();
+            let state = state.clone();
+            prefetch.insert(
+                id,
+                tokio::spawn(
+                    async move { gate_then_transcribe(&state, &asr, &pcm, rate, &lang).await },
+                ),
+            );
             Turn::Continue
         }
 
@@ -262,16 +260,62 @@ async fn collect(
         };
     }
     let asr = state.asr.clone().ok_or(ServeError::NoStage("asr"))?;
-    let wav = wav_of(pcm, rate)?;
-    asr.transcribe(wav, &state.config.asr_lang).await
+    gate_then_transcribe(state, &asr, pcm, rate, &state.config.asr_lang).await
 }
 
-/// Decodes base64 PCM into a WAV.
-fn wav_of(pcm_b64: &str, rate: u32) -> Result<Vec<u8>, ServeError> {
+/// Runs the VAD, then transcribes only if there was speech.
+///
+/// This is the first of the pipeline's three hallucination layers, and the
+/// cheapest: a clip with no speech never reaches the ASR at all, which both
+/// prevents the invented sentence and saves the round trip. The clip is also
+/// trimmed to the speech it found - leading and trailing silence is exactly
+/// what Whisper turns into 謝謝觀看.
+///
+/// With no VAD stage configured this is a plain transcription, so adding or
+/// removing the stage changes latency and hallucination rate, never the shape
+/// of the answer.
+async fn gate_then_transcribe(
+    state: &AppState,
+    asr: &Upstream,
+    pcm_b64: &str,
+    rate: u32,
+    lang: &str,
+) -> Result<String, ServeError> {
     let pcm = B64
         .decode(pcm_b64)
         .map_err(|e| ServeError::BadPcm(e.to_string()))?;
-    Ok(xabe_audio::wav_from_pcm16(&pcm, rate).bytes)
+    let wav = xabe_audio::wav_from_pcm16(&pcm, rate);
+
+    if state.vad.is_none() {
+        return asr.transcribe(wav.bytes, lang).await;
+    }
+
+    let audio = xabe_audio::parse_wav(&wav.bytes).map_err(|e| ServeError::BadPcm(e.to_string()))?;
+    let spans = state.speech_in(audio.samples.clone()).await;
+    if spans.is_empty() {
+        tracing::debug!(ms = wav.millis(), "vad found no speech; not transcribing");
+        return Ok(String::new());
+    }
+
+    // One span from the first speech to the last, rather than several requests.
+    // The gaps between segments are part of the utterance's rhythm, and the ASR
+    // reads a pause better than it reads a splice.
+    let start = spans.iter().map(|s| s.start).min().unwrap_or(0);
+    let end = spans
+        .iter()
+        .map(|s| s.end)
+        .max()
+        .unwrap_or(audio.samples.len())
+        .min(audio.samples.len());
+    let trimmed = &audio.samples[start..end];
+    tracing::debug!(
+        spans = spans.len(),
+        kept_ms = (end - start) * 1000 / rate.max(1) as usize,
+        of_ms = wav.millis(),
+        "vad gated the clip",
+    );
+    asr.transcribe(xabe_audio::wav_bytes(trimmed, rate), lang)
+        .await
 }
 
 /// Streams a reply, synthesising it clause by clause.

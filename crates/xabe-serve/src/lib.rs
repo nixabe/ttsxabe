@@ -25,7 +25,9 @@ pub mod wire;
 pub use client::{Upstream, translate_body};
 pub use config::{GatewayConfig, LOCAL_ENGINE, Role, direct_taigi_prompt, mandarin_prompt};
 pub use error::ServeError;
-pub use state::{AppState, Inner, LocalTts, SynthesisJob, TtsBackend};
+pub use state::{
+    AppState, Inner, LocalTts, LocalVad, SpeechSpan, SynthesisJob, TtsBackend, VadJob,
+};
 pub use text::{Chunker, clean, normalize_for_mms, sanitize_asr, split_poj, split_sentences};
 pub use turntaking::{Decision, Endpointer, TurnPolicy};
 pub use wire::{ClientMessage, PageConfig, ServerMessage, TtsChunk, TtsRequest};

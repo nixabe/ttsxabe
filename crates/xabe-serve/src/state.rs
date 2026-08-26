@@ -29,6 +29,31 @@ pub struct SynthesisJob {
 /// The sending half of a local synthesiser's work queue.
 pub type LocalTts = mpsc::Sender<SynthesisJob>;
 
+/// A span of speech within a clip, in samples.
+///
+/// Defined here rather than reused from `xabe-vad` for the same reason the TTS
+/// arrives as a channel: this crate owns HTTP and refuses to know which model
+/// produced the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeechSpan {
+    /// First sample.
+    pub start: usize,
+    /// One past the last sample.
+    pub end: usize,
+}
+
+/// One request to find speech, and where the answer should go.
+#[derive(Debug)]
+pub struct VadJob {
+    /// Mono 16 kHz samples.
+    pub samples: Vec<f32>,
+    /// The spans found, or an empty vector if there is no speech.
+    pub reply: tokio::sync::oneshot::Sender<Vec<SpeechSpan>>,
+}
+
+/// The sending half of a local detector's work queue.
+pub type LocalVad = mpsc::Sender<VadJob>;
+
 /// Where a TTS engine lives.
 #[derive(Clone)]
 pub enum TtsBackend {
@@ -57,6 +82,11 @@ pub struct Inner {
     pub config: GatewayConfig,
     /// Speech to text, if this process can reach one.
     pub asr: Option<Upstream>,
+    /// Voice activity detection, if this process runs one.
+    ///
+    /// Always local: the VAD is 15 tensors and a millisecond of CPU, so
+    /// delegating it over HTTP would cost more than running it.
+    pub vad: Option<LocalVad>,
     /// The chat model, which is always another process.
     pub llm: Option<Upstream>,
     /// Mandarin to Taigi, if configured.
@@ -92,5 +122,32 @@ impl Inner {
     /// Whether this process can answer a whole voice turn.
     pub fn can_converse(&self) -> bool {
         self.asr.is_some() && self.llm.is_some() && !self.tts.is_empty()
+    }
+
+    /// Finds speech, or returns the whole clip when there is no detector.
+    ///
+    /// Returning the whole clip rather than nothing is what keeps the VAD
+    /// optional: a process without one behaves exactly as it did before the
+    /// stage existed.
+    pub async fn speech_in(&self, samples: Vec<f32>) -> Vec<SpeechSpan> {
+        let whole = vec![SpeechSpan {
+            start: 0,
+            end: samples.len(),
+        }];
+        let Some(vad) = &self.vad else {
+            return whole;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if vad.send(VadJob { samples, reply: tx }).await.is_err() {
+            tracing::warn!("the vad worker is gone; treating the clip as speech");
+            return whole;
+        }
+        match rx.await {
+            Ok(spans) => spans,
+            Err(_) => {
+                tracing::warn!("the vad worker dropped a job; treating the clip as speech");
+                whole
+            }
+        }
     }
 }

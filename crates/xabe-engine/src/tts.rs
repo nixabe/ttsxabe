@@ -238,3 +238,61 @@ fn runtime() -> Result<tokio::runtime::Runtime, EngineError> {
             source,
         })
 }
+
+/// Prints the speech segments a clip contains.
+///
+/// The tool form of the VAD: over a file it answers "where is the speech",
+/// which is a question worth asking on its own. Served, the same detector is a
+/// gate in front of the ASR instead.
+pub fn segment(path: &Path, input: &Path) -> Result<(), EngineError> {
+    let audio = read_audio(input)?;
+    if audio.sample_rate != 16_000 {
+        return Err(EngineError::WrongRate {
+            path: input.display().to_string(),
+            rate: audio.sample_rate,
+            want: 16_000,
+        });
+    }
+
+    let mut vad = xabe_vad::open(path)?;
+    let probs = vad.probabilities(&audio.samples);
+    let found = xabe_vad::segments(&probs, xabe_vad::SegmentParams::default());
+
+    tracing::info!(
+        seconds = format!("{:.2}", audio.seconds()),
+        frames = probs.len(),
+        segments = found.len(),
+        "analysed",
+    );
+    // The segments are the tool's output, so they go to stdout at INFO - the
+    // level that appears by default - one line each, in a shape a script can cut.
+    for (i, s) in found.iter().enumerate() {
+        tracing::info!(
+            "{i}\t{:.2}\t{:.2}\t{:.2}",
+            s.start_s(),
+            s.end_s(),
+            s.end_s() - s.start_s(),
+        );
+    }
+    if found.is_empty() {
+        let peak = probs.iter().copied().fold(0.0f32, f32::max);
+        tracing::info!("no speech; peak frame probability {peak:.4}");
+    }
+    Ok(())
+}
+
+/// Reads a WAV from a path, or from stdin when it is `-`.
+fn read_audio(input: &Path) -> Result<xabe_audio::Wav, EngineError> {
+    if input.as_os_str() != "-" {
+        return Ok(xabe_audio::read_wav(input)?);
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|source| EngineError::Io {
+            what: "reading",
+            path: "stdin".into(),
+            source,
+        })?;
+    Ok(xabe_audio::parse_wav(&buf)?)
+}

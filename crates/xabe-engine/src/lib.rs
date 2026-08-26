@@ -81,10 +81,14 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
             }),
             Stage::Off => unreachable!("Action::Transcribe needs an ASR stage"),
         },
-        Action::Segment { .. } => Err(EngineError::NotImplemented {
-            stage: Kind::Vad,
-            phase: "3",
-        }),
+        Action::Segment { input } => match &stages.vad {
+            Stage::Local { path, .. } => tts::segment(path, &input),
+            Stage::Remote { .. } => Err(EngineError::NotImplemented {
+                stage: Kind::Vad,
+                phase: "3",
+            }),
+            Stage::Off => unreachable!("Action::Segment needs a VAD stage"),
+        },
     }
 }
 
@@ -131,12 +135,7 @@ fn unbuilt(stages: &Stages) -> Result<(), EngineError> {
             },
             Stage::Local { .. } => match kind {
                 Kind::Tts => {}
-                Kind::Vad => {
-                    return Err(EngineError::NotImplemented {
-                        stage: kind,
-                        phase: "3",
-                    });
-                }
+                Kind::Vad => {}
                 Kind::Asr => {
                     return Err(EngineError::NotImplemented {
                         stage: kind,

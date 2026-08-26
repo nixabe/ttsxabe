@@ -76,6 +76,30 @@ fn a_device_with_no_stage_at_all_is_refused() {
 }
 
 #[test]
+fn a_cpu_only_stage_refuses_a_card_rather_than_quietly_ignoring_it() {
+    // The VAD has no CUDA implementation and is not going to: 15 tensors and a
+    // millisecond of work, where the transfer would cost more than the
+    // arithmetic. Accepting the flag and running on the CPU anyway made the
+    // startup log announce `device=cuda:0` for a stage that was on the CPU.
+    let e = stages(&["--vad-model", "/v", "--vad-device", "0", "--in", "c.wav"]).unwrap_err();
+    assert_eq!(e, xabe_engine::StageError::CpuOnly(xabe_engine::Kind::Vad));
+
+    // Explicit `cpu` is accepted, because it is true.
+    let ok = stages(&["--vad-model", "/v", "--vad-device", "cpu", "--in", "c.wav"]);
+    assert!(ok.is_ok(), "{ok:?}");
+
+    match stages(&["--vad-model", "/v", "--in", "c.wav"])
+        .expect("stages")
+        .vad
+    {
+        xabe_engine::Stage::Local { device, .. } => {
+            assert_eq!(device, xabe_engine::Device::Cpu, "and it is the default");
+        }
+        other => panic!("expected Local, got {other:?}"),
+    }
+}
+
+#[test]
 fn the_device_defaults_to_the_first_card_not_to_the_cpu() {
     // The CPU path is the scalar reference and roughly 45x slower than real
     // time. Defaulting to it would make the engine look broken rather than slow.

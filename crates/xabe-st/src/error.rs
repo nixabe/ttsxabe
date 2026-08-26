@@ -107,6 +107,15 @@ pub enum StError {
     },
 
     /// A tensor was requested by name and is not in the file.
+    #[error("tensor {name} is {dtype}; borrow it with tensor_f32, which widens")]
+    NotBorrowable {
+        /// The tensor asked for.
+        name: String,
+        /// What the file actually stores.
+        dtype: &'static str,
+    },
+
+    /// A tensor the schema expected is not in the file.
     #[error("no tensor named {name}")]
     MissingTensor {
         /// The name that was requested.

@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
 async fn health(State(state): State<AppState>) -> Response {
     let stages: Vec<&str> = [
         state.asr.is_some().then_some("asr"),
+        state.vad.is_some().then_some("vad"),
         state.llm.is_some().then_some("llm"),
         state.translator.is_some().then_some("translator"),
         (!state.tts.is_empty()).then_some("tts"),

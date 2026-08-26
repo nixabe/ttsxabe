@@ -125,3 +125,57 @@ is not an oracle.
   the prior's `[1, 192, F]` second. The capture relies on that order, and the
   second draw's shape depends on the *first* draw's outcome, so the two cannot
   be reordered even in principle.
+
+---
+
+# The VAD oracle
+
+The reference for voice activity detection is **whisper.cpp's**, not Python
+silero-vad, and that is a deliberate exception to the rule that the upstream
+author's implementation is the oracle.
+
+Every threshold the pipeline runs with — `vad_start`, the segmenter's 0.6, the
+turn-taking constants in `xabe-serve::turntaking` — was tuned against
+whisper.cpp's probabilities. whisper.cpp differs from upstream on purpose: it
+parses `n_context` and then ignores it, substituting a reflective pad. Matching
+Python instead would produce a more faithful Silero and invalidate every number
+the rest of the system is built on.
+
+## Capturing
+
+```sh
+WHISPER=~/whisper.cpp tools/oracle/capture_vad.sh
+```
+
+It builds `tools/oracle/vad_capture.cpp` against a built whisper.cpp checkout,
+generates the corpus, synthesises two speech clips with the engine itself at a
+fixed seed, and writes per-clip `probs.bin` and `segments.bin` under
+`.golden/vad/`, with a `manifest.json` recording the whisper.cpp commit and the
+segment parameters.
+
+## The corpus
+
+Eight clips, all deterministic (`tools/oracle/vad_corpus.py`, seed 20250827).
+Four of them are the pipeline's known hallucination triggers, and they are the
+reason the corpus exists:
+
+| clip | what the ASR did with it |
+| --- | --- |
+| `silence` | digital silence transcribed as `我…` |
+| `hiss` | faint broadband noise as `我現在在醫院` |
+| `room` | low-frequency room tone as `(我會陪你一起走)` |
+| `click` | a single transient opening a turn on its own |
+
+The rest exercise the segmenter rather than the detector: `bursts` has two tone
+spans with a gap the 200 ms merge has to decide about, `click_then_tone` puts a
+transient immediately before speech so the onset rule and the padding interact,
+and the two `speech` clips are real synthesis.
+
+## The conversion
+
+The VAD ships as legacy ggml, not safetensors — 864 KB with the magic `ggml` and
+a hand-rolled header. `tools/vad/ggml_to_safetensors.py` converts it once, so
+`xabe-st` keeps its single job rather than learning a second container format
+for one 15-tensor model. The ggml header's geometry is written into
+`__metadata__`, which is what lets the weight schema check the shapes it binds
+against what the original file declared.

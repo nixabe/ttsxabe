@@ -113,13 +113,50 @@ fn rejects_a_shape_that_disagrees_with_its_byte_range() {
 
 #[test]
 fn rejects_an_unsupported_dtype() {
-    let header = r#"{"a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
-    let path = write_file("rejects_an_unsupported_dtype", header, &[0u8; 4]);
+    // BF16 used to be here. It is supported now - the Silero VAD is F16 and the
+    // translator is BF16 - so the case moved to a dtype that really is not
+    // handled. Integer tensors appear in real checkpoints (token ids, offsets),
+    // which is exactly why reading one as float has to be refused rather than
+    // reinterpreted.
+    let header = r#"{"a":{"dtype":"I64","shape":[2],"data_offsets":[0,16]}}"#;
+    let path = write_file("rejects_an_unsupported_dtype", header, &[0u8; 16]);
 
     match StFile::open(&path) {
-        Err(StError::UnsupportedDtype { dtype, .. }) => assert_eq!(dtype, "BF16"),
+        Err(StError::UnsupportedDtype { dtype, .. }) => assert_eq!(dtype, "I64"),
         other => panic!("expected UnsupportedDtype, got {other:?}"),
     }
+}
+
+#[test]
+fn a_half_precision_tensor_is_widened_rather_than_reinterpreted() {
+    // 1.0 and -2.0 as IEEE binary16.
+    let header = r#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+    let bytes = [0x00, 0x3C, 0x00, 0xC0];
+    let path = write_file("half_precision", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    // Borrowing must be refused: two halves reinterpreted as one f32 is a
+    // number, just not this one, and nothing downstream would notice.
+    let err = f.tensor("a").unwrap_err();
+    assert!(err.to_string().contains("F16"), "{err}");
+
+    assert_eq!(f.tensor_f32("a").expect("widen"), vec![1.0, -2.0]);
+}
+
+#[test]
+fn brain_float_widening_is_exact_because_it_is_the_top_half_of_an_f32() {
+    // bf16 keeps the sign, the exponent and 7 mantissa bits, so widening is a
+    // shift and cannot round. 1.0 is 0x3F80, -2.0 is 0xC000.
+    let header = r#"{"a":{"dtype":"BF16","shape":[3],"data_offsets":[0,6]}}"#;
+    let bytes = [0x80, 0x3F, 0x00, 0xC0, 0x49, 0x40];
+    let path = write_file("brain_float", header, &bytes);
+    let f = StFile::open(&path).expect("open");
+
+    let got = f.tensor_f32("a").expect("widen");
+    assert_eq!(got[0], 1.0);
+    assert_eq!(got[1], -2.0);
+    // 0x4049 << 16 is exactly f32 3.140625, not an approximation of it.
+    assert_eq!(got[2], f32::from_bits(0x4049_0000));
 }
 
 #[test]

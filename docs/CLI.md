@@ -51,7 +51,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--asr-device` | `XABE_ASR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
 | `--vad-model` | `XABE_VAD_MODEL` | — | voice-activity checkpoint |
 | `--vad-url` | `XABE_VAD_URL` | — | delegate voice-activity detection |
-| `--vad-device` | `XABE_VAD_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--vad-device` | `XABE_VAD_DEVICE` | `cpu` | `cpu` only; see below |
 | `--tts-model` | `XABE_TTS_MODEL` | — | directory, or the safetensors file itself |
 | `--tts-url` | `XABE_TTS_URL` | — | delegate text-to-speech |
 | `--tts-device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
@@ -94,6 +94,12 @@ to no purpose.
 stages across cards: putting the ASR and the TTS on one GPU makes the next
 turn's prefill queue behind the last turn's synthesis.
 
+`--vad-device` takes only `cpu`, and defaults to it. The VAD is 15 tensors and
+about a millisecond of work per clip, so the transfer would cost more than the
+arithmetic. `--vad-device 0` is refused by name rather than accepted and
+silently ignored, which is what the flag surface did first — and what made the
+startup log announce `device=cuda:0` for a stage running on the CPU.
+
 ### What the preflight refuses
 
 Every rejection names the flag that caused it and happens *before* any
@@ -131,8 +137,8 @@ waiting on.
 | `--tts-model` | works |
 | `--serve` | works |
 | `--asr-url`, `--tts-url`, `--translator-url`, `--llm-url` | work |
-| `--vad-url` | phase 3, with the model that defines its protocol |
-| `--vad-model` | phase 3 |
+| `--vad-model` | works, CPU only |
+| `--vad-url` | never: the VAD is a millisecond of CPU, so a round trip would cost more than the work |
 | `--asr-model` | phase 4 |
 | `--translator-model` | phase 5a |
 

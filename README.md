@@ -59,8 +59,12 @@ binary that can be the gateway, a single-stage worker, or the whole assistant.
 A running engine holds a full voice turn today — speech in, Taigi reply, speech
 out — with the ASR and the chat model delegated over HTTP.
 
-The ASR, the VAD and the translator loader are not built yet. Their flags are,
-and each fails naming the phase that builds it.
+**Voice activity detection is complete**: Silero from scratch, agreeing with
+whisper.cpp on every segment of an eight-clip corpus, and refusing all four of
+the noise cases that used to make the ASR invent sentences.
+
+The ASR and the translator loader are not built yet. Their flags are, and each
+fails naming the phase that builds it.
 
 | crate | state |
 | --- | --- |
@@ -72,6 +76,7 @@ and each fails naming the phase that builds it.
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-audio` | WAV reading and writing, sample handling |
 | `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
+| `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:

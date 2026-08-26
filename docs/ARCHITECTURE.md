@@ -28,7 +28,7 @@ configuration of the same flags, not a different program.
    xabe-engine
       │
       ├── xabe-serve    HTTP, WebSocket, the page, turn-taking policy
-      ├── xabe-vad      Silero geometry and weight schema             [phase 3]
+      ├── xabe-vad      Silero geometry, weights and forward pass
       ├── xabe-whisper  Whisper geometry, weight schema, BPE          [phase 4]
       ├── xabe-llama    Llama geometry, weight schema, SentencePiece  [phase 5a]
       ├── xabe-tts      the VITS forward pass and synthesis API
@@ -100,6 +100,7 @@ crates above it.
 | `xabe-golden` | reading captures, comparing tensors | producing them |
 | `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
+| `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 

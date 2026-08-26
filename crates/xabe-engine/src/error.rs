@@ -39,6 +39,21 @@ pub enum EngineError {
     #[error(transparent)]
     Audio(#[from] xabe_audio::AudioError),
 
+    /// The voice-activity checkpoint could not be loaded.
+    #[error(transparent)]
+    Vad(#[from] xabe_vad::VadError),
+
+    /// Audio was handed to a stage at a rate it cannot process.
+    #[error("{path} is {rate} Hz; this stage needs {want} Hz")]
+    WrongRate {
+        /// The file involved.
+        path: String,
+        /// What it is.
+        rate: u32,
+        /// What was needed.
+        want: u32,
+    },
+
     /// The TTS could not load or could not speak.
     #[error("text-to-speech: {0}")]
     Tts(#[from] xabe_tts::SynthesisError),

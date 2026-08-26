@@ -84,9 +84,11 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
 | `xabe-engine` | flags, stage wiring, orchestration, the binary | all |
 
-Crates that the plan adds and that do not exist yet: `xabe-vad` (phase 3),
-`xabe-whisper` (phase 4), `xabe-llama` (phase 5a). Their flags exist already and
-fail with the phase they are waiting on.
+| `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
+
+Crates that the plan adds and that do not exist yet: `xabe-whisper` (phase 4),
+`xabe-llama` (phase 5a). Their flags exist already and fail with the phase they
+are waiting on.
 
 ## House style
 

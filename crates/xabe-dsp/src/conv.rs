@@ -26,11 +26,39 @@ pub fn conv1d(
     pad_right: usize,
     dilation: usize,
 ) -> Vec<f32> {
+    conv1d_strided(
+        x, in_c, t, w, bias, out_c, k, 1, pad_left, pad_right, dilation,
+    )
+}
+
+/// Convolves with a stride, subsuming [`conv1d`].
+///
+/// Stride is separate rather than another parameter on `conv1d` because every
+/// caller in the VITS path passes 1, and threading a constant through fifty
+/// call sites to serve one model that needs 2 and 128 would make each of them
+/// say less about what it is doing. The Silero VAD needs both: its STFT is a
+/// convolution with a hop of 128, and two of its encoder layers halve time.
+// Shapes are arguments, not types - see the crate essay.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_strided(
+    x: &[f32],
+    in_c: usize,
+    t: usize,
+    w: &[f32],
+    bias: Option<&[f32]>,
+    out_c: usize,
+    k: usize,
+    stride: usize,
+    pad_left: usize,
+    pad_right: usize,
+    dilation: usize,
+) -> Vec<f32> {
     debug_assert_eq!(x.len(), in_c * t);
     debug_assert_eq!(w.len(), out_c * in_c * k);
+    debug_assert!(stride >= 1);
 
     let span = dilation * (k - 1) + 1;
-    let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+    let out_t = (t + pad_left + pad_right).saturating_sub(span) / stride + 1;
     let mut out = vec![0.0; out_c * out_t];
 
     for o in 0..out_c {
@@ -42,7 +70,7 @@ pub fn conv1d(
                     // Position in the *unpadded* input. Negative or past the
                     // end means the pad, which is zero, so it contributes
                     // nothing and is skipped rather than materialised.
-                    let pos = (p + tap * dilation) as isize - pad_left as isize;
+                    let pos = (p * stride + tap * dilation) as isize - pad_left as isize;
                     if pos < 0 || pos as usize >= t {
                         continue;
                     }

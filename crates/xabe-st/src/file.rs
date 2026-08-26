@@ -23,13 +23,24 @@ use crate::error::StError;
 /// Byte width of the header-length prefix that opens every safetensors file.
 const HEADER_LEN_PREFIX: usize = 8;
 
-/// Element types this reader decodes. The VITS checkpoints are pure F32; the
-/// enum exists so an unexpected dtype is named in an error instead of being
-/// reinterpreted as float and producing noise.
+/// Element types this reader decodes.
+///
+/// The enum exists so an unexpected dtype is named in an error instead of being
+/// reinterpreted as float and producing noise. Only [`Dtype::F32`] can be
+/// borrowed without copying; the narrower two are widened on read, because this
+/// card computes in f32 and every kernel in the workspace takes `&[f32]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     /// IEEE-754 single precision.
     F32,
+    /// IEEE-754 half precision. The Silero VAD's convolutions are stored this way.
+    F16,
+    /// Brain float: an f32 with the low 16 mantissa bits cut off.
+    ///
+    /// This card is Turing and has no bf16 arithmetic at all, so a bf16
+    /// checkpoint can only be read by widening it here. The widening is exact -
+    /// bf16 *is* the top half of an f32 - so nothing is lost by it.
+    Bf16,
 }
 
 impl Dtype {
@@ -37,6 +48,8 @@ impl Dtype {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "F32" => Some(Self::F32),
+            "F16" => Some(Self::F16),
+            "BF16" => Some(Self::Bf16),
             _ => None,
         }
     }
@@ -45,6 +58,16 @@ impl Dtype {
     const fn width(self) -> u64 {
         match self {
             Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
+    /// The name safetensors uses, for error messages.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
         }
     }
 }
@@ -83,6 +106,8 @@ pub struct StFile {
     /// order; weight-schema tests compare inventories and flapping order makes
     /// their failures unreadable.
     tensors: BTreeMap<String, TensorInfo>,
+    /// The producer's `__metadata__` block, which is free-form string pairs.
+    metadata: BTreeMap<String, String>,
 }
 
 /// Prints what the file *is*, not its 139 MB of contents: a panic in a test
@@ -155,9 +180,20 @@ impl StFile {
 
         let data_len = len - data_start;
         let mut tensors = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
         for (name, value) in header {
             // Written by the producer to carry format metadata; not a tensor.
+            // Kept rather than skipped: a converter that records the source
+            // geometry there is the only thing that lets a schema check the
+            // shapes it binds against what the original file declared.
             if name == "__metadata__" {
+                if let serde_json::Value::Object(map) = value {
+                    for (k, v) in map {
+                        if let serde_json::Value::String(v) = v {
+                            metadata.insert(k, v);
+                        }
+                    }
+                }
                 continue;
             }
             let info = parse_tensor(&name, &value, data_len)?;
@@ -176,6 +212,7 @@ impl StFile {
             map,
             data_start: data_start as usize,
             tensors,
+            metadata,
         })
     }
 
@@ -204,15 +241,101 @@ impl StFile {
         self.tensors.get(name)
     }
 
+    /// One entry of the producer's `__metadata__` block.
+    pub fn meta(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Every `__metadata__` entry, in sorted order.
+    pub fn metadata(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.metadata.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Borrows a tensor's data as `f32`, without copying.
+    ///
+    /// F32 only. A narrower tensor is refused by name rather than widened here,
+    /// because widening allocates and this function promises not to - see
+    /// [`StFile::tensor_f32`] for the copying version.
     pub fn tensor(&self, name: &str) -> Result<&[f32], StError> {
-        let info = self
-            .tensors
+        let info = self.require(name)?;
+        self.require_f32(name, info)?;
+        Ok(self.slice(info))
+    }
+
+    /// Reads a tensor as `f32`, widening it if the file stores it narrower.
+    ///
+    /// Unlike [`StFile::tensor`] this always allocates, which is why it is a
+    /// separate function rather than the default: a 6 GiB F32 checkpoint should
+    /// not be copied just because some other checkpoint is F16.
+    pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, StError> {
+        let info = self.require(name)?;
+        Ok(self.widen(info))
+    }
+
+    /// Reads a tensor as `f32` and asserts its shape.
+    pub fn tensor_f32_shaped(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, StError> {
+        let info = self.require(name)?;
+        Self::require_shape(name, info, expected)?;
+        Ok(self.widen(info))
+    }
+
+    /// Looks a tensor up, or names the one that is missing.
+    fn require(&self, name: &str) -> Result<&TensorInfo, StError> {
+        self.tensors
             .get(name)
             .ok_or_else(|| StError::MissingTensor {
                 name: name.to_string(),
-            })?;
-        Ok(self.slice(info))
+            })
+    }
+
+    /// Refuses a tensor that cannot be borrowed as `f32`.
+    fn require_f32(&self, name: &str, info: &TensorInfo) -> Result<(), StError> {
+        if info.dtype != Dtype::F32 {
+            return Err(StError::NotBorrowable {
+                name: name.to_string(),
+                dtype: info.dtype.name(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks a declared shape against an expected one.
+    fn require_shape(name: &str, info: &TensorInfo, expected: &[usize]) -> Result<(), StError> {
+        if info.shape != expected {
+            return Err(StError::ShapeMismatch {
+                name: name.to_string(),
+                expected: expected.to_vec(),
+                actual: info.shape.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Copies a tensor into `f32`, widening F16 or BF16 on the way.
+    fn widen(&self, info: &TensorInfo) -> Vec<f32> {
+        let start = self.data_start + info.start as usize;
+        let end = self.data_start + info.end as usize;
+        let bytes = &self.map[start..end];
+        match info.dtype {
+            Dtype::F32 => self.slice(info).to_vec(),
+            // Read pairwise rather than cast: a 2-byte element only needs
+            // 2-byte alignment, and requiring 4 here would refuse files that
+            // are perfectly readable.
+            Dtype::F16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from(half::f16::from_le_bytes(*b)))
+                .collect(),
+            // bf16 is the top half of an f32, so this is exact and needs no
+            // rounding decision at all.
+            Dtype::Bf16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+                .collect(),
+        }
     }
 
     /// Borrows a tensor and asserts its shape.
@@ -221,19 +344,9 @@ impl StFile {
     /// fails while loading, named, instead of producing plausible-sounding
     /// noise at synthesis time.
     pub fn tensor_shaped(&self, name: &str, expected: &[usize]) -> Result<&[f32], StError> {
-        let info = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| StError::MissingTensor {
-                name: name.to_string(),
-            })?;
-        if info.shape != expected {
-            return Err(StError::ShapeMismatch {
-                name: name.to_string(),
-                expected: expected.to_vec(),
-                actual: info.shape.clone(),
-            });
-        }
+        let info = self.require(name)?;
+        self.require_f32(name, info)?;
+        Self::require_shape(name, info, expected)?;
         Ok(self.slice(info))
     }
 

@@ -34,6 +34,26 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Whether this stage has a CUDA implementation at all.
+    ///
+    /// The VAD does not, and is not going to: it is 15 tensors and a
+    /// millisecond of CPU per clip, so the transfer would cost more than the
+    /// arithmetic. Saying so is better than accepting `--vad-device 0` and then
+    /// running on the CPU anyway, which is what the flag surface did first and
+    /// what made the startup log claim `device=cuda:0` for a CPU stage.
+    pub fn has_cuda(self) -> bool {
+        !matches!(self, Kind::Vad)
+    }
+
+    /// Where this stage runs when no device is named.
+    pub fn default_device(self) -> Device {
+        if self.has_cuda() {
+            Device::Cuda(0)
+        } else {
+            Device::Cpu
+        }
+    }
+
     /// The flag prefix, so an error can quote the flag the user actually typed.
     pub fn flag(self) -> &'static str {
         match self {
@@ -153,6 +173,10 @@ pub enum StageError {
     #[error("--{0}-device must be `cpu` or a CUDA device ordinal, got `{1}`")]
     BadDevice(Kind, String),
 
+    /// A CUDA device was asked for by a stage that only runs on the CPU.
+    #[error("--{0}-device must be `cpu`; the {0} stage has no CUDA implementation")]
+    CpuOnly(Kind),
+
     /// Voice activity detection with nothing to gate and nothing to read.
     ///
     /// VAD alone is meaningful over `--in`, where it prints segments. Served,
@@ -240,11 +264,14 @@ fn one(kind: Kind, r: &Requested) -> Result<Stage, StageError> {
         }
         (Some(path), None) => {
             let device = match r.device.as_deref() {
-                None => Device::Cuda(0),
+                None => kind.default_device(),
                 Some(s) => {
                     Device::parse(s).ok_or_else(|| StageError::BadDevice(kind, s.to_string()))?
                 }
             };
+            if device != Device::Cpu && !kind.has_cuda() {
+                return Err(StageError::CpuOnly(kind));
+            }
             Ok(Stage::Local {
                 path: path.clone(),
                 device,

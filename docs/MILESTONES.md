@@ -66,9 +66,19 @@ probabilities with no change.
 
 | # | State | Done |
 | --- | --- | --- |
-| 6 | Silero is converted to safetensors; 15 tensors typed and shape-checked | |
-| 7 | Per-frame probabilities match `whisper_vad_probs()` on a clip corpus | |
-| 8 | The hysteresis segmenter matches, including whisper.cpp's own additions | |
+| 6 | Silero is converted to safetensors; 15 tensors typed and shape-checked | ✅ |
+| 7 | Per-frame probabilities match `whisper_vad_probs()` on a clip corpus | ✅ |
+| 8 | The hysteresis segmenter matches, including whisper.cpp's own additions | ✅ |
+
+Measured on the corpus: every segment matches on every clip, all four
+hallucination triggers peak below 0.05 against a threshold of 0.6 and agree
+with the reference to four decimals, and all 926 frames land on the same side
+of both thresholds. Raw probabilities differ by at most 6.8e-3, which has an
+explanation rather than a tolerance — see `docs/MODEL.md`.
+
+Two items from later phases came forward because this one needed them:
+`xabe-st` reads F16 and BF16 (part of item 18, since the Silero checkpoint
+turned out to be F16), and `xabe-dsp` gained a strided convolution.
 
 ### Phase 4 — speech to text
 

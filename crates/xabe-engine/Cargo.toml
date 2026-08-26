@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 xabe-audio.workspace = true
 xabe-serve.workspace = true
+xabe-vad.workspace = true
 xabe-tts.workspace = true
 xabe-vits.workspace = true
 clap.workspace = true

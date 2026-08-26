@@ -238,6 +238,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -391,6 +397,17 @@ dependencies = [
  "libc",
  "r-efi",
  "wasip2",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1545,6 +1562,7 @@ dependencies = [
  "xabe-audio",
  "xabe-serve",
  "xabe-tts",
+ "xabe-vad",
  "xabe-vits",
 ]
 
@@ -1580,6 +1598,7 @@ dependencies = [
 name = "xabe-st"
 version = "0.0.0"
 dependencies = [
+ "half",
  "memmap2",
  "serde",
  "serde_json",
@@ -1600,6 +1619,17 @@ dependencies = [
  "xabe-golden",
  "xabe-st",
  "xabe-vits",
+]
+
+[[package]]
+name = "xabe-vad"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "xabe-audio",
+ "xabe-dsp",
+ "xabe-st",
 ]
 
 [[package]]
