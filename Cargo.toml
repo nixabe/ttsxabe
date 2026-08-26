@@ -5,6 +5,7 @@ members = [
     "crates/xabe-golden",
     "crates/xabe-vits",
     "crates/xabe-dsp",
+    "crates/xabe-cuda",
     "crates/xabe-tts",
 ]
 
@@ -20,6 +21,7 @@ xabe-st = { path = "crates/xabe-st" }
 xabe-vits = { path = "crates/xabe-vits" }
 xabe-dsp = { path = "crates/xabe-dsp" }
 xabe-golden = { path = "crates/xabe-golden" }
+xabe-cuda = { path = "crates/xabe-cuda" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
@@ -31,6 +33,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# `fallback-dynamic-loading` is what keeps CUDA out of the build: the workspace
+# compiles and its non-GPU tests run on a machine with no toolkit and no card.
+# GPU-ness is a runtime skip, not a compile-time cfg.
+cudarc = { version = "0.19", default-features = false, features = ["std", "cuda-12040", "driver", "nvrtc", "fallback-dynamic-loading"] }
 
 [profile.release]
 opt-level = 3

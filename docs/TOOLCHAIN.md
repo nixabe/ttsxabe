@@ -11,9 +11,8 @@ the channel means a toolchain update is a commit rather than a surprise.
 
 ## CUDA
 
-Not yet a dependency. When kernels arrive they follow `llmxabe`'s approach:
-`cudarc` with `fallback-dynamic-loading`, kernels as `const &str` compiled at
-runtime via NVRTC.
+`cudarc` with `fallback-dynamic-loading`, kernels as a `const &str` compiled at
+runtime via NVRTC. All of `xabe-cuda` is one translation unit.
 
 The consequence is worth stating early, because it shapes the build: **there is
 no `build.rs`, no `cc` crate, no nvcc, and no CUDA feature flag.** The workspace

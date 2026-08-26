@@ -1,0 +1,16 @@
+[package]
+name = "xabe-cuda"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cudarc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+xabe-dsp.workspace = true
