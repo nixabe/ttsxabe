@@ -62,3 +62,46 @@ pub fn conv1d(
 pub fn same_padding(k: usize) -> (usize, usize) {
     ((k - 1) / 2, k / 2)
 }
+
+/// Depthwise convolution: each channel is convolved with its own kernel.
+///
+/// The weights are `[channels, 1, k]` - PyTorch stores a grouped convolution as
+/// `[out_channels, in_channels / groups, k]`, and with `groups == channels`
+/// that middle dimension is 1. Nothing about the shape distinguishes this from
+/// an ordinary convolution with one input channel, which is why it is a
+/// separate function rather than a flag.
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_conv1d(
+    x: &[f32],
+    ch: usize,
+    t: usize,
+    w: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    pad_left: usize,
+    pad_right: usize,
+    dilation: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), ch * t);
+    debug_assert_eq!(w.len(), ch * k);
+
+    let span = dilation * (k - 1) + 1;
+    let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+    let mut out = vec![0.0; ch * out_t];
+
+    for c in 0..ch {
+        let b = bias.map_or(0.0, |b| b[c]);
+        for p in 0..out_t {
+            let mut acc = b;
+            for tap in 0..k {
+                let pos = (p + tap * dilation) as isize - pad_left as isize;
+                if pos < 0 || pos as usize >= t {
+                    continue;
+                }
+                acc += x[c * t + pos as usize] * w[c * k + tap];
+            }
+            out[c * out_t + p] = acc;
+        }
+    }
+    out
+}

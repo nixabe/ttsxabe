@@ -127,6 +127,8 @@ fn config_validation_rejects_impossible_geometry() {
         "resblock_dilation_sizes": [[1,3,5],[1,3,5],[1,3,5]],
         "depth_separable_channels": 2, "duration_predictor_kernel_size": 3,
         "duration_predictor_num_flows": 4, "window_size": 4,
+        "depth_separable_num_layers": 3, "duration_predictor_flow_bins": 10,
+        "duration_predictor_tail_bound": 5.0,
         "noise_scale": 0.667, "noise_scale_duration": 0.8, "speaking_rate": 1.0,
         "leaky_relu_slope": 0.1, "use_stochastic_duration_prediction": true
     }"#;

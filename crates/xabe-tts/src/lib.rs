@@ -8,6 +8,8 @@
 //! PyTorch oracle before the next is started. See `docs/MILESTONES.md` for what
 //! is finished and `docs/ORACLE.md` for what it is being checked against.
 
+mod duration;
 mod text_encoder;
 
+pub use duration::duration_predictor;
 pub use text_encoder::{EncoderOutput, text_encoder};

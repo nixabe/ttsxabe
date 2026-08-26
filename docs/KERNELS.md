@@ -13,15 +13,31 @@ exists.
 | relative-position self-attention | text encoder (window 4) | `xabe_dsp::self_attention` |  | `xabe-dsp` relative_position + `xabe-tts` |
 | conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
 | conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` |  | `xabe-tts` text_encoder |
-| depthwise-separable conv | duration predictor | | | |
+| depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` |  | `xabe-tts` duration |
 | transposed conv1d | decoder upsamplers | | | |
 | leaky ReLU | decoder | | | |
 | WaveNet residual block | flow coupling, posterior | | | |
 | affine coupling | flow | | | |
-| stochastic duration flow | duration predictor | | | |
+| stochastic duration flow | duration predictor | `xabe_dsp::spline_inverse` |  | `xabe-tts` duration |
 | length regulation / attention expansion | prior → frames | | | |
 | HiFi-GAN resblock (MRF) | decoder | | | |
 | tanh output | decoder | | | |
+
+## Also implemented
+
+Two kernels the original inventory did not name, because reading the reference
+is what turned them up:
+
+| kernel | used by | reference | CUDA | differential |
+| --- | --- | --- | --- | --- |
+| exact GELU (needs `erf`) | duration predictor | `xabe_dsp::gelu` | | `xabe-dsp` gelu |
+| softmax | attention, spline knots | `xabe_dsp::softmax_rows` | | via attention |
+
+GELU is the one kernel here that *approximates* the reference rather than
+rearranging it: Rust has no `erf`, so `xabe-dsp` carries Cody's rational
+approximation. PyTorch's default GELU is the exact erf form, and the tanh
+approximation - the obvious substitute - differs by up to 4.7e-4 near
+`|x| = 2.7`, an order of magnitude above the tolerances here.
 
 ## Notes that will bite
 

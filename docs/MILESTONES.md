@@ -9,7 +9,7 @@ Numbered by what becomes *true*, not by how much work it was.
 | 3 | The PyTorch oracle is captured and its format is read by tests | ✅ |
 | 4 | Text → symbol ids matches the reference tokenizer exactly | ✅ |
 | 5 | The text encoder matches the oracle within tolerance | ✅ |
-| 6 | The stochastic duration predictor matches on fixed noise | |
+| 6 | The stochastic duration predictor matches on fixed noise | ✅ |
 | 7 | The flow, reversed, matches the oracle | |
 | 8 | The HiFi-GAN decoder matches the oracle | |
 | 9 | End-to-end synthesis on CPU matches the reference waveform | |

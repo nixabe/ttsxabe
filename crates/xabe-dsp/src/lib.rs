@@ -19,13 +19,17 @@
 mod activation;
 mod attention;
 mod conv;
+mod erf;
 mod linear;
 mod norm;
+mod spline;
 mod tensor;
 
 pub use activation::{leaky_relu, relu, softmax_rows};
 pub use attention::self_attention;
-pub use conv::{conv1d, same_padding};
+pub use conv::{conv1d, depthwise_conv1d, same_padding};
+pub use erf::{erf, gelu};
 pub use linear::linear;
 pub use norm::layer_norm;
+pub use spline::spline_inverse;
 pub use tensor::transpose;

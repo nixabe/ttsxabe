@@ -60,6 +60,12 @@ pub struct VitsConfig {
     pub duration_predictor_kernel_size: usize,
     /// Coupling blocks in the stochastic duration predictor.
     pub duration_predictor_num_flows: usize,
+    /// Layers in each depthwise-separable convolution stack.
+    pub depth_separable_num_layers: usize,
+    /// Bins in each rational-quadratic spline.
+    pub duration_predictor_flow_bins: usize,
+    /// Beyond +/- this, the spline is the identity.
+    pub duration_predictor_tail_bound: f32,
     /// Half-width of the relative attention window.
     pub window_size: usize,
     /// Epsilon added inside every layer norm's square root.
