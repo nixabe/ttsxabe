@@ -31,6 +31,7 @@
 pub mod action;
 pub mod args;
 pub mod error;
+pub mod serve;
 pub mod stage;
 pub mod tts;
 
@@ -66,16 +67,20 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
 
     // 4: the work.
     match action {
-        Action::Serve { .. } => Err(EngineError::NoServer),
+        Action::Serve { addr } => serve::serve(args, &stages, &addr),
         Action::Speak { text, out } => match &stages.tts {
             Stage::Local { path, device } => tts::speak(args, path, *device, &text, &out),
-            Stage::Remote { .. } => Err(EngineError::NoHttpClient(Kind::Tts)),
+            Stage::Remote { url } => tts::speak_remote(url, &text, &out),
             Stage::Off => unreachable!("Action::Speak is only produced with a TTS stage"),
         },
-        Action::Transcribe { .. } => Err(EngineError::NotImplemented {
-            stage: Kind::Asr,
-            phase: "4",
-        }),
+        Action::Transcribe { input } => match &stages.asr {
+            Stage::Remote { url } => tts::transcribe_remote(args, url, &input),
+            Stage::Local { .. } => Err(EngineError::NotImplemented {
+                stage: Kind::Asr,
+                phase: "4",
+            }),
+            Stage::Off => unreachable!("Action::Transcribe needs an ASR stage"),
+        },
         Action::Segment { .. } => Err(EngineError::NotImplemented {
             stage: Kind::Vad,
             phase: "3",
@@ -112,7 +117,18 @@ fn announce(stages: &Stages) {
 fn unbuilt(stages: &Stages) -> Result<(), EngineError> {
     for (kind, stage) in stages.summary() {
         match stage {
-            Stage::Remote { .. } => return Err(EngineError::NoHttpClient(kind)),
+            // A delegated stage needs no implementation here beyond an HTTP
+            // client, and that exists - except for the VAD, whose wire protocol
+            // arrives with the model that defines it.
+            Stage::Remote { .. } => match kind {
+                Kind::Vad => {
+                    return Err(EngineError::NotImplemented {
+                        stage: kind,
+                        phase: "3",
+                    });
+                }
+                _ => continue,
+            },
             Stage::Local { .. } => match kind {
                 Kind::Tts => {}
                 Kind::Vad => {

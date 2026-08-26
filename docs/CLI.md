@@ -63,6 +63,17 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |
 | `--out` | — | — | one-shot output; `-` writes stdout |
+| `--tts-engine` | `XABE_TTS_ENGINES` | — | extra engines as `name=url`, repeatable |
+| `--tts-default` | `XABE_TTS_DEFAULT` | `mms` | which engine the page selects |
+| `--translator-target` | `XABE_TRANSLATOR_TARGET` | `POJ` | `POJ`, `HAN` or `HL` |
+| `--asr-lang` | `XABE_ASR_LANG` | `zh` | never `en`; see below |
+| `--person` / `--bot` | `XABE_PERSON` / `XABE_BOT` | 使用者 / 小助理 | names in the transcript |
+| `--temperature` | `XABE_TEMPERATURE` | 0.3 | reply sampling |
+| `--max-tokens` | `XABE_MAX_TOKENS` | 160 | reply length cap |
+| `--history-turns` | `XABE_HISTORY_TURNS` | 6 | turns kept in the prompt |
+| `--min-chunk` | `XABE_MIN_CHUNK` | 6 | characters before a later chunk is spoken |
+| `--first-chunk` | `XABE_FIRST_CHUNK` | 4 | characters before the *first* chunk is spoken |
+| `--prompt-file` | `XABE_PROMPT_FILE` | — | replaces the built-in system prompt |
 | `--config` | `XABE_TTS_CONFIG` | next to the model | TTS `config.json` |
 | `--seed` | `XABE_SEED` | 0 | duration and prior sampling |
 | `--noise-scale` | | 0.667 | prior temperature |
@@ -118,11 +129,56 @@ waiting on.
 | stage | status |
 | --- | --- |
 | `--tts-model` | works |
+| `--serve` | works |
+| `--asr-url`, `--tts-url`, `--translator-url`, `--llm-url` | work |
+| `--vad-url` | phase 3, with the model that defines its protocol |
 | `--vad-model` | phase 3 |
 | `--asr-model` | phase 4 |
 | `--translator-model` | phase 5a |
-| any `--<stage>-url` | phase 2 |
-| `--serve` | phase 2 |
+
+## What `--serve` publishes
+
+The endpoints are the ones the Python services already publish, not new ones.
+That is what makes the migration incremental rather than a flag day: an engine
+process is a drop-in for `whisper-server`, for the TTS daemon, or for the
+gateway, so each stage can be swapped in behind the existing system and A/B'd
+against the service it replaces, one at a time.
+
+| route | replaces | published when |
+| --- | --- | --- |
+| `GET /health` | all three | always |
+| `POST /inference` | `whisper-server` | there is an ASR stage |
+| `POST /tts`, `POST /tts_stream` | `taigi_tts_daemon.py` | there is a TTS stage |
+| `GET /`, `GET /api/config`, `WS /ws` | `gateway.py` | ASR **and** LLM **and** TTS |
+
+A process publishes only the routes for stages it owns. Asking a TTS worker for
+`/inference` is a 503 naming the flag that would give it one. The page is
+published only by a process that can actually hold a conversation — a TTS worker
+answering `GET /` with a chat UI that cannot hear anything would be a worse
+failure than a 404.
+
+`GET /api/config` also carries the turn-taking constants, so the page does not
+keep its own copy of numbers that were tuned against real speech. They are
+defined and unit-tested in `xabe-serve::turntaking`; see `docs/MODEL.md` for
+what each one is a fix for.
+
+## Turn-taking
+
+Every constant is a fix for an observed failure, not a round number:
+
+| | | |
+| --- | --- | --- |
+| `vad_start` | 0.035 | 0.012 sat at room-noise level, so the mic fired on silence and the ASR hallucinated |
+| `vad_stop` | 0.018 | hysteresis; one threshold chops a turn up at every unvoiced consonant |
+| `onset_frames` | 3 | a click or a door cannot open a turn |
+| `silence_ms` | 700 | a pause only *arms* the end of turn |
+| `grace_ms` | 900 | ...and this much more silence commits it |
+| `voiced_ms` | 250 | enough loud audio to be worth transcribing at all |
+| `min_ms` / `max_ms` | 500 / 20000 | shortest turn worth sending; backstop for a stuck mic |
+
+Committing on `silence_ms` alone cut people off at natural mid-sentence pauses,
+sending half a question. Arming and then committing means finishing a turn costs
+1600 ms of trailing silence, while a thinking pause inside one costs nothing.
 
 ## What it costs
 

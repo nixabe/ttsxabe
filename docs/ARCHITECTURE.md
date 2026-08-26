@@ -27,7 +27,7 @@ configuration of the same flags, not a different program.
 ```
    xabe-engine
       │
-      ├── xabe-serve    HTTP, WebSocket, static assets, turn-taking   [phase 2]
+      ├── xabe-serve    HTTP, WebSocket, the page, turn-taking policy
       ├── xabe-vad      Silero geometry and weight schema             [phase 3]
       ├── xabe-whisper  Whisper geometry, weight schema, BPE          [phase 4]
       ├── xabe-llama    Llama geometry, weight schema, SentencePiece  [phase 5a]
@@ -45,6 +45,20 @@ validates and then fails with the phase it is waiting on, because a flag
 surface that is designed and tested before the stages behind it are built is
 what lets the topology be settled first. A flag that parses and silently does
 nothing would be worse than one that says which milestone it needs.
+
+## How a model reaches the serving layer
+
+`xabe-serve` owns HTTP and refuses to know what a model is. `xabe-tts` owns the
+model and refuses to know what a socket is. They meet in `xabe-engine`, and the
+join is a **channel**: a synthesiser thread reads `SynthesisJob`s and writes WAV
+chunks back, and neither side learns anything about the other. A trait would
+have worked and would have been the obvious move; the channel is narrower, and
+the house style asks for no traits unless forced.
+
+That thread is an OS thread, not an executor task. A forward pass is a blocking
+GPU-bound 48 ms that would otherwise stall every socket the runtime is polling.
+There is exactly one, because the model is one utterance at a time by design and
+a second thread would only queue on the same device.
 
 ## Why the CLI left `xabe-tts`
 
@@ -85,6 +99,7 @@ crates above it.
 | `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
 | `xabe-golden` | reading captures, comparing tensors | producing them |
 | `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
+| `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 

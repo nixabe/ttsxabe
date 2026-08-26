@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台語語音助理</title>
+<style>
+  :root{--bg:#faf9f7;--fg:#1c1b1a;--mut:#6b6864;--line:#e3e0db;--card:#fff;
+        --user:#e8f0fe;--bot:#f2efe9;--accent:#b4553a;--ok:#3f7d58}
+  @media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+        --bg:#191817;--fg:#eceae7;--mut:#9b9791;--line:#332f2c;--card:#211f1d;
+        --user:#243244;--bot:#282521;--accent:#e08a6c;--ok:#7bbd93}}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.6 ui-sans-serif,system-ui,"Noto Sans TC",sans-serif;
+       background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
+         gap:14px;align-items:center;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:650;letter-spacing:-.01em}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--mut);flex:none}
+  .dot.on{background:var(--ok)} .dot.rec{background:var(--accent);animation:p 1s infinite}
+  @keyframes p{50%{opacity:.3}}
+  .grow{flex:1}
+  select,button{font:inherit;color:var(--fg);background:var(--card);
+       border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  #log{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:min(680px,86%);padding:10px 14px;border-radius:12px;white-space:pre-wrap;
+       word-break:break-word}
+  .me{align-self:flex-end;background:var(--user)}
+  .bot{align-self:flex-start;background:var(--bot)}
+  .meta{font-size:12px;color:var(--mut);margin-top:6px;font-family:ui-monospace,monospace}
+  footer{border-top:1px solid var(--line);padding:12px 20px;display:flex;gap:10px;align-items:center}
+  #text{flex:1;font:inherit;padding:9px 13px;border:1px solid var(--line);
+        border-radius:8px;background:var(--card);color:var(--fg)}
+  #ptt{min-width:130px}
+  .hint{font-size:12px;color:var(--mut);padding:0 20px 10px;line-height:1.7}
+  .hint code{background:var(--card);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-family:ui-monospace,monospace;user-select:all}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>台語語音助理</h1>
+  <span class="grow"></span>
+  <label style="font-size:13px;color:var(--mut)">TTS
+    <select id="engine"></select>
+  </label>
+  <label style="font-size:13px;color:var(--mut)">
+    <input type="checkbox" id="vad" checked> 自動偵測
+  </label>
+  <button id="reset">清除</button>
+</header>
+<div id="log"></div>
+<div class="hint" id="hint">連線中…</div>
+<footer>
+  <button id="ptt">按住講話</button>
+  <input id="text" placeholder="也可以直接打字…" autocomplete="off">
+  <button id="send" class="primary">送出</button>
+</footer>
+<script>
+const $=s=>document.querySelector(s);
+const log=$("#log"), dot=$("#dot"), hint=$("#hint");
+let ws, ctx, stream, node, src, recording=false, buf=[], vadOn=true;
+let speaking=false, queue=[], playing=false, curBot=null, micOK=false;
+
+// Turn-taking policy. These numbers are NOT defined here: the server sends them
+// with /api/config and they are unit-tested there against recorded traces. The
+// values below are only what the page falls back to if that fetch fails, and
+// they must stay in step with GatewayConfig's defaults.
+//
+// What each one is for, because none is obvious:
+//   vad_start   The old value, 0.012, sat at room-noise level, so the mic fired
+//               on silence and Whisper hallucinated a sentence out of it.
+//   onset_frames  Speech must persist this long before a turn opens, so a
+//               single click or thump cannot start one.
+//   silence_ms / grace_ms  A pause only ARMS the end of turn; it is committed
+//               only after grace_ms more silence. SILENCE_MS alone cut people
+//               off mid-sentence ("台北的天氣…嗯…今天如何"). So finishing a turn
+//               costs silence_ms+grace_ms, while a thinking pause costs nothing.
+//   voiced_ms   Enough actually-loud audio must be in the buffer to bother
+//               sending it at all.
+let P = {rate:16000, vad_start:0.035, vad_stop:0.018, silence_ms:700, grace_ms:900,
+         min_ms:500, max_ms:20000, onset_frames:3, voiced_ms:250};
+
+let above=false, lastVoice=0, startedAt=0, onset=0, voicedMs=0, armedAt=0;
+// Frames held back so a turn does not begin at the moment the threshold was
+// crossed. Without this the buffer was reset to a single frame on onset, which
+// threw away every frame that proved speech was starting - about 512 ms - and
+// clipped the first syllable off every utterance.
+let preroll=[];
+// Whether the current turn came from the button rather than the detector.
+// Push-to-talk never accumulates voicedMs, so applying the voiced_ms test to it
+// discarded every push-to-talk utterance whenever auto-detect was checked -
+// which is the default.
+let pushToTalk=false;
+
+// getUserMedia only exists on a secure origin (https, or localhost). Playback
+// must NOT depend on it - that was the bug: initMic() threw on its first line,
+// so the AudioContext never existed and every reply died silently.
+const SECURE = window.isSecureContext && navigator.mediaDevices &&
+               navigator.mediaDevices.getUserMedia;
+
+function add(cls,text){const d=document.createElement("div");d.className="msg "+cls;
+  d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+function meta(el,t){let m=el.querySelector(".meta");if(!m){m=document.createElement("div");
+  m.className="meta";el.appendChild(m)}m.textContent=t}
+
+function connect(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = ()=>{ dot.classList.add("on");
+    if(micOK) hint.textContent="就緒。按住按鈕或直接講話。";
+    else if(!SECURE) {/* keep the insecure-origin explanation */}
+    else hint.textContent="就緒。可以打字，或按住按鈕講話。" };
+  ws.onclose = ()=>{ dot.classList.remove("on");
+    hint.textContent="連線中斷，3 秒後重試…"; setTimeout(connect,3000) };
+  ws.onerror = ()=>{ dot.classList.remove("on") };
+  ws.onmessage = e=>{
+    const m = JSON.parse(e.data);
+    if(m.type==="asr"){ if(m.text) add("me", m.text); curBot=null; }
+    else if(m.type==="token"){
+      if(!curBot) curBot = add("bot","");
+      curBot.insertBefore(document.createTextNode(m.text),
+                          curBot.querySelector(".meta") || null);
+      log.scrollTop = log.scrollHeight;
+    }
+    else if(m.type==="audio"){
+      queue.push(m); drain();
+      if(curBot && m.taigi) meta(curBot, `台語 ${m.taigi}\n羅馬字 ${m.roman}`);
+    }
+    else if(m.type==="done"){
+      hint.textContent = m.first_audio_ms
+        ? `首次出聲 ${m.first_audio_ms} ms · 總計 ${m.total_ms} ms` : "就緒。";
+    }
+    else if(m.type==="ignored"){
+      hint.textContent = "偵測到雜音（辨識為「"+m.raw.trim().slice(0,18)+"」），已忽略。"; }
+    else if(m.type==="error"){ hint.textContent = "錯誤：" + m.message; }
+    else if(m.type==="reset_ok"){ log.innerHTML=""; hint.textContent="已清除。"; }
+  };
+}
+
+/* ---------- playback: independent of the microphone ---------- */
+function audioCtx(){
+  if(!ctx){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(AC) ctx = new AC();
+  }
+  if(ctx && ctx.state==="suspended") ctx.resume();
+  return ctx;
+}
+// Any gesture unlocks autoplay-blocked audio.
+["click","keydown","touchstart"].forEach(e=>
+  document.addEventListener(e,()=>audioCtx(),{once:false,passive:true}));
+
+function playViaTag(bytes){                 // fallback when WebAudio is unavailable
+  return new Promise(res=>{
+    const url=URL.createObjectURL(new Blob([bytes],{type:"audio/wav"}));
+    const a=new Audio(url);
+    a.onended=a.onerror=()=>{URL.revokeObjectURL(url);res()};
+    a.play().catch(err=>{hint.textContent="瀏覽器擋住自動播放，請點一下畫面。";res()});
+  });
+}
+
+async function drain(){
+  if(playing||!queue.length)return; playing=true; speaking=true;
+  // seq is monotonic for the whole connection, so this global sort is correct.
+  // It was not when the server restarted seq at 1 per turn: a new turn's first
+  // chunk could sort ahead of the previous turn's last and play out of order.
+  queue.sort((a,b)=>a.seq-b.seq);
+  while(queue.length){
+    const m=queue.shift();
+    const bytes=Uint8Array.from(atob(m.wav),c=>c.charCodeAt(0));
+    const c=audioCtx();
+    let done=false;
+    if(c){
+      try{
+        const ab=await c.decodeAudioData(bytes.buffer.slice(0));
+        await new Promise(res=>{const s=c.createBufferSource();s.buffer=ab;
+          s.connect(c.destination);s.onended=res;s.start()});
+        done=true;
+      }catch(err){ console.warn("WebAudio failed, falling back:",err); }
+    }
+    if(!done) await playViaTag(bytes);      // <audio> works without AudioContext
+  }
+  playing=false;
+  setTimeout(()=>{speaking=false},250);
+}
+
+function send(obj){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(
+  Object.assign({engine:$("#engine").value},obj))) }
+
+let utterId=0, prefetched=null;
+
+// The capture context is whatever rate the browser gave us - asking for 16 kHz
+// is a hint, not a guarantee, and a context created by an earlier click is
+// usually 48 kHz. Labelling 48 kHz audio as 16 kHz fed the ASR speech three
+// times too slow, so the samples are resampled here and the rate we claim is
+// the rate we send.
+function resampleTo(frames, from, to){
+  const n=frames.reduce((a,b)=>a+b.length,0);
+  const all=new Float32Array(n); let o=0; for(const b of frames){all.set(b,o);o+=b.length}
+  if(from===to) return all;
+  const ratio=from/to, out=new Float32Array(Math.floor(n/ratio));
+  for(let i=0;i<out.length;i++){
+    const x=i*ratio, i0=Math.floor(x), i1=Math.min(i0+1,n-1), t=x-i0;
+    out[i]=all[i0]*(1-t)+all[i1]*t;          // linear is enough for 48k->16k speech
+  }
+  return out;
+}
+
+function encodePCM(frames){
+  const rate = (ctx && ctx.sampleRate) || P.rate;
+  const all = resampleTo(frames, rate, P.rate);
+  const pcm=new Int16Array(all.length);
+  for(let i=0;i<all.length;i++){const v=Math.max(-1,Math.min(1,all[i]));pcm[i]=v*32767}
+  let bin=""; const u8=new Uint8Array(pcm.buffer);
+  for(let i=0;i<u8.length;i+=8192) bin+=String.fromCharCode(...u8.subarray(i,i+8192));
+  return {b64:btoa(bin), ms:all.length/P.rate*1000};
+}
+
+// Start transcribing the moment the pause ARMS, not when the turn commits. If
+// the speaker resumes we cancel it; if they do not, the transcript is already
+// waiting and the ASR latency disappears from the turn.
+function prefetchASR(){
+  if(!ws||ws.readyState!==1)return;
+  const {b64,ms}=encodePCM(buf);
+  if(ms<P.min_ms)return;
+  prefetched=++utterId;
+  send({type:"asr_prefetch",id:prefetched,pcm:b64,rate:P.rate});
+}
+function cancelPrefetch(){
+  if(prefetched){ send({type:"asr_cancel",id:prefetched}); prefetched=null }
+}
+
+function flush(){
+  // Every early return cancels the prefetch. Returning without cancelling leaks
+  // a transcription task on the server for each occurrence, and those tasks
+  // hold a GPU.
+  if(!buf.length){cancelPrefetch();pushToTalk=false;return}
+  const frames=buf; buf=[]; preroll=[];
+  const {b64,ms}=encodePCM(frames);
+  const wasPTT=pushToTalk; pushToTalk=false;
+  if(ms<P.min_ms){hint.textContent="太短，忽略。";voicedMs=0;cancelPrefetch();return}
+  // The voiced-audio test applies only to what the detector opened. A held
+  // button is an explicit statement that this is a turn.
+  if(vadOn && !wasPTT && voicedMs<P.voiced_ms){
+    hint.textContent="只有雜音，忽略。";voicedMs=0;cancelPrefetch();return}
+  voicedMs=0;
+  hint.textContent="辨識中…";
+  const id=prefetched; prefetched=null;
+  send({type:"audio",id:id,pcm:b64,rate:P.rate});
+}
+
+async function initMic(){
+  if(!SECURE) throw new Error("insecure-origin");
+  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,
+    echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = ctx || new AC({sampleRate:P.rate});
+  if(ctx.state==="suspended") await ctx.resume();
+  src=ctx.createMediaStreamSource(stream);
+  node=ctx.createScriptProcessor(4096,1,1);
+  node.onaudioprocess=e=>{
+    const d=e.inputBuffer.getChannelData(0);
+    let sum=0; for(let i=0;i<d.length;i++)sum+=d[i]*d[i];
+    const rms=Math.sqrt(sum/d.length);
+    const now=performance.now();
+    if(recording){ buf.push(new Float32Array(d));
+      if(now-startedAt>P.max_ms){recording=false;dot.classList.remove("rec");flush()}
+      return }
+    if(!vadOn||speaking||playing){onset=0;armedAt=0;preroll=[];return}
+    const frameMs = d.length/((ctx&&ctx.sampleRate)||P.rate)*1000;
+    if(!above){
+      // Hold the last onset_frames frames so the turn can start *before* the
+      // threshold was crossed rather than after it.
+      preroll.push(new Float32Array(d));
+      if(preroll.length>P.onset_frames) preroll.shift();
+      if(rms>P.vad_start){
+        onset++;
+        if(onset>=P.onset_frames){                 // sustained, not a click
+          above=true;startedAt=now;lastVoice=now;voicedMs=0;armedAt=0;
+          dot.classList.add("rec");buf=preroll.slice();preroll=[];
+          hint.textContent="聽到了…"}
+      } else onset=0;
+    } else {
+      buf.push(new Float32Array(d));
+      if(rms>P.vad_stop){
+        lastVoice=now; voicedMs+=frameMs;
+        if(armedAt){ armedAt=0; cancelPrefetch(); hint.textContent="繼續聽…" }
+      }
+      const quiet = now-lastVoice;
+      if(!armedAt && quiet>P.silence_ms){                      // pause: arm + prefetch
+        armedAt=now; hint.textContent="等你講完…"; prefetchASR();
+      }
+      if((armedAt && now-armedAt>P.grace_ms) || now-startedAt>P.max_ms){
+        above=false;onset=0;armedAt=0;dot.classList.remove("rec");flush()}
+    }
+  };
+  src.connect(node); node.connect(ctx.destination);
+  micOK=true;
+}
+
+function micUnavailable(msg){
+  micOK=false;
+  $("#ptt").disabled=true; $("#vad").checked=false; $("#vad").disabled=true; vadOn=false;
+  $("#ptt").textContent="麥克風不可用";
+  hint.innerHTML = msg;
+}
+
+$("#ptt").onmousedown=$("#ptt").ontouchstart=async e=>{e.preventDefault();
+  if(!micOK){ try{ await initMic() }catch(err){ return } }
+  await audioCtx();
+  above=false;recording=true;pushToTalk=true;buf=[];preroll=[];
+  startedAt=performance.now();
+  dot.classList.add("rec");hint.textContent="錄音中…"};
+const stop=e=>{if(!recording)return;e.preventDefault();recording=false;
+  dot.classList.remove("rec");flush()};
+$("#ptt").onmouseup=$("#ptt").ontouchend=$("#ptt").onmouseleave=stop;
+
+$("#send").onclick=()=>{const v=$("#text").value.trim();if(!v)return;
+  $("#text").value="";send({type:"text",content:v})};
+$("#text").onkeydown=e=>{if(e.key==="Enter")$("#send").click()};
+$("#reset").onclick=()=>send({type:"reset"});
+$("#vad").onchange=async e=>{vadOn=e.target.checked;
+  if(vadOn&&!micOK){ try{ await initMic() }catch(err){ e.target.checked=false } } };
+
+fetch("/api/config").then(r=>r.json()).then(c=>{
+  if(c.turn) P = Object.assign(P, c.turn);
+  const s=$("#engine"); (c.engines||[]).forEach(n=>{const o=document.createElement("option");
+    o.value=n;o.textContent=n;if(n===c.default)o.selected=true;s.appendChild(o)});
+});
+connect();
+if(SECURE){
+  initMic().catch(err=>micUnavailable("無法取得麥克風："+err.message));
+}else{
+  micUnavailable('瀏覽器只在安全來源（HTTPS 或 localhost）開放麥克風，' +
+    '所以這個網址不能錄音。<b>文字聊天與台語語音播放正常。</b><br>' +
+    '要用麥克風，請開 SSH 通道再連 localhost：<br>' +
+    '<code>ssh -N -L 8000:127.0.0.1:8000 ' + (location.hostname||'HOST') + '</code><br>' +
+    '然後改開 <code>http://127.0.0.1:8000</code>');
+}
+</script>
+</body>
+</html>

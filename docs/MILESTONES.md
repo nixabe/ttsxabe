@@ -45,9 +45,22 @@ optimise** — `docs/ORACLE.md`, `docs/TESTING.md`.
 
 | # | State | Done |
 | --- | --- | --- |
-| 3 | `xabe-serve` speaks both halves: `--<stage>-url` as a client, `--serve` as a server | |
-| 4 | The gateway is a behaviour-for-behaviour port of `gateway.py`, driving the Python services | |
-| 5 | Turn-taking is server-side; the browser keeps only capture, VAD and playback | |
+| 3 | `xabe-serve` speaks both halves: `--<stage>-url` as a client, `--serve` as a server | ✅ |
+| 4 | The gateway is a behaviour-for-behaviour port of `gateway.py`, driving the Python services | ✅ |
+| 5 | The turn-taking policy is server-side and tested; the browser executes it | ✅ |
+
+Milestone 5 is narrower than it was first written, and deliberately. The plan
+said turn-taking would move server-side and the browser would keep "only
+capture, VAD and playback" — but the VAD *is* the turn detector, so that
+sentence asked for two things at once. What moved is the **policy**: the
+constants and the state machine now live in `xabe-serve::turntaking`, are unit
+tested against synthetic energy traces, and reach the page through
+`GET /api/config`, so tuning is a restart rather than an edit to an HTML file.
+What did not move is the frame-by-frame execution, because sending every
+4096-sample frame over the socket would cost more than it saves. `Endpointer`
+takes one scalar per frame rather than audio, so when the engine owns a VAD of
+its own (phase 3) the same state machine runs server-side over Silero's
+probabilities with no change.
 
 ### Phase 3 — voice activity detection
 

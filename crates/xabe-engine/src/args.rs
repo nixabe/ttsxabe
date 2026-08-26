@@ -110,6 +110,70 @@ pub struct Args {
     #[arg(long)]
     pub speaking_rate: Option<f32>,
 
+    /// Extra TTS engines the page can choose, as `name=url`. Repeatable.
+    ///
+    /// `--tts-model` and `--tts-url` register one engine; this registers the
+    /// others, which is how the page offers mms and cosyvoice side by side.
+    #[arg(
+        long = "tts-engine",
+        env = "XABE_TTS_ENGINES",
+        value_name = "NAME=URL",
+        value_delimiter = ','
+    )]
+    pub tts_engines: Vec<String>,
+
+    /// Which engine the page selects on load.
+    #[arg(long, env = "XABE_TTS_DEFAULT", value_name = "NAME")]
+    pub tts_default: Option<String>,
+
+    /// What the translator is asked to produce: POJ, HAN or HL.
+    ///
+    /// mms consumes romanisation, so it needs POJ; CosyVoice reads Han.
+    #[arg(long, env = "XABE_TRANSLATOR_TARGET", default_value = "POJ")]
+    pub translator_target: String,
+
+    /// Language given to the ASR. Never `en`.
+    ///
+    /// Breeze-ASR-26 transcribes Taigi speech *into* Mandarin Han; asking it
+    /// for English gets a translation instead of a transcript.
+    #[arg(long, env = "XABE_ASR_LANG", default_value = "zh")]
+    pub asr_lang: String,
+
+    /// What the user is called in the chat transcript.
+    #[arg(long, env = "XABE_PERSON", default_value = "使用者")]
+    pub person: String,
+
+    /// What the assistant is called in the chat transcript.
+    #[arg(long, env = "XABE_BOT", default_value = "小助理")]
+    pub bot: String,
+
+    /// Sampling temperature for the reply.
+    #[arg(long, env = "XABE_TEMPERATURE", default_value_t = 0.3)]
+    pub temperature: f32,
+
+    /// Maximum reply length, in tokens.
+    #[arg(long, env = "XABE_MAX_TOKENS", default_value_t = 160)]
+    pub max_tokens: u32,
+
+    /// How many previous turns stay in the prompt.
+    #[arg(long, env = "XABE_HISTORY_TURNS", default_value_t = 6)]
+    pub history_turns: usize,
+
+    /// Minimum characters before a later chunk is synthesised.
+    #[arg(long, env = "XABE_MIN_CHUNK", default_value_t = 6)]
+    pub min_chunk: usize,
+
+    /// Minimum characters before the first chunk is synthesised.
+    ///
+    /// Lower than --min-chunk on purpose: getting the voice started is worth
+    /// more than getting the first clause exactly right.
+    #[arg(long, env = "XABE_FIRST_CHUNK", default_value_t = 4)]
+    pub first_chunk: usize,
+
+    /// Read the system prompt from a file instead of using the built-in one.
+    #[arg(long, env = "XABE_PROMPT_FILE", value_name = "PATH")]
+    pub prompt_file: Option<PathBuf>,
+
     /// Log verbosity: info, debug or trace.
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,

@@ -70,6 +70,57 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     out
 }
 
+/// Wraps already-encoded 16-bit little-endian mono PCM in a WAV header.
+///
+/// Separate from [`wav_bytes`] because the browser sends PCM, not floats, and
+/// converting to f32 and back would round twice for no reason - the samples
+/// pass through untouched.
+pub fn wav_from_pcm16(pcm: &[u8], sample_rate: u32) -> Wav16 {
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    // An odd byte count is not a whole number of samples. Truncating is the
+    // only honest option: padding would append half a sample as a click.
+    let usable = pcm.len() & !1;
+    out.extend_from_slice(&(usable as u32).to_le_bytes());
+    out.extend_from_slice(&pcm[..usable]);
+    Wav16 {
+        bytes: out,
+        frames: usable / 2,
+        sample_rate,
+    }
+}
+
+/// A serialised 16-bit mono WAV and what it contains.
+#[derive(Debug, Clone)]
+pub struct Wav16 {
+    /// The whole file.
+    pub bytes: Vec<u8>,
+    /// Samples, so a caller can reject a clip as too short without parsing.
+    pub frames: usize,
+    /// Frames per second.
+    pub sample_rate: u32,
+}
+
+impl Wav16 {
+    /// Duration in milliseconds.
+    pub fn millis(&self) -> u64 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        (self.frames as u64 * 1000) / self.sample_rate as u64
+    }
+}
+
 /// Writes a mono WAV to `w`.
 pub fn write_wav(w: &mut dyn Write, samples: &[f32], sample_rate: u32) -> std::io::Result<()> {
     w.write_all(&wav_bytes(samples, sample_rate))

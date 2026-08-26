@@ -53,10 +53,14 @@ the evidence.
 
 ## Status
 
-**The synthesiser is complete**: text in, waveform out, on CPU and on CUDA,
-matching the PyTorch reference stage by stage. The ASR, the VAD, the translator
-loader and the serving layer are not built yet; their flags are, and each fails
-naming the phase that builds it.
+**The synthesiser and the serving layer are complete.** Text in, waveform out,
+on CPU and on CUDA, matching the PyTorch reference stage by stage; and one
+binary that can be the gateway, a single-stage worker, or the whole assistant.
+A running engine holds a full voice turn today — speech in, Taigi reply, speech
+out — with the ASR and the chat model delegated over HTTP.
+
+The ASR, the VAD and the translator loader are not built yet. Their flags are,
+and each fails naming the phase that builds it.
 
 | crate | state |
 | --- | --- |
@@ -67,6 +71,7 @@ naming the phase that builds it.
 | `xabe-cuda` | 22 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-audio` | WAV reading and writing, sample handling |
+| `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:
@@ -104,9 +109,20 @@ xabe-engine --tts-model models/tts/mms-tts-nan --tts-device 0 \
             --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
 ```
 
-Every model lives under `models/`, which is gitignored: one tree to populate,
-nothing tracked. `docs/CLI.md` has the whole flag surface, including the
-topologies that split stages across processes.
+Or as the whole assistant, with a web page at the address given:
+
+```sh
+xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
+            --tts-model models/tts/mms-tts-nan --tts-device 1 \
+            --asr-url http://127.0.0.1:8080 \
+            --llm-url http://127.0.0.1:8082
+```
+
+Each stage is satisfied either locally or by another process, and nothing
+downstream can tell which — so the same binary is a monolith, a worker, or
+anything between. Every model lives under `models/`, which is gitignored: one
+tree to populate, nothing tracked. `docs/CLI.md` has the whole flag surface and
+the endpoints `--serve` publishes.
 
 Input must be NFC-normalised POJ. Anything outside the 48 symbols is deleted
 silently - that is the reference's behaviour, and `docs/MODEL.md` explains why

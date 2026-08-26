@@ -9,6 +9,7 @@ members = [
     "crates/xabe-tts",
     "crates/xabe-audio",
     "crates/xabe-engine",
+    "crates/xabe-serve",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ xabe-golden = { path = "crates/xabe-golden" }
 xabe-cuda = { path = "crates/xabe-cuda" }
 xabe-tts = { path = "crates/xabe-tts" }
 xabe-audio = { path = "crates/xabe-audio" }
+xabe-serve = { path = "crates/xabe-serve" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
@@ -37,6 +39,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+regex = "1"
+
+# The serving surface. Taken as a set from `llmxabe/crates/xabe-server`, which
+# already runs this stack against the same card, rather than re-argued here.
+# `tokio`'s features are hand-picked rather than `full`: the engine drives GPU
+# work on its own threads and needs the executor for sockets, not for compute.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "multipart", "query"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+async-stream = "0.3"
+base64 = "0.22"
+# HTTP client for `--<stage>-url`. `llmxabe` has no client at all, so this is
+# the one dependency in the set with no precedent there. Default features are
+# off deliberately: every URL the engine dials is another process on this host,
+# reached over plain HTTP, so a TLS stack would be weight with no user.
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream"] }
 # `fallback-dynamic-loading` is what keeps CUDA out of the build: the workspace
 # compiles and its non-GPU tests run on a machine with no toolkit and no card.
 # GPU-ness is a runtime skip, not a compile-time cfg.

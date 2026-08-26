@@ -11,6 +11,8 @@
 use crate::args::Args;
 use crate::error::EngineError;
 use crate::stage::Device;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use xabe_audio::write_wav;
@@ -129,4 +131,110 @@ fn write_out(path: &Path, audio: &[f32], rate: u32) -> Result<(), EngineError> {
     let mut f = std::fs::File::create(path).map_err(io)?;
     write_wav(&mut f, audio, rate).map_err(io)?;
     f.flush().map_err(io)
+}
+
+/// Synthesises through another process and writes the result.
+///
+/// The remote returns one self-contained WAV per clause, so they are decoded
+/// and rewritten as a single file rather than concatenated: a WAV is a header
+/// plus samples, and appending whole files produces something no player will
+/// read past the first chunk.
+pub fn speak_remote(url: &str, text: &str, out: &Path) -> Result<(), EngineError> {
+    let text = read_text(text)?;
+    let runtime = runtime()?;
+    let chunks = runtime.block_on(async move {
+        let up = xabe_serve::Upstream::new(url)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let up = up.clone();
+            let text = text.clone();
+            async move { up.stream_tts(&text, tx).await }
+        });
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.push(chunk);
+        }
+        match stream.await {
+            Ok(Ok(())) => Ok(got),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(xabe_serve::ServeError::Upstream {
+                stage: "tts",
+                message: e.to_string(),
+            }),
+        }
+    })?;
+
+    let mut samples = Vec::new();
+    let mut rate = 16_000;
+    for chunk in &chunks {
+        let bytes = B64
+            .decode(&chunk.wav)
+            .map_err(|e| xabe_serve::ServeError::BadPcm(e.to_string()))?;
+        let wav = xabe_audio::parse_wav(&bytes)?;
+        rate = wav.sample_rate;
+        samples.extend_from_slice(&wav.samples);
+    }
+    tracing::info!(
+        seconds = format!("{:.2}", samples.len() as f32 / rate as f32),
+        chunks = chunks.len(),
+        "synthesised remotely",
+    );
+    write_out(out, &samples, rate)?;
+    tracing::info!(out = %out.display(), "wrote");
+    Ok(())
+}
+
+/// Transcribes a file through another process and prints the transcript.
+pub fn transcribe_remote(args: &Args, url: &str, input: &Path) -> Result<(), EngineError> {
+    let wav = if input.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|source| EngineError::Io {
+                what: "reading",
+                path: "stdin".into(),
+                source,
+            })?;
+        buf
+    } else {
+        std::fs::read(input).map_err(|source| EngineError::Io {
+            what: "reading",
+            path: input.display().to_string(),
+            source,
+        })?
+    };
+    // Parsed before sending so a file that is not audio fails here, naming the
+    // problem, rather than as an opaque error from the other process.
+    let parsed = xabe_audio::parse_wav(&wav)?;
+    tracing::debug!(
+        seconds = format!("{:.2}", parsed.seconds()),
+        rate = parsed.sample_rate,
+        "read audio",
+    );
+
+    let lang = args.asr_lang.clone();
+    let url = url.to_string();
+    let text = runtime()?.block_on(async move {
+        xabe_serve::Upstream::new(&url)?
+            .transcribe(wav, &lang)
+            .await
+    })?;
+    // The transcript is the tool's output, so it goes to stdout at INFO - the
+    // level that appears by default - not to a log the caller has to enable.
+    tracing::info!("{text}");
+    Ok(())
+}
+
+/// A runtime for the one-shot paths, which are otherwise synchronous.
+fn runtime() -> Result<tokio::runtime::Runtime, EngineError> {
+    // Current-thread: a one-shot run makes one request and has nothing to
+    // overlap it with, so a thread pool would be startup cost for no work.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| EngineError::Io {
+            what: "starting the runtime",
+            path: "one-shot".into(),
+            source,
+        })
 }

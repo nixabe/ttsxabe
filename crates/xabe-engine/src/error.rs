@@ -27,13 +27,17 @@ pub enum EngineError {
         phase: &'static str,
     },
 
-    /// Delegating a stage over HTTP is not built yet.
-    #[error("--{0}-url is not implemented yet (plan phase 2)")]
-    NoHttpClient(Kind),
+    /// The serving layer failed.
+    #[error(transparent)]
+    Serve(#[from] xabe_serve::ServeError),
 
-    /// Serving is not built yet.
-    #[error("--serve is not implemented yet (plan phase 2)")]
-    NoServer,
+    /// A `--tts-engine` argument was not `name=url`.
+    #[error("--tts-engine wants NAME=URL, got `{0}`")]
+    BadEngine(String),
+
+    /// An audio file could not be read.
+    #[error(transparent)]
+    Audio(#[from] xabe_audio::AudioError),
 
     /// The TTS could not load or could not speak.
     #[error("text-to-speech: {0}")]

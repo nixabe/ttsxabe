@@ -17,4 +17,4 @@ mod error;
 mod wav;
 
 pub use error::AudioError;
-pub use wav::{Wav, parse_wav, read_wav, wav_bytes, write_wav};
+pub use wav::{Wav, Wav16, parse_wav, read_wav, wav_bytes, wav_from_pcm16, write_wav};
