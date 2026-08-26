@@ -179,3 +179,68 @@ a hand-rolled header. `tools/vad/ggml_to_safetensors.py` converts it once, so
 for one 15-tensor model. The ggml header's geometry is written into
 `__metadata__`, which is what lets the weight schema check the shapes it binds
 against what the original file declared.
+
+# The ASR oracle
+
+The reference is 🤗 `WhisperForConditionalGeneration` on CPU in float32 with
+one thread, **not** whisper.cpp — the opposite choice from the VAD, and for a
+reason that reverses cleanly. The VAD exists to reproduce a *decision* the rest
+of the pipeline was tuned against, so whisper.cpp's own divergence from upstream
+Silero is the thing to match. The ASR exists to produce *text*, and here
+whisper.cpp is the one that diverges: its tokenizer is a greedy longest-match
+over a `std::regex` in which `[[:alpha:]]` is not `\p{L}`, so it already
+disagrees with the reference on Han input, which is all this engine ever
+transcribes. `whisper-server`'s transcripts stay a cross-check.
+
+## Capturing
+
+```sh
+python tools/oracle/capture_asr.py --model models/asr/breeze-asr-26 \
+    --wav .golden/vad/clips/speech.wav --out .golden/asr/speech
+python tools/oracle/capture_tokenizer.py --model models/asr/breeze-asr-26 \
+    --out .golden/asr/tokenizer.json
+```
+
+The first writes the mel filter bank, the input features, the samples, the
+first four encoder and decoder block outputs, both final normalisations, the
+logits and a greedy transcript, all as raw little-endian f32 with a
+`manifest.json`. The per-layer taps are the point: "the encoder is wrong" is
+not a fact anyone can act on, and "layer 7 is wrong" is.
+
+`torch.set_num_threads(1)`, because f32 reduction order is not thread-invariant
+and the last bits of every tensor move without it.
+
+## The corpus reuses the VAD's clips
+
+Deliberately. `silence` transcribes as `我…` — the hallucination the VAD exists
+to prevent — so the same clip is evidence in two places at once: that the VAD
+gates it, and that the ASR reproduces the reference's mistake exactly rather
+than a different one.
+
+## What the reference gets wrong
+
+Two things are asserted directly rather than captured, because capturing them
+would enshrine a defect. Both are recorded here so that a future capture does
+not quietly reintroduce them.
+
+**`decode_with_timestamps` is broken in transformers 5.15.1.** It computes
+`timestamp_begin = self.all_special_ids[-1] + 1`, and `all_special_ids` on this
+checkpoint holds exactly one entry — `<|endoftext|>`, 50257 — so it renders
+`<|startoftranscript|>` as `<|0.00|>` and every control token after it as a
+timestamp. The engine uses the real boundary, the id of `<|0.00|>`.
+
+**`<|nospeech|>` is not in this checkpoint.** 50362 is spelled
+`<|nocaptions|>`, OpenAI's original name. Asking the reference for
+`<|nospeech|>` does not fail: it returns the *unknown* id, 50257, which is also
+end-of-text. A caller that trusts the answer stops the decode on the wrong
+token, and it looks like a model that gives up early.
+
+## The filter bank is computed, not captured
+
+`WhisperFeatureExtractor`'s mel bank is the one thing here that could have been
+stored beside the model and is not. It is a closed form in four numbers, and
+this engine's version matches the capture *bit for bit* — both sides evaluate
+it in f64 and round once, with no reduction anywhere for an ordering to
+disagree about. The capture is kept as the test. Shipping it as an asset would
+have added a file that can go missing, go stale, or silently be the `htk`
+variant instead of `slaney`.

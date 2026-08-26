@@ -29,10 +29,11 @@ configuration of the same flags, not a different program.
       │
       ├── xabe-serve    HTTP, WebSocket, the page, turn-taking policy
       ├── xabe-vad      Silero geometry, weights and forward pass
-      ├── xabe-whisper  Whisper geometry, weight schema, BPE          [phase 4]
+      ├── xabe-asr      the Whisper forward pass, CUDA only
+      ├── xabe-whisper  Whisper geometry, weight schema, BPE, mel
       ├── xabe-llama    Llama geometry, weight schema, SentencePiece  [phase 5a]
       ├── xabe-tts      the VITS forward pass and synthesis API
-      ├── xabe-audio    WAV, mel, resampling, PCM framing
+      ├── xabe-audio    WAV, mel spectrogram, PCM framing
       ├── xabe-vits     config, weight schema, shape validation
       ├── xabe-dsp      scalar reference kernels
       ├── xabe-cuda     CUDA kernels, tested against xabe-dsp
@@ -40,11 +41,31 @@ configuration of the same flags, not a different program.
       └── xabe-st       safetensors container, mmap, addressing
 ```
 
-The bracketed crates do not exist yet. Their flags do: `--asr-model` parses,
-validates and then fails with the phase it is waiting on, because a flag
-surface that is designed and tested before the stages behind it are built is
-what lets the topology be settled first. A flag that parses and silently does
-nothing would be worse than one that says which milestone it needs.
+The bracketed crate does not exist yet. Its flags do:
+`--translator-model` parses, validates and then fails with the phase it is
+waiting on, because a flag surface designed and tested before the stages behind
+it are built is what lets the topology be settled first. A flag that parses and
+silently does nothing would be worse than one that says which milestone it
+needs.
+
+The ASR is split the way the TTS is: `xabe-whisper` says what the tensors are
+and refuses to do arithmetic, `xabe-asr` runs them. The difference is that
+`xabe-asr` has no CPU twin - see below.
+
+## Why the ASR has no CPU path
+
+Every other model in this engine runs both ways: a scalar version in
+`xabe-dsp` that is written to be read against the reference, and a CUDA version
+checked against it. The ASR does not, and the reason is arithmetic rather than
+taste. One 30-second window is about 2.2 TFLOP through Whisper's encoder alone,
+and the scalar kernels run at something under 2 GFLOP/s - twenty minutes an
+utterance. That is not a slow option; it is a fictional one, and shipping it
+would be shipping something nobody can use.
+
+So `--asr-device cpu` is refused at preflight by name, the mirror of the rule
+that refuses `--vad-device 0`. The kernels the ASR is built from still have
+their scalar twins and their differential tests; it is only the assembly of
+them that is checked against the captured oracle directly instead.
 
 ## How a model reaches the serving layer
 
@@ -101,6 +122,8 @@ crates above it.
 | `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
 | `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
+| `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | doing model arithmetic |
+| `xabe-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 

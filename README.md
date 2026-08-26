@@ -12,7 +12,8 @@ decided by flags, and each stage is satisfied either locally
 (`--<stage>-model`) or by another process over HTTP (`--<stage>-url`) — so the
 same binary is a monolith, a single-stage worker, or anything between.
 
-Finished: the synthesiser. In progress: the rest. `docs/MILESTONES.md` has the
+Finished: the synthesiser, the serving layer, voice activity detection and
+speech recognition. In progress: the translator. `docs/MILESTONES.md` has the
 phases and `docs/CLI.md` the flag surface.
 
 ## Why this exists
@@ -63,8 +64,19 @@ out — with the ASR and the chat model delegated over HTTP.
 whisper.cpp on every segment of an eight-clip corpus, and refusing all four of
 the noise cases that used to make the ASR invent sentences.
 
-The ASR and the translator loader are not built yet. Their flags are, and each
-fails naming the phase that builds it.
+**Speech recognition is complete and correct, and slower than what it
+replaces.** Whisper large-v2 from scratch — 1,259 tensors, a general-radix mel
+frontend, a byte-level BPE, a tensor-core matmul, encoder and decoder matching
+a captured oracle layer by layer, and greedy decoding reproducing 🤗
+`WhisperForConditionalGeneration`'s transcripts token for token. Measured
+against `whisper-server` on the same card with the same model and no VAD on
+either side, it is **0.55x** — 264 ms against 144 on a 2.7-second clip, with
+identical transcripts. That was a stated milestone and it is not met;
+`docs/BENCHMARKS.md` computes what closing the gap would take rather than
+restating the target.
+
+The translator loader is not built yet. Its flags are, and they fail naming the
+phase that builds them.
 
 | crate | state |
 | --- | --- |
@@ -72,11 +84,13 @@ fails naming the phase that builds it.
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 22 CUDA kernels, each diffed against its scalar twin |
+| `xabe-cuda` | 31 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-audio` | WAV reading and writing, sample handling |
 | `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
 | `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
+| `xabe-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
+| `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:

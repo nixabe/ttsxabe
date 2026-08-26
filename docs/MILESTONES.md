@@ -86,19 +86,46 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 | --- | --- | --- |
 | 9 | `xabe-st` reads sharded checkpoints via `model.safetensors.index.json` | ✅ |
 | 10 | A real tiled GEMM in `xabe-cuda` | ✅ |
-| 11 | The mel frontend matches `WhisperFeatureExtractor` | |
-| 12 | Whisper geometry and weight schema, 1259 tensors, shape-checked at bind | |
-| 13 | Byte-level BPE matches the reference tokenizer exactly | |
-| 14 | The encoder matches a captured oracle, per layer | |
-| 15 | The decoder, with KV cache and cross-attention, matches per layer | |
-| 16 | Greedy decoding reproduces transcripts on held-out Taigi audio | |
-| 17 | CUDA ASR is faster than whisper-server, measured and interleaved | |
+| 11 | The mel frontend matches `WhisperFeatureExtractor` | ✅ |
+| 12 | Whisper geometry and weight schema, 1259 tensors, shape-checked at bind | ✅ |
+| 13 | Byte-level BPE matches the reference tokenizer exactly | ✅ |
+| 14 | The encoder matches a captured oracle, per layer | ✅ |
+| 15 | The decoder, with KV cache and cross-attention, matches per layer | ✅ |
+| 16 | Greedy decoding reproduces transcripts on held-out Taigi audio | ✅ |
+| 17 | CUDA ASR is faster than whisper-server, measured and interleaved | ❌ |
+
+**Item 17 is not met.** Measured, alternated in pairs against a
+`whisper-server` started without `--vad` so both do the same job: 264 ms
+against 144 on a 2.67 s clip, 296 against 177 on a 3.9 s one - 0.55x to 0.60x.
+Both produce identical transcripts. `docs/BENCHMARKS.md` computes what closing
+the gap would take: flash attention for the 34 ms the encoder spends moving an
+attention score matrix it never needed to materialise, and an `ldmatrix`
+double-buffered matmul for the 79 ms of projections currently running at 24% of
+this card's peak. Together those put the encoder near 100 ms and the whole
+transcription near 190 - still short of 144, and what the third lever would be
+has not been established. Recorded as a miss rather than restated as a
+different target.
+
+The filter bank is computed rather than shipped, and matches the capture *bit
+for bit*: both sides evaluate the same closed form in f64 and round once, with
+no reduction for an ordering to disagree about. That removes a runtime asset
+that could go missing, go stale, or silently be the htk variant.
+
+Three findings from item 13, none of which a shape check or a round trip would
+have caught: `<|endoftext|>` is special but lives in `vocab.json` rather than
+`added_tokens.json`; 50362 is spelled `<|nocaptions|>` here, and asking the
+reference for `<|nospeech|>` returns the *unknown* id, which is also
+end-of-text; and `decode_with_timestamps` is broken in transformers 5.15.1, so
+it is asserted directly rather than captured.
 
 ### Phase 5a — the translator loader, built regardless
 
 | # | State | Done |
 | --- | --- | --- |
 | 18 | `xabe-st` reads F16 and BF16, converting BF16 → F16 with a tested range check | |
+
+Item 18 is partly done already: phase 3 needed F16 because the Silero
+checkpoint turned out to be one. What remains is BF16 and the range check.
 | 19 | All 363 tensors of the 13 B bind and shape-check, with a parameter-count test | |
 | 20 | SentencePiece matches the reference tokenizer on a captured corpus | |
 

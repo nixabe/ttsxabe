@@ -231,3 +231,110 @@ segment on every clip matches.
 | `min_silence_at_max_speech` | 98 ms | where a segment *could* be split if it overruns — a different question from whether it has ended |
 | merge gap | 200 ms | whisper.cpp's; without it one sentence arrives as several ASR requests |
 | second min-duration sweep | — | whisper.cpp's; the first sweep can pass a short segment the merge then fails to absorb |
+
+# Whisper, `Breeze-ASR-26`
+
+A large-v2 fine-tune for Taiwanese Mandarin and Taigi. 1,259 tensors,
+1,543,304,960 parameters, F32 throughout — which is why it came before the
+translator: no dtype work is on its critical path.
+
+## Geometry
+
+| | |
+| --- | --- |
+| `d_model` | 1280 |
+| encoder / decoder layers | 32 / 32 |
+| attention heads | 20, head dim 64 |
+| feed-forward dim | 5120 |
+| mel bins | 80 |
+| encoder positions | 1500, from 3000 mel frames at stride 2 |
+| decoder positions | 448, learned, no extrapolation |
+| vocabulary | 51,865 |
+
+The encoder's window is fixed at 30 seconds. A 2.7-second clip and a
+29-second one cost exactly the same encoder pass, which is the single most
+important thing to know about the ASR's timing.
+
+## The frontend
+
+400-point transform, hop 160, periodic Hann, centred with a reflective pad of
+200, 80 slaney-normalised mel filters up to 8 kHz, then `log10`, a floor at
+`max - 8`, and `(x + 4) / 4`.
+
+**The normalisation is global, and it is load-bearing.** The floor is taken
+over the *entire* 30-second window, so the value at second one depends on the
+loudest frame anywhere in the file — including in the silence that was padded
+on. That is why the frontend takes a whole window rather than a stream: any
+chunked design has to answer this, and there is no good answer.
+
+The filter bank is computed rather than shipped. `slaney`, not `htk`: they
+disagree by a few percent across the whole band, which moves every filter edge
+and produces a spectrogram that looks entirely reasonable and transcribes
+badly.
+
+The window is *periodic* Hann — `torch.hann_window` divides by `n`, and the
+symmetric variant every textbook writes divides by `n - 1`. One sample of
+taper, audible in the top bins.
+
+## The attention scale goes on the query
+
+Whisper multiplies the query by `head_dim ** -0.5` immediately after `q_proj`
+and uses a softmax scale of 1. Algebraically that is the same as scaling the
+scores, and it is not the same rounding. The reference says so itself, in a
+comment: *"Scaling is susceptible to floating point arithmetics' imprecisions
+which can lead to different results (this is dependent from model to model,
+e.g. whisper is one such case)."*
+
+whisper.cpp does something different again — the encoder leaves Q and K
+unscaled and puts `1/sqrt(64)` inside the softmax, while the decoder multiplies
+*both* by `64 ** -0.25`. Three spellings of one identity. Copy whichever
+belongs to the reference you are matching.
+
+## Cross-attention reads the encoder output raw
+
+`encoder_attn_layer_norm` belongs to the decoder's own residual stream and
+normalises the queries only. Normalising the keys and values with it as well is
+an easy symmetry to assume, and is not what the reference does.
+
+## 1,607 special tokens, and one that is not among them
+
+`vocab.json` holds 50,258 entries against a vocabulary of 51,865. This
+checkpoint ships `added_tokens.json`, so the 1,607 are read rather than derived
+— whisper.cpp derives them, because its container has nowhere to put them, with
+`num_languages = n_vocab - 51765 - 1`. Get that expression wrong and every
+language and timestamp id is off by one: a transcript in the wrong language,
+with nothing to indicate why. The arithmetic is checked once, in the tests,
+against the file rather than against itself.
+
+`<|endoftext|>` is *not* in `added_tokens.json`. It predates the multilingual
+tokens and lives in `vocab.json`, declared special only by
+`special_tokens_map.json`. A loader that reads only the former gets 1,607 of
+1,608 specials right and leaves the one the decoder stops on looking like
+ordinary text.
+
+## Decoding: what is deliberately absent
+
+The live pipeline runs `-nt`, greedy, at a fixed `language=zh`, on VAD-gated
+utterances of a few seconds. That makes a large part of the reference dead
+weight here. Each omission is a decision, listed so that re-adding one is also
+a decision:
+
+| absent | why |
+| --- | --- |
+| beam search, `best_of` | greedy at a fixed language; nothing samples |
+| the temperature ladder and its retries | the fallbacks exist for long-form transcription |
+| `no_speech_prob` gating | the VAD in front of the ASR is the gate, and a better one |
+| DTW and token timestamps | `-nt`; every downstream stage takes plain text |
+| the grammar engine | no grammar in this pipeline |
+| `whisper_full_parallel` | one utterance at a time by design |
+| chunking of long audio | the VAD gates to a single window |
+
+`suppress_tokens` and `begin_suppress_tokens` are *not* absent. Skipping them
+does not fail loudly — it produces a transcript that begins with a space, or an
+empty one, on some utterances and not others.
+
+## There is no CPU implementation
+
+2.2 TFLOP for one encoder pass against scalar kernels that run at something
+under 2 GFLOP/s. `--asr-device cpu` is refused at preflight rather than
+accepted and then taking twenty minutes. See `docs/ARCHITECTURE.md`.

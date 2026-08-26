@@ -32,10 +32,31 @@ Deliberately few. Current set, all workspace-pinned:
 | `thiserror` | error enums; there is no `anyhow` in this workspace |
 | `tracing`, `tracing-subscriber` | all output; `println!` is forbidden outside tests |
 | `clap` | CLI, derive + `env` |
-| `half`, `rustc-hash` | reserved for the kernel work |
+| `half` | rounding weights to f16 once, at load — see `docs/KERNELS.md` |
+| `rustc-hash` | the tokenizer's vocabulary and merge tables |
+| `sha2` | verifying a capture's checksums on read |
+| `regex` | GPT-2's pre-tokenization pattern, and the hallucination phrase list |
+| `axum`, `tokio`, `async-stream`, `base64` | the serving surface |
+| `reqwest` | the client half of `--<stage>-url` |
+
+The serving set is taken as a whole from `llmxabe/crates/xabe-server`, which
+already runs it against this card, rather than being re-argued here. `tokio`'s
+features are hand-picked rather than `full`: the engine drives GPU work on its
+own OS threads and needs the executor for sockets, not for compute. `reqwest`
+has default features *off* — every URL the engine dials is another process on
+this host over plain HTTP, so a TLS stack would be weight with no user.
+
+`regex` is used for one thing that genuinely needs it: `\p{L}` and `\p{N}` as
+the reference defines them. Rust's `char::is_alphabetic` is the Alphabetic
+property, which is not `\p{L}` — it also admits `Nl` and `Other_Alphabetic`,
+and the difference falls exactly on the combining marks POJ uses. Guessing
+there would have been a tokenizer that is subtly wrong on Taigi and right on
+everything used to test it.
 
 No ML framework. No `candle`, `tch`, `ort`, `ndarray`, or bindings to
 whisper.cpp or llama.cpp. If one appears, it needs an argument in a commit body.
+No `sentencepiece` or `tokenizers` crate either: both tokenizers are written by
+hand and tested against captured outputs.
 
 ## Build profiles
 

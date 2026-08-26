@@ -48,7 +48,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--serve` | `XABE_SERVE` | — | listen address; without it the run is one-shot |
 | `--asr-model` | `XABE_ASR_MODEL` | — | speech-to-text checkpoint directory |
 | `--asr-url` | `XABE_ASR_URL` | — | delegate speech-to-text |
-| `--asr-device` | `XABE_ASR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--asr-device` | `XABE_ASR_DEVICE` | `0` | a CUDA device ordinal; **not** `cpu` |
 | `--vad-model` | `XABE_VAD_MODEL` | — | voice-activity checkpoint |
 | `--vad-url` | `XABE_VAD_URL` | — | delegate voice-activity detection |
 | `--vad-device` | `XABE_VAD_DEVICE` | `cpu` | `cpu` only; see below |
@@ -113,6 +113,8 @@ does, refuse the stages that are not built yet, then work.
 | `--asr-device` with `--asr-url` | a device applies only to a local stage |
 | `--asr-device` with no ASR stage at all | the same typo, one flag earlier |
 | `--vad-*` with `--serve` and no ASR | served, a VAD is only ever a gate |
+| `--vad-device 0` | the VAD has no CUDA implementation |
+| `--asr-device cpu` | the ASR has no CPU implementation |
 | no stage at all | names the four flag pairs that would give one |
 | stages but no `--serve`, `--in` or `--text` | a serve command with `--serve` forgotten |
 | `--in` and `--text` together | alternatives; give one |
@@ -126,11 +128,20 @@ prints segments, and only when served is it a gate that needs something to gate.
 
 ### Stages that are not built yet
 
-The flag surface is complete ahead of the stages behind it. `--asr-model` parses
-and validates, then fails with the phase that builds it. That ordering is
-deliberate: the topology is the part worth settling first, and a flag that
+The flag surface is complete ahead of the stages behind it. `--translator-model`
+parses and validates, then fails with the phase that builds it. That ordering
+is deliberate: the topology is the part worth settling first, and a flag that
 parses and then silently does nothing is worse than one that says what it is
 waiting on.
+
+Two stages refuse a device rather than accepting it and doing something else.
+The VAD has no CUDA implementation and is not going to: 15 tensors and a
+millisecond of work, where the transfer would cost more than the arithmetic.
+The ASR has no CPU implementation for the mirror-image reason: one 30-second
+window is 2.2 TFLOP through the encoder, which the scalar kernels would take
+twenty minutes to do. Both would otherwise be a flag that is accepted and then
+quietly means something else - which is exactly how the startup log once came
+to announce `device=cuda:0` for a stage running on the CPU.
 
 | stage | status |
 | --- | --- |
@@ -139,7 +150,7 @@ waiting on.
 | `--asr-url`, `--tts-url`, `--translator-url`, `--llm-url` | work |
 | `--vad-model` | works, CPU only |
 | `--vad-url` | never: the VAD is a millisecond of CPU, so a round trip would cost more than the work |
-| `--asr-model` | phase 4 |
+| `--asr-model` | works, CUDA only |
 | `--translator-model` | phase 5a |
 
 ## What `--serve` publishes

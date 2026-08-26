@@ -25,6 +25,14 @@ exists.
 | strided conv1d | VAD stft + encoder | `xabe_dsp::conv1d_strided` | (cpu only) | `xabe-vad` reference |
 | magnitude from re/im halves | VAD stft | `xabe-vad` stft | (cpu only) | `xabe-vad` reference |
 | LSTM cell, gates i f g o | VAD decoder | `xabe-vad` lstm | (cpu only) | `xabe-vad` reference |
+| discrete Fourier transform, any length | mel frontend | `xabe_dsp::Fft` | (cpu only) | `xabe-dsp` fft |
+| mel filter bank and spectrogram | ASR frontend | `xabe_audio::mel_power` | (cpu only) | `xabe-whisper` frontend |
+| tiled matmul, f16 operands | ASR everywhere | `xabe_dsp::linear` | `gemm` | `xabe-cuda` kernels |
+| matmul for a handful of rows | ASR decode | `xabe_dsp::linear` | `gemv` | `xabe-cuda` kernels |
+| convolution as a matrix | ASR encoder stem | `xabe_dsp::conv1d_strided` | `im2col` + `gemm` | `xabe-cuda` kernels |
+| head split, merge and transpose | ASR attention | (index formula, in the test) | `split_heads`, `split_heads_t`, `merge_heads` | `xabe-cuda` kernels |
+| causal mask | ASR decoder self-attention | (index formula, in the test) | `causal_mask` | `xabe-cuda` kernels |
+| round to f16 | ASR weights and KV cache | `half::f16::from_f32` | `pack_f16` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -41,6 +49,18 @@ rearranging it: Rust has no `erf`, so `xabe-dsp` carries Cody's rational
 approximation. PyTorch's default GELU is the exact erf form, and the tanh
 approximation - the obvious substitute - differs by up to 4.7e-4 near
 `|x| = 2.7`, an order of magnitude above the tolerances here.
+
+The last five have no `xabe-dsp` twin, and deliberately not. Three are pure
+index permutations and one is a comparison, so their reference *is* the index
+formula: written beside the assertion it can be read against the kernel, where
+exported as a library function nothing calls it would be the same formula
+further away. `pack_f16` has a host twin instead - `half::f16::from_f32` - and
+the test asserts the two produce identical bits rather than close values.
+
+The DFT is general-radix rather than radix-2, which is not gold-plating:
+Whisper wants `n_fft = 400`, and 400 is `2^4 * 5^2`. The recursive mixed-radix
+form is barely longer, takes any length, and degrades to a correct O(n^2) sum
+on a prime rather than refusing.
 
 ## Notes that will bite
 
@@ -96,6 +116,43 @@ to reason about is not a reference.
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
 not have the same precision, which is why the constant is public: a test that
 compares against a reference has to know which side of it a shape falls on.
+
+### Either operand may already be f16
+
+`Operand::F16` hands the kernel a tensor that is already rounded. On the tiled
+path this changes *nothing* about the arithmetic and the tests assert exactly
+that - bit-identical results, not close ones. `gemm_pack` rounds an F32 operand
+to f16 round-to-nearest-even on the way into shared memory on every trip, and
+two halves stored contiguously little-endian are the same 32 bits, so an f16
+operand is staged with a plain word load and no conversion at all.
+
+What it changes is traffic and residency: Whisper's weights are 3 GB rather
+than 6.12, and the ASR's decode loop went from 86 ms to 57 on the strength of
+it. Storing them as F32 was buying nothing.
+
+On the *scalar* path it is a real precision decision - `gemv` accumulates an
+F32 operand exactly, and rounding one costs about 3.5e-4 relative over a
+64-long contraction, measured. That is why `Operand` is a type the caller
+chooses rather than something the upload decides.
+
+### Any contraction length, and why that took three tries
+
+`k` is unrestricted for F32 operands. It was twice wrongly restricted:
+
+1. "A multiple of 8", on the theory that `m16n8k8` steps the contraction in
+   eights. Wrong about the kernel: the staging loop zero-extends a short trip
+   and the instruction accumulates the zeros.
+2. "Even", which was right about the `float2` staging load - it sits at offset
+   `row * k + kk` with `kk` even, so an odd `k` misaligns every row after the
+   first - but the fix was to stage an odd `k` scalar, not to refuse it.
+
+Both mattered. Attention contracts over 1500 encoder positions, which is even
+and is not a multiple of 8, and over the 1, 2, 3, ... tokens emitted so far,
+half of which are odd. An `Operand::F16` still needs an even `k`, because two
+halves genuinely share a word - and every contraction in a transformer is even.
+
+The general lesson: **a constraint inherited from an instruction is a claim
+about the kernel, and the kernel is where it has to be checked.**
 
 ### What the tensor-core path is worth
 
