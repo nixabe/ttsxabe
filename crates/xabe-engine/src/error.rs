@@ -14,17 +14,15 @@ pub enum EngineError {
     #[error(transparent)]
     Action(#[from] crate::action::ActionError),
 
-    /// A stage was configured that this build cannot run yet.
+    /// A stage was asked to run over HTTP that only ever runs in process.
     ///
-    /// This exists so the flag surface can be complete and validated before
-    /// the stages behind it are written. A flag that parses and then does
-    /// nothing is worse than one that says which milestone it is waiting on.
-    #[error("the {stage} stage is not implemented yet (plan phase {phase}); use --{stage}-url")]
-    NotImplemented {
+    /// Not a milestone waiting to be reached: the VAD is fifteen tensors and a
+    /// millisecond of CPU, so a round trip would cost more than the work it
+    /// delegates. Naming it as unbuilt would invite someone to wait for it.
+    #[error("--{stage}-url: the {stage} stage only runs in process; give --{stage}-model")]
+    LocalOnly {
         /// Which stage was asked for.
         stage: Kind,
-        /// The plan phase that builds it.
-        phase: &'static str,
     },
 
     /// The serving layer failed.

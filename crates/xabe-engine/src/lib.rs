@@ -60,10 +60,10 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     )?;
     announce(&stages);
 
-    // 3: the stages that are configured but not yet built. Reported before any
-    //    work starts, so a half-built configuration fails at once rather than
-    //    after the one stage that does exist has already run.
-    unbuilt(&stages)?;
+    // 3: a stage placed somewhere it cannot run. Reported before any work
+    //    starts, so an impossible topology fails at once rather than after the
+    //    stages that are possible have already run.
+    misplaced(&stages)?;
 
     // 4: the work.
     match action {
@@ -80,10 +80,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         },
         Action::Segment { input } => match &stages.vad {
             Stage::Local { path, .. } => tts::segment(path, &input),
-            Stage::Remote { .. } => Err(EngineError::NotImplemented {
-                stage: Kind::Vad,
-                phase: "3",
-            }),
+            Stage::Remote { .. } => Err(EngineError::LocalOnly { stage: Kind::Vad }),
             Stage::Off => unreachable!("Action::Segment needs a VAD stage"),
         },
     }
@@ -109,34 +106,20 @@ fn announce(stages: &Stages) {
     }
 }
 
-/// Refuses stages whose implementation is still ahead in the plan.
+/// Refuses a stage asked to run somewhere it cannot.
 ///
-/// The flag surface is complete before the stages behind it are, so that the
-/// topology can be designed and tested first. A flag that parses and then
-/// silently does nothing would be worse than one that says which phase it is
-/// waiting on.
-fn unbuilt(stages: &Stages) -> Result<(), EngineError> {
+/// Every stage is satisfied either locally or over HTTP, and the symmetry is
+/// the point of the flag surface - but the VAD is the one exception, and it is
+/// permanent rather than pending. Fifteen tensors and a millisecond of CPU do
+/// not survive a round trip, so `--vad-url` is refused by name instead of
+/// being accepted and then costing more than the work it delegates.
+fn misplaced(stages: &Stages) -> Result<(), EngineError> {
     for (kind, stage) in stages.summary() {
-        match stage {
-            // A delegated stage needs no implementation here beyond an HTTP
-            // client, and that exists - except for the VAD, whose wire protocol
-            // arrives with the model that defines it.
-            Stage::Remote { .. } => match kind {
-                Kind::Vad => {
-                    return Err(EngineError::NotImplemented {
-                        stage: kind,
-                        phase: "3",
-                    });
-                }
-                _ => continue,
-            },
-            Stage::Local { .. } => match kind {
-                Kind::Tts => {}
-                Kind::Vad => {}
-                Kind::Asr => {}
-                Kind::Translator => {}
-            },
-            Stage::Off => {}
+        match (kind, stage) {
+            (Kind::Vad, Stage::Remote { .. }) => {
+                return Err(EngineError::LocalOnly { stage: kind });
+            }
+            _ => continue,
         }
     }
     Ok(())

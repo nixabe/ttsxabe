@@ -118,9 +118,8 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         // Always local. The VAD is 15 tensors and a millisecond of CPU, so a
         // round trip would cost more than the work.
         Stage::Remote { .. } => {
-            return Err(EngineError::NotImplemented {
+            return Err(EngineError::LocalOnly {
                 stage: crate::stage::Kind::Vad,
-                phase: "3",
             });
         }
         Stage::Off => None,
