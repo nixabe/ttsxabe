@@ -31,21 +31,64 @@ tensor cores, no bf16 and no fp8, which rules out several otherwise obvious
 optimisations and is why `docs/OPTIMIZATION.md` exists.
 
 The model is `facebook/mms-tts-nan`: VITS, 36.3 M parameters in 762 F32
-tensors, 16 kHz output, Tâi-lô romanisation in (48-symbol vocabulary), waveform
-out. `docs/MODEL.md` has the geometry.
+tensors, 662 of them read at inference, 16 kHz output, waveform out. Its
+48-symbol vocabulary is **Pe̍h-ōe-jī, not Tâi-lô** - it has `c` and U+0358 and
+no `ts` - which is not what the model card says and is the single most
+consequential thing to get right about it. `docs/MODEL.md` has the geometry and
+the evidence.
 
 ## Status
 
-**Container reading works. Nothing synthesises yet.**
+**Complete.** Text in, waveform out, on CPU and on CUDA, matching the PyTorch
+reference stage by stage.
 
 | crate | state |
 | --- | --- |
-| `xabe-st` | safetensors container, validated addressing — 11 tests |
-| `xabe-vits` | config and weight schema — not started |
-| `xabe-dsp` | CPU reference kernels + differential harness — not started |
-| `xabe-tts` | forward pass, synthesis API, CLI — not started |
+| `xabe-st` | safetensors container, validated addressing |
+| `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
+| `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
+| `xabe-dsp` | scalar reference kernels |
+| `xabe-cuda` | 22 CUDA kernels, each diffed against its scalar twin |
+| `xabe-tts` | forward pass on both devices, synthesis API, CLI, benchmark |
 
-There is no performance claim to make yet, and `docs/BENCHMARKS.md` says so.
+Correctness, against tensors captured from 🤗 `VitsModel`:
+
+| stage | max absolute error |
+| --- | --- |
+| tokenizer | exact, 21/21 cases |
+| text encoder | 3.8e-6 |
+| duration predictor | 1.0e-5 |
+| flow, reversed | 1.9e-6 |
+| decoder | 1.7e-6 |
+| **end to end, CPU** | **8.3e-6** |
+| **end to end, CUDA** | **1.2e-5** |
+
+And, because numerical agreement does not prove a file is *speech*: synthesising
+`lí hó, kin-á-ji̍t thinn-khì chin hó.` and transcribing the result with
+Breeze-ASR-26 - a model with no part in producing it - returns
+你好 今天天氣很好, which is what the input means.
+
+Speed, one Quadro RTX 8000, medians of 20 runs alternated with the baseline:
+
+| | 2.6 s of audio | x realtime |
+| --- | --- | --- |
+| PyTorch, CUDA | 65.6 ms | 43.2 |
+| **`xabe-tts`, CUDA** | **48.4 ms** | **53.9** |
+| `xabe-tts`, CPU (scalar reference) | ~120 s | 0.02 |
+
+**1.24x faster than PyTorch** per second of audio. `docs/BENCHMARKS.md` has the
+stage breakdown, the computed FLOP ceiling, and the things that did not work.
+
+## Using it
+
+```sh
+xabe-tts --model model.safetensors --device 0 \
+         --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
+```
+
+Input must be NFC-normalised POJ. Anything outside the 48 symbols is deleted
+silently - that is the reference's behaviour, and `docs/MODEL.md` explains why
+it matters more than it sounds.
 
 ## Building
 
@@ -57,14 +100,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests that need the checkpoint find it in the HuggingFace cache, or take
-`XABE_TTS_MODEL=/path/to/model.safetensors`. Without it they print `SKIP:` and
-the reason — a skipped test is not a passing test.
+`XABE_TTS_MODEL=/path/to/model.safetensors`. Differential tests also need a
+capture — `python tools/oracle/capture.py --out .golden/base --seed 0 --text
+"..."`, see [docs/ORACLE.md](docs/ORACLE.md). Without either they print `SKIP:`
+and the reason.
+
+**A skipped test is not a passing test**, and this repository learned that the
+hard way: twelve CUDA kernel tests once reported green while every one of them
+had skipped, because the harness treated a kernel compile error as an absent
+GPU. They now skip only when there is genuinely no device and fail on anything
+else. Run with `--nocapture` if you want to see which skipped.
 
 ## Scope
 
-This synthesises Taigi from Tâi-lô romanisation. It does not do grapheme-to-
-phoneme conversion, does not translate, and does not know what Han characters
-are. Producing Tâi-lô from Mandarin is the job of the pipeline upstream.
+This synthesises Taigi from Pe̍h-ōe-jī romanisation. It does not do
+grapheme-to-phoneme conversion, does not translate, and does not know what Han
+characters are - text made only of them tokenises to nothing and is refused
+rather than returned as silence. Producing POJ from Mandarin is the job of the
+pipeline upstream.
 
 There is no KV cache and no request scheduler here; an utterance is a single
 forward pass with no state carried between calls. If batching arrives it will be
