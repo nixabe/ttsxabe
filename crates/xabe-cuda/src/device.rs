@@ -483,8 +483,10 @@ impl Gpu {
     /// enough not to care - the choice is per call site, which is why both
     /// exist rather than one replacing the other.
     ///
-    /// `k` must be even - see [`CudaError::RaggedContraction`] for why that,
-    /// and not the multiple of 8 the instruction might suggest.
+    /// Any `k` is accepted, including an odd one. That is worth saying because
+    /// it twice was not - first "a multiple of 8", which was wrong about the
+    /// instruction, then "even", which was right about the `float2` staging
+    /// and still refused the decoder's own arithmetic.
     pub fn gemm(
         &self,
         a: &CudaSlice<f32>,
@@ -517,9 +519,6 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        if !k.is_multiple_of(2) {
-            return Err(CudaError::RaggedContraction { k });
-        }
         let mut out = self.zeros(batch.count * m * n)?;
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
         let (sa, sw, so) = (batch.a as i64, batch.w as i64, batch.out as i64);

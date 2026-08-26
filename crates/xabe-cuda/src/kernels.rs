@@ -209,9 +209,17 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         // The pair of floats is read as one `float2` on the common path. Two
         // scalar loads is two memory transactions where one would do, and the
         // staging is on the critical path of every trip - the scalar fallback
-        // exists only for the ragged tail, where the second float is past the
-        // end of the contraction.
-        const bool whole = (kc + GEMM_KC <= k);
+        // exists for the ragged tail, where the second float is past the end of
+        // the contraction, and for an odd `k`.
+        //
+        // An odd `k` is not hypothetical: decoding attends over the tokens
+        // emitted so far, so the contraction is 1, 2, 3, ... and half of those
+        // are odd. `float2` wants an 8-byte alignment and the offset is
+        // `row * k + kk` with `kk` even, so an odd `k` misaligns every row
+        // after the first. Taking the scalar path for the whole trip costs
+        // nothing that can be measured - every contraction big enough to care
+        // about (1280, 5120, 1500, 240, 3840) is even.
+        const bool whole = (kc + GEMM_KC <= k) && ((k & 1) == 0);
         for (int i = tid; i < GEMM_MT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
             int row = i / (GEMM_KC / 2);
             int j   = i % (GEMM_KC / 2);

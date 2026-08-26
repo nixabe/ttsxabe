@@ -1,0 +1,19 @@
+[package]
+name = "xabe-asr"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+xabe-audio.workspace = true
+xabe-cuda.workspace = true
+xabe-dsp.workspace = true
+xabe-st.workspace = true
+xabe-whisper.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

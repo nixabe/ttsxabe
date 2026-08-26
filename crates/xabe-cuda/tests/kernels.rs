@@ -585,31 +585,18 @@ fn gemm_without_a_bias_adds_nothing() {
 }
 
 #[test]
-fn gemm_refuses_an_odd_contraction_and_accepts_every_even_one() {
+fn gemm_accepts_every_contraction_length() {
     let Some(g) = gpu() else { return };
-    // This test used to assert "not a multiple of 8", on the theory that
-    // m16n8k8 steps k in eights. That was wrong about the kernel: the staging
-    // loop zero-extends a short trip and the instruction accumulates the
-    // zeros. The real constraint is the `float2` staging load at offset
-    // `row * k + kk` with `kk` even, which an odd `k` misaligns from the
-    // second row on. It matters: attention contracts over 1500 encoder
-    // positions, which is even and is not a multiple of 8, and the old check
-    // would have refused the model's own arithmetic.
-    let err = g
-        .gemm(
-            &g.upload(&seq(4 * 7, 1)).expect("upload"),
-            &g.upload(&seq(8 * 7, 2)).expect("upload"),
-            None,
-            4,
-            7,
-            8,
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("odd"), "{err}");
-
-    // And the lengths that are even but not multiples of 8 must work, on both
-    // the tiled and the scalar path.
-    for k in [2usize, 6, 30, 1500] {
+    // This test twice asserted a refusal, and both were wrong about the
+    // kernel. "A multiple of 8" was wrong about the instruction: the staging
+    // loop zero-extends a short trip and `m16n8k8` accumulates the zeros.
+    // "Even" was right about the `float2` staging - the load is at offset
+    // `row * k + kk` with `kk` even, so an odd `k` misaligns every row after
+    // the first - but the fix was to stage an odd `k` scalar, not to refuse
+    // it. Both mattered: attention contracts over 1500 encoder positions,
+    // which is even and not a multiple of 8, and over the 1, 2, 3, ... tokens
+    // emitted so far, half of which are odd.
+    for k in [1usize, 2, 3, 6, 7, 30, 1500] {
         for m in [4usize, 100] {
             let n = 10;
             let (a, w) = (seq(m * k, 1), seq(n * k, 2));
