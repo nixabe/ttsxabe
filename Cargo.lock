@@ -212,8 +212,11 @@ dependencies = [
 name = "xabe-vits"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
+ "xabe-st",
 ]
 
 [[package]]

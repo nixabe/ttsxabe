@@ -5,7 +5,7 @@ Numbered by what becomes *true*, not by how much work it was.
 | # | State | Done |
 | --- | --- | --- |
 | 1 | The checkpoint can be opened, addressed and validated | ✅ |
-| 2 | Model geometry and weight schema are typed and shape-checked | |
+| 2 | Model geometry and weight schema are typed and shape-checked | ✅ |
 | 3 | The PyTorch oracle is captured and its format is read by tests | |
 | 4 | Text → symbol ids matches the reference tokenizer exactly | |
 | 5 | The text encoder matches the oracle within tolerance | |

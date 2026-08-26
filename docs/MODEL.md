@@ -83,3 +83,28 @@ upsamplers are *transposed* convolutions and store `[in, out, kernel]` —
 `decoder.upsampler.0.weight` is `[512, 256, 16]`, going 512 channels in to 256
 out. Reading that pair in the wrong order produces audio, which is precisely the
 failure mode `docs/TESTING.md` exists to catch.
+
+Bias, in a transposed convolution, is still per *output* channel — so the bias
+length does not match the weight's leading dimension the way it does everywhere
+else. That asymmetry is a separate loader path in `xabe-vits::weights`, not a
+flag on the ordinary one.
+
+Weight normalisation is applied inconsistently across the checkpoint, and this
+is the detail most likely to waste an afternoon. PyTorch's `weight_norm`
+reparameterises a kernel as `g · v / ‖v‖`, storing `weight_g` and `weight_v`
+instead of `weight`. In this checkpoint **only the flow's WaveNet layers are
+stored unfused**:
+
+| module | storage |
+| --- | --- |
+| `flow.flows.*.wavenet.*` | `weight_g` + `weight_v` |
+| `decoder.upsampler.*` | plain `weight` |
+| `decoder.resblocks.*` | plain `weight` |
+| `decoder.conv_pre`, `conv_post` | plain `weight` |
+| text encoder, duration predictor | plain `weight` |
+
+So the flow needs the norm computed at load time and the decoder does not.
+Assuming either rule holds everywhere fails loudly — `MissingTensor:
+decoder.upsampler.0.weight_v` in one direction, a silently wrong kernel in the
+other. `conv_post` additionally has **no bias**; the `Conv` type carries
+`Option<&[f32]>` for that one tensor alone.
