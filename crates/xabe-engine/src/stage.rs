@@ -47,14 +47,15 @@ impl Kind {
 
     /// Whether this stage has a CPU implementation at all.
     ///
-    /// The ASR does not. One 30-second window is about 2.2 TFLOP through the
-    /// encoder alone, and the scalar kernels run at something under 2 GFLOP/s -
-    /// twenty minutes an utterance, which is not a slow option but a fictional
-    /// one. The mirror of [`Kind::has_cuda`], and for the mirror-image reason:
+    /// Neither the ASR nor the translator does. One 30-second window is about
+    /// 2.2 TFLOP through Whisper's encoder alone, and the 13 B translator is
+    /// 26 GFLOP a token against scalar kernels that run at something under
+    /// 2 GFLOP/s. Neither is a slow option; both are fictional ones. The
+    /// mirror of [`Kind::has_cuda`], and for the mirror-image reason:
     /// accepting `--asr-device cpu` and then taking twenty minutes is worse
     /// than saying so at preflight.
     pub fn has_cpu(self) -> bool {
-        !matches!(self, Kind::Asr)
+        !matches!(self, Kind::Asr | Kind::Translator)
     }
 
     /// Where this stage runs when no device is named.

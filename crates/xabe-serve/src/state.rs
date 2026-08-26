@@ -126,6 +126,75 @@ impl AsrBackend {
     }
 }
 
+/// One request to translate, and where the answer should go.
+#[derive(Debug)]
+pub struct TranslateJob {
+    /// The source text.
+    pub text: String,
+    /// The target script: `POJ`, `HAN`, `HL`, `ZH` or `EN`.
+    pub target: String,
+    /// The translation, or a message describing why there is none.
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
+/// The sending half of a local translator's work queue.
+pub type LocalTranslator = mpsc::Sender<TranslateJob>;
+
+/// Where the translator lives.
+#[derive(Clone)]
+pub enum TranslatorBackend {
+    /// In this process, behind a work queue.
+    Local(LocalTranslator),
+    /// In another process.
+    Remote(Upstream),
+}
+
+impl std::fmt::Debug for TranslatorBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TranslatorBackend::Local(_) => f.write_str("local"),
+            TranslatorBackend::Remote(u) => write!(f, "remote({})", u.base()),
+        }
+    }
+}
+
+impl TranslatorBackend {
+    /// Translates one chunk, wherever the model happens to be.
+    ///
+    /// Both paths run the same prompt template and the same repetition
+    /// penalty; the only difference is which process owns the weights.
+    pub async fn translate(&self, text: &str, target: &str) -> Result<String, crate::ServeError> {
+        match self {
+            TranslatorBackend::Remote(u) => {
+                u.completion(crate::client::translate_body(text, target))
+                    .await
+            }
+            TranslatorBackend::Local(tx) => {
+                let (reply, done) = tokio::sync::oneshot::channel();
+                tx.send(TranslateJob {
+                    text: text.to_string(),
+                    target: target.to_string(),
+                    reply,
+                })
+                .await
+                .map_err(|_| crate::ServeError::Upstream {
+                    stage: "translator",
+                    message: "the local translator stopped".into(),
+                })?;
+                done.await
+                    .map_err(|_| crate::ServeError::Upstream {
+                        stage: "translator",
+                        message: "the local translator dropped the job".into(),
+                    })?
+                    .map_err(|message| crate::ServeError::Upstream {
+                        stage: "translator",
+                        message,
+                    })
+            }
+        }
+    }
+}
+
 /// Where a TTS engine lives.
 #[derive(Clone)]
 pub enum TtsBackend {
@@ -162,7 +231,7 @@ pub struct Inner {
     /// The chat model, which is always another process.
     pub llm: Option<Upstream>,
     /// Mandarin to Taigi, if configured.
-    pub translator: Option<Upstream>,
+    pub translator: Option<TranslatorBackend>,
     /// Which target the translator is asked for: `POJ`, `HAN` or `HL`.
     pub translator_target: String,
     /// Synthesisers by engine name.

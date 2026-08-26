@@ -134,12 +134,7 @@ fn unbuilt(stages: &Stages) -> Result<(), EngineError> {
                 Kind::Tts => {}
                 Kind::Vad => {}
                 Kind::Asr => {}
-                Kind::Translator => {
-                    return Err(EngineError::NotImplemented {
-                        stage: kind,
-                        phase: "5a",
-                    });
-                }
+                Kind::Translator => {}
             },
             Stage::Off => {}
         }

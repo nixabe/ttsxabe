@@ -152,6 +152,9 @@ const NAMES: &[&str] = &[
     "expand_prior",
     "im2col",
     "pack_f16",
+    "rms_norm",
+    "silu_mul",
+    "rope",
     "split_heads",
     "split_heads_t",
     "merge_heads",
@@ -287,6 +290,20 @@ impl Gpu {
             what: "allocating",
             source,
         })
+    }
+
+    /// Copies already-packed f16 bits to the device.
+    ///
+    /// For weights a checkpoint stores narrow, where rounding has already
+    /// happened at load - see `xabe_st::StFile::tensor_f16`, which is also
+    /// where the range check lives.
+    pub fn upload_u16(&self, x: &[u16]) -> Result<CudaSlice<u16>, CudaError> {
+        self.stream
+            .clone_htod(x)
+            .map_err(|source| CudaError::Driver {
+                what: "uploading f16 weights",
+                source,
+            })
     }
 
     /// Copies a slice to the device as f16, rounding once.
@@ -1001,6 +1018,66 @@ impl Gpu {
             lb.launch(Self::flat(t * embed))
         })?;
         Ok(out)
+    }
+
+    /// Root-mean-square normalisation. Mirrors [`xabe_dsp::rms_norm`].
+    pub fn rms_norm(
+        &self,
+        x: &CudaSlice<f32>,
+        rows: usize,
+        dim: usize,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        // SAFETY: the kernel writes every element of every row it owns, and
+        // the grid is one block per row.
+        let mut out = unsafe { self.uninit(rows * dim) }?;
+        let d = dim as i32;
+        let f = self.func("rms_norm");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(weight).arg(&mut out).arg(&d).arg(&eps);
+        // A power of two, because the reduction halves the block each step.
+        let threads = (dim as u32).next_power_of_two().clamp(32, 1024);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        launched("rms_norm", unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
+    /// `a = silu(a) * b`. Mirrors [`xabe_dsp::silu_mul`].
+    pub fn silu_mul(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        let len = n as i32;
+        let f = self.func("silu_mul");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(b).arg(&len);
+        launched("silu_mul", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// Rotary position embedding, in place. Mirrors [`xabe_dsp::rope`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(
+        &self,
+        x: &mut CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+        theta: f32,
+        first: usize,
+    ) -> Result<(), CudaError> {
+        let n = t * heads * head_dim / 2;
+        let (a, b_, c, d) = (t as i32, heads as i32, head_dim as i32, first as i32);
+        let f = self.func("rope");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&a).arg(&b_).arg(&c).arg(&theta).arg(&d);
+        launched("rope", unsafe { lb.launch(Self::flat(n)) })
     }
 
     /// Lays a convolution out as a matrix: `[t, in_ch]` to `[out_t, in_ch*k]`.

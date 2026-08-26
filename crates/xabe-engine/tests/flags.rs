@@ -87,6 +87,27 @@ fn a_gpu_only_stage_refuses_the_cpu_rather_than_taking_twenty_minutes() {
     // A card is accepted, and is also what happens with no device flag.
     let ok = stages(&["--asr-model", "/a", "--asr-device", "1", "--in", "c.wav"]);
     assert!(ok.is_ok(), "{ok:?}");
+
+    // The translator too: 27 GB of weights and 26 GFLOP a token.
+    let e = stages(&[
+        "--serve",
+        "127.0.0.1:8000",
+        "--asr-url",
+        "http://a",
+        "--llm-url",
+        "http://l",
+        "--tts-url",
+        "http://t",
+        "--translator-model",
+        "/t",
+        "--translator-device",
+        "cpu",
+    ])
+    .unwrap_err();
+    assert_eq!(
+        e,
+        xabe_engine::StageError::GpuOnly(xabe_engine::Kind::Translator)
+    );
     match stages(&["--asr-model", "/a", "--in", "c.wav"])
         .expect("stages")
         .asr

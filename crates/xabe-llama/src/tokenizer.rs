@@ -279,6 +279,12 @@ impl Tokenizer {
         self.unk
     }
 
+    /// The id of the `<0xNN>` piece for one byte.
+    pub fn byte_id(&self, b: u8) -> Option<u32> {
+        let id = self.byte_ids[usize::from(b)];
+        (id != u32::MAX).then_some(id)
+    }
+
     /// One piece, by id.
     pub fn piece(&self, id: u32) -> Option<&Piece> {
         self.pieces.get(id as usize)

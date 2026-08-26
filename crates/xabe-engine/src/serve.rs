@@ -23,8 +23,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use xabe_serve::{
     AppState, AsrBackend, GatewayConfig, Inner, SpeechSpan, SynthesisJob, TranscribeJob,
-    TtsBackend, Upstream, VadJob,
+    TranslateJob, TranslatorBackend, TtsBackend, Upstream, VadJob,
 };
+
+/// The longest translation the engine will produce for one chunk.
+///
+/// `gateway.py` sends `n_predict: 256` and chunks a reply at clause
+/// boundaries, so a chunk is a sentence at most. The limit is a runaway guard,
+/// not a budget.
+const TRANSLATE_MAX_NEW: usize = 256;
 
 /// How many synthesis jobs may wait before the caller blocks.
 ///
@@ -94,12 +101,9 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     // without restarting it.
     let translator = match (&stages.translator, args.direct_taigi) {
         (_, true) => None,
-        (Stage::Remote { url }, _) => Some(Upstream::new(url)?),
-        (Stage::Local { .. }, _) => {
-            return Err(EngineError::NotImplemented {
-                stage: crate::stage::Kind::Translator,
-                phase: "5a",
-            });
+        (Stage::Remote { url }, _) => Some(TranslatorBackend::Remote(Upstream::new(url)?)),
+        (Stage::Local { path, device }, _) => {
+            Some(TranslatorBackend::Local(spawn_translator(path, *device)?))
         }
         (Stage::Off, _) => None,
     };
@@ -260,6 +264,48 @@ fn transcribe_one(
     model
         .transcribe(&audio.samples, language)
         .map_err(|e| e.to_string())
+}
+
+/// Starts the translator thread and returns its work queue.
+///
+/// One OS thread, started before the listener binds, exactly as the ASR and
+/// the synthesiser are. The load is about 27 GB of transfers and takes as long
+/// as that sounds, which is the point of doing it at preflight: a service is
+/// started once and answers for hours.
+fn spawn_translator(
+    path: &std::path::Path,
+    device: Device,
+) -> Result<mpsc::Sender<TranslateJob>, EngineError> {
+    // `Kind::has_cpu` refuses `--translator-device cpu` at preflight: the 13 B
+    // is 27 GB of weights and 26 GFLOP a token.
+    let Device::Cuda(ordinal) = device else {
+        unreachable!("--translator-device cpu is refused when the stages resolve");
+    };
+    let model = xabe_translate::Translator::open(path, ordinal)?;
+
+    let (tx, mut rx) = mpsc::channel::<TranslateJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-translate".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                let out = model
+                    .translate(
+                        &job.text,
+                        &job.target,
+                        TRANSLATE_MAX_NEW,
+                        xabe_translate::Translator::REPEAT_PENALTY,
+                    )
+                    .map_err(|e| e.to_string());
+                let _ = job.reply.send(out);
+            }
+            tracing::debug!("translator thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the translator thread",
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(tx)
 }
 
 fn spawn_synthesiser(

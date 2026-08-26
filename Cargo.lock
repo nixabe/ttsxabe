@@ -1579,6 +1579,7 @@ dependencies = [
  "xabe-asr",
  "xabe-audio",
  "xabe-serve",
+ "xabe-translate",
  "xabe-tts",
  "xabe-vad",
  "xabe-vits",
@@ -1635,6 +1636,19 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "xabe-translate"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-cuda",
+ "xabe-llama",
+ "xabe-st",
 ]
 
 [[package]]

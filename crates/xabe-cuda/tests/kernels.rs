@@ -45,6 +45,30 @@ fn seq(n: usize, salt: u64) -> Vec<f32> {
 }
 
 /// Largest absolute difference, with a name for the failure message.
+/// The same, with the tolerance named at the call site.
+///
+/// The llama kernels use CUDA's fast intrinsics - `__expf`, `__sincosf`,
+/// `__powf` - which are about 2^-21 accurate against CPU twins that are not.
+/// Folding that into the shared constants would loosen every other test to
+/// suit three.
+fn assert_close_to(name: &str, want: &[f32], got: &[f32], tol: f32) {
+    assert_eq!(want.len(), got.len(), "{name}: length");
+    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+    let (worst, at) = want
+        .iter()
+        .zip(got)
+        .enumerate()
+        .map(|(i, (a, b))| ((a - b).abs(), i))
+        .fold((0.0f32, 0), |acc, e| if e.0 > acc.0 { e } else { acc });
+    assert!(
+        worst / scale < tol,
+        "{name}: {:e} of full scale at [{at}], cpu {} vs gpu {}",
+        worst / scale,
+        want[at],
+        got[at],
+    );
+}
+
 fn assert_close(name: &str, want: &[f32], got: &[f32]) {
     assert_eq!(want.len(), got.len(), "{name}: length");
     let mut worst = 0.0f32;
@@ -991,4 +1015,90 @@ fn an_odd_contraction_with_a_packed_operand_is_refused() {
         )
         .unwrap_err();
     assert!(e.to_string().contains("odd"), "{e}");
+}
+
+// --------------------------------------------------------------------- llama
+
+#[test]
+fn rms_norm_matches() {
+    let Some(g) = gpu() else { return };
+    // Awkward widths on purpose: 5120 is the model's, and the others are
+    // shapes the block reduction has to predicate rather than fill.
+    for &(rows, dim) in &[(4usize, 5120usize), (1, 128), (7, 33), (3, 1)] {
+        let x = seq(rows * dim, 71);
+        let w = seq(dim, 72);
+        let want = xabe_dsp::rms_norm(&x, rows, dim, &w, 1e-5);
+        let got = g
+            .download(
+                &g.rms_norm(
+                    &g.upload(&x).expect("upload"),
+                    rows,
+                    dim,
+                    &g.upload(&w).expect("upload"),
+                    1e-5,
+                )
+                .expect("rms_norm"),
+            )
+            .expect("download");
+        // The reduction orders differ - the CPU twin sums left to right and
+        // the kernel is a tree - so this is a tolerance rather than equality,
+        // and it is the reduction that sets it.
+        assert_close_to(&format!("rms_norm {rows}x{dim}"), &want, &got, 1e-5);
+    }
+}
+
+#[test]
+fn silu_mul_matches() {
+    let Some(g) = gpu() else { return };
+    let n = 1000;
+    let (a, b) = (seq(n, 73), seq(n, 74));
+    let mut want = a.clone();
+    xabe_dsp::silu_mul(&mut want, &b);
+
+    let mut dev = g.upload(&a).expect("upload");
+    g.silu_mul(&mut dev, &g.upload(&b).expect("upload"), n)
+        .expect("silu_mul");
+    // `__expf` is the fast intrinsic, so this is two implementations of the
+    // same function rather than one checked against itself.
+    assert_close_to(
+        "silu_mul",
+        &want,
+        &g.download(&dev).expect("download"),
+        1e-5,
+    );
+}
+
+#[test]
+fn rope_matches_at_every_offset() {
+    let Some(g) = gpu() else { return };
+    // The offset is the part that is a no-op at position zero and wrong
+    // everywhere else, so it is the part worth sweeping.
+    for &first in &[0usize, 1, 17, 4095] {
+        let (t, heads, hd) = (5usize, 3usize, 128usize);
+        let x = seq(t * heads * hd, 75);
+        let mut want = x.clone();
+        xabe_dsp::rope(&mut want, t, heads, hd, 10_000.0, first);
+
+        let mut dev = g.upload(&x).expect("upload");
+        g.rope(&mut dev, t, heads, hd, 10_000.0, first)
+            .expect("rope");
+        // The tolerance has to grow with the position, and the reason is not
+        // sloppiness on either side. Both compute `angle = pos * inv_freq` in
+        // f32, as the reference does; the two `powf` implementations differ in
+        // the last bit of `inv_freq`, which is a relative 6e-8, and the angle
+        // multiplies that by `pos`. At 4095 radians a 1-ulp frequency
+        // disagreement *is* 2.4e-4 of phase, and no amount of care in either
+        // implementation removes it.
+        //
+        // The same arithmetic says something about the model: RoPE in f32 is
+        // intrinsically imprecise at long positions, in 🤗 as much as here.
+        // Translation prompts are twenty tokens, so it never arrives - but it
+        // would, at four thousand.
+        assert_close_to(
+            &format!("rope first={first}"),
+            &want,
+            &g.download(&dev).expect("download"),
+            1e-5 + first as f32 * f32::EPSILON,
+        );
+    }
 }

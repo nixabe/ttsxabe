@@ -84,4 +84,8 @@ pub enum EngineError {
     /// The ASR stage failed.
     #[error(transparent)]
     Asr(#[from] xabe_asr::AsrError),
+
+    /// The translator stage failed.
+    #[error(transparent)]
+    Translate(#[from] xabe_translate::TranslateError),
 }

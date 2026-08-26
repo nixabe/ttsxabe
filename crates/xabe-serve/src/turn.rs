@@ -24,10 +24,9 @@
 //! through the loop in [`run`], fed by channels. Splitting it would let a
 //! synthesis error and a token race for the same frame.
 
-use crate::client::{Upstream, translate_body};
 use crate::config::Role;
 use crate::error::ServeError;
-use crate::state::{AppState, AsrBackend, SynthesisJob, TtsBackend};
+use crate::state::{AppState, AsrBackend, SynthesisJob, TranslatorBackend, TtsBackend};
 use crate::text::{Chunker, sanitize_asr};
 use crate::wire::{ClientMessage, ServerMessage, TtsChunk};
 use axum::extract::ws::{Message, WebSocket};
@@ -455,7 +454,7 @@ async fn reply(
 /// long earlier one.
 async fn synthesis_worker(
     backend: TtsBackend,
-    translator: Option<Upstream>,
+    translator: Option<TranslatorBackend>,
     target: String,
     mut jobs: mpsc::Receiver<String>,
     audio: mpsc::Sender<TtsChunk>,
@@ -466,7 +465,7 @@ async fn synthesis_worker(
         // this hop is skipped entirely - measured 3.8 s -> 1.6 s on a turn.
         let (text, taigi) = match &translator {
             None => (chunk, String::new()),
-            Some(t) => match t.completion(translate_body(&chunk, &target)).await {
+            Some(t) => match t.translate(&chunk, &target).await {
                 Ok(out) if !out.is_empty() => (out.clone(), out),
                 Ok(_) => (chunk, String::new()),
                 Err(e) => {

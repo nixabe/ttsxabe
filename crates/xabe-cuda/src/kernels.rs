@@ -874,6 +874,98 @@ __global__ void expand_prior(
 }
 
 }
+// -------------------------------------------------------------------- llama
+
+// Root-mean-square normalisation, one block per row.
+//
+// Not layer normalisation: no mean subtraction and no bias. Substituting one
+// for the other passes every shape check and shifts every activation by the
+// row's mean, which on a residual stream is not small.
+extern "C" __global__ void rms_norm(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int dim, float eps)
+{
+    extern __shared__ float partial[];
+    const int row = blockIdx.x;
+    const float* xr = x + (size_t)row * dim;
+    float* orow = out + (size_t)row * dim;
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        acc += xr[i] * xr[i];
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            partial[threadIdx.x] += partial[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        orow[i] = xr[i] * scale * weight[i];
+    }
+}
+
+// a = silu(a) * b, the SwiGLU gate.
+extern "C" __global__ void silu_mul(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float v = a[i];
+    // `expf`, not `__expf`. The fast intrinsic is about 2^-21 accurate and
+    // this one is a few ulp; the difference costs nothing measurable here and
+    // it keeps the differential test against the scalar twin tight enough to
+    // catch a real mistake.
+    a[i] = v * (1.0f / (1.0f + expf(-v))) * b[i];
+}
+
+// Rotary position embedding, in place over [t, heads * head_dim].
+//
+// 🤗 pairs dimension i with i + head_dim/2, not 2i with 2i+1. The two are a
+// permutation of each other, both are called RoPE, and picking the wrong one
+// gives a model that is coherent for four or five tokens and then drifts -
+// the hardest possible thing to debug. `first` is the absolute position of row
+// zero, so a decode step past a KV cache rotates by where the token really is.
+extern "C" __global__ void rope(
+    float* __restrict__ x,
+    int t, int heads, int head_dim, float theta, int first)
+{
+    const int half = head_dim >> 1;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= t * heads * half) {
+        return;
+    }
+    const int j = i % half;
+    const int h = (i / half) % heads;
+    const int p = i / (half * heads);
+
+    // Accurate `powf` and `sincosf`, not the `__` intrinsics. `__sincosf` does
+    // no real range reduction, and at position 4095 the angle for the lowest
+    // frequency is 4095 radians - measured 6e-4 of full scale out, against
+    // 6e-6 here. The reference computes this in f32 too, so the scalar twin
+    // does the same rather than being more accurate than what it is a
+    // reference for.
+    const float inv = powf(theta, -2.0f * (float)j / (float)head_dim);
+    const float angle = (float)(first + p) * inv;
+    float sn, cs;
+    sincosf(angle, &sn, &cs);
+
+    const size_t base = ((size_t)p * heads + h) * head_dim + j;
+    const float a = x[base];
+    const float b = x[base + half];
+    x[base]        = a * cs - b * sn;
+    x[base + half] = b * cs + a * sn;
+}
+
 // ------------------------------------------------------------------ whisper
 
 // Convolution rewritten as a matrix, so it can use the tensor cores.
