@@ -1,37 +1,135 @@
 # Command surface
 
-`xabe-tts` builds a binary, and a second one, `xabe-tts-bench`, for timing.
+The workspace builds two binaries: `xabe-engine`, the engine itself, and
+`xabe-tts-bench`, for timing the synthesiser.
 
-## `xabe-tts`
+## `xabe-engine`
+
+Every stage is satisfied one of two ways, and the symmetry is the whole design:
+
+| | |
+| --- | --- |
+| `--<stage>-model PATH` | run the stage **in this process** |
+| `--<stage>-url URL` | delegate the stage to **another process** over HTTP |
+
+The two are alternatives per stage, and either satisfies that stage's
+dependency. Nothing downstream can tell which was used, so the same binary is a
+monolith, a single-stage worker, or anything between. The six-port topology the
+Python pipeline runs today is one configuration of these flags.
+
+Stages are `asr`, `vad`, `tts` and `translator`. `llm` is **URL-only** — it
+stays in llama.cpp by decision, so there is no `--llm-model`.
 
 ```sh
-xabe-tts --model model.safetensors --config config.json \
-         --text "lí hó, kin-á-ji̍t thinn-khì chin hó." \
-         --out hello.wav
+# everything in one process
+xabe-engine --serve 127.0.0.1:8000 \
+            --asr-model    models/asr/breeze-asr-26   --asr-device 0 \
+            --vad-model    models/vad/silero-v5.1.2.safetensors \
+            --tts-model    models/tts/mms-tts-nan     --tts-device 1 \
+            --llm-url      http://127.0.0.1:8082
+
+# split across processes and GPUs, as run.sh does today
+xabe-engine --serve 127.0.0.1:8080 --asr-model models/asr/breeze-asr-26 \
+            --vad-model models/vad/silero-v5.1.2.safetensors --asr-device 0
+xabe-engine --serve 127.0.0.1:8100 --tts-model models/tts/mms-tts-nan --tts-device 1
+xabe-engine --serve 127.0.0.1:8000 --asr-url http://127.0.0.1:8080 \
+            --tts-url http://127.0.0.1:8100 --llm-url http://127.0.0.1:8082
+
+# one stage, one shot, no server
+xabe-engine --tts-model models/tts/mms-tts-nan --text "lí hó" --out hello.wav
+xabe-engine --asr-model models/asr/breeze-asr-26 --in clip.wav
+xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 ```
+
+### Flags
 
 | flag | env | default | |
 | --- | --- | --- | --- |
-| `--model` | `XABE_TTS_MODEL` | — | safetensors checkpoint |
-| `--config` | `XABE_TTS_CONFIG` | next to the model | `config.json` |
-| `--text` | — | — | POJ input; `-` reads stdin |
-| `--out` | — | — | output WAV; `-` writes stdout |
-| `--seed` | `XABE_TTS_SEED` | 0 | duration and prior sampling |
+| `--serve` | `XABE_SERVE` | — | listen address; without it the run is one-shot |
+| `--asr-model` | `XABE_ASR_MODEL` | — | speech-to-text checkpoint directory |
+| `--asr-url` | `XABE_ASR_URL` | — | delegate speech-to-text |
+| `--asr-device` | `XABE_ASR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--vad-model` | `XABE_VAD_MODEL` | — | voice-activity checkpoint |
+| `--vad-url` | `XABE_VAD_URL` | — | delegate voice-activity detection |
+| `--vad-device` | `XABE_VAD_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--tts-model` | `XABE_TTS_MODEL` | — | directory, or the safetensors file itself |
+| `--tts-url` | `XABE_TTS_URL` | — | delegate text-to-speech |
+| `--tts-device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint |
+| `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
+| `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--llm-url` | `XABE_LLM_URL` | — | chat model; there is no `--llm-model` |
+| `--direct-taigi` | `XABE_DIRECT_TAIGI` | off | chat model answers in Taigi Han itself |
+| `--in` | — | — | one-shot input WAV; `-` reads stdin |
+| `--text` | — | — | one-shot input text; `-` reads stdin |
+| `--out` | — | — | one-shot output; `-` writes stdout |
+| `--config` | `XABE_TTS_CONFIG` | next to the model | TTS `config.json` |
+| `--seed` | `XABE_SEED` | 0 | duration and prior sampling |
 | `--noise-scale` | | 0.667 | prior temperature |
 | `--noise-scale-duration` | | 0.8 | duration temperature |
 | `--speaking-rate` | | 1.0 | duration multiplier |
-| `--device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
 | `--log-level` | `RUST_LOG` | `info` | `info`, `debug`, `trace` |
 
 `--seed` defaults to a fixed value rather than to entropy. Reproducible by
 default is the right posture for something whose output is hard to check.
 
+`--tts-model` accepts either the model directory or the `model.safetensors`
+inside it. Both spellings are in use — the consolidated tree names directories,
+while the older flag and every test named the file — and the directory is
+recoverable from the file, so refusing one of them would break working commands
+to no purpose.
+
+`--<stage>-device` exists per stage because the pipeline deliberately spreads
+stages across cards: putting the ASR and the TTS on one GPU makes the next
+turn's prefill queue behind the last turn's synthesis.
+
+### What the preflight refuses
+
+Every rejection names the flag that caused it and happens *before* any
+checkpoint is opened, so a mistyped topology costs a millisecond rather than
+six gigabytes of reads. The order is: resolve the stages, decide what the run
+does, refuse the stages that are not built yet, then work.
+
+| | |
+| --- | --- |
+| `--tts-model` and `--tts-url` together | alternatives; give one |
+| `--asr-device` with `--asr-url` | a device applies only to a local stage |
+| `--asr-device` with no ASR stage at all | the same typo, one flag earlier |
+| `--vad-*` with `--serve` and no ASR | served, a VAD is only ever a gate |
+| no stage at all | names the four flag pairs that would give one |
+| stages but no `--serve`, `--in` or `--text` | a serve command with `--serve` forgotten |
+| `--in` and `--text` together | alternatives; give one |
+| `--serve` with `--in` or `--text` | a server is not a one-shot run |
+| `--text` with no TTS stage | names `--tts-model` and `--tts-url` |
+| `--text` with no `--out` | nowhere to put the WAV |
+| `--in` with neither ASR nor VAD | nothing here reads audio |
+
+`--vad-model --in clip.wav` is *accepted*: over a file the VAD is a tool that
+prints segments, and only when served is it a gate that needs something to gate.
+
+### Stages that are not built yet
+
+The flag surface is complete ahead of the stages behind it. `--asr-model` parses
+and validates, then fails with the phase that builds it. That ordering is
+deliberate: the topology is the part worth settling first, and a flag that
+parses and then silently does nothing is worse than one that says what it is
+waiting on.
+
+| stage | status |
+| --- | --- |
+| `--tts-model` | works |
+| `--vad-model` | phase 3 |
+| `--asr-model` | phase 4 |
+| `--translator-model` | phase 5a |
+| any `--<stage>-url` | phase 2 |
+| `--serve` | phase 2 |
+
 ## What it costs
 
 | device | 2.6 s of audio |
 | --- | --- |
-| `--device 0` | ~48 ms, 54x realtime |
-| `--device cpu` | ~120 s, 0.02x realtime |
+| `--tts-device 0` | ~48 ms, 54x realtime |
+| `--tts-device cpu` | ~120 s, 0.02x realtime |
 
 The CPU path is the scalar reference and is not meant to be used: it exists to
 be read and to be correct. See [BENCHMARKS.md](BENCHMARKS.md) for the
@@ -44,8 +142,8 @@ say the file is speech. The check that does is an ASR round trip - synthesise,
 then transcribe with a model that was never involved in producing it:
 
 ```sh
-xabe-tts --model .../model.safetensors \
-         --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
+xabe-engine --tts-model models/tts/mms-tts-nan \
+            --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
 curl -s -F file=@hello.wav -F language=zh http://127.0.0.1:8080/inference
 # {"text":"你好 今天天氣很好\n"}
 ```
@@ -66,8 +164,20 @@ plausible audio, which matters when the language is one you cannot judge by ear.
   own failure and returns, rather than unwinding a `Result` chain that loses
   which stage broke.
 
-## Not planned
+## Retracted: "no serve subcommand"
 
-No `serve` subcommand. The pipeline this feeds already has an HTTP surface, and
-duplicating it here would mean owning a second one. If that changes it will be
-because a measurement asked for it.
+This file used to say there would be no `serve` subcommand, on the grounds that
+the pipeline already had an HTTP surface and duplicating it would mean owning a
+second one.
+
+That reasoning was sound and the premise changed. The engine now *is* the
+pipeline: with ASR, VAD, TTS and turn-taking folded in, the Python gateway is
+not a surface being duplicated but one being replaced, and the alternative to
+`--serve` is keeping a seventh process alive to do nothing but route between
+stages that live in this binary. `--serve` is also what makes the migration
+incremental — an engine process that speaks the existing wire protocols can be
+swapped in behind the existing gateway one stage at a time and A/B'd against
+the service it replaces.
+
+The flag it takes is an address, not a subcommand, which keeps the flat `Args`
+struct the house style asks for.

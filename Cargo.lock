@@ -541,6 +541,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xabe-audio"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "xabe-cuda"
 version = "0.0.0"
 dependencies = [
@@ -556,6 +563,19 @@ version = "0.0.0"
 dependencies = [
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "xabe-engine"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "xabe-audio",
+ "xabe-tts",
+ "xabe-vits",
 ]
 
 [[package]]

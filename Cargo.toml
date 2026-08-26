@@ -7,6 +7,8 @@ members = [
     "crates/xabe-dsp",
     "crates/xabe-cuda",
     "crates/xabe-tts",
+    "crates/xabe-audio",
+    "crates/xabe-engine",
 ]
 
 [workspace.package]
@@ -22,6 +24,8 @@ xabe-vits = { path = "crates/xabe-vits" }
 xabe-dsp = { path = "crates/xabe-dsp" }
 xabe-golden = { path = "crates/xabe-golden" }
 xabe-cuda = { path = "crates/xabe-cuda" }
+xabe-tts = { path = "crates/xabe-tts" }
+xabe-audio = { path = "crates/xabe-audio" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"

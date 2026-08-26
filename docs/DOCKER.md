@@ -24,9 +24,18 @@ FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ## What must not go in the image
 
-Model weights. `facebook/mms-tts-nan` is CC-BY-NC 4.0 and this repository does
-not redistribute it. The checkpoint is mounted or downloaded at run time, and
-`XABE_TTS_MODEL` points at it.
+Model weights. `facebook/mms-tts-nan` is CC-BY-NC 4.0 and the translator is
+CC-BY-NC-SA 4.0; this repository redistributes neither, and `models/` is
+gitignored for the same reason. The tree is mounted at run time.
+
+The repository layout was chosen to make that mount trivial — `models/` here
+has the same shape as `/models` in the container, so the per-stage variables
+point at the same relative paths either way:
+
+```
+models/asr/breeze-asr-26/       models/tts/mms-tts-nan/
+models/vad/                     models/translator/taigi-llama2-13b/
+```
 
 ## Environment
 
@@ -35,8 +44,17 @@ configured without rewriting argv:
 
 ```sh
 docker run --gpus all \
-  -e XABE_TTS_MODEL=/models/mms-tts-nan.safetensors \
+  -e XABE_TTS_MODEL=/models/tts/mms-tts-nan \
+  -e XABE_TTS_DEVICE=0 \
   -e RUST_LOG=info \
   -v /srv/models:/models:ro \
   ttsxabe --text "lí hó." --out -
 ```
+
+A stage the container is not meant to run is configured by *leaving its
+variables unset*: absent means off, so one image serves as the ASR worker, the
+TTS worker or the whole pipeline depending only on which variables are present.
+
+The entrypoint is the `xabe-engine` binary itself and `command:` is the
+argument list, so `docker run ... --help` prints the real flag surface rather
+than a shell's.

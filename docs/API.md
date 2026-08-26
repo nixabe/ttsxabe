@@ -33,15 +33,19 @@ let weights = VitsWeights::load(&file, &cfg)?;   // every tensor shape-checked
 
 `load` reads only the inference subset; `posterior_encoder` is skipped.
 
-## `xabe-tts` — planned
+## `xabe-tts`
 
 ```rust
-let model = Synthesizer::open(model_path, config_path)?;
-let audio: Audio = model.synthesize("lí hó, kin-á-ji̍t thinn-khì chin hó.", Seed(0))?;
-audio.sample_rate();   // 16_000
-audio.samples();       // &[f32]
-audio.write_wav(path)?;
+let model = Synthesizer::open(checkpoint_dir)?;          // CPU reference
+let model = GpuModel::open(checkpoint_dir, ordinal)?;    // CUDA
+let audio: Vec<f32> = model.synthesize("lí hó, kin-á-ji̍t thinn-khì chin hó.", seed)?;
+model.config().sampling_rate;   // 16_000
 ```
+
+Writing the result is `xabe_audio::write_wav(&mut w, &audio, rate)`, not a
+method on the audio. The samples are a plain `Vec<f32>`, and a container that
+knew how to serialise itself would be the synthesiser owning a WAV writer — the
+dependency edge that moving `wav.rs` into `xabe-audio` removed.
 
 Input is POJ with `ⁿ` written `nn` — see [MODEL.md](MODEL.md). The synthesiser
 does not romanise, translate, or read Han characters.

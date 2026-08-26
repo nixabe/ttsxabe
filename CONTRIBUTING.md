@@ -13,9 +13,12 @@ cargo test --workspace --release
 You need the checkpoint for the tests that read it:
 
 ```sh
-huggingface-cli download facebook/mms-tts-nan model.safetensors
-export XABE_TTS_MODEL=/path/to/model.safetensors
+huggingface-cli download facebook/mms-tts-nan --local-dir models/tts/mms-tts-nan
 ```
+
+`models/` is gitignored and holds every model the pipeline uses. Tests look
+there first, fall back to the HuggingFace cache, and take `XABE_TTS_MODEL` over
+both.
 
 A GPU is not required to build or to run most tests. Kernel tests that need one
 skip when it is absent, and say so.

@@ -4,7 +4,7 @@
 //! because a wrong field here produces a file that some players open and others
 //! reject, which is a far more annoying failure than one that never opens.
 
-use xabe_tts::wav_bytes;
+use xabe_audio::wav_bytes;
 
 /// Reads a little-endian `u32` at `off`.
 fn u32_at(b: &[u8], off: usize) -> u32 {

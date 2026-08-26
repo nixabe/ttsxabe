@@ -2,17 +2,58 @@
 
 ## The shape
 
-One process, one utterance at a time, no state carried between calls.
+One binary, `xabe-engine`, for every stage of the Taigi voice pipeline except
+the chat LLM, which stays in llama.cpp by decision.
 
 ```
-   text ──► xabe-tts ──► waveform
-              │
-              ├── xabe-vits    config, weight schema, shape validation
-              ├── xabe-dsp     scalar reference kernels
-              ├── xabe-cuda    CUDA kernels, tested against xabe-dsp
-              ├── xabe-golden  reads the captured PyTorch oracle
-              └── xabe-st      safetensors container, mmap, addressing
+   speech ──► VAD ──► ASR ──► [LLM] ──► [translator] ──► TTS ──► speech
+                                 ▲
+                                 └── always another process, over HTTP
 ```
+
+Which of those stages *this* process runs is decided entirely by flags, and
+each one is satisfied two ways:
+
+```
+   --<stage>-model PATH   run it here
+   --<stage>-url   URL    delegate it to another process
+```
+
+Nothing downstream of `stage.rs` can tell which was used. That symmetry is what
+makes one binary serve as a monolith, as a single-stage worker, or as anything
+between - the six-process topology the Python pipeline runs today is one
+configuration of the same flags, not a different program.
+
+```
+   xabe-engine
+      │
+      ├── xabe-serve    HTTP, WebSocket, static assets, turn-taking   [phase 2]
+      ├── xabe-vad      Silero geometry and weight schema             [phase 3]
+      ├── xabe-whisper  Whisper geometry, weight schema, BPE          [phase 4]
+      ├── xabe-llama    Llama geometry, weight schema, SentencePiece  [phase 5a]
+      ├── xabe-tts      the VITS forward pass and synthesis API
+      ├── xabe-audio    WAV, mel, resampling, PCM framing
+      ├── xabe-vits     config, weight schema, shape validation
+      ├── xabe-dsp      scalar reference kernels
+      ├── xabe-cuda     CUDA kernels, tested against xabe-dsp
+      ├── xabe-golden   reads the captured oracle
+      └── xabe-st       safetensors container, mmap, addressing
+```
+
+The bracketed crates do not exist yet. Their flags do: `--asr-model` parses,
+validates and then fails with the phase it is waiting on, because a flag
+surface that is designed and tested before the stages behind it are built is
+what lets the topology be settled first. A flag that parses and silently does
+nothing would be worse than one that says which milestone it needs.
+
+## Why the CLI left `xabe-tts`
+
+`xabe-tts` used to own `main.rs`, because the synthesiser was the whole program.
+It is now one stage of five, so the binary moved up into `xabe-engine` and the
+crate went back to being a library. `wav.rs` moved the other way, down into
+`xabe-audio`: the TTS writes audio, the ASR and VAD read it, and a WAV writer
+living inside the synthesiser cannot be reached by the others without pointing
+a dependency edge the wrong way.
 
 ## Why no cache and no scheduler
 
@@ -25,6 +66,10 @@ Batching is a different question, and an open one. It would help if the caller
 sends several clauses at once — which the pipeline upstream does, one per
 sentence. That is a measurement to make after the single-utterance path is
 correct, not a design decision to take now.
+
+The ASR changes this only slightly. An utterance is still whole and still shares
+nothing with the next; what it adds is a decoder KV cache *within* one
+utterance, which is a buffer, not a scheduler.
 
 ## Crate boundaries
 
@@ -39,7 +84,9 @@ crates above it.
 | `xabe-dsp` | scalar f32 reference kernels | being fast |
 | `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
 | `xabe-golden` | reading captures, comparing tensors | producing them |
-| `xabe-tts` | the forward pass, the public API, the CLI | container details |
+| `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
+| `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
+| `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 
 `xabe-cuda` takes flat slices and dimensions, exactly as `xabe-dsp` does, and
 knows nothing about the model. That is what lets its tests be a plain

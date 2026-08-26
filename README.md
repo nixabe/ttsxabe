@@ -1,17 +1,25 @@
 # ttsxabe
 
-A from-scratch Rust implementation of VITS for Taiwanese Hokkien (Taigi) speech
-synthesis, reading `facebook/mms-tts-nan` weights directly.
+A from-scratch Rust engine for a Taiwanese Hokkien (Taigi) voice assistant.
 
-No ML framework, no bindings. The container reader, the weight schema and the
-kernels all live in this repository and are verified against the PyTorch
-reference.
+No ML framework, no bindings. The container readers, the weight schemas and the
+kernels all live in this repository and are verified against captured
+references.
+
+One binary, `xabe-engine`, runs every stage of the pipeline except the chat
+LLM, which stays in llama.cpp by decision. Which stages *this* process runs is
+decided by flags, and each stage is satisfied either locally
+(`--<stage>-model`) or by another process over HTTP (`--<stage>-url`) — so the
+same binary is a monolith, a single-stage worker, or anything between.
+
+Finished: the synthesiser. In progress: the rest. `docs/MILESTONES.md` has the
+phases and `docs/CLI.md` the flag surface.
 
 ## Why this exists
 
-It is the only stage of the Taigi voice pipeline still running unoptimised
-PyTorch. Everything upstream is already hand-tuned CUDA, and rewriting it would
-buy nothing — measured, on one voice turn of that pipeline:
+It began as the synthesiser alone, which was the only stage of the Taigi voice
+pipeline still running unoptimised PyTorch. Everything upstream was already
+hand-tuned CUDA — measured, on one voice turn of that pipeline:
 
 | stage | engine | time |
 | --- | --- | --- |
@@ -20,9 +28,15 @@ buy nothing — measured, on one voice turn of that pipeline:
 | **TTS** | **PyTorch** | **~1.4 s** |
 | orchestration | Python | <100 ms |
 
-TTS is roughly 85% of what is left. That is the number this project exists to
-move. Porting Whisper or the LLM here is out of scope until this synthesiser is
-finished and measured.
+TTS was roughly 85% of what was left, and that is the number this project was
+built to move. It has been moved.
+
+What widened the scope afterwards was not speed but the seams. Making that one
+stage fast left a working system of **7 processes, 2 Python environments, 2
+languages and 6 ports**, held together by a shell script — and the interesting
+problems that remain are in the orchestration as much as the arithmetic. So the
+engine is absorbing the rest of it. The chat LLM stays in llama.cpp
+permanently; rewriting that would buy nothing.
 
 ## Target hardware and model
 
@@ -39,8 +53,10 @@ the evidence.
 
 ## Status
 
-**Complete.** Text in, waveform out, on CPU and on CUDA, matching the PyTorch
-reference stage by stage.
+**The synthesiser is complete**: text in, waveform out, on CPU and on CUDA,
+matching the PyTorch reference stage by stage. The ASR, the VAD, the translator
+loader and the serving layer are not built yet; their flags are, and each fails
+naming the phase that builds it.
 
 | crate | state |
 | --- | --- |
@@ -49,7 +65,9 @@ reference stage by stage.
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
 | `xabe-cuda` | 22 CUDA kernels, each diffed against its scalar twin |
-| `xabe-tts` | forward pass on both devices, synthesis API, CLI, benchmark |
+| `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
+| `xabe-audio` | WAV reading and writing, sample handling |
+| `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:
 
@@ -82,9 +100,13 @@ stage breakdown, the computed FLOP ceiling, and the things that did not work.
 ## Using it
 
 ```sh
-xabe-tts --model model.safetensors --device 0 \
-         --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
+xabe-engine --tts-model models/tts/mms-tts-nan --tts-device 0 \
+            --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
 ```
+
+Every model lives under `models/`, which is gitignored: one tree to populate,
+nothing tracked. `docs/CLI.md` has the whole flag surface, including the
+topologies that split stages across processes.
 
 Input must be NFC-normalised POJ. Anything outside the 48 symbols is deleted
 silently - that is the reference's behaviour, and `docs/MODEL.md` explains why
@@ -99,8 +121,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Tests that need the checkpoint find it in the HuggingFace cache, or take
-`XABE_TTS_MODEL=/path/to/model.safetensors`. Differential tests also need a
+Tests that need the checkpoint look in `models/tts/mms-tts-nan` first, fall
+back to the HuggingFace cache, and take `XABE_TTS_MODEL` over both. Differential tests also need a
 capture — `python tools/oracle/capture.py --out .golden/base --seed 0 --text
 "..."`, see [docs/ORACLE.md](docs/ORACLE.md). Without either they print `SKIP:`
 and the reason.
@@ -113,11 +135,14 @@ else. Run with `--nocapture` if you want to see which skipped.
 
 ## Scope
 
-This synthesises Taigi from Pe̍h-ōe-jī romanisation. It does not do
-grapheme-to-phoneme conversion, does not translate, and does not know what Han
-characters are - text made only of them tokenises to nothing and is refused
-rather than returned as silence. Producing POJ from Mandarin is the job of the
-pipeline upstream.
+The synthesiser speaks Taigi from Pe̍h-ōe-jī romanisation. It does not do
+grapheme-to-phoneme conversion and does not know what Han characters are - text
+made only of them tokenises to nothing and is refused rather than returned as
+silence. Producing POJ from Mandarin is the translator's job, and the
+translator is phase 5.
+
+The chat model is out of scope permanently and is reachable only as
+`--llm-url`. There is no `--llm-model`.
 
 There is no KV cache and no request scheduler here; an utterance is a single
 forward pass with no state carried between calls. If batching arrives it will be

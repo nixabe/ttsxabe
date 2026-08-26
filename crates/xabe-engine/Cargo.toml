@@ -1,5 +1,5 @@
 [package]
-name = "xabe-tts"
+name = "xabe-engine"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -7,18 +7,14 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-xabe-cuda.workspace = true
-xabe-dsp.workspace = true
-xabe-st.workspace = true
+xabe-audio.workspace = true
+xabe-tts.workspace = true
 xabe-vits.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[dev-dependencies]
-xabe-golden.workspace = true
-
 [[bin]]
-name = "xabe-tts-bench"
-path = "src/bin/bench.rs"
+name = "xabe-engine"
+path = "src/main.rs"

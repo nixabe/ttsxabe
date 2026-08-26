@@ -4,24 +4,37 @@ Operating instructions for AI agents working in this repository.
 
 ## What this project is
 
-`ttsxabe` is a from-scratch Taiwanese Hokkien speech synthesiser: a Rust
-reimplementation of VITS as shipped in `facebook/mms-tts-nan` (36.3 M
-parameters, 16 kHz, Tâi-lô input), targeting 3× Quadro RTX 8000 (sm_75).
+`ttsxabe` is a from-scratch Rust engine for a Taiwanese Hokkien voice
+assistant, targeting 3× Quadro RTX 8000 (sm_75). No ML framework, no bindings:
+it reads the published checkpoints directly and does the arithmetic itself.
 
-It exists because TTS is the one stage of the Taigi voice pipeline still running
-unoptimised PyTorch. Everything upstream — Whisper and the LLM — is already
-hand-tuned CUDA in `whisper.cpp` and `llama.cpp`, where a rewrite buys nothing.
-Measured on that pipeline: the ASR contributed 0 ms once prefetched, the LLM
-~120 ms to first clause, and TTS ~1.4 s. **This project targets the 1.4 s.**
+It began as a synthesiser alone — a reimplementation of VITS as shipped in
+`facebook/mms-tts-nan` (36.3 M parameters, 16 kHz, Tâi-lô input) — because TTS
+was the one stage of the pipeline still running unoptimised PyTorch, at ~1.4 s
+against the ASR's 0 ms and the LLM's ~120 ms to first clause. That is finished
+and measured: 1.24× faster than PyTorch, stage-by-stage against a captured
+oracle.
 
-Porting Whisper or the LLM here is explicitly out of scope until this
-synthesiser is finished and measured.
+**The scope has since widened, by decision.** The engine is becoming every
+stage of the pipeline except the chat LLM, which stays in llama.cpp: ASR
+(Whisper large-v2 fine-tune), voice activity detection (Silero), the
+Mandarin-to-Taigi translator's loader, turn-taking and the web front end, all
+in one binary with per-stage flags. `docs/MILESTONES.md` has the phases.
+
+An earlier version of this file said porting Whisper or the LLM here was
+explicitly out of scope. That was the right rule while the synthesiser was
+unfinished; it is retracted now that it is finished and measured. The chat LLM
+remains out of scope permanently — llama.cpp is not a rewrite that buys
+anything.
 
 ## Current standing
 
-There is no standing yet. The reference PyTorch implementation is the only thing
-that has produced audio. When this engine does, the comparison belongs in
-`docs/BENCHMARKS.md` and nowhere else.
+The synthesiser is finished: end-to-end CUDA agreement with the captured oracle
+at 1.2e-5, and 1.24× faster than the PyTorch reference on interleaved medians.
+That number and every other comparison belong in `docs/BENCHMARKS.md` and
+nowhere else.
+
+Nothing else has been measured, because nothing else has been built.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.
@@ -49,7 +62,7 @@ that has not been measured on this hardware.
 
 ## Correctness before speed
 
-VITS drifts silently. A wrong flow coupling, a transposed convolution kernel
+Every model here drifts silently, and VITS is only the clearest case. A wrong flow coupling, a transposed convolution kernel
 read in the wrong order, an off-by-one in the duration expansion — all of these
 produce *plausible speech* that is subtly wrong, and no listening test on a
 language you do not speak will catch it. The differential harness is the only
@@ -63,9 +76,16 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | Crate | Owns | Depends on |
 | --- | --- | --- |
 | `xabe-st` | safetensors container parsing, mmap, tensor addressing | — |
+| `xabe-audio` | WAV containers, sample handling, framing | — |
 | `xabe-vits` | model config, weight schema, shape validation | `xabe-st` |
 | `xabe-dsp` | CPU reference kernels + differential compare harness | `xabe-vits` |
-| `xabe-tts` | forward pass, synthesis API, CLI | all |
+| `xabe-cuda` | CUDA kernels and the device handle | — |
+| `xabe-tts` | the VITS forward pass and its API | all of the above |
+| `xabe-engine` | flags, stage wiring, orchestration, the binary | all |
+
+Crates that the plan adds and that do not exist yet: `xabe-serve` (phase 2),
+`xabe-vad` (phase 3), `xabe-whisper` (phase 4), `xabe-llama` (phase 5a). Their
+flags exist already and fail with the phase they are waiting on.
 
 ## House style
 

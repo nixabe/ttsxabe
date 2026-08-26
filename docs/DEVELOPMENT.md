@@ -13,12 +13,13 @@ either skip and say so.
 To run the tests that read real weights:
 
 ```sh
-huggingface-cli download facebook/mms-tts-nan model.safetensors --local-dir /tmp/mms
-export XABE_TTS_MODEL=/tmp/mms/model.safetensors
+huggingface-cli download facebook/mms-tts-nan --local-dir models/tts/mms-tts-nan
 cargo test --workspace --release
 ```
 
-They are also found automatically in `~/.cache/huggingface/hub/`.
+`models/` is gitignored and is where every model in the pipeline lives, so
+populating it is the whole of provisioning a machine. Tests look there first,
+fall back to `~/.cache/huggingface/hub/`, and take `XABE_TTS_MODEL` over both.
 
 ## The loop
 
