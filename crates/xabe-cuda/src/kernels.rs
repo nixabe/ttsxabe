@@ -18,34 +18,123 @@
 
 /// All device code, as one translation unit.
 pub const SOURCE: &str = r#"
-extern "C" {
-
 // ---------------------------------------------------------------- convolution
 
 // Cross-correlation over time. `w` is [out_ch, in_ch, k].
-__global__ void conv1d(
+//
+// This is where essentially all of the model's arithmetic is - the decoder's
+// residual blocks are 99% of the FLOP count and every one of them is this
+// kernel - so it is the one place that is written for speed rather than for
+// obviousness. Two things make it fast, and the first matters far more:
+//
+//   1. **Each thread computes OC_TILE channels x T_REG time positions.** The
+//      naive form does one multiply-add per value loaded from `x` and one per
+//      weight loaded, which leaves it entirely load-bound. The channel tile
+//      reuses each `x` value OC_TILE times; the time tile reuses each weight
+//      T_REG times. Both were needed: the channel tile alone took the decoder
+//      from 4.6% of the card's fp32 peak to 13.7%, and it stalled there
+//      because the weight loads had become the limit.
+//   2. **The input window lives in shared memory.** Adjacent output positions
+//      read overlapping windows, so without this each value is fetched `k`
+//      times.
+//
+// Its differential twin is `xabe_dsp::conv1d`, which stays the plain triple
+// loop. That is the division of labour the whole project is built on: the
+// readable one defines correct, the fast one is tested against it.
+// The body, parameterised so that one implementation serves both the long
+// sequences the decoder produces and the short ones everything else works on.
+template <int OC_TILE, int T_REG>
+__device__ __forceinline__ void conv1d_body(
+    const float* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t,
+    float* sx)
+{
+    int oc0 = blockIdx.x * OC_TILE;
+    int per_block = blockDim.x * T_REG;
+    int p0 = blockIdx.y * per_block;
+
+    float acc[OC_TILE][T_REG];
+    #pragma unroll
+    for (int a = 0; a < OC_TILE; ++a) {
+        float b0 = (oc0 + a < out_ch && bias) ? bias[oc0 + a] : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < T_REG; ++j) acc[a][j] = b0;
+    }
+
+    int span = (k - 1) * dilation + 1;
+    int tile = per_block + span - 1;
+    // Positions rise with j, so a thread whose first one is past the end has
+    // nothing to do at all. Without this the tail block does a full block's
+    // worth of arithmetic and stores none of it.
+    bool active = (p0 + (int)threadIdx.x) < out_t;
+
+    for (int i = 0; i < in_ch; ++i) {
+        for (int sIdx = threadIdx.x; sIdx < tile; sIdx += blockDim.x) {
+            int pos = p0 + sIdx - pad_left;
+            sx[sIdx] = (pos >= 0 && pos < t) ? x[(size_t)i * t + pos] : 0.0f;
+        }
+        __syncthreads();
+
+        if (active) {
+            const float* wi = w + ((size_t)oc0 * in_ch + i) * k;
+            for (int tap = 0; tap < k; ++tap) {
+                float xv[T_REG];
+                #pragma unroll
+                for (int j = 0; j < T_REG; ++j) {
+                    xv[j] = sx[threadIdx.x + j * blockDim.x + tap * dilation];
+                }
+                #pragma unroll
+                for (int a = 0; a < OC_TILE; ++a) {
+                    // One weight load, T_REG multiply-adds. Without the time
+                    // register tile this loaded a weight per multiply-add,
+                    // which is what held the decoder at a seventh of peak.
+                    float wv = wi[(size_t)a * in_ch * k + tap];
+                    #pragma unroll
+                    for (int j = 0; j < T_REG; ++j) {
+                        acc[a][j] = fmaf(xv[j], wv, acc[a][j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!active) return;
+    #pragma unroll
+    for (int j = 0; j < T_REG; ++j) {
+        int p = p0 + threadIdx.x + j * blockDim.x;
+        if (p >= out_t) continue;
+        #pragma unroll
+        for (int a = 0; a < OC_TILE; ++a) {
+            int o = oc0 + a;
+            if (o < out_ch) out[(size_t)o * out_t + p] = acc[a][j];
+        }
+    }
+}
+
+extern "C" __global__ void conv1d(
     const float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ bias, float* __restrict__ out,
     int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= out_ch * out_t) return;
-    int o = idx / out_t;
-    int p = idx - o * out_t;
-
-    float acc = bias ? bias[o] : 0.0f;
-    const float* wo = w + (size_t)o * in_ch * k;
-    for (int i = 0; i < in_ch; ++i) {
-        const float* xi = x + (size_t)i * t;
-        const float* wi = wo + (size_t)i * k;
-        for (int tap = 0; tap < k; ++tap) {
-            int pos = p + tap * dilation - pad_left;
-            if (pos < 0 || pos >= t) continue;
-            acc = fmaf(xi[pos], wi[tap], acc);
-        }
-    }
-    out[idx] = acc;
+    extern __shared__ float sx[];
+    conv1d_body<8, 4>(x, w, bias, out, in_ch, t, out_ch, k, pad_left, dilation, out_t, sx);
 }
+
+// For sequences too short to fill a four-deep time tile. The text encoder runs
+// over 69 symbols and the flow over a couple of hundred frames; at T_REG = 4
+// three quarters of every thread's arithmetic would fall past the end.
+extern "C" __global__ void conv1d_short(
+    const float* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)
+{
+    extern __shared__ float sx[];
+    conv1d_body<8, 1>(x, w, bias, out, in_ch, t, out_ch, k, pad_left, dilation, out_t, sx);
+}
+
+extern "C" {
 
 // One kernel per channel; `w` is [ch, k].
 __global__ void depthwise_conv1d(
@@ -170,7 +259,9 @@ __global__ void softmax_rows(float* __restrict__ x, int cols)
     int row = blockIdx.x;
     float* xr = x + (size_t)row * cols;
 
-    float m = -INFINITY;
+    // NVRTC compiles without the host math headers, so `INFINITY` is not
+    // defined here; this is its bit pattern.
+    float m = __int_as_float(0xff800000);
     for (int i = threadIdx.x; i < cols; i += blockDim.x) m = fmaxf(m, xr[i]);
     sdata[threadIdx.x] = m;
     __syncthreads();
@@ -259,6 +350,27 @@ __global__ void scale_inplace(float* a, int n, float s)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] *= s;
+}
+
+// Copies a contiguous range out of a larger buffer.
+//
+// Exists so that a channel split - the text encoder's projection into a mean
+// and a log-variance, the WaveNet's residual and skip halves - is an explicit
+// copy rather than a device view threaded through every signature.
+__global__ void copy_range(
+    const float* __restrict__ x, float* __restrict__ out, int offset, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[offset + i];
+}
+
+// Writes `n` values into `dst` starting at `offset`. The inverse of
+// `copy_range`, and what makes a channel concatenation one launch.
+__global__ void copy_into(
+    float* __restrict__ dst, const float* __restrict__ src, int offset, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[offset + i] = src[i];
 }
 
 __global__ void transpose(

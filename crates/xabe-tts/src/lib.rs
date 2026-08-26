@@ -11,6 +11,7 @@
 mod decoder;
 mod duration;
 mod flow;
+mod gpu;
 mod prior;
 mod rng;
 mod synthesize;
@@ -20,6 +21,7 @@ mod wav;
 pub use decoder::decoder;
 pub use duration::duration_predictor;
 pub use flow::flow_reverse;
+pub use gpu::GpuModel;
 pub use prior::{Prior, expand_prior};
 pub use rng::Rng;
 pub use synthesize::{Prepared, Prosody, SynthesisError, Synthesizer};

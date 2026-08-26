@@ -1,7 +1,6 @@
 # Command surface
 
-`xabe-tts` builds a binary. Everything below works except `--device`, which
-arrives with the CUDA milestones - until then synthesis is CPU only.
+`xabe-tts` builds a binary, and a second one, `xabe-tts-bench`, for timing.
 
 ## `xabe-tts`
 
@@ -21,19 +20,22 @@ xabe-tts --model model.safetensors --config config.json \
 | `--noise-scale` | | 0.667 | prior temperature |
 | `--noise-scale-duration` | | 0.8 | duration temperature |
 | `--speaking-rate` | | 1.0 | duration multiplier |
-| `--device` | `XABE_TTS_DEVICE` | `auto` | `cpu`, `cuda:N`, `auto` - *not yet implemented* |
+| `--device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
 | `--log-level` | `RUST_LOG` | `info` | `info`, `debug`, `trace` |
 
 `--seed` defaults to a fixed value rather than to entropy. Reproducible by
 default is the right posture for something whose output is hard to check.
 
-## What it currently costs
+## What it costs
 
-The reference kernels are scalar on purpose (see
-[ARCHITECTURE.md](ARCHITECTURE.md)), so the CPU path is slow: 2.67 s of audio
-takes about 120 s, roughly 45x slower than real time, nearly all of it in the
-decoder. That is the number the CUDA milestones have to beat, and it is
-deliberately not being optimised before then.
+| device | 2.6 s of audio |
+| --- | --- |
+| `--device 0` | ~48 ms, 54x realtime |
+| `--device cpu` | ~120 s, 0.02x realtime |
+
+The CPU path is the scalar reference and is not meant to be used: it exists to
+be read and to be correct. See [BENCHMARKS.md](BENCHMARKS.md) for the
+comparison against PyTorch and where the GPU time goes.
 
 ## Verifying the output
 

@@ -16,9 +16,17 @@
 
 use xabe_cuda::Gpu;
 
-/// The GPU fuses multiply-add where the scalar twin does not, so the last bits
-/// differ - in the GPU's favour, since FMA rounds once instead of twice.
+/// Absolute floor, for values near zero.
 const ATOL: f32 = 1e-5;
+
+/// Relative tolerance, which is what actually judges these.
+///
+/// The GPU fuses multiply-add where the scalar twin does not, so the last bits
+/// differ - in the GPU's favour, since FMA rounds once instead of twice. A
+/// purely absolute tolerance is the wrong rule here and was the wrong rule at
+/// first: these kernels accumulate hundreds of terms, so a dot product of
+/// magnitude 4e4 is out by 1e-2 while being correct to within one ulp.
+const RTOL: f32 = 1e-5;
 
 /// A deterministic spread of values in roughly [-2, 2].
 ///
@@ -41,29 +49,50 @@ fn assert_close(name: &str, want: &[f32], got: &[f32]) {
     assert_eq!(want.len(), got.len(), "{name}: length");
     let mut worst = 0.0f32;
     let mut at = 0;
+    let mut over = 0;
     for (i, (a, b)) in want.iter().zip(got).enumerate() {
         let d = (a - b).abs();
+        if d > ATOL + RTOL * a.abs() {
+            over += 1;
+        }
         if d > worst {
             worst = d;
             at = i;
         }
     }
     assert!(
-        worst <= ATOL,
-        "{name}: max abs {worst:.3e} at [{at}], cpu {} vs gpu {}",
+        over == 0,
+        "{name}: {over}/{} values out of tolerance; worst {worst:.3e} at [{at}], \
+         cpu {} vs gpu {}",
+        want.len(),
         want[at],
         got[at],
     );
 }
 
+/// Opens the device, skipping only when there genuinely is not one.
+///
+/// Skipping on *any* error is a trap, and this file fell into it once: a
+/// kernel that failed to compile was reported as an absent GPU, and twelve
+/// tests passed without running. A missing device is an environment fact; a
+/// compile failure is a defect, and it has to fail.
 fn gpu() -> Option<Gpu> {
-    match Gpu::open_default() {
+    match Gpu::open(ordinal()) {
         Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("SKIP: {e}");
+        Err(xabe_cuda::CudaError::NoDevice(why)) => {
+            eprintln!("SKIP: no CUDA device ({why})");
             None
         }
+        Err(e) => panic!("the device is present but unusable: {e}"),
     }
+}
+
+/// Which device to use. GPU 2 on this host runs somebody else's job.
+fn ordinal() -> usize {
+    std::env::var("XABE_TTS_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 #[test]

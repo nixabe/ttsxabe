@@ -2,13 +2,52 @@
 
 ## Current standing
 
-**There is no standing. Nothing in this repository synthesises audio yet.**
+One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
+`lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
+Twenty timed synthesis calls after five warm-up, medians, alternated in pairs.
+
+| implementation | median | x realtime |
+| --- | --- | --- |
+| PyTorch, CUDA, fp32 | 65.6 ms / 2.85 s | 43.2 |
+| `xabe-tts`, CUDA, fp32 | 48.4 ms / 2.61 s | 53.9 |
+| `xabe-tts`, CPU, scalar | ~120 s / 2.67 s | 0.02 |
+
+**1.24x faster than PyTorch** per second of audio, stable to within 0.2 across
+three interleaved rounds. The utterance lengths differ because both sample
+their own durations, which is why the comparison is made on time per second of
+audio rather than on the raw medians.
+
+Where that time goes, measured with `xabe-tts-bench --stages`:
+
+| stage | ms | share |
+| --- | --- | --- |
+| decoder | 34.1 | 72% |
+| text encoder | 6.0 | 13% |
+| flow | 5.1 | 11% |
+| duration predictor | 1.9 | 4% |
+| prior, download | 0.1 | <1% |
+
+The CPU row is the scalar reference and is not a target: it exists to be read
+and to be correct.
 
 This section holds the current numbers and nothing else. When a measurement
 supersedes a cell, replace the cell — never append a dated note, a before/after
 delta, or an "improved from X" narrative. The change story belongs in the commit
 message; durable reasoning belongs in WHY below, and measured rejections in
 WHY NOT.
+
+## Headroom
+
+The decoder is 100.2 GFLOP for this utterance - 6.15e8 per input frame, 2.4e6
+per output sample - and it runs in 34.1 ms, which is 2.94 TFLOPS, or **18% of
+this card's 16.3 TFLOPS fp32 peak**. At 100% of peak the decoder would take
+6.1 ms; nothing reaches that, but a well-tuned dense kernel reaching 40-60%
+would put it at 10-15 ms.
+
+So the honest statement of remaining headroom is roughly 2-3x on the decoder,
+and it is in the convolution kernel rather than anywhere else. This number is
+computed rather than guessed because
+[OPTIMIZATION.md](OPTIMIZATION.md) refuses to promise a factor without it.
 
 ## The baseline to beat
 
@@ -44,6 +83,27 @@ No performance number is admissible unless `cargo test --workspace --release` is
 green on the same commit. A fast wrong kernel is not a result; see
 [TESTING.md](TESTING.md).
 
+## WHY NOT
+
+Measured rejections. Things that looked like they should help and did not.
+
+### `torch.backends.cudnn.benchmark = True` makes the baseline 13x slower
+
+The obvious knob to turn when comparing against PyTorch, and turning it moved
+the baseline from 65 ms to 1023 ms. cuDNN's autotuner caches its algorithm
+choice per input shape, and every utterance has a different frame count because
+the durations are sampled - so it re-tunes on every call and reuses nothing.
+
+The general lesson: **autotuning is a bet on shape stability, and a model that
+samples its own output length has none.** Left off, which makes PyTorch's
+defaults its best settings for this workload.
+
+### fp16 was already rejected upstream
+
+Measured slower on these cards for the neighbouring TTS model in the same
+pipeline. Turing has fp16 tensor cores but no bf16, so mixed precision here
+means real overflow risk for no measured gain. Not attempted.
+
 # WHY
 
 Durable reasoning. Things learned that outlive the change that taught them.
@@ -64,6 +124,27 @@ classes of orthography and prosody bugs that no unit test would.
 
 `posterior_encoder` (100 tensors, 7.24 M parameters) exists for training. Load
 time and VRAM budgets should be computed on the inference subset.
+
+## WHY NOT
+
+Measured rejections. Things that looked like they should help and did not.
+
+### `torch.backends.cudnn.benchmark = True` makes the baseline 13x slower
+
+The obvious knob to turn when comparing against PyTorch, and turning it moved
+the baseline from 65 ms to 1023 ms. cuDNN's autotuner caches its algorithm
+choice per input shape, and every utterance has a different frame count because
+the durations are sampled - so it re-tunes on every call and reuses nothing.
+
+The general lesson: **autotuning is a bet on shape stability, and a model that
+samples its own output length has none.** Left off, which makes PyTorch's
+defaults its best settings for this workload.
+
+### fp16 was already rejected upstream
+
+Measured slower on these cards for the neighbouring TTS model in the same
+pipeline. Turing has fp16 tensor cores but no bf16, so mixed precision here
+means real overflow risk for no measured gain. Not attempted.
 
 # WHY NOT
 

@@ -588,6 +588,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "xabe-cuda",
  "xabe-dsp",
  "xabe-golden",
  "xabe-st",

@@ -58,9 +58,38 @@ see WHY NOT in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## 5. The ceiling
 
-If the whole synthesis reduces to arithmetic on the decoder and every launch is
-fused perfectly, the floor is set by the transposed convolutions' FLOP count at
-sm_75 fp32 rates. That bound has not been computed yet, and until it is, "how
-much faster can this get" has no honest answer.
+Now computed. The decoder is **6.15e8 FLOPs per input frame**, or 2.4e6 per
+output sample - dominated by the residual blocks, not by the transposed
+convolutions, which are under 1% of it. For a 163-frame utterance that is
+100.2 GFLOP.
 
-Compute it before promising a factor.
+At the card's 16.3 TFLOPS fp32 peak that is a 6.1 ms floor. The current kernels
+reach 2.94 TFLOPS, 18% of peak. A well-tuned dense kernel reaching 40-60% would
+land at 10-15 ms, so the honest remaining headroom is **2-3x, all of it in the
+convolution kernel**.
+
+## 6. What was actually true
+
+Written after the measurements, against section 2's predictions.
+
+**Right:** the decoder is where the time is (72%), and the text encoder is not
+the bottleneck (13% even at 69 symbols). Bandwidth is not the constraint.
+
+**Wrong, or at least misleading:** section 2 said the cost was "in the number of
+small kernel launches and in the decoder's arithmetic". Launch overhead turned
+out to be negligible - synthesis time is linear in output length with an
+intercept indistinguishable from zero, across a 15x range of utterance
+lengths - so allocation and launch discipline bought nothing, and the arena
+work section 4 expected to transfer from `llmxabe` was not needed. The whole
+gain came from arithmetic intensity inside one kernel:
+
+| change | decoder |
+| --- | --- |
+| one thread per output element | 4.6% of peak |
+| + 8 output channels per thread (register tile) | 13.7% |
+| + 4 time positions per thread (weight reuse) | 18.0% |
+
+The second step is the one worth remembering: after the channel tile the kernel
+was loading one weight per multiply-add, so it was still load-bound - just on a
+different operand than before. **Fixing an arithmetic-intensity problem on one
+operand can leave you with the same problem on the other.**

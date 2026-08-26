@@ -13,7 +13,7 @@ use clap::Parser;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use xabe_tts::{Synthesizer, write_wav};
+use xabe_tts::{GpuModel, Synthesizer, write_wav};
 
 /// Synthesise Taiwanese Hokkien speech from Pe̍h-ōe-jī text.
 #[derive(Debug, Parser)]
@@ -50,6 +50,13 @@ struct Args {
     /// Speaking rate. Higher is faster.
     #[arg(long)]
     speaking_rate: Option<f32>,
+
+    /// Where to synthesise: cpu, or a CUDA device ordinal.
+    ///
+    /// The CPU path is the scalar reference and is roughly 45x slower than real
+    /// time; it exists to be read and to be correct, not to be used.
+    #[arg(long, env = "XABE_TTS_DEVICE", default_value = "0")]
+    device: String,
 
     /// Log verbosity: info, debug or trace.
     #[arg(long, env = "RUST_LOG", default_value = "info")]
@@ -94,32 +101,58 @@ fn main() -> ExitCode {
         }
     };
 
-    // 2: the model.
-    let mut synth = match Synthesizer::open_files(&args.model, &config, &dir) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("2/4 loading model: {e}");
-            return ExitCode::FAILURE;
+    // 2: the model, on whichever device was asked for.
+    let ordinal = if args.device == "cpu" {
+        None
+    } else {
+        match args.device.parse::<usize>() {
+            Ok(o) => Some(o),
+            Err(_) => {
+                tracing::error!(
+                    "2/4 --device must be `cpu` or a CUDA device ordinal, got {}",
+                    args.device,
+                );
+                return ExitCode::FAILURE;
+            }
         }
     };
-    let cfg = synth.config_mut();
-    if let Some(v) = args.noise_scale {
-        cfg.noise_scale = v;
-    }
-    if let Some(v) = args.noise_scale_duration {
-        cfg.noise_scale_duration = v;
-    }
-    if let Some(v) = args.speaking_rate {
-        cfg.speaking_rate = v;
-    }
-    let rate = synth.config().sampling_rate;
 
-    // 3: synthesis.
-    let audio = match synth.synthesize(&text, args.seed) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("3/4 synthesising: {e}");
-            return ExitCode::FAILURE;
+    let (rate, audio) = match ordinal {
+        None => {
+            let mut synth = match Synthesizer::open_files(&args.model, &config, &dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("2/4 loading model: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            apply_overrides(synth.config_mut(), &args);
+            let rate = synth.config().sampling_rate;
+            match synth.synthesize(&text, args.seed) {
+                Ok(a) => (rate, a),
+                Err(e) => {
+                    tracing::error!("3/4 synthesising: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Some(o) => {
+            let mut model = match GpuModel::open(&dir, o) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("2/4 loading model on device {o}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            apply_overrides(model.config_mut(), &args);
+            let rate = model.config().sampling_rate;
+            match model.synthesize(&text, args.seed) {
+                Ok(a) => (rate, a),
+                Err(e) => {
+                    tracing::error!("3/4 synthesising: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
     tracing::info!(
@@ -135,6 +168,22 @@ fn main() -> ExitCode {
     }
     tracing::info!(out = %args.out.display(), "wrote");
     ExitCode::SUCCESS
+}
+
+/// Applies the three sampling overrides the CLI exposes.
+///
+/// Only these three: they are temperatures and a rate, not geometry. Anything
+/// else would contradict the checkpoint.
+fn apply_overrides(cfg: &mut xabe_vits::VitsConfig, args: &Args) {
+    if let Some(v) = args.noise_scale {
+        cfg.noise_scale = v;
+    }
+    if let Some(v) = args.noise_scale_duration {
+        cfg.noise_scale_duration = v;
+    }
+    if let Some(v) = args.speaking_rate {
+        cfg.speaking_rate = v;
+    }
 }
 
 /// Reads the text argument, or stdin when it is `-`.

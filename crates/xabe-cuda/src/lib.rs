@@ -25,6 +25,7 @@ mod device;
 mod error;
 mod kernels;
 
+pub use cudarc::driver::CudaSlice;
 pub use device::Gpu;
 pub use error::CudaError;
 pub use kernels::SOURCE;

@@ -15,7 +15,7 @@ Numbered by what becomes *true*, not by how much work it was.
 | 9 | End-to-end synthesis on CPU matches the reference waveform | ✅ |
 | 10 | The CLI synthesises a WAV from Tâi-lô/POJ on the command line | ✅ |
 | 11 | CUDA kernels match the CPU reference, per kernel | ✅ |
-| 12 | End-to-end CUDA synthesis is faster than PyTorch, measured | |
+| 12 | End-to-end CUDA synthesis is faster than PyTorch, measured | ✅ |
 
 Milestone 9 is the one that matters. Everything before it is scaffolding, and
 everything after it is optimisation — which cannot start until there is a

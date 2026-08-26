@@ -229,6 +229,10 @@ pub enum SynthesisError {
     #[error(transparent)]
     Tokenizer(#[from] xabe_vits::TokenizerError),
 
+    /// The GPU path failed, or there is no device.
+    #[error(transparent)]
+    Cuda(#[from] xabe_cuda::CudaError),
+
     /// The checkpoint does not match its config.
     #[error(transparent)]
     Weights(#[from] xabe_vits::WeightError),

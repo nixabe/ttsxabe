@@ -19,6 +19,16 @@ const BLOCK: u32 = 256;
 /// to the block.
 const REDUCE_BLOCK: u32 = 256;
 
+/// Output positions per block in the tiled convolution.
+const CONV_BLOCK: u32 = 128;
+
+/// Output channels each convolution thread accumulates. Must match `OC_TILE`
+/// in the device source.
+const CONV_OC_TILE: u32 = 8;
+
+/// Time positions each convolution thread accumulates. Must match `T_REG`.
+const CONV_T_REG: u32 = 4;
+
 /// An open CUDA device with the kernels compiled and loaded.
 pub struct Gpu {
     stream: Arc<CudaStream>,
@@ -38,6 +48,7 @@ impl std::fmt::Debug for Gpu {
 /// Every kernel in [`SOURCE`], looked up once at load.
 const NAMES: &[&str] = &[
     "conv1d",
+    "conv1d_short",
     "depthwise_conv1d",
     "transposed_conv1d",
     "linear",
@@ -51,6 +62,8 @@ const NAMES: &[&str] = &[
     "add_inplace",
     "sub_inplace",
     "scale_inplace",
+    "copy_range",
+    "copy_into",
     "transpose",
     "flip_channels",
     "embed_scaled",
@@ -235,6 +248,18 @@ impl Gpu {
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
         let span = dilation * (k - 1) + 1;
         let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+        // Which specialisation: the four-deep time tile pays for itself only
+        // when the sequence can fill it. Below that the short kernel wins,
+        // because three quarters of every thread's arithmetic would otherwise
+        // fall past the end of the sequence.
+        let long_form = out_t >= (CONV_BLOCK * CONV_T_REG) as usize;
+        let t_reg = if long_form { CONV_T_REG } else { 1 };
+        let threads = if long_form {
+            CONV_BLOCK
+        } else {
+            (out_t as u32).next_multiple_of(32).clamp(32, CONV_BLOCK)
+        };
+        let per_block = threads * t_reg;
         let mut out = self.zeros(out_ch * out_t)?;
         let (a, b_, c, d, e, g, h) = (
             in_ch as i32,
@@ -246,7 +271,7 @@ impl Gpu {
             out_t as i32,
         );
         let null: u64 = 0;
-        let f = self.func("conv1d");
+        let f = self.func(if long_form { "conv1d" } else { "conv1d_short" });
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(w);
         match bias {
@@ -261,7 +286,20 @@ impl Gpu {
             .arg(&e)
             .arg(&g)
             .arg(&h);
-        launched("conv1d", unsafe { lb.launch(Self::flat(out_ch * out_t)) })?;
+        // The tiled kernel's launch shape: one block per (output-channel tile,
+        // time tile), with the input window in dynamic shared memory.
+        let span = dilation * (k - 1) + 1;
+        let tile = per_block as usize + span - 1;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (out_ch as u32).div_ceil(CONV_OC_TILE),
+                (out_t as u32).div_ceil(per_block),
+                1,
+            ),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: (tile * 4) as u32,
+        };
+        launched("conv1d", unsafe { lb.launch(cfg) })?;
         Ok((out, out_t))
     }
 
@@ -519,6 +557,37 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(a).arg(&len).arg(&s);
         launched("scale_inplace", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// Copies `n` values starting at `offset` into a fresh buffer.
+    pub fn copy_range(
+        &self,
+        x: &CudaSlice<f32>,
+        offset: usize,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let mut out = self.zeros(n)?;
+        let (a, b_) = (offset as i32, n as i32);
+        let f = self.func("copy_range");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&a).arg(&b_);
+        launched("copy_range", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
+    }
+
+    /// Writes `src` into `dst` starting at `offset`.
+    pub fn copy_into(
+        &self,
+        dst: &mut CudaSlice<f32>,
+        src: &CudaSlice<f32>,
+        offset: usize,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        let (a, b_) = (offset as i32, n as i32);
+        let f = self.func("copy_into");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(dst).arg(src).arg(&a).arg(&b_);
+        launched("copy_into", unsafe { lb.launch(Self::flat(n)) })
     }
 
     /// Transposes a row-major `[rows, cols]`. Mirrors [`xabe_dsp::transpose`].
