@@ -16,6 +16,13 @@ fn find_snapshot() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
         return PathBuf::from(p).parent().map(Into::into);
     }
+    // The consolidated model tree is the canonical home. The HuggingFace cache
+    // is kept as a fallback so a checkout that never ran the move still tests.
+    let local =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tts/mms-tts-nan");
+    if local.join("model.safetensors").is_file() {
+        return Some(local);
+    }
     let home = std::env::var("HOME").ok()?;
     let root = std::path::Path::new(&home)
         .join(".cache/huggingface/hub/models--facebook--mms-tts-nan/snapshots");

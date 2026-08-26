@@ -12,6 +12,13 @@ fn find_model() -> Option<std::path::PathBuf> {
         let p = std::path::PathBuf::from(p);
         return p.is_file().then_some(p);
     }
+    // The consolidated model tree is the canonical home. The HuggingFace cache
+    // is kept as a fallback so a checkout that never ran the move still tests.
+    let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models/tts/mms-tts-nan/model.safetensors");
+    if local.is_file() {
+        return Some(local);
+    }
     let home = std::env::var("HOME").ok()?;
     let root = std::path::Path::new(&home)
         .join(".cache/huggingface/hub/models--facebook--mms-tts-nan/snapshots");
