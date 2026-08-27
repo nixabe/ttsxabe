@@ -700,6 +700,44 @@ __global__ void act_elu(float* x, int n)
     if (i < n && x[i] < 0.0f) x[i] = __expf(x[i]) - 1.0f;
 }
 
+/* Mish: x * tanh(softplus(x)).
+ *
+ * `log1pf(expf(x))` rather than `logf(1 + expf(x))`: the second loses every
+ * bit of a small `x` to the addition, and overflows to infinity for x above
+ * about 88 where softplus should simply be x. The threshold below keeps the
+ * large branch exact instead of relying on `log1p` to recover it. */
+__global__ void act_mish(float* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        float sp = v > 20.0f ? v : log1pf(expf(v));
+        x[i] = v * tanhf(sp);
+    }
+}
+
+/* SiLU, on its own rather than fused with a gate. */
+__global__ void act_silu(float* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] / (1.0f + __expf(-x[i]));
+}
+
+/* GELU's tanh approximation, which is `nn.GELU(approximate="tanh")`.
+ *
+ * A different function from `act_gelu`'s exact erf form - they agree to about
+ * 1e-3, which is far more than a rounding difference and far less than an
+ * obvious break. The DiT's feed-forward asks for this one by name. */
+__global__ void act_gelu_tanh(float* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+        x[i] = 0.5f * v * (1.0f + tanhf(inner));
+    }
+}
+
 __global__ void act_tanh(float* x, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1297,6 +1335,70 @@ extern "C" __global__ void strided_conv1d(
         const float* xr = x + (size_t)c * t;
         for (int j = 0; j < k; ++j) {
             int at = s * stride + j - pad_left;
+            if (at >= 0 && at < t) acc += wr[j] * xr[at];
+        }
+    }
+    out[i] = acc;
+}
+
+/* GPT-J style partial rotary embedding, over the *interleaved* pairs.
+ *
+ * Two things make this not the `rope` next door, and both are easy to get
+ * wrong in a way that still produces speech:
+ *
+ * - **Partial.** Only the first `rot_dim` of each `dim`-wide row is rotated
+ *   and the rest passes through. In this model `dim` is 1024 and `rot_dim` is
+ *   64, and the rotation happens *before* the heads are split - so of sixteen
+ *   heads exactly one carries position information.
+ * - **Interleaved.** Element `2j` pairs with `2j + 1`, which is ggml's
+ *   convention rather than the one `rope` implements for HuggingFace layouts.
+ *
+ * The frequencies come from the checkpoint rather than from a base, because
+ * `x_transformers` stores `inv_freq` as a buffer. */
+extern "C" __global__ void rope_gptj(
+    float* x, const float* __restrict__ inv_freq,
+    int positions, int dim, int rot_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int pairs = rot_dim / 2;
+    if (i >= positions * pairs) return;
+    int pos = i / pairs, j = i % pairs;
+
+    float ang = (float)pos * inv_freq[j];
+    float c = __cosf(ang), s = __sinf(ang);
+    size_t at = (size_t)pos * dim + 2 * j;
+    float a = x[at], b = x[at + 1];
+    x[at]     = a * c - b * s;
+    x[at + 1] = b * c + a * s;
+}
+
+/* A grouped 1-D convolution with left padding only.
+ *
+ * The DiT's positional embedding is `groups = 16` over 1024 channels, so each
+ * group sees 64 in-channels and produces 64 out. Running it as sixteen
+ * ungrouped convolutions would mean sixteen slices per call and forty
+ * launches per solver step; running it as one ungrouped convolution would be
+ * a different, much larger, function. */
+extern "C" __global__ void grouped_conv1d(
+    const float* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int in_ch, int t, int out_ch, int k, int groups, int pad_left, int out_t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_ch * out_t) return;
+    int o = i / out_t, s = i % out_t;
+
+    int in_per = in_ch / groups, out_per = out_ch / groups;
+    int g = o / out_per;
+
+    float acc = bias[o];
+    for (int c = 0; c < in_per; ++c) {
+        // The weight is `[out_ch, in_ch / groups, k]`: the second axis is the
+        // channel *within* the group, not the absolute channel.
+        const float* wr = w + ((size_t)o * in_per + c) * k;
+        const float* xr = x + (size_t)(g * in_per + c) * t;
+        for (int j = 0; j < k; ++j) {
+            int at = s + j - pad_left;
             if (at >= 0 && at < t) acc += wr[j] * xr[at];
         }
     }

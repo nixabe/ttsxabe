@@ -120,17 +120,44 @@ pub struct Args {
     #[arg(long)]
     pub speaking_rate: Option<f32>,
 
-    /// Extra TTS engines the page can choose, as `name=url`. Repeatable.
+    /// Extra TTS engines the page can choose, as `name=url` or `name=path`.
+    /// Repeatable.
     ///
     /// `--tts-model` and `--tts-url` register one engine; this registers the
     /// others, which is how the page offers mms and cosyvoice side by side.
+    ///
+    /// A value that begins `http://` or `https://` is another process. Anything
+    /// else is a directory, opened **in this one**: a CosyVoice3 checkpoint if
+    /// it holds `llm.safetensors`, `flow.safetensors` and `hift.safetensors`,
+    /// and a VITS one otherwise. Local engines from here run on
+    /// `--tts-device`, the same card as `--tts-model`.
     #[arg(
         long = "tts-engine",
         env = "XABE_TTS_ENGINES",
-        value_name = "NAME=URL",
+        value_name = "NAME=URL|PATH",
         value_delimiter = ','
     )]
     pub tts_engines: Vec<String>,
+
+    /// The speaker bundle a local CosyVoice engine speaks with.
+    ///
+    /// Written by `tools/make_cosyvoice_voice.py`. Defaults to
+    /// `<checkpoint>/voices/taigi-ref.safetensors`.
+    #[arg(long, env = "XABE_COSY_VOICE", value_name = "PATH")]
+    pub cosy_voice: Option<std::path::PathBuf>,
+
+    /// The instruction a local CosyVoice engine is given.
+    ///
+    /// It must end on `<|endofprompt|>`; in instruct mode the language model
+    /// sees only text, so this string is half of what decides how the reply
+    /// sounds. Changing it changes the speech tokens for the same sentence.
+    #[arg(
+        long,
+        env = "XABE_COSY_INSTRUCT",
+        value_name = "TEXT",
+        default_value = "You are a helpful assistant. \u{8acb}\u{7528}\u{95a9}\u{5357}\u{8a71}\u{8868}\u{9054}\u{3002}<|endofprompt|>"
+    )]
+    pub cosy_instruct: String,
 
     /// Which engine the page selects on load.
     #[arg(long, env = "XABE_TTS_DEFAULT", value_name = "NAME")]

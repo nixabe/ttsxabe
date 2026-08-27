@@ -6,15 +6,22 @@ No ML framework, no bindings. The container readers, the weight schemas and the
 kernels all live in this repository and are verified against captured
 references.
 
-One binary, `xabe-engine`, runs every stage of the pipeline except the chat
-LLM, which stays in llama.cpp by decision. Which stages *this* process runs is
-decided by flags, and each stage is satisfied either locally
-(`--<stage>-model`) or by another process over HTTP (`--<stage>-url`) — so the
-same binary is a monolith, a single-stage worker, or anything between.
+One binary, `xabe-engine`, runs every stage of the pipeline. Which stages
+*this* process runs is decided by flags, and each stage is satisfied either
+locally (`--<stage>-model`) or by another process over HTTP (`--<stage>-url`)
+— so the same binary is a monolith, a single-stage worker, or anything
+between.
 
 Finished: the synthesiser, the serving layer, voice activity detection, speech
-recognition and Mandarin-to-Taigi translation. Remaining: CosyVoice.
-`docs/MILESTONES.md` has the phases and `docs/CLI.md` the flag surface.
+recognition, Mandarin-to-Taigi translation, the chat model, and CosyVoice3.
+Remaining inside CosyVoice: deriving a **new** voice still runs two ONNX models
+once, through `tools/make_cosyvoice_voice.py`. `docs/MILESTONES.md` has the
+phases and `docs/CLI.md` the flag surface.
+
+The chat model was originally excluded by decision — llama.cpp already ran it
+well, and a second decode loop was not obviously worth writing. That is
+retracted: `--llm-model` reads a GGUF and runs it here, verified against
+llama-server by teacher forcing at 124 of 125 decisions.
 
 ## Why this exists
 
@@ -75,6 +82,16 @@ identical transcripts. That was a stated milestone and it is not met;
 `docs/BENCHMARKS.md` computes what closing the gap would take rather than
 restating the target.
 
+**CosyVoice3 runs in the engine.** Three networks from scratch — a Qwen2 0.5 B
+speech language model, a 22-layer diffusion transformer with its Euler solver,
+and a causal HiFi-GAN with an inverse-STFT head and a harmonic source — plus a
+Qwen2 byte-level BPE and eleven new CUDA kernels. Against a capture from
+CosyVoice3 itself: the language model agrees at 143 of 143 positions on forced
+log-probabilities, the flow reaches the reference mel at correlation 0.999970,
+and the vocoder reproduces the reference waveform at 1.000000 with a worst
+sample of 1e-5. `--tts-engine cosyvoice=<dir>` opens it in-process; deriving a
+**new** voice still runs two ONNX models once, through a `tools/` script.
+
 The translator is a Llama-2 13 B, all 363 tensors bound and shape-checked
 before a byte is read, BF16 converted to f16 at load because Turing has no
 bf16, and a hand-written SentencePiece tokenizer. Its output matches
@@ -88,8 +105,9 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 31 CUDA kernels, each diffed against its scalar twin |
+| `xabe-cuda` | 47 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
+| `xabe-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
 | `xabe-audio` | WAV reading and writing, sample handling |
 | `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
 | `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
@@ -144,6 +162,18 @@ xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
             --llm-model models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf
 ```
 
+Two synthesisers in one process, and the page chooses between them:
+
+```sh
+xabe-engine --serve 127.0.0.1:8000 \
+            --tts-model  models/tts/mms-tts-nan       --tts-device 2 \
+            --tts-engine cosyvoice=models/tts/cosyvoice3-0.5b \
+            --tts-script cosyvoice=HAN
+```
+
+mms reads romanisation and CosyVoice reads Han, which is what `--tts-script`
+settles per engine rather than per process.
+
 Each stage is satisfied either locally or by another process, and nothing
 downstream can tell which — so the same binary is a monolith, a worker, or
 anything between. Every model lives under `models/`, which is gitignored: one
@@ -183,14 +213,11 @@ made only of them tokenises to nothing and is refused rather than returned as
 silence. Producing POJ from Mandarin is the translator's job, and the
 translator is a separate stage with its own model and its own flag.
 
-The chat model runs either way: `--llm-model` loads the GGUF here,
+The chat model runs either way: `--llm-model` loads the GGUF and runs it here,
 `--llm-url` delegates it to a llama-server. GGUF only, and no `cpu` device —
-see `docs/CLI.md`.
-Its **weights** do load here — `xabe-gguf` reads the GGUF and `xabe-llama`
-binds all 292 tensors of the 8 B Breeze2 — but nothing runs them, so serving it
-is still llama.cpp's job. Quantized checkpoints load too: `Q4_0`, `Q4_1`,
-`Q5_0`, `Q5_1`, `Q8_0` and `Q2_K` through `Q6_K` are unpacked on read. That is a
-smaller file, not a smaller model — the weights land at full width either way.
+see `docs/CLI.md`. Quantized checkpoints load too: `Q4_0`, `Q4_1`, `Q5_0`,
+`Q5_1`, `Q8_0` and `Q2_K` through `Q6_K` are unpacked on read. That is a smaller
+file, not a smaller model — the weights land at full width either way.
 
 There is no KV cache and no request scheduler here; an utterance is a single
 forward pass with no state carried between calls. If batching arrives it will be

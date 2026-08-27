@@ -181,6 +181,13 @@ gate.
 | # | State | Done |
 | --- | --- | --- |
 | 23 | Scoped, against the checkpoint on disk rather than the plan's estimate | ✅ |
+| 24 | `tools/convert_cosyvoice.py` converts all three `.pt` files; every tensor typed and shape-checked at bind | ✅ |
+| 25 | The speech LM's forward pass, GQA 7:1 and q/k/v biases, matches at **143 of 143** positions | ✅ |
+| 26 | The Qwen2 BPE matches the reference on both strings; `ras_sampling` transcribed with its traps named | ✅ |
+| 27 | The DiT estimator and the Euler/CFG solver reach the reference mel at correlation **0.999970** | ✅ |
+| 28 | Snake, iSTFT and the NSF source in `xabe-dsp`/`xabe-cuda`; the waveform matches at **1.000000** | ✅ |
+| 29 | End to end in-process: `--tts-engine cosyvoice=<dir>`, Han text in, 24 kHz audio out | ✅ |
+| 30 | The speech tokenizer and CAMPPlus ported from ONNX, so a new voice needs no Python | ⬜ |
 
 The plan said "4 sub-models across 3 formats, larger than the ASR port". Only
 the middle claim survives reading the files. It is **five** sub-models, and it
@@ -269,25 +276,74 @@ does not: `docs/BENCHMARKS.md` already records fp16 being rejected upstream in
 VITS's flow and decoder, and a HiFi-GAN with an iSTFT head is the same kind of
 arithmetic. 20.8 M parameters is not worth the risk of finding out by ear.
 
-#### Proposed items
+#### What 24-29 came to, and the four things that decided them
 
-Not started. Ordered so that 24-29 produce audio for the one cached reference
-speaker, and only 30 is about supporting a new voice.
+Items 24-29 are done and 30 is not. Item 30 is a different kind of work —
+deriving a network from an ONNX graph rather than from reference source — and
+should be re-scoped when it is reached rather than estimated now.
 
-| # | item |
+Two of the guesses above were wrong, and are corrected here rather than quietly
+left standing:
+
+- **`xabe-llama` did not grow GQA.** The speech LM lives in `xabe-cosy` with its
+  own forward pass. It shares no weights, no tokenizer and no rope convention
+  with the translator, and folding a 6761-way speech head into a crate that
+  exists to read Llama geometry would have bought a shared file and nothing
+  else.
+- **`ras_sampling` is not reproduced under a pinned RNG,** because it cannot be:
+  upstream draws with `torch.multinomial`. Measured on the capture, its sampled
+  run agrees with its own greedy argmax at **21 of 143** positions — so two
+  correct implementations produce visibly different tokens, and comparing them
+  would prove nothing in either direction. The LM is compared by **forced
+  log-probabilities** instead: 143 observations rather than one, and it keeps
+  measuring past the first divergence.
+
+Four findings cost real time, and each is invisible in a shape check.
+
+| | |
 | --- | --- |
-| 24 | `tools/` converts `llm.pt`, `flow.pt` and `hift.pt` to safetensors; geometry and all 951 tensors typed and shape-checked |
-| 25 | `xabe-llama` grows GQA and q/k/v biases; the Qwen2 backbone matches a captured oracle per layer |
-| 26 | Qwen2 byte-level BPE matches the reference tokenizer, and `ras_sampling` reproduces the reference under a pinned RNG |
-| 27 | The DiT estimator matches per layer; the Euler/CFG solver matches the reference mel |
-| 28 | Snake, iSTFT and the NSF source land in `xabe-dsp`/`xabe-cuda` with differential tests; the vocoder matches the reference waveform |
-| 29 | End to end from cached speaker tensors: `--tts-model` selects CosyVoice, Han text in, 24 kHz audio out |
-| 30 | The speech tokenizer and CAMPPlus ported from ONNX, so a new reference voice needs no Python |
+| The vocoder's final `F.leaky_relu` | takes torch's **0.01** default where every other slope in this checkpoint is 0.1. Every stage stayed exact, `conv_post` moved to 0.962, and the waveform came out with **ten times** its energy once the magnitudes were exponentiated. |
+| `copy_into` has no source offset | so both prompt markers were written as `sos`. 113 of 143 positions still agreed, which reads exactly like a rounding problem. `copy_range` first, then copy. |
+| A tap saved as a transposed **view** | `np.save` records it faithfully as `fortran_order: True`, so the header's shape and the bytes disagree and a reader that trusts the shape gets a permutation: identical rms, correlation 0.26. The capture now forces C order on every tap. |
+| The excitation's phase is a cumulative sum | so a 1e-4 relative difference in the predicted F0 has grown into a fraction of a cycle by the end of six seconds. The waveform is then the same speech with its carrier slid along — and correlates at **zero** sample for sample. |
 
-Items 24-29 are the ASR port's shape with a different model. Item 30 is a
-different kind of work — deriving a network from an ONNX graph rather than from
-reference source — and is the one that should be re-scoped when it is reached
-rather than estimated now.
+#### What is measured, stage by stage
+
+Every figure is against `.golden/cosyvoice`, captured from CosyVoice3-0.5B
+itself on the same reference clip.
+
+| stage | measurement | result |
+| --- | --- | --- |
+| tokenizer | ids, instruct and utterance | identical |
+| speech LM | argmax agreement on forced log-probabilities | 143 / 143 |
+| flow | the whole thing, against the reference mel | correlation 0.999970 |
+| F0 | per frame | correlation 1.000000, worst 0.0016 Hz |
+| excitation | given the reference's own dither | correlation 0.999999 |
+| vocoder | waveform, given the reference excitation | correlation 1.000000, worst sample 1e-5 |
+| the acoustic half chained | energy envelope, its own dither and its own F0 | correlation 0.968, gain 1.008 |
+
+#### Two things are deliberately not bit-exact, and could not be
+
+- **The vocoder's dither.** `SineGen2` and `SourceModuleHnNSF` each call
+  `torch.rand` in `__init__` and keep the result as a plain attribute — not a
+  parameter, not a registered buffer — so none of it reaches `hift.pt`.
+  Upstream redraws it on every construction and **does not reproduce across
+  load orderings either**. The engine draws its own from a named seed and is
+  reproducible on its own terms; on the reference mel that alone still leaves
+  the waveform at correlation 0.996.
+- **The estimator's tail.** The residual stream through twenty-two blocks
+  carries a handful of activations near 280 against an rms of 8.7, and float32
+  error concentrates on exactly those: worst element 0.35 against an rms of
+  6.14, at correlation 0.999951.
+
+#### The speaker is a file, not an ONNX runtime
+
+`tools/make_cosyvoice_voice.py` runs both ONNX models **once per voice** and
+writes four tensors plus the diffusion's starting noise. That last one is not a
+property of the speaker at all — `CausalConditionalCFM.__init__` seeds the
+global RNG to zero and draws it, so it is the same for every voice and every
+utterance — and it is load-bearing, so it rides in the bundle because that is
+the file the engine already opens. See `crates/xabe-cosy/src/voice.rs`.
 
 ## Outside the numbering: the chat model's loader
 

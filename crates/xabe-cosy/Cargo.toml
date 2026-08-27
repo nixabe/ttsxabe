@@ -10,9 +10,12 @@ authors.workspace = true
 xabe-cuda.workspace = true
 xabe-dsp.workspace = true
 xabe-st.workspace = true
+regex.workspace = true
+rustc-hash.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 serde.workspace = true
-serde_json.workspace = true
+xabe-audio.workspace = true

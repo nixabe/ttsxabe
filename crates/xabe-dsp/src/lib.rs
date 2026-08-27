@@ -28,7 +28,7 @@ mod spline;
 mod tensor;
 mod weight_norm;
 
-pub use activation::{elu, leaky_relu, relu, snake, softmax_rows};
+pub use activation::{elu, gelu_tanh, leaky_relu, mish, relu, snake, softmax_rows};
 pub use attention::self_attention;
 pub use conv::{conv1d, conv1d_strided, depthwise_conv1d, same_padding, transposed_conv1d};
 pub use erf::{erf, gelu};

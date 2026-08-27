@@ -274,3 +274,49 @@ The trap next to it has no kernel of its own: **`rope` on `k` runs over
 position, so passing the query count reads 4096 floats out of a 1024-wide row
 and rotates four positions' keys as if they were one position's heads. The
 buffer is the right length in total, so nothing checks it and nothing crashes.
+
+## The eleven kernels CosyVoice3 added
+
+Five are activations, and each is in the checkpoint for a reason that is not
+interchangeable with another's:
+
+| kernel | what it is | where |
+| --- | --- | --- |
+| `act_snake` | `x + sin²(αx)/α`, with a **learned per-channel α** | every residual block of the vocoder |
+| `act_elu` | `x` above zero, `exp(x) - 1` below | between the F0 predictor's five convolutions |
+| `act_mish` | `x · tanh(softplus(x))` | the flow's convolutional positional embedding |
+| `act_gelu_tanh` | GELU's **tanh approximation**, not the erf form | the DiT's feed-forward |
+| `act_silu` | `x · σ(x)` | the DiT's timestep MLP |
+
+`act_gelu_tanh` is a different function from `gelu`, not a faster one: they
+agree to about 1e-3, and callers ask for the one their checkpoint was fitted
+against. Snake is the only one with parameters, and α is per channel — 72 of
+them across the vocoder — so it is a pointer argument rather than a constant.
+
+Six are structural, and three of them exist because a shape that looks familiar
+is not:
+
+**`upsample_nearest` and `strided_conv1d`, because HiFT's `ups` is not a
+transposed convolution.** It is a nearest-neighbour upsample followed by a
+causal convolution. `repeat_kv` looks like it would do the upsample — it is a
+gather along a contiguous axis — and it does not: it repeats *heads*, and this
+repeats *positions* inside a channel.
+
+**`grouped_conv1d`, because the flow's positional embedding is grouped.** 1024
+channels in 16 groups, which is neither a dense convolution nor the depthwise
+one `depthwise_conv1d` already had. Written rather than expressed as 16 dense
+convolutions, because the launch overhead would have dominated a kernel this
+small.
+
+**`rope_gptj`, because the DiT's rotary embedding is partial and interleaved.**
+Only the first 64 of 1024 dimensions are rotated, the pairs are `(2j, 2j+1)`
+rather than `(j, j + d/2)`, and it is applied **before** the heads are split —
+so one head of sixteen carries position and the other fifteen do not. Three
+things that each look like a bug and are all deliberate, which is why this is
+its own kernel rather than a flag on `rope`.
+
+**`stft_dft` and `istft_ola`, because the vocoder's output head is an inverse
+transform.** `conv_post` emits 18 channels, which is magnitude and phase over
+the 9 bins of a 16-point transform with hop 4. Small enough that a direct DFT
+beats a radix-2 plan, and the differential test is against `xabe_dsp::istft`
+like every other kernel here.

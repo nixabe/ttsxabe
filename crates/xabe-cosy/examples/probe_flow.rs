@@ -1,9 +1,6 @@
-//! Where the vocoder starts to disagree with the reference.
+//! Where the DiT estimator starts to disagree with the reference.
 //!
-//!     cargo run --release -p xabe-cosy --example probe_vocoder -- <device>
-//!
-//! Not a test - a test says pass or fail, and by the time one fails the useful
-//! question is which stage. This prints one line per tap.
+//!     cargo run --release -p xabe-cosy --example probe_flow -- <device>
 
 use std::path::{Path, PathBuf};
 
@@ -44,71 +41,73 @@ fn npy(p: &Path) -> (Vec<usize>, Vec<f32>) {
 }
 
 fn report(name: &str, want: &[f32], got: &[f32]) {
+    let n = want.len().min(got.len()) as f64;
     if want.len() != got.len() {
-        println!("  {name:14} LENGTH {} against {}", got.len(), want.len());
-        return;
+        println!("  {name:18} LENGTH {} against {}", got.len(), want.len());
     }
-    let n = want.len() as f64;
+    let (w, g) = (&want[..n as usize], &got[..n as usize]);
     let (mw, mg) = (
-        want.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
-        got.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
+        w.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
+        g.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
     );
     let (mut num, mut dw, mut dg) = (0.0, 0.0, 0.0);
-    for (&a, &b) in want.iter().zip(got) {
+    for (&a, &b) in w.iter().zip(g) {
         let (a, b) = (f64::from(a) - mw, f64::from(b) - mg);
         num += a * b;
         dw += a * a;
         dg += b * b;
     }
-    let corr = num / (dw.sqrt() * dg.sqrt());
     let rms = |x: &[f32]| (x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / n).sqrt();
-    let worst = want
+    let worst = w
         .iter()
-        .zip(got)
+        .zip(g)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!(
-        "  {name:14} corr {corr:9.6}  rms {:.5} -> {:.5} (x{:.4})  worst {worst:.5}",
-        rms(want),
-        rms(got),
-        rms(got) / rms(want)
+        "  {name:18} corr {:9.6}  rms {:.5} -> {:.5}  worst {worst:.5}",
+        num / (dw.sqrt() * dg.sqrt()),
+        rms(w),
+        rms(g)
     );
 }
 
 fn main() {
     let dev: usize = std::env::args()
         .nth(1)
-        .expect("usage: probe_vocoder <device>")
+        .expect("usage: probe_flow <device>")
         .parse()
         .expect("a device number");
     let dir = root().join(".golden/cosyvoice");
-    let v = xabe_cosy::Vocoder::open(
-        &root().join("models/tts/cosyvoice3-0.5b/hift.safetensors"),
+    let flow = xabe_cosy::Flow::open(
+        &root().join("models/tts/cosyvoice3-0.5b/flow.safetensors"),
         dev,
     )
     .expect("open");
 
-    let (mel_shape, mel) = npy(&dir.join("mel.npy"));
-    let (src_shape, source) = npy(&dir.join("source.npy"));
-    let frames = mel_shape[2];
-    let source_len = *src_shape.last().expect("len");
+    // The capture saves everything through `.float()`, so ids arrive as f32.
+    let ids = |name: &str| -> Vec<u32> {
+        npy(&dir.join(name))
+            .1
+            .iter()
+            .map(|v| v.round() as u32)
+            .collect()
+    };
+    let prompt_tokens = ids("flow_prompt_speech_token.npy");
+    let tokens = ids("speech_token.npy");
+    let (_, prompt_feat) = npy(&dir.join("prompt_speech_feat.npy"));
+    let (_, embedding) = npy(&dir.join("flow_embedding.npy"));
+    let (_, noise) = npy(&dir.join("cfm_noise.npy"));
 
-    let taps = v
-        .decode_tapped(
-            &v.gpu().upload(&mel).expect("mel"),
-            frames,
-            &v.gpu().upload(&source).expect("source"),
-            source_len,
-        )
-        .expect("decode");
-
-    for (name, got) in &taps {
-        let p = dir.join(format!("{name}.npy"));
-        if !p.is_file() {
-            println!("  {name:14} (no capture)");
+    for (name, got) in flow
+        .mel_tapped(&prompt_tokens, &tokens, &prompt_feat, &embedding, &noise)
+        .expect("mel")
+    {
+        let path = dir.join(format!("{name}.npy"));
+        if !path.is_file() {
+            println!("  {name:18} no capture");
             continue;
         }
-        let (_, want) = npy(&p);
-        report(name, &want, got);
+        let (_, want) = npy(&path);
+        report(&name, &want, &got);
     }
 }

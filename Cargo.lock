@@ -1563,10 +1563,13 @@ dependencies = [
 name = "xabe-cosy"
 version = "0.0.0"
 dependencies = [
+ "regex",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
+ "xabe-audio",
  "xabe-cuda",
  "xabe-dsp",
  "xabe-st",
@@ -1605,6 +1608,7 @@ dependencies = [
  "xabe-asr",
  "xabe-audio",
  "xabe-chat",
+ "xabe-cosy",
  "xabe-serve",
  "xabe-translate",
  "xabe-tts",

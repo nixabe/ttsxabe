@@ -196,6 +196,9 @@ impl Upstream {
             .post(self.url("/tts_stream"))
             .json(&TtsRequest {
                 text: text.to_string(),
+                // The upstream is a process dedicated to one engine; naming
+                // ours would be naming a registration it does not have.
+                engine: None,
             })
             .send()
             .await

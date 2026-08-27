@@ -10,6 +10,7 @@ authors.workspace = true
 xabe-asr.workspace = true
 xabe-chat.workspace = true
 xabe-audio.workspace = true
+xabe-cosy.workspace = true
 xabe-serve.workspace = true
 xabe-vad.workspace = true
 xabe-translate.workspace = true

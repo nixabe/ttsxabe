@@ -152,3 +152,34 @@ first process has exited and freed the card before the second starts. Within a
 binary, one `OnceLock<Mutex<Translator>>` keeps cargo's parallel test threads
 from loading three copies and reporting an out-of-memory that reads like a
 broken loader.
+
+## CosyVoice: two things that cannot be bit-exact, and how each is bounded
+
+Most of this workspace is tested against a captured oracle to within float32
+rounding. Two parts of CosyVoice3 cannot be, and the reason is a property of the
+reference rather than a limitation here. Saying so is the point: a loose bound
+with no reason attached is a bound that will be loosened again.
+
+**The vocoder's dither is not in the checkpoint.** `SineGen2` and
+`SourceModuleHnNSF` each call `torch.rand` in `__init__` and keep the result as
+a plain attribute, so upstream redraws it on every construction and does not
+reproduce across load orderings either. `tests/vocoder.rs` and
+`tests/source.rs` load the captured buffers and hold correlation above 0.9999;
+`tests/pipeline.rs` lets the engine draw its own and holds the **energy
+envelope** instead.
+
+**The excitation's phase is a cumulative sum**, so any difference in the
+predicted F0 accumulates into a phase offset over the utterance. Measured, the
+chained pipeline correlates at **-0.001** sample for sample and at 0.968 on a
+10 ms envelope, at a gain of 1.008. The envelope is what a wrong stage moves; a
+phase shift leaves it alone.
+
+## `XABE_COSY_DEVICE` has no default
+
+The CosyVoice tests skip unless it is set, and it is not defaulted to 0 for the
+same reason the ASR's are not: two of this box's three cards are running
+somebody else's pipeline, and these models are not small. `nvidia-smi` first.
+
+```sh
+XABE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
+```

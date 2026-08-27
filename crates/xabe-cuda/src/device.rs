@@ -137,6 +137,9 @@ const NAMES: &[&str] = &[
     "act_leaky_relu",
     "act_snake",
     "act_elu",
+    "act_mish",
+    "act_silu",
+    "act_gelu_tanh",
     "act_tanh",
     "act_gelu",
     "gated_activation",
@@ -162,6 +165,8 @@ const NAMES: &[&str] = &[
     "istft_ola",
     "upsample_nearest",
     "strided_conv1d",
+    "rope_gptj",
+    "grouped_conv1d",
     "split_heads",
     "split_heads_t",
     "merge_heads",
@@ -929,6 +934,96 @@ impl Gpu {
     }
 
     /// Fuses weight normalisation. Mirrors [`xabe_dsp::fuse_weight_norm`].
+    /// SiLU in place, unfused.
+    pub fn silu(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
+        self.activate("act_silu", x, n, None)
+    }
+
+    /// GELU's tanh approximation, which is `nn.GELU(approximate="tanh")`.
+    ///
+    /// A different function from [`Gpu::gelu`]'s exact erf form: they agree to
+    /// about 1e-3, which is far more than rounding and far less than an
+    /// obvious break. Callers ask for the one their checkpoint was fitted
+    /// against.
+    pub fn gelu_tanh(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
+        self.activate("act_gelu_tanh", x, n, None)
+    }
+
+    /// A grouped convolution with left padding. Returns the output and its
+    /// length.
+    ///
+    /// The weight's second axis is the channel *within* the group, so it is
+    /// `[out_ch, in_ch / groups, k]` and not `[out_ch, in_ch, k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grouped_conv1d(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        in_ch: usize,
+        t: usize,
+        out_ch: usize,
+        k: usize,
+        groups: usize,
+        pad_left: usize,
+    ) -> Result<(CudaSlice<f32>, usize), CudaError> {
+        let out_t = (t + pad_left).saturating_sub(k) + 1;
+        let mut out = self.zeros(out_ch * out_t)?;
+        let (a, b, c, d, e, g, h) = (
+            in_ch as i32,
+            t as i32,
+            out_ch as i32,
+            k as i32,
+            groups as i32,
+            pad_left as i32,
+            out_t as i32,
+        );
+        let f = self.func("grouped_conv1d");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(w)
+            .arg(bias)
+            .arg(&mut out)
+            .arg(&a)
+            .arg(&b)
+            .arg(&c)
+            .arg(&d)
+            .arg(&e)
+            .arg(&g)
+            .arg(&h);
+        launched("grouped_conv1d", unsafe {
+            lb.launch(Self::flat(out_ch * out_t))
+        })?;
+        Ok((out, out_t))
+    }
+
+    /// Mish in place: `x * tanh(softplus(x))`.
+    pub fn mish(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
+        self.activate("act_mish", x, n, None)
+    }
+
+    /// GPT-J style partial rotary embedding over interleaved pairs.
+    ///
+    /// Not [`Gpu::rope`]: that one rotates every head and pairs `i` with
+    /// `i + head_dim / 2`, which is what a HuggingFace layout wants. This
+    /// rotates only the first `rot_dim` of each row and pairs `2j` with
+    /// `2j + 1`. Both produce fluent speech from the wrong weights.
+    pub fn rope_gptj(
+        &self,
+        x: &mut CudaSlice<f32>,
+        inv_freq: &CudaSlice<f32>,
+        positions: usize,
+        dim: usize,
+        rot_dim: usize,
+    ) -> Result<(), CudaError> {
+        let n = positions * rot_dim / 2;
+        let (a, b, c) = (positions as i32, dim as i32, rot_dim as i32);
+        let f = self.func("rope_gptj");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(inv_freq).arg(&a).arg(&b).arg(&c);
+        launched("rope_gptj", unsafe { lb.launch(Self::flat(n)) })
+    }
+
     /// ELU in place, with alpha 1 - torch's default and the only one used.
     pub fn elu(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
         self.activate("act_elu", x, n, None)

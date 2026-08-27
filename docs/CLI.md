@@ -93,7 +93,9 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |
 | `--out` | — | — | one-shot output; `-` writes stdout |
-| `--tts-engine` | `XABE_TTS_ENGINES` | — | extra engines as `name=url`, repeatable |
+| `--tts-engine` | `XABE_TTS_ENGINES` | — | extra engines as `name=url` or `name=path`, repeatable |
+| `--cosy-voice` | `XABE_COSY_VOICE` | `<checkpoint>/voices/taigi-ref.safetensors` | speaker bundle for a local CosyVoice |
+| `--cosy-instruct` | `XABE_COSY_INSTRUCT` | a Taigi instruction | what a local CosyVoice is told; must end on `<|endofprompt|>` |
 | `--tts-default` | `XABE_TTS_DEFAULT` | `mms` | which engine the page selects |
 | `--translator-target` | `XABE_TRANSLATOR_TARGET` | `POJ` | `POJ`, `HAN` or `HL` |
 | `--asr-lang` | `XABE_ASR_LANG` | `zh` | never `en`; see below |
@@ -119,6 +121,33 @@ inside it. Both spellings are in use — the consolidated tree names directories
 while the older flag and every test named the file — and the directory is
 recoverable from the file, so refusing one of them would break working commands
 to no purpose.
+
+### `--tts-engine` takes a URL or a directory
+
+A value beginning `http://` or `https://` is another process. Anything else is
+a directory, opened **in this one**: a CosyVoice3 checkpoint if it holds
+`llm.safetensors`, `flow.safetensors` and `hift.safetensors`, and a VITS one
+otherwise. All three files, not one — a half-converted directory would
+otherwise be opened as CosyVoice and fail deep inside a weight schema instead
+of here, where the path is still in hand.
+
+`--tts-model` sniffs the same way, so it takes either checkpoint. Which one it
+is, is a property of the directory rather than of a second flag.
+
+```sh
+# mms and CosyVoice3 in one process, both on card 2
+xabe-engine --serve 127.0.0.1:8000 \
+            --tts-model  models/tts/mms-tts-nan       --tts-device 2 \
+            --tts-engine cosyvoice=models/tts/cosyvoice3-0.5b \
+            --tts-script cosyvoice=HAN
+```
+
+CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms reads
+romanisation and gets POJ from `--translator-target`. A local engine registered
+through `--tts-engine` shares `--tts-device` with `--tts-model`, and CosyVoice
+is CUDA only — there is no scalar path for a 642 M-parameter decode plus a
+22-layer diffusion transformer, and offering one would give a configuration
+that starts and then never answers.
 
 `--<stage>-device` exists per stage because the pipeline deliberately spreads
 stages across cards: putting the ASR and the TTS on one GPU makes the next

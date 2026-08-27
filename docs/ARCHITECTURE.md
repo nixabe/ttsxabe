@@ -2,8 +2,7 @@
 
 ## The shape
 
-One binary, `xabe-engine`, for every stage of the Taigi voice pipeline except
-the chat LLM, which stays in llama.cpp by decision.
+One binary, `xabe-engine`, for every stage of the Taigi voice pipeline.
 
 ```
    speech ──► VAD ──► ASR ──► [LLM] ──► [translator] ──► TTS ──► speech
@@ -35,6 +34,7 @@ configuration of the same flags, not a different program.
       ├── xabe-chat     the Llama-3 forward pass, CUDA only, grouped-query
       ├── xabe-llama    Llama geometry from either container, two tokenizers
       ├── xabe-tts      the VITS forward pass and synthesis API
+      ├── xabe-cosy     CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voices
       ├── xabe-audio    WAV, mel spectrogram, PCM framing
       ├── xabe-vits     config, weight schema, shape validation
       ├── xabe-dsp      scalar reference kernels

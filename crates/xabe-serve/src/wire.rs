@@ -161,6 +161,15 @@ pub struct TtsChunk {
 pub struct TtsRequest {
     /// The text to speak.
     pub text: String,
+    /// Which registered engine should speak it.
+    ///
+    /// Absent means the configured default. The WebSocket path has carried an
+    /// engine per utterance since the page grew a selector; these two
+    /// endpoints did not, so a request that asked for CosyVoice was answered
+    /// by whatever the default was - audibly a different voice, with nothing
+    /// in the response to say so.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// One `data:` line of `llama-server`'s streamed `POST /completion`.

@@ -87,6 +87,33 @@ pub struct Dither {
 }
 
 impl Dither {
+    /// Draws a fresh dither of `samples` samples.
+    ///
+    /// Upstream's is `torch.rand(1, 300 * 24000, 9)` taken from the *global*
+    /// RNG during construction, so it is not in the checkpoint and does not
+    /// reproduce across load orderings - see the module header. There is
+    /// therefore nothing to match, and shipping 259 MB of somebody else's
+    /// arbitrary draw with every voice would be pretending otherwise.
+    ///
+    /// So the engine draws its own, from a named seed, and is reproducible on
+    /// its own terms. The differential test still loads the captured one,
+    /// because there the point is to compare against upstream rather than to
+    /// sound right.
+    pub fn seeded(samples: usize, seed: u64) -> Self {
+        let mut rng = crate::Rng::new(seed);
+        // Uniform, not normal: `torch.rand`, not `torch.randn`. The buffer is
+        // used as additive noise and a normal draw here would be a louder hiss
+        // with a different mean.
+        let sine_waves = (0..samples * HARMONICS).map(|_| rng.unit()).collect();
+        let mut rand_ini: Vec<f32> = (0..HARMONICS).map(|_| rng.unit()).collect();
+        rand_ini[0] = 0.0;
+        Self {
+            rand_ini,
+            sine_waves,
+            len: samples,
+        }
+    }
+
     /// Refuses a bundle that cannot cover `samples`.
     ///
     /// Named rather than silently truncated: too short a buffer would make the

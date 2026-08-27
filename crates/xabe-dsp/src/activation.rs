@@ -63,3 +63,30 @@ pub fn elu(x: &mut [f32]) {
         }
     }
 }
+
+/// Mish in place: `x * tanh(softplus(x))`.
+///
+/// `ln_1p(exp(x))` rather than `(1 + x.exp()).ln()`: the second loses a small
+/// `x` entirely to the addition and overflows for `x` past about 88, where
+/// softplus is simply `x`.
+pub fn mish(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        let sp = if *v > 20.0 { *v } else { v.exp().ln_1p() };
+        *v *= sp.tanh();
+    }
+}
+
+/// GELU's tanh approximation, which is `nn.GELU(approximate="tanh")`.
+///
+/// A different function from the exact erf form in [`crate::gelu`]: they agree
+/// to about 1e-3. Callers ask for the one their checkpoint was fitted against.
+pub fn gelu_tanh(x: &mut [f32]) {
+    // `sqrt(2/pi)`, to the last bit f32 holds. Written as the literal rather
+    // than computed so it reads the same as the reference's, which spells it
+    // out too.
+    const ROOT_2_OVER_PI: f32 = 0.797_884_6;
+    for v in x.iter_mut() {
+        let inner = ROOT_2_OVER_PI * (*v + 0.044_715 * *v * *v * *v);
+        *v = 0.5 * *v * (1.0 + inner.tanh());
+    }
+}

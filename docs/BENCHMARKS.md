@@ -117,6 +117,29 @@ Both together put the encoder near 100 ms and the whole transcription near
 what it is has not been established, which is exactly why this section does not
 name one.
 
+## CosyVoice3 in-engine: a preliminary figure, and why it is only that
+
+| implementation | median | seconds of audio | s per s of audio |
+| --- | --- | --- | --- |
+| Python `taigi_tts_daemon.py`, `POST /tts` | 3.57 s | 3.64 | 0.98 |
+| `xabe-engine`, `--tts-engine cosyvoice=<dir>` | 4.61 s | 6.08 | 0.76 |
+
+**1.29x faster per second of audio.** The utterance lengths differ because both
+sample their own speech tokens, which is the same reason the VITS comparison
+above is made per second of audio rather than on the raw medians.
+
+This does **not** meet this document's own bar and should not be quoted as if it
+did. Five timed calls, not twenty. More importantly the two are not on the same
+card: the Python service shares GPU 1 with a 26 GB `llama-server`, and the
+engine has GPU 2 to itself. That confound points the same way as the result, so
+the real figure is somewhere below 1.29x and the honest statement is that the
+port is *not slower*. A proper paired run belongs in `xabe-tts-bench` alongside
+the VITS one, on one card, and has not been done.
+
+The `examples/say` path, measured on its own: 3.1 s to load all three networks,
+then 6.08 s of audio in 5.06 s — 1.20x realtime, one utterance at a time, no
+batching and no streaming.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

@@ -66,6 +66,13 @@ import torch
 def save(out: pathlib.Path, name: str, t) -> dict:
     """Writes one tensor and returns what the manifest should say about it."""
     a = t.detach().cpu().float().numpy() if torch.is_tensor(t) else np.asarray(t)
+    # C order, always. A tap that is a transposed *view* - `h.transpose(1, 2)`,
+    # say - keeps its original memory, and `np.save` faithfully records that as
+    # `fortran_order: True`. The shape in the header then says one thing and the
+    # bytes say another, and a reader that trusts the shape gets a permutation
+    # of the right values: identical rms, correlation near nothing. Cost is one
+    # copy of a tensor that is already on the host.
+    a = np.ascontiguousarray(a)
     np.save(out / f"{name}.npy", a)
     return {
         "shape": list(a.shape),
@@ -244,6 +251,96 @@ def main() -> None:
         )
     T["mel"] = save(out, "mel", mel)
     print(f"  {'mel':26} {T['mel']['shape']}")
+
+    # 3b. Inside the flow, boundary by boundary, plus the noise the solver
+    #     starts from.
+    #
+    # `CausalConditionalCFM.__init__` seeds torch and draws
+    # `randn([1, 80, 15000])`, so the starting point is a construction-time
+    # buffer like the vocoder's dither - deterministic given that seed, and not
+    # something to reproduce in Rust. A solver compared against a different
+    # starting point is not a comparison, so it is captured.
+    flow = m.model.flow
+    with torch.no_grad():
+        emb = torch.nn.functional.normalize(inp["flow_embedding"].to(dev), dim=1)
+        emb = flow.spk_embed_affine_layer(emb)
+        T["spk80"] = save(out, "spk80", emb)
+
+        tok = torch.concat(
+            [inp["flow_prompt_speech_token"].to(dev), speech_token.to(dev)], dim=1
+        )
+        te = flow.input_embedding(torch.clamp(tok, min=0))
+        T["flow_token_embed"] = save(out, "flow_token_embed", te)
+
+        h = flow.pre_lookahead_layer(te)
+        T["pre_lookahead"] = save(out, "pre_lookahead", h)
+        h = h.repeat_interleave(flow.token_mel_ratio, dim=1)
+        # Channel-major, which is how `solve_euler` hands it to the estimator
+        # (`mu_in[0] = mu` where `mu = h.transpose(1, 2)`). Saving `h` as it
+        # stands here would be position-major and would silently transpose the
+        # estimator's largest input.
+        T["flow_mu"] = save(out, "flow_mu", h.transpose(1, 2))
+
+        mel_len1 = inp["prompt_speech_feat"].shape[1]
+        n = h.shape[1]
+        conds = torch.zeros([1, n, 80], device=dev, dtype=h.dtype)
+        conds[:, :mel_len1] = inp["prompt_speech_feat"].to(dev)
+        T["flow_cond"] = save(out, "flow_cond", conds.transpose(1, 2))
+
+        T["cfm_noise"] = save(out, "cfm_noise", flow.decoder.rand_noise[:, :, :n])
+        print(f"  {'cfm_noise':26} {T['cfm_noise']['shape']}  (constructed, not in flow.pt)")
+
+        # One estimator evaluation at the solver's first timestep, with the
+        # classifier-free pair batched exactly as `solve_euler` batches it.
+        est = flow.decoder.estimator
+        t_span = 1 - torch.cos(torch.linspace(0, 1, 11, device=dev) * 0.5 * torch.pi)
+        z = flow.decoder.rand_noise[:, :, :n].to(dev)
+        mask = torch.ones(1, 1, n, device=dev)
+        x_in = torch.zeros(2, 80, n, device=dev)
+        mu_in = torch.zeros(2, 80, n, device=dev)
+        t_in = torch.zeros(2, device=dev)
+        spk_in = torch.zeros(2, 80, device=dev)
+        cond_in = torch.zeros(2, 80, n, device=dev)
+        x_in[:] = z
+        mu_in[0] = h.transpose(1, 2)
+        t_in[:] = t_span[0]
+        spk_in[0] = emb
+        cond_in[0] = conds.transpose(1, 2)
+        mask_in = torch.ones(2, 1, n, device=dev)
+
+        T["t_span"] = save(out, "t_span", t_span)
+
+        # Inside the estimator, so a failure names a module rather than "the
+        # mel is wrong". Row 0 only: the two rows differ in their inputs, not
+        # in their arithmetic.
+        xt = x_in.transpose(1, 2)
+        mut = mu_in.transpose(1, 2)
+        ct = cond_in.transpose(1, 2)
+        temb = est.time_embed(t_in)
+        T["dit_temb"] = save(out, "dit_temb", temb)
+        from einops import repeat as _repeat
+        _cat = torch.cat(
+            [xt, ct, mut, _repeat(spk_in, "b c -> b t c", t=xt.shape[1])], dim=-1
+        )
+        T["dit_cat"] = save(out, "dit_cat", _cat)
+        _proj = est.input_embed.proj(_cat)
+        T["dit_proj"] = save(out, "dit_proj", _proj)
+        T["dit_pos"] = save(out, "dit_pos", est.input_embed.conv_pos_embed(_proj))
+        ie = est.input_embed(xt, ct, mut, spk_in)
+        T["dit_input_embed"] = save(out, "dit_input_embed", ie)
+
+        rope = est.rotary_embed.forward_from_seq_len(n)
+        am = torch.ones(2, 1, n, n, dtype=torch.bool, device=dev)
+        hblk = ie
+        for bi, blk in enumerate(est.transformer_blocks):
+            hblk = blk(hblk, temb, mask=am, rope=rope)
+            if bi in (0, 1, 7, 14, 21):
+                T[f"dit_block{bi}"] = save(out, f"dit_block{bi}", hblk)
+        print(f"  {'dit_input_embed':26} {T['dit_input_embed']['shape']}")
+
+        dphi = est(x_in, mask_in, mu_in, t_in, spk_in, cond_in, streaming=False)
+        T["dit_step0"] = save(out, "dit_step0", dphi)
+        print(f"  {'dit_step0':26} {T['dit_step0']['shape']}")
 
     # 4. The vocoder, with its own boundaries.
     #

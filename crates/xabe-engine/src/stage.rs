@@ -144,6 +144,17 @@ impl Stage {
     pub fn is_on(&self) -> bool {
         !matches!(self, Stage::Off)
     }
+
+    /// Where the stage runs, when it runs here.
+    ///
+    /// `None` for a stage that is off or delegated - not `Device::Cpu`, which
+    /// would silently put a model on the wrong side of the PCIe bus.
+    pub fn device(&self) -> Option<Device> {
+        match self {
+            Stage::Local { device, .. } => Some(*device),
+            Stage::Off | Stage::Remote { .. } => None,
+        }
+    }
 }
 
 /// Every stage, resolved.

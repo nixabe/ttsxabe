@@ -137,7 +137,7 @@ async fn inference(State(state): State<AppState>, mut form: Multipart) -> Respon
 
 /// `POST /tts`, returning one WAV for the whole utterance.
 async fn tts(State(state): State<AppState>, axum::Json(req): axum::Json<TtsRequest>) -> Response {
-    let Some(backend) = state.tts_for(None).cloned() else {
+    let Some(backend) = state.tts_for(req.engine.as_deref()).cloned() else {
         return no_stage("tts", "--tts-model or --tts-url");
     };
 
@@ -190,7 +190,7 @@ async fn tts_stream(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<TtsRequest>,
 ) -> Response {
-    let Some(backend) = state.tts_for(None).cloned() else {
+    let Some(backend) = state.tts_for(req.engine.as_deref()).cloned() else {
         return no_stage("tts", "--tts-model or --tts-url");
     };
 

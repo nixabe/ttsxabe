@@ -54,6 +54,10 @@ pub enum EngineError {
     #[error(transparent)]
     Audio(#[from] xabe_audio::AudioError),
 
+    /// A CosyVoice stage could not be loaded or run.
+    #[error(transparent)]
+    Cosy(#[from] xabe_cosy::CosyError),
+
     /// The voice-activity checkpoint could not be loaded.
     #[error(transparent)]
     Vad(#[from] xabe_vad::VadError),

@@ -656,3 +656,107 @@ The reference is llama.cpp reading the same GGUF, not 🤗 — there is no 🤗
 checkpoint for this model on this machine, and `llama-server` is the thing being
 replaced anyway. 60 captured cases, exact. See `docs/ORACLE.md` for the two bugs
 that found, both of which produced real tokens that decoded back to the input.
+
+# CosyVoice3, `Fun-CosyVoice3-0.5B`
+
+Three networks on the per-request path, converted out of pickle by
+`tools/convert_cosyvoice.py` and bound in `xabe-cosy`.
+
+```
+text ──[Qwen2 BPE]──► ids ──[speech LM, 642 M]──► speech tokens (6561-way, 25 Hz)
+     ──[flow, 332 M]──► mel (80 x N, 50 Hz) ──[HiFT, 21 M]──► 24 kHz
+```
+
+## The speech LM sees no audio
+
+`frontend_instruct2` **deletes** `llm_prompt_speech_token`. In instruct mode the
+language model is given the instruct string and the utterance and nothing else;
+the speaker is carried entirely by the flow's prompt tokens and prompt mel.
+Wiring the audio prompt into the LM because the zero-shot path does gives fluent
+speech in the wrong voice, and nothing about it looks wrong.
+
+## Geometry
+
+| | speech LM | flow (DiT) | vocoder |
+| --- | --- | --- | --- |
+| width | 896 | 1024 | 512 in, 18 out |
+| depth | 24 | 22 | 3 upsamples x 6 residual blocks |
+| heads | 14 q / **2 kv** | 16 x 64 | — |
+| rope | 1e6, standard | **GPT-J partial, interleaved** | — |
+| norm | RMS, eps 1e-6 | LayerNorm, eps **1e-6** | weight norm, unfused |
+
+The prompt is `[sos] embed(instruct ++ text) [task_id]`, and `sos` and `task_id`
+come from the **speech** embedding table, not the text one. `sos` is 6561 and
+`task_id` is 6563, which are ids 0 and 1 of `llm_embedding` in upstream's
+Qwen2LM and ids into `speech_embedding` in CosyVoice3LM — the class decides
+which, and the two tables are different weights.
+
+## The rotary embedding is partial, interleaved and pre-split
+
+Three things at once, each of which looks like a bug:
+
+- only the **first 64** of 1024 dimensions are rotated, so one head of sixteen
+  carries position and the other fifteen do not;
+- the pairs are `(2j, 2j+1)`, not `(j, j + d/2)`;
+- it is applied **before** the heads are split.
+
+## `AdaLayerNormZero_Final` chunks the other way round
+
+The block norm produces six modulation vectors as
+`(shift, scale, gate) x (attention, feed-forward)`. The *final* norm produces
+two, and chunks them as **(scale, shift)** — reversed. Swapped, the mel is
+plausible and the voice is not.
+
+## The vocoder's upsampler is not a transposed convolution
+
+`ups` is a nearest-neighbour upsample followed by a causal convolution. Its
+activations are **Snake**, `x + sin²(αx)/α`, with a learned per-channel α. Its
+output head is an **iSTFT**: 18 channels are magnitude and phase over the 9 bins
+of a 16-point transform, hop 4.
+
+Causal padding is `(k*d - d)/2*2 + (k+1)%2`, and `conv_pre` pads **right** where
+everything else pads left.
+
+## The last leaky ReLU has a different slope, again
+
+`F.leaky_relu(x)` before `conv_post` takes torch's **0.01** default, where every
+other slope in this checkpoint is 0.1. This is the second checkpoint in this
+workspace with exactly that trap — the VITS decoder has it too, recorded
+above — and it cost the same afternoon twice.
+
+Left at 0.1, every stage of the vocoder stayed exact, `conv_post` alone fell to
+correlation 0.962, and the waveform came out with **ten times** its energy once
+the magnitudes were exponentiated.
+
+`pre_lookahead_layer.conv1` has the same default and the same trap.
+
+## The NSF source runs in float64 upstream, and this runs float32
+
+Upstream's comment is that "precision is crucial for causal inference", and the
+streaming path that comment is about does not exist here: a whole-utterance pass
+has no cache boundary for an error to accumulate across. Measured, the F0 comes
+out at correlation 1.000000 and a worst frame of 0.0016 Hz.
+
+The voiced threshold is **10 Hz**, not the class default of zero. At zero, every
+frame with any predicted pitch at all counts as voiced, which turns silence into
+a hum.
+
+## The excitation's phase is a cumulative sum, which decides how it can be tested
+
+Phase is accumulated at the **frame** rate and held constant across each frame's
+480 samples. A 1e-4 relative difference in the predicted F0 has therefore grown
+into a fraction of a cycle by the end of six seconds — the same speech with
+its carrier slid along, which sounds identical and correlates at **zero** sample
+for sample. `tests/pipeline.rs` compares the energy envelope for that reason;
+`tests/vocoder.rs` can compare samples only because it is handed the reference's
+own excitation and never predicts an F0.
+
+## The Qwen2 tokenizer's specials are not in the checkpoint
+
+`CosyVoice-BlankEN` ships `vocab.json` and `merges.txt` and nothing else. The
+281 special tokens are a literal list in CosyVoice's *source*, and their ids
+fall out of that list's order: `<|endofprompt|>` is 151646 only because
+`<|im_start|>` and `<|im_end|>` were already present.
+
+The pre-tokenization pattern differs from Llama-3's in exactly one alternative,
+`\p{N}` against `\p{N}{1,3}` — every digit is its own piece here.

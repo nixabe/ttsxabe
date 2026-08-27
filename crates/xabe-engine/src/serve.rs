@@ -133,9 +133,15 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     let mut tts: BTreeMap<String, TtsBackend> = BTreeMap::new();
     match &stages.tts {
         Stage::Local { path, device } => {
+            // `--tts-model` takes either checkpoint; which one it is, is a
+            // property of the directory rather than of a second flag.
+            let local = match is_cosyvoice(path) {
+                true => spawn_cosy(args, path, *device)?,
+                false => spawn_synthesiser(args, path, *device)?,
+            };
             tts.insert(
                 xabe_serve::LOCAL_ENGINE.to_string(),
-                TtsBackend::Local(spawn_synthesiser(args, path, *device)?),
+                TtsBackend::Local(local),
             );
         }
         Stage::Remote { url } => {
@@ -147,10 +153,32 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         Stage::Off => {}
     }
     for spec in &args.tts_engines {
-        let Some((name, url)) = spec.split_once('=') else {
+        let Some((name, target)) = spec.split_once('=') else {
             return Err(EngineError::BadEngine(spec.clone()));
         };
-        tts.insert(name.to_string(), TtsBackend::Remote(Upstream::new(url)?));
+        // A URL is another process; anything else is a directory in this one.
+        // Sniffed by scheme rather than by trying to open it both ways, so a
+        // typo in a path fails as a missing checkpoint rather than as a DNS
+        // lookup of a directory name.
+        let backend = if target.starts_with("http://") || target.starts_with("https://") {
+            TtsBackend::Remote(Upstream::new(target)?)
+        } else {
+            let dir = std::path::PathBuf::from(target);
+            // A local engine registered here shares `--tts-device` with
+            // `--tts-model`. With no local TTS stage there is no card to
+            // share, and `--tts-device` alone is what says which one.
+            let device = stages
+                .tts
+                .device()
+                .or_else(|| args.tts_device.as_deref().and_then(Device::parse))
+                .unwrap_or(Device::Cpu);
+            let local = match is_cosyvoice(&dir) {
+                true => spawn_cosy(args, &dir, device)?,
+                false => spawn_synthesiser(args, &dir, device)?,
+            };
+            TtsBackend::Local(local)
+        };
+        tts.insert(name.to_string(), backend);
     }
     if let Some(name) = &args.tts_default {
         config.tts_default = name.clone();
@@ -425,6 +453,100 @@ fn spawn_synthesiser(
         })?;
 
     Ok(tx)
+}
+
+/// Whether a directory holds a CosyVoice3 checkpoint rather than a VITS one.
+///
+/// All three files, not one: a half-converted directory - `tools/convert_cosyvoice.py`
+/// interrupted, say - would otherwise be opened as CosyVoice and fail deep
+/// inside a weight schema instead of here, where the path is still in hand.
+fn is_cosyvoice(dir: &std::path::Path) -> bool {
+    ["llm.safetensors", "flow.safetensors", "hift.safetensors"]
+        .iter()
+        .all(|f| dir.join(f).is_file())
+}
+
+/// Starts a CosyVoice3 synthesiser on its own thread.
+///
+/// Mirrors [`spawn_synthesiser`] and differs in three things, each of which is
+/// a property of the model rather than a choice:
+///
+/// - It is **CUDA only**. There is no scalar path for a 642 M-parameter decode
+///   plus a 22-layer diffusion transformer, and pretending otherwise would give
+///   a configuration that starts and then never answers.
+/// - It reads **Han**, so the text is split on sentences rather than
+///   romanised. Pair it with `--tts-script <name>=HAN`.
+/// - It carries a speaker bundle and an instruct string, both pinned here
+///   because they decide what the model *is* for this process.
+fn spawn_cosy(
+    args: &Args,
+    dir: &std::path::Path,
+    device: Device,
+) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
+    let Device::Cuda(ordinal) = device else {
+        return Err(EngineError::LocalOnly {
+            stage: crate::stage::Kind::Tts,
+        });
+    };
+    let voice = args
+        .cosy_voice
+        .clone()
+        .unwrap_or_else(|| dir.join("voices/taigi-ref.safetensors"));
+
+    // Opened on the calling thread, so a missing bundle or an instruct without
+    // `<|endofprompt|>` fails preflight rather than at the first turn.
+    let cosy = xabe_cosy::Cosy::open(dir, &voice, &args.cosy_instruct, ordinal)?;
+    let rate = cosy.sample_rate() as u32;
+
+    let (tx, mut rx) = mpsc::channel::<SynthesisJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-cosy".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                speak_cosy(&cosy, &job, rate);
+            }
+            tracing::debug!("cosyvoice thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the cosyvoice thread",
+            path: dir.display().to_string(),
+            source,
+        })?;
+
+    Ok(tx)
+}
+
+/// Speaks one job with CosyVoice, sending each sentence as it is produced.
+///
+/// Chunked for the same reason the VITS path is: the first chunk is what the
+/// listener waits on, and a long reply synthesised whole would hold every
+/// sentence back until the last one was done. Sixty Han characters is about
+/// the same duration as the 120 characters of romanisation mms is given.
+fn speak_cosy(cosy: &xabe_cosy::Cosy, job: &SynthesisJob, rate: u32) {
+    let text = xabe_serve::clean(&job.text);
+    if text.is_empty() {
+        return;
+    }
+
+    for (i, chunk) in xabe_serve::split_sentences(&text, 60).iter().enumerate() {
+        match cosy.synthesize(chunk) {
+            Ok(audio) if !audio.is_empty() => {
+                let wav = xabe_audio::wav_bytes(&audio, rate);
+                let msg = xabe_serve::TtsChunk {
+                    seq: i as u64 + 1,
+                    wav: B64.encode(&wav),
+                    taigi: chunk.clone(),
+                    roman: String::new(),
+                };
+                if job.reply.blocking_send(msg).is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            // One unspeakable clause should not silence the whole reply.
+            Err(e) => tracing::warn!(%e, chunk = %chunk, "could not synthesise a clause"),
+        }
+    }
 }
 
 /// Speaks one job, sending each chunk as it is produced.

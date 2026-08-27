@@ -513,3 +513,74 @@ implementations drawing from the same distribution give different text. The
 capture pins `temperature: 0` with the repetition penalty off, which makes the
 reply a function of the prompt alone. The sampler is tested separately, against
 the distribution rather than against a draw.
+
+# The CosyVoice3 oracle
+
+`tools/oracle/capture_cosyvoice.py` runs `Fun-CosyVoice3-0.5B` on one reference
+clip and one sentence, and writes 43 tensors: the frontend's outputs, the speech
+LM's forced log-probabilities, every boundary inside the flow, the vocoder's
+per-stage taps, and the waveform.
+
+## Every tap is forced to C order, and that is not paperwork
+
+A tap that is a transposed **view** — `h.transpose(1, 2)`, say — keeps its
+original memory, and `np.save` records that faithfully as
+`fortran_order: True`. The shape in the header then says one thing and the bytes
+say another, and a reader that trusts the shape gets a *permutation* of the
+right values.
+
+That cost an afternoon. The estimator's largest input came back at identical rms
+and correlation 0.26, which reads as a layout bug in the engine rather than in
+the capture — and transposing the tensor on the way in changed nothing at all,
+because a transpose of a Fortran-order view is the same bytes again. The capture
+now calls `np.ascontiguousarray` on everything, and the readers refuse
+`fortran_order: True` by name.
+
+## The speech LM is captured as log-probabilities, because tokens prove nothing
+
+`ras_sampling` draws with `torch.multinomial`. Measured on this capture,
+upstream's sampled run agrees with its own greedy argmax at **21 of 143**
+positions — so two correct implementations produce visibly different token
+sequences, and a token-by-token comparison would be measuring the RNG.
+
+So the captured tokens are fed back in and the *log-probabilities* are compared
+at every position. Deterministic, 143 observations rather than one, and it keeps
+measuring past the first divergence.
+
+## `frontend_instruct2` deletes the LLM's audio prompt
+
+Asserted in the capture rather than trusted: `llm_prompt_speech_token` is
+removed, so in instruct mode the language model sees **only text** and the
+speaker is carried entirely by the flow. Wiring the prompt tokens into the LLM
+because the zero-shot path does is a mistake that produces fluent speech in the
+wrong voice.
+
+## Three buffers that are not in the checkpoint, and are captured anyway
+
+`SineGen2` and `SourceModuleHnNSF` each call `torch.rand` in `__init__` and keep
+the result as a plain attribute. None of it reaches `hift.pt`, and upstream
+redraws it on every construction — so **upstream does not reproduce across
+load orderings either**.
+
+They are captured so the vocoder can be compared against upstream at all. The
+engine does not ship them: it draws its own from a named seed, which is
+reproducible on its own terms. See `crates/xabe-cosy/src/source.rs`.
+
+One of the three turns out not to matter, and it is worth saying which:
+`rand_ini` is added to phase row **0 only**, and the very next operation
+decimates by 480 sampling at 239.5 — so row 0 is never read.
+
+## The speaker bundle is a separate tool
+
+`tools/make_cosyvoice_voice.py` runs `campplus.onnx` and
+`speech_tokenizer_v3.onnx` **once per voice** and writes four tensors plus the
+diffusion's starting noise. It is not part of the capture because it is not a
+comparison: it produces an engine *input*, for any clip, rather than a reference
+answer for one.
+
+`tools/dump_cosyvoice_tokens.py` is the third: the tokenizer's 281 special
+tokens are a literal list in CosyVoice's *source*, not in
+`CosyVoice-BlankEN`, and their ids fall out of that list's order.
+`<|endofprompt|>` is 151646 only because `<|im_start|>` and `<|im_end|>` were
+already in `added_tokens_decoder`. Read out once, written down, rather than
+re-derived by hand.

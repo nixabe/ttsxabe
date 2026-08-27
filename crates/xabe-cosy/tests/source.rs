@@ -24,6 +24,14 @@ fn npy(p: &Path) -> (Vec<usize>, Vec<f32>) {
         _ => (u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize, 12),
     };
     let head = std::str::from_utf8(&b[at..at + hlen]).expect("ascii");
+    // See `tools/oracle/capture_cosyvoice.py`: a Fortran-order file has the
+    // right shape in its header and its axes the other way round in its bytes,
+    // so a reader that trusts the shape gets a permutation of the right values.
+    assert!(
+        head.contains("'fortran_order': False"),
+        "{}: fortran order",
+        p.display()
+    );
     let o = head.find('(').expect("shape");
     let c = head[o..].find(')').expect("shape") + o;
     let shape: Vec<usize> = head[o + 1..c]

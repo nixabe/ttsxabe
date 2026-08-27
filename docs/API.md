@@ -152,6 +152,34 @@ does not romanise, translate, or read Han characters.
 both sample, so a caller that wants reproducible output must be able to say so,
 and a caller that does not must be made to notice.
 
+## `xabe-cosy` — CUDA only
+
+```rust
+let cosy = xabe_cosy::Cosy::open(dir, &voice, instruct, ordinal)?;
+let audio: Vec<f32> = cosy.synthesize("台北今仔日好天。")?;
+cosy.sample_rate();                               // 24_000
+```
+
+`instruct` has to end on `<|endofprompt|>` and is pinned at construction, not
+passed per utterance: `frontend_instruct2` deletes the LLM's audio prompt, so
+the language model sees only text and this string is half of what decides how
+the reply sounds. `voice` is a bundle from `tools/make_cosyvoice_voice.py`.
+
+The four stages are also public on their own, because the oracle tests compare
+each against the reference and a failure in one otherwise looks like a failure
+in all of them:
+
+```rust
+let ids = xabe_cosy::Tokenizer::from_dir(&dir.join("CosyVoice-BlankEN"))?.encode(text);
+let tokens = cosy.speech_tokens(&ids)?;           // 25 Hz speech tokens
+let audio = cosy.vocode(&tokens)?;                // flow, F0, excitation, vocoder
+```
+
+`Flow::estimate_tapped` and `Vocoder::decode_tapped` return every intermediate
+by name, for the same reason the ASR's do — "the waveform is wrong" localises
+to nothing, and "stage 1 is wrong" localises to twelve tensors. They are not a
+streaming API.
+
 ## `xabe-vad`
 
 ```rust
