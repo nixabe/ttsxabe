@@ -8,11 +8,29 @@ use std::path::{Path, PathBuf};
 use xabe_asr::AsrModel;
 
 /// The checkpoint, or `None` if it is not on this machine.
+///
+/// The same distinction [`model`] draws one step later, applied one step
+/// earlier: **absent is a skip, present-but-broken is a failure.** A machine
+/// that was never given the models - a fresh checkout, or CI, where
+/// `.gitignore` keeps `models/` out of the repository entirely - has nothing
+/// to test and says so. A machine where `models/asr/` exists but the shard
+/// index inside it does not has a half-populated tree, which is a setup
+/// mistake worth shouting about rather than passing over in silence.
+///
+/// These tests used to panic on both, which made them correct on a developer's
+/// box and wrong everywhere else.
 fn checkpoint() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/asr/breeze-asr-26");
-    p.join("model.safetensors.index.json")
-        .is_file()
-        .then_some(p)
+    if !p.is_dir() {
+        return None;
+    }
+    assert!(
+        p.join("model.safetensors.index.json").is_file(),
+        "{} exists but has no model.safetensors.index.json; \
+         a half-populated checkpoint is a setup error, not an absent one",
+        p.display()
+    );
+    Some(p)
 }
 
 /// Every captured clip directory.
@@ -63,7 +81,8 @@ fn read_f32(path: &Path) -> Vec<f32> {
 #[test]
 fn greedy_decoding_reproduces_the_reference_transcripts() {
     let Some(dir) = checkpoint() else {
-        panic!("models/asr/breeze-asr-26 is missing");
+        println!("SKIP: models/asr/breeze-asr-26 is not on this machine");
+        return;
     };
     let Some(m) = model(&dir) else { return };
     let clips = captures();
@@ -100,7 +119,8 @@ fn the_whole_pipeline_from_samples_agrees_too() {
     // reference's features. Both stages have their own gate; this is the one
     // that says they compose.
     let Some(dir) = checkpoint() else {
-        panic!("models/asr/breeze-asr-26 is missing");
+        println!("SKIP: models/asr/breeze-asr-26 is not on this machine");
+        return;
     };
     let Some(m) = model(&dir) else { return };
 
@@ -122,7 +142,8 @@ fn a_decode_past_the_learned_positions_is_refused_by_name() {
     // them the position embedding would be read out of bounds; a model that
     // wrapped instead would produce fluent nonsense.
     let Some(dir) = checkpoint() else {
-        panic!("models/asr/breeze-asr-26 is missing");
+        println!("SKIP: models/asr/breeze-asr-26 is not on this machine");
+        return;
     };
     let Some(m) = model(&dir) else { return };
     let mel = vec![0.0f32; m.config().num_mel_bins * m.config().n_frames()];

@@ -182,10 +182,23 @@ phase shift leaves it alone.
 
 `.github/workflows/ci.yml` runs on a GitHub-hosted runner, which has no CUDA
 device and no checkpoints, and `.gitignore` keeps `models/` and `.golden/` out
-of the repository. So **every numerical test skips there**, and the guards that
-make that graceful — each test checks for its device and its capture and
-prints `SKIP:` with what is missing — are what let the workspace run green on
-a machine that can prove none of it.
+of the repository. So **every numerical test skips there**.
+
+That did not work the first time it was tried, and the reason is worth keeping.
+Every test skipped correctly on an absent *GPU* — that guard was uniform and
+careful. But seven test targets across five crates **panicked** on an absent
+*model or capture*, which is a different condition and which the paragraph
+above sanctions skipping on. Twenty-six call sites said
+`panic!("models/... is missing")` where the policy this document already stated
+says to skip. They were written on a machine that has the models, where the
+distinction never comes up.
+
+The sharper form of the rule, and the one worth copying, is in
+`xabe-asr`'s `checkpoint()`: **absent is a skip, present-but-broken is a
+failure.** A tree that was never populated has nothing to test; a tree where
+`models/asr/` exists but the shard index inside it does not is a setup mistake,
+and passing over that in silence is how a green suite comes to mean nothing.
+The other crates currently do the simpler thing and skip on absence alone.
 
 That is a trap this document already warns about in general, so the workflow
 does not get an exemption: it counts the skips and writes them into the run

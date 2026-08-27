@@ -12,11 +12,29 @@ use xabe_asr::AsrModel;
 const TAPS: usize = 4;
 
 /// The checkpoint, or `None` if it is not on this machine.
+///
+/// The same distinction [`model`] draws one step later, applied one step
+/// earlier: **absent is a skip, present-but-broken is a failure.** A machine
+/// that was never given the models - a fresh checkout, or CI, where
+/// `.gitignore` keeps `models/` out of the repository entirely - has nothing
+/// to test and says so. A machine where `models/asr/` exists but the shard
+/// index inside it does not has a half-populated tree, which is a setup
+/// mistake worth shouting about rather than passing over in silence.
+///
+/// These tests used to panic on both, which made them correct on a developer's
+/// box and wrong everywhere else.
 fn checkpoint() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/asr/breeze-asr-26");
-    p.join("model.safetensors.index.json")
-        .is_file()
-        .then_some(p)
+    if !p.is_dir() {
+        return None;
+    }
+    assert!(
+        p.join("model.safetensors.index.json").is_file(),
+        "{} exists but has no model.safetensors.index.json; \
+         a half-populated checkpoint is a setup error, not an absent one",
+        p.display()
+    );
+    Some(p)
 }
 
 /// Every captured clip directory.
@@ -138,7 +156,8 @@ impl Report {
 #[test]
 fn the_encoder_matches_the_oracle_layer_by_layer() {
     let Some(dir) = checkpoint() else {
-        panic!("models/asr/breeze-asr-26 is missing");
+        println!("SKIP: models/asr/breeze-asr-26 is not on this machine");
+        return;
     };
     let Some(m) = model(&dir) else { return };
     let clips = captures();
@@ -167,7 +186,8 @@ fn the_encoder_matches_the_oracle_layer_by_layer() {
 #[test]
 fn the_decoder_matches_the_oracle_layer_by_layer() {
     let Some(dir) = checkpoint() else {
-        panic!("models/asr/breeze-asr-26 is missing");
+        println!("SKIP: models/asr/breeze-asr-26 is not on this machine");
+        return;
     };
     let Some(m) = model(&dir) else { return };
 
