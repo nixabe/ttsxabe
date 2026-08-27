@@ -19,7 +19,15 @@ cargo test --workspace --release
 
 `models/` is gitignored and is where every model in the pipeline lives, so
 populating it is the whole of provisioning a machine. Tests look there first,
-fall back to `~/.cache/huggingface/hub/`, and take `XABE_TTS_MODEL` over both.
+fall back to `~/.cache/huggingface/hub/`, and take an environment variable over
+both — [TESTING.md](TESTING.md) lists all of them.
+
+Nothing in `models/` is required. Every test that reads real weights detects
+their absence, prints `SKIP:` with the variable to set, and returns, so a clone
+with an empty `models/` still runs green. The one directory with no default at
+all is `XABE_QUANT_DIR`: those files are multi-gigabyte `llama-quantize`
+outputs, derived rather than downloaded, and one command reproduces any of
+them.
 
 ## The loop
 

@@ -15,14 +15,24 @@
 //! crate knows a tensor is 4096x14336 f16 at byte 2101362944; it has no idea
 //! it is a feed-forward gate. Meaning lives in `xabe-llama`.
 //!
-//! Two deliberate reductions against the format as published:
+//! Nine block formats are decoded alongside the three unquantized widths:
+//! `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0` and the K-quants `Q2_K` through
+//! `Q6_K`. Each is unpacked to f32 on read, so nothing above this crate has to
+//! know a tensor was packed at all.
 //!
-//! - **No quantized types.** F32, F16 and BF16 are read; every block format
-//!   is refused by name and id. Decoding one needs a dequantizer per format,
-//!   and this workspace runs f16 throughout, so a `Q4_K` tensor has no
-//!   correct downstream interpretation. Refusing beats mis-sizing: the block
-//!   formats pack a scale per 32 or 256 elements, so reading one as raw
-//!   values consumes the right number of bytes and yields the wrong numbers.
+//! **Unpacking is not the same as running quantized.** The weights land in
+//! memory, and on the device, at full width: a 4-bit 13 B is a 7 GB file and
+//! still 26.5 GB of f16 once loaded. What this buys is disk and load
+//! bandwidth. Keeping blocks packed on the device would mean teaching every
+//! matmul the block layouts, which is a different and much larger piece of
+//! work - see `docs/MODEL.md`.
+//!
+//! Two deliberate limits remain:
+//!
+//! - **No `IQ*`, `TQ*` or `Q8_K`.** The first two are importance-weighted and
+//!   ternary families this workspace has no file in; `Q8_K` is an intermediate
+//!   used while quantizing and never appears in a stored tensor. All are
+//!   refused by name and id rather than mis-sized.
 //! - **v3 only.** v1 and v2 differ in the width of the count fields, so
 //!   guessing would read the tensor directory at the wrong offset and report
 //!   plausible nonsense.
@@ -39,12 +49,14 @@
 //!
 //! Adapted from `llmxabe/crates/xabe-gguf`, the same author's LLM engine,
 //! which has been reading GGUF on this hardware for a while. The cursor, the
-//! value model and the parse order came from there; the quantized type table
-//! was dropped, the accessors were reshaped to mirror `xabe-st`, and
-//! [`TensorInfo::shape`] is new. See `docs/TOOLCHAIN.md`.
+//! value model and the parse order came from there. The accessors were
+//! reshaped to mirror `xabe-st`, [`TensorInfo::shape`] is new, and the
+//! dequantizers are written against `gguf-py` and checked against it. See
+//! `docs/TOOLCHAIN.md`.
 //!
 //! Start at [`GgufFile::open`].
 
+mod dequant;
 mod error;
 mod file;
 mod reader;

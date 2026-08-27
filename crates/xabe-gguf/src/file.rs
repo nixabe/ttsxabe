@@ -302,6 +302,9 @@ impl GgufFile {
             .info(name)
             .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
         let raw = self.tensor_bytes(name)?;
+        if info.ggml_type.is_quantized() {
+            return crate::dequant::dequantize(info.ggml_type, raw, info.n_elements as usize);
+        }
         // Read element-wise rather than casting the mapping: a 2-byte element
         // needs only 2-byte alignment, and a tensor's offset carries no
         // promise of more than the file's 32-byte section alignment.
@@ -325,6 +328,10 @@ impl GgufFile {
                 .iter()
                 .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
                 .collect(),
+            // Returned above. Spelled out rather than caught by a wildcard so
+            // that a new block format is a compile error here too.
+            t if t.is_quantized() => unreachable!("handled by the block path"),
+            _ => unreachable!("every width is covered"),
         })
     }
 
@@ -340,6 +347,16 @@ impl GgufFile {
             .info(name)
             .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
         let raw = self.tensor_bytes(name)?;
+        if info.ggml_type.is_quantized() {
+            // Unpack, then round once. There is no shortcut: a block format's
+            // values are a scale times a small integer, and that product is
+            // not an f16 until it is computed.
+            let wide = crate::dequant::dequantize(info.ggml_type, raw, info.n_elements as usize)?;
+            return Ok(wide
+                .into_iter()
+                .map(|v| half::f16::from_f32(v).to_bits())
+                .collect());
+        }
         Ok(match info.ggml_type {
             // Already f16: the bytes are the answer, so no conversion runs at
             // all and the result is bit-identical by construction.
@@ -364,6 +381,8 @@ impl GgufFile {
                     half::f16::from_f32(wide).to_bits()
                 })
                 .collect(),
+            t if t.is_quantized() => unreachable!("handled by the block path"),
+            _ => unreachable!("every width is covered"),
         })
     }
 }
@@ -485,8 +504,21 @@ fn parse(bytes: &[u8]) -> Result<Parsed, GgufError> {
         let offset = cur.u64()?;
 
         let n_elements: u64 = dims.iter().product::<u64>();
+        // A block format packs a whole row's worth of elements together, so
+        // the fastest-varying dimension must be a whole number of blocks.
+        // ggml guarantees this when writing; checking it here means a file
+        // that does not is refused rather than read at a sliding offset.
+        let bs = ggml_type.block_size();
+        if !dims[0].is_multiple_of(bs) {
+            return Err(GgufError::RaggedBlocks {
+                name,
+                row: dims[0],
+                block: bs,
+            });
+        }
         let n_bytes = n_elements
-            .checked_mul(ggml_type.byte_size())
+            .checked_div(bs)
+            .and_then(|b| b.checked_mul(ggml_type.type_size()))
             .ok_or_else(|| GgufError::OffsetOverflow(name.clone()))?;
 
         if seen.insert(name.clone(), ()).is_some() {

@@ -101,3 +101,40 @@ looking like a broken flag parser.
 
 Check `nvidia-smi` before choosing - this host is shared, and the tests will
 happily allocate on a card that is already running somebody's training job.
+
+### The environment variables a test may look for
+
+Every one of these is optional: absent, the test that wants it prints `SKIP:`
+and says which variable to set.
+
+| variable | what it points at | default |
+| --- | --- | --- |
+| `XABE_TEST_DEVICE` | CUDA ordinal for tests that need a card | `0` |
+| `XABE_TTS_MODEL` | the VITS checkpoint | `models/tts/mms-tts-nan` |
+| `XABE_LLM_GGUF` | the Breeze2 chat GGUF | `models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
+| `XABE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/llm/taigi-translator-13b-f16.gguf` |
+| `XABE_QUANT_DIR` | a directory of quantized Breeze2 copies | none; those tests skip |
+
+`XABE_QUANT_DIR` has no default on purpose. The files are several gigabytes
+each, they are derived rather than downloaded, and checking a multi-gigabyte
+artefact into a fixed path that a test then silently depends on is how a suite
+becomes unrunnable on a second machine. One command reproduces any of them:
+
+```sh
+llama-quantize models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+    $XABE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
+```
+
+The synthetic quantization corpus under `.golden/gguf/quants` is different: it
+is kilobytes, it is committed, and it covers all ten block formats. The real
+file is the end-to-end check, not the coverage.
+
+### Two tests that must not share a process
+
+`xabe-translate`'s oracle and its GGUF twin each load 26.5 GB onto the card, so
+they cannot both be resident on a 48 GB one. They live in **separate test
+binaries** for that reason - cargo runs test targets one after another, so the
+first process has exited and freed the card before the second starts. Within a
+binary, one `OnceLock<Mutex<Translator>>` keeps cargo's parallel test threads
+from loading three copies and reporting an out-of-memory that reads like a
+broken loader.

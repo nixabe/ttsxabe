@@ -50,6 +50,26 @@ fn image(tensor_dims: &[u64], ggml_type: u32, data: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// The same image, with the data section given as raw bytes rather than f32 -
+/// which is the only way to build one for a format whose elements are not
+/// four bytes wide.
+fn image_raw(name: &str, dims: &[u64], ty: u32, raw: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.0.extend_from_slice(b"GGUF");
+    w.u32(3).u64(1).u64(0);
+    w.str(name).u32(dims.len() as u32);
+    for &d in dims {
+        w.u64(d);
+    }
+    w.u32(ty).u64(0);
+    let mut bytes = w.0;
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(raw);
+    bytes
+}
+
 #[test]
 fn a_hand_built_file_round_trips() {
     let f = GgufFile::from_bytes(image(&[2, 3], 0, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
@@ -113,14 +133,37 @@ fn an_older_version_is_refused_rather_than_attempted() {
 }
 
 #[test]
-fn a_quantized_tensor_is_refused_by_name_and_id() {
-    // Q8_0 is id 8. Reading its packed blocks as raw values would consume the
-    // right number of bytes and produce the wrong numbers, which is the
-    // failure this refusal exists to prevent.
-    match GgufFile::from_bytes(image(&[32], 8, &[0.0; 32])) {
+fn a_quantized_tensor_is_sized_by_its_block_geometry() {
+    // This test used to assert that Q8_0 was *refused*, which was true when
+    // the crate read only the three unquantized widths. It reads nine block
+    // formats now, so what matters is the sizing: a block format's bytes are
+    // `elements / block_size * type_size`, and using the unquantized rule
+    // instead would claim a 32-element Q8_0 tensor needs 32 bytes where it
+    // needs 34 - a directory that validates and then reads every tensor after
+    // the first at the wrong offset.
+    //
+    // The unpacked values are checked against `gguf-py` in `dequant.rs`; this
+    // is only about the arithmetic in the directory.
+    let raw = vec![0u8; 34];
+    let f = GgufFile::from_bytes(image_raw("t", &[32], 8, &raw)).expect("Q8_0 parses");
+    let info = f.info("t").expect("bound");
+    assert_eq!(info.ggml_type, GgmlType::Q8_0);
+    assert_eq!(info.n_elements, 32, "one block of 32");
+    assert_eq!(info.n_bytes, 34, "an f16 scale and 32 signed bytes");
+    assert!(info.ggml_type.is_quantized());
+    assert_eq!(info.ggml_type.block_size(), 32);
+    assert_eq!(info.ggml_type.type_size(), 34);
+}
+
+#[test]
+fn a_format_outside_the_table_is_still_refused_by_name_and_id() {
+    // The table grew; the refusal did not go away. Id 16 is `Q2_K`'s
+    // neighbour `IQ2_XXS`, an importance-weighted format with no file in this
+    // project - refused rather than mis-sized.
+    match GgufFile::from_bytes(image_raw("t", &[256], 16, &vec![0u8; 66])) {
         Err(GgufError::UnsupportedGgmlType { name, ggml_type }) => {
             assert_eq!(name, "t");
-            assert_eq!(ggml_type, 8);
+            assert_eq!(ggml_type, 16);
         }
         other => panic!(
             "wanted UnsupportedGgmlType, got {other:?}",

@@ -31,8 +31,14 @@ explicitly out of scope. That was the right rule while the synthesiser was
 unfinished; it is retracted now that it is finished and measured. The chat LLM
 remains out of scope for *inference* — llama.cpp is not a rewrite that buys
 anything — but its **weights are now readable here**, which is a smaller claim
-and a real one: `xabe-gguf` reads the GGUF container and `xabe-llama` binds all
-292 tensors of the 8 B Breeze2 against its own metadata. Nothing runs them.
+and a real one: `xabe-gguf` reads the GGUF container - nine block formats
+included, checked against `gguf-py` at exact equality - and `xabe-llama` binds
+all 292 tensors of the 8 B Breeze2 against its own metadata. Nothing runs them.
+
+Unpacking a quantized file is not running quantized: the weights land at full
+width, so it buys disk and load bandwidth and not memory. Packed-in-VRAM
+inference would mean teaching every matmul the block layouts, which is a kernel
+project and not a loader change.
 
 ## Current standing
 
@@ -87,7 +93,7 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | Crate | Owns | Depends on |
 | --- | --- | --- |
 | `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
-| `xabe-gguf` | GGUF container parsing, mmap, metadata, tensor addressing | — |
+| `xabe-gguf` | GGUF container parsing, mmap, metadata, block-format unpacking | — |
 | `xabe-dsp` | CPU reference kernels + differential compare harness | — |
 | `xabe-golden` | reading captures and comparing tensors | — |
 | `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |

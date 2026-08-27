@@ -297,7 +297,7 @@ kept apart.
 
 | | State | Done |
 | --- | --- | --- |
-| — | `xabe-gguf` reads the GGUF container, v3, unquantized types only | ✅ |
+| — | `xabe-gguf` reads the GGUF container: v3, three widths and nine block formats | ✅ |
 | — | All 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` bind | ✅ |
 | — | A forward pass for it | not started, and not planned |
 
@@ -328,6 +328,17 @@ is a fact about that engine. So `check` now accepts it and
 500000 rather than 10000. Neither has a shape check that would catch it: a
 defaulted rope base gives a model fluent for one sentence and drifting after,
 and a skipped tensor gives a schema that binds 291 of 292 and calls it done.
+
+Quantized formats came later and are worth their own line, because the crate
+first refused them by name. `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0` and the
+K-quants `Q2_K` through `Q6_K` all decode now, checked against `gguf-py`'s own
+dequantization — the code that wrote the files — at **exact** equality on all
+ten. `IQ*`, `TQ*` and `Q8_K` are still refused; the last because it is an
+intermediate used while quantizing and never appears in a stored tensor.
+
+The limit to hold in mind is that unpacking is not running quantized: weights
+land at full width, so a 4-bit 13 B is a 7 GB file and still 26.5 GB of f16 on
+the card. That buys disk and load bandwidth, not memory. See `docs/MODEL.md`.
 
 The GPT-2 byte-level BPE the Breeze2 file carries — 128,256 tokens and 280,147
 merges, all inside the GGUF — is read as metadata and is **not** built into a

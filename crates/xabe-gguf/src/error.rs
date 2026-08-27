@@ -93,6 +93,17 @@ pub enum GgufError {
         file_len: u64,
     },
 
+    /// A row that is not a whole number of quantization blocks.
+    #[error("tensor `{name}` has rows of {row}, which is not a multiple of {block}")]
+    RaggedBlocks {
+        /// The tensor.
+        name: String,
+        /// The fastest-varying dimension.
+        row: u64,
+        /// The format's block size.
+        block: u64,
+    },
+
     /// An offset computation overflowed.
     #[error("offset arithmetic overflowed for tensor `{0}`")]
     OffsetOverflow(String),

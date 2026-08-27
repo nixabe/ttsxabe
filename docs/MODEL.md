@@ -538,6 +538,56 @@ rather than skipped, because a schema that binds 291 of 292 tensors is not a
 proof that the geometry is understood, and the one left over is precisely the
 one nothing else would have told you about.
 
+## Quantized GGUFs load, and that is not the same as running quantized
+
+`xabe-gguf` decodes nine block formats — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
+`Q8_0`, and the K-quants `Q2_K` through `Q6_K` — unpacking each to f32 on read.
+So a `Q4_K_M` checkpoint opens and binds exactly like an f16 one, and nothing
+above the container knows the difference.
+
+**What that buys is disk and load bandwidth, not memory.** The weights are
+unpacked on the way in, so a 4-bit 13 B is a 7 GB file and still 26.5 GB of f16
+once it is on the card. Running *quantized* — keeping blocks packed in VRAM and
+unpacking inside the matmul — is a different piece of work: every kernel would
+have to learn every block layout, and on this card the tensor-core path that
+makes it worthwhile is the int8 one, not f16. `llmxabe` has that path for Q8_0;
+this workspace does not, and adding it is not a loader change.
+
+Two limits remain, both by decision. The `IQ*` and `TQ*` families are refused —
+importance-weighted and ternary formats this project has no file in. `Q8_K` is
+refused too, for a different reason: it is an intermediate used *while*
+quantizing and never appears in a stored tensor, so a file containing one is
+malformed rather than unsupported.
+
+### The dequantizers are transcribed, then checked
+
+Each format is read off `gguf-py/gguf/quants.py` — the same code that writes
+these files. The reference expresses a format as a reshape-and-shift over whole
+blocks; unpacking one element at a time means deriving the element *ordering*
+by hand, and that is the only hard part.
+
+Q4_0 shows the shape of the trap. The reference does
+
+```
+qs.reshape((n, -1, 1, 16)) >> [0, 4]  ->  (n, 1, 2, 16)  ->  (n, 32)
+```
+
+so a block's first sixteen values are the **low** nibbles of bytes 0..16 and
+its last sixteen are the **high** nibbles of the same bytes. The intuitive
+reading — low then high of byte 0, low then high of byte 1 — is wrong, and
+produces a tensor that is a *permutation* of the right one: same values, same
+histogram, no correlation. Every format here has a trap of that shape, which is
+why none of them is reasoned about. `tools/oracle/capture_quants.py` captures
+packed bytes and the f32 the reference unpacks them to, and the test asserts
+**exact** equality on all ten formats.
+
+The corpus is pseudo-random encodings rather than a quantizer's output, for two
+reasons. Python `gguf` can only quantize the five legacy formats — the
+K-quants exist in C alone — so a round-trip corpus would have covered half the
+table. And random encodings reach every nibble, every packed six-bit scale and
+every high-bit mask, where a quantizer only ever emits the well-conditioned
+subset. A nibble-order mistake survives the second and dies against the first.
+
 ## GGUF stores shapes transposed
 
 The single easiest thing to get wrong. GGUF writes dimensions fastest-varying

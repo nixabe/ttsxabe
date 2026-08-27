@@ -35,7 +35,13 @@ point at the same relative paths either way:
 ```
 models/asr/breeze-asr-26/       models/tts/mms-tts-nan/
 models/vad/                     models/translator/taigi-llama2-13b/
+models/llm/                     models/tts/cosyvoice3-0.5b/
 ```
+
+`models/llm/` holds GGUFs. It is where `--llm-url`'s llama-server reads from,
+and `--translator-model` accepts a `.gguf` from there directly - the translator
+takes either container, so a deployment that only wants one copy of those
+weights can drop the safetensors directory and point at the GGUF.
 
 ## Environment
 

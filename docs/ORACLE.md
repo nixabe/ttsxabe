@@ -315,3 +315,68 @@ be a bug. The rule that came out of both: when the reference is wrong, do not
 capture it. Assert the intended behaviour directly, in the test, with the reason
 attached — a capture is a record of what the reference does, and enshrining a
 defect in one makes it permanent and invisible.
+
+---
+
+# The quantization oracle
+
+The reference is upstream llama.cpp's `gguf-py/gguf/quants.py` — literally the
+code that writes the files being read — and the comparison is **exact**. There
+is no tolerance to negotiate: this workspace never quantizes, it only unpacks,
+and an unpacking either reproduces the reference bit for bit or has an indexing
+bug.
+
+## Capturing
+
+```sh
+python tools/oracle/capture_quants.py --out .golden/gguf/quants
+```
+
+Ten formats: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0` and `Q2_K` through `Q6_K`.
+For each it writes the packed bytes and the f32 the reference unpacks them to,
+plus a `manifest.json` with the block geometry.
+
+## Why the corpus is random bytes, not a quantizer's output
+
+Two reasons, and the second is the better one.
+
+Python `gguf` implements `quantize` for the five legacy formats only — the
+K-quants exist in C alone — so a round-trip corpus would have covered half the
+table and left the harder half untested.
+
+And a quantizer only ever emits the well-conditioned subset of the encoding
+space. Random encodings reach every nibble, every packed six-bit scale and
+every high-bit mask. The failure this is guarding against is an element
+*ordering* mistake, which produces a permutation of the right tensor — same
+values, same histogram, no correlation — and a permutation is exactly the kind
+of bug that survives a well-behaved corpus.
+
+The one thing not left to chance is the f16 scale fields. Random bits there are
+NaN about 3% of the time, which says nothing about a layout. Those offsets are
+listed per format and filled with finite values spanning several orders of
+magnitude, so no two blocks share a scale and a per-block indexing error has
+nowhere to hide. For the five formats Python can quantize, a real round trip is
+captured as well, so the corpus holds both the whole space and the part a
+quantizer reaches.
+
+## And one real file
+
+`crates/xabe-gguf/tests/quantized_model.rs` opens an actual
+`llama-quantize` output beside its f16 original. It is skipped unless
+`XABE_QUANT_DIR` points at one, because the files are gigabytes and are
+reproducible in a single command:
+
+```sh
+llama-quantize models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+    $XABE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
+```
+
+What it asserts is **correlation**, not mean error, and that is the point: a
+lossy-but-correct unpacking correlates above 0.99 with the weights it encoded,
+while a permuted one correlates around zero despite having identical values and
+an identical histogram. Mean absolute error would pass a permutation; this does
+not.
+
+It also checks that a `_M` mix carries more than one format in one file, which
+is what `Q4_K_M` means — llama-quantize picks per tensor role. A reader that
+assumed one type per file would open it and mis-size most of it.

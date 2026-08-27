@@ -1591,6 +1591,8 @@ version = "0.0.0"
 dependencies = [
  "half",
  "memmap2",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]

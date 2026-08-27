@@ -95,7 +95,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
 | `xabe-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
 | `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
-| `xabe-gguf` | GGUF container, mmap, metadata, tensor addressing |
+| `xabe-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
 | `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
@@ -186,7 +186,9 @@ translator is a separate stage with its own model and its own flag.
 The chat model is reachable only as `--llm-url`; there is no `--llm-model`.
 Its **weights** do load here — `xabe-gguf` reads the GGUF and `xabe-llama`
 binds all 292 tensors of the 8 B Breeze2 — but nothing runs them, so serving it
-is still llama.cpp's job.
+is still llama.cpp's job. Quantized checkpoints load too: `Q4_0`, `Q4_1`,
+`Q5_0`, `Q5_1`, `Q8_0` and `Q2_K` through `Q6_K` are unpacked on read. That is a
+smaller file, not a smaller model — the weights land at full width either way.
 
 There is no KV cache and no request scheduler here; an utterance is a single
 forward pass with no state carried between calls. If batching arrives it will be

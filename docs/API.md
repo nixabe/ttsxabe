@@ -48,15 +48,24 @@ f.info("blk.0.attn_k.weight");            // Option<&TensorInfo>
 f.get_u32("llama.block_count");           // metadata, typed
 f.get_strings("tokenizer.ggml.tokens");   // the vocabulary lives in the file
 f.tensor_bytes("output_norm.weight")?;    // borrowed from the mapping
-f.tensor_f32("output_norm.weight")?;      // Vec<f32>, widened if needed
-f.tensor_f16("blk.0.attn_q.weight")?;     // Vec<u16>, rounded if needed
+f.tensor_f32("output_norm.weight")?;      // Vec<f32>, widened or unpacked
+f.tensor_f16("blk.0.attn_q.weight")?;     // Vec<u16>, rounded or unpacked
 ```
 
-The same contract as `xabe-st` over a different container, with one thing that
-has no safetensors equivalent: `TensorInfo::dims` is what the file stores,
-fastest-varying first, and `TensorInfo::shape()` is the row-major reading. Bind
-against `shape()`. Binding against `dims` agrees for every square matrix and
-silently transposes the rest.
+The same contract as `xabe-st` over a different container, with two things that
+have no safetensors equivalent.
+
+`TensorInfo::dims` is what the file stores, fastest-varying first, and
+`TensorInfo::shape()` is the row-major reading. **Bind against `shape()`** —
+binding against `dims` agrees for every square matrix and silently transposes
+the rest.
+
+And a tensor may be block-quantized. `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0` and
+`Q2_K` through `Q6_K` are unpacked by both accessors, so a caller never branches
+on it; `GgmlType::is_quantized` says so for anyone who needs to know, and
+`block_size`/`type_size`/`bytes_for` give the geometry. Unpacking happens on
+read, at full width — see `docs/MODEL.md` for why that is a disk saving and not
+a memory one.
 
 ## The geometry crates
 
@@ -78,19 +87,49 @@ let weights = LlamaWeights::load(&set, &cfg)?;   // 363 tensors, no bytes read
 let cfg = LlamaConfig::from_gguf(&gguf)?;        // the same geometry, from metadata
 let weights = LlamaWeights::from_gguf(&gguf, &cfg)?;  // 292 tensors, no bytes read
 cfg.refuse_grouped_query()?;                     // what an engine calls, not the schema
+
+let tok = xabe_llama::Tokenizer::from_gguf(&gguf)?;   // the vocabulary is inside the file
 ```
+
+A GGUF Llama's `attn_q` and `attn_k` are **row-permuted** relative to the 🤗
+checkpoint, because llama.cpp bakes its interleaved rope convention into the
+weights. `xabe_llama::gguf` undoes it:
+
+```rust
+use xabe_llama::gguf::{is_rope_permuted, unpermute_rope};
+
+if is_rope_permuted(&bound.name) {
+    let heads = if bound.name.ends_with(".attn_q.weight") {
+        cfg.num_attention_heads
+    } else {
+        cfg.num_key_value_heads          // k is divided into kv heads, not q heads
+    };
+    raw = unpermute_rope(&raw, bound.shape[0], bound.shape[1], heads);
+}
+```
+
+A `Bound` carries `dtype`, the width it is delivered at, and `packed`, the
+block format it is stored in when it is stored in one. They differ only for a
+quantized GGUF tensor: `dtype` is then `F32` because that is what unpacking
+yields, and `packed` is `Some(Q4K)` or whichever. Calling such a tensor "F16"
+in a field whose job is to say what the file holds would be a plain lie.
 
 `VitsWeights::load` reads only the inference subset; `posterior_encoder` is
 skipped. `LlamaWeights::load` reads *nothing* — it binds names, shapes and
 dtypes, and the 26.5 GB moves only when a stage asks for it.
 
-Both tokenizers are constructed from the checkpoint directory and answer
+Each tokenizer is constructed from wherever its vocabulary lives and answers
 `encode` / `decode`:
 
 ```rust
-let tok = xabe_whisper::Tokenizer::from_dir(dir)?;   // byte-level BPE
-let tok = xabe_llama::Tokenizer::from_dir(dir)?;     // SentencePiece
+let tok = xabe_whisper::Tokenizer::from_dir(dir)?;    // byte-level BPE, beside the model
+let tok = xabe_llama::Tokenizer::from_dir(dir)?;      // SentencePiece, tokenizer.model
+let tok = xabe_llama::Tokenizer::from_gguf(&gguf)?;   // the same, from inside the GGUF
 ```
+
+The two Llama sources agree on all 56,020 pieces and on every encoding. They
+differ on four scores and two kinds, all of them non-mergeable tokens — see
+`docs/MODEL.md`.
 
 ## `xabe-tts`
 
@@ -128,13 +167,15 @@ over a browser's VAD or over this one without knowing the difference.
 
 ## `xabe-asr` and `xabe-translate` — CUDA only
 
-Both open a checkpoint directory onto a device ordinal and refuse the CPU.
+Both open a checkpoint onto a device ordinal and refuse the CPU. The translator
+takes either container: a `.gguf` extension picks the GGUF reader, anything
+else is treated as a 🤗 directory, and the rope permutation is undone for you.
 
 ```rust
 let asr = AsrModel::open(dir, ordinal)?;
 let text = asr.transcribe(&samples, "zh")?;       // 16 kHz mono f32
 
-let tr = Translator::open(dir, ordinal)?;
+let tr = Translator::open(dir, ordinal)?;         // or Translator::open(gguf, ordinal)
 let taigi = tr.translate("今天天氣很好", "POJ",
                          256, Translator::REPEAT_PENALTY)?;
 ```

@@ -57,13 +57,18 @@ everything used to test it.
 the obvious alternative exists. The container was adapted from
 `llmxabe/crates/xabe-gguf`, the same author's LLM engine, which has been
 reading GGUF on this hardware for a while: the bounds-checked cursor, the value
-model and the parse order came from there. Two things changed on the way in.
-The quantized type table was **dropped** - F32, F16 and BF16 are read and every
-block format is refused by name and id, because this workspace runs f16
-throughout and has no dequantizer, so a `Q4_K` tensor has no correct reading
-downstream. And the accessors were reshaped to mirror `xabe-st`'s
-`tensor`/`tensor_f16`, so that a crate above cannot tell the two containers
-apart.
+model and the parse order came from there. The accessors were reshaped to
+mirror `xabe-st`'s `tensor`/`tensor_f16`, so a crate above cannot tell the two
+containers apart, and the nine block formats were written fresh.
+
+Those dequantizers are transcribed from `gguf-py/gguf/quants.py` in the local
+llama.cpp checkout - the same code that writes the files - and checked against
+it rather than reasoned about. The reference expresses each format as a
+reshape-and-shift over whole blocks; walking one element at a time means
+deriving the element *ordering* by hand, and that is where every plausible
+mistake lives. `tools/oracle/capture_quants.py` captures packed bytes and the
+f32 the reference unpacks them to, and the test asserts exact equality on all
+ten. No quantizer is written, and none is needed: this side only ever unpacks.
 
 No ML framework. No `candle`, `tch`, `ort`, `ndarray`, or bindings to
 whisper.cpp or llama.cpp. If one appears, it needs an argument in a commit body.

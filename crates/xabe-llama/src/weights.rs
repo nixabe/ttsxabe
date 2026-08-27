@@ -23,8 +23,20 @@ pub struct Bound {
     pub name: String,
     /// The shape the header declares, already checked against the geometry.
     pub shape: Vec<usize>,
-    /// The width it is stored at.
+    /// The width it is delivered at when read.
+    ///
+    /// For a safetensors tensor this is also how it is stored. For a
+    /// block-quantized GGUF tensor the two differ, and [`Self::packed`] is
+    /// what says so - `dtype` then describes the unpacking, since that is
+    /// what a caller receives.
     pub dtype: Dtype,
+    /// The block format it is stored in, when it is stored in one.
+    ///
+    /// `None` for every safetensors tensor and for the unquantized GGUF
+    /// widths. `Some` means the bytes on disk are packed blocks and the
+    /// container unpacks them on read - so the file is smaller and the
+    /// delivered tensor is not.
+    pub packed: Option<xabe_gguf::GgmlType>,
 }
 
 impl Bound {
@@ -114,6 +126,7 @@ fn get(st: &StSet, name: &str, want: &[usize]) -> Result<Bound, LlamaError> {
         name: name.to_string(),
         shape: info.shape.clone(),
         dtype: info.dtype,
+        packed: None,
     })
 }
 
@@ -136,14 +149,21 @@ fn get_gguf(f: &xabe_gguf::GgufFile, name: &str, want: &[usize]) -> Result<Bound
             want: want.to_vec(),
         });
     }
+    // A block format has no `Dtype`, because `Dtype` describes a width and a
+    // block format is not one. It is reported as the f32 it unpacks to, with
+    // the real storage in `packed` - the alternative, calling a Q4_K tensor
+    // "F16", would be a plain lie in a field whose whole job is to say what
+    // the file holds.
+    let ty = info.ggml_type;
     Ok(Bound {
         name: name.to_string(),
         shape,
-        dtype: match info.ggml_type {
-            xabe_gguf::GgmlType::F32 => Dtype::F32,
+        dtype: match ty {
             xabe_gguf::GgmlType::F16 => Dtype::F16,
             xabe_gguf::GgmlType::Bf16 => Dtype::Bf16,
+            _ => Dtype::F32,
         },
+        packed: ty.is_quantized().then_some(ty),
     })
 }
 

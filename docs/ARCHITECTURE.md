@@ -31,8 +31,8 @@ configuration of the same flags, not a different program.
       ├── xabe-vad      Silero geometry, weights and forward pass
       ├── xabe-asr      the Whisper forward pass, CUDA only
       ├── xabe-whisper  Whisper geometry, weight schema, BPE, mel
-      ├── xabe-translate the Llama-2 forward pass, CUDA only
-      ├── xabe-llama    Llama geometry, weight schema, SentencePiece
+      ├── xabe-translate the Llama-2 forward pass, CUDA only, either container
+      ├── xabe-llama    Llama geometry from either container, SentencePiece
       ├── xabe-tts      the VITS forward pass and synthesis API
       ├── xabe-audio    WAV, mel spectrogram, PCM framing
       ├── xabe-vits     config, weight schema, shape validation
@@ -43,12 +43,21 @@ configuration of the same flags, not a different program.
       └── xabe-gguf     GGUF container, mmap, metadata, addressing
 ```
 
-The bracketed crate does not exist yet. Its flags do:
-`--translator-model` parses, validates and then fails with the phase it is
-waiting on, because a flag surface designed and tested before the stages behind
-it are built is what lets the topology be settled first. A flag that parses and
-silently does nothing would be worse than one that says which milestone it
-needs.
+Every crate in that tree exists and every stage flag reaches a built stage.
+That was not always true - the flag surface was deliberately finished ahead of
+the stages behind it, so the topology could be settled first, and
+`--translator-model` used to parse, validate and then fail naming the phase it
+was waiting on. Nothing does that now; the only refusal left is `--vad-url`,
+which is a permanent limit rather than a pending one.
+
+**Two containers, one contract.** `xabe-st` reads safetensors and `xabe-gguf`
+reads GGUF, and they are siblings rather than one wrapping the other: same
+accessors, same errors, no shared trait. A model crate above them takes either.
+The translator does exactly that - `Translator::open` accepts a 🤗 directory or
+a `.gguf` file - and the awkward part is not the dispatch but that a GGUF Llama
+stores `attn_q` and `attn_k` row-permuted. That is undone at load in
+`xabe-llama`, so one rope kernel serves both and nothing downstream learns
+which container it came from.
 
 The ASR is split the way the TTS is: `xabe-whisper` says what the tensors are
 and refuses to do arithmetic, `xabe-asr` runs them. The difference is that
