@@ -1,5 +1,7 @@
 # ttsxabe
 
+[![CI](https://github.com/nixabe/ttsxabe/actions/workflows/ci.yml/badge.svg)](https://github.com/nixabe/ttsxabe/actions/workflows/ci.yml)
+
 A from-scratch Rust engine for a Taiwanese Hokkien (Taigi) voice assistant.
 
 No ML framework, no bindings. The container readers, the weight schemas and the
@@ -183,6 +185,23 @@ the endpoints `--serve` publishes.
 Input must be NFC-normalised POJ. Anything outside the 48 symbols is deleted
 silently - that is the reference's behaviour, and `docs/MODEL.md` explains why
 it matters more than it sounds.
+
+## What CI checks
+
+The badge means the workspace compiles with **no CUDA toolkit at all**, is
+formatted, and is clean under `clippy` and `rustdoc` at `-D warnings`. It does
+not mean any model is correct: a GitHub runner has no GPU and no checkpoints,
+and `.gitignore` keeps `models/` and `.golden/` out of the repository, so every
+numerical test skips there. The workflow counts those skips into the run
+summary rather than letting a green tick stand for something it did not check.
+
+The gate that does check the models is one command on a machine that has them:
+
+```sh
+XABE_COSY_DEVICE=<a free card> cargo test --workspace --release
+```
+
+`docs/TESTING.md` has the table of which column proves what.
 
 ## Building
 

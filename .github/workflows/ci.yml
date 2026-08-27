@@ -1,0 +1,128 @@
+# What CI can and cannot prove about this repository.
+#
+# Every numerical test here needs two things a GitHub-hosted runner does not
+# have: a CUDA device and a model checkpoint. They are not skipped by a flag —
+# each one checks for its device and its capture first and prints `SKIP:` with
+# what is missing, so the whole workspace runs green on a runner with neither.
+#
+# `docs/TESTING.md` says a skipped test is not a passing test, and that applies
+# to this file more than anywhere else. So the gate below reports how many
+# skipped and what for, rather than letting a green tick stand for something it
+# did not check. What CI actually proves:
+#
+#   - it compiles, on a machine with no CUDA toolkit at all
+#   - it is formatted
+#   - clippy is clean at `-D warnings`
+#   - rustdoc is clean at `-D warnings`, which is what catches a broken
+#     intra-doc link in a codebase this heavily commented
+#   - the pure-logic tests pass: shape arithmetic, tokenizers, container
+#     parsing, the quantization corpus, wire formats
+#
+# What it does not prove is that any model is correct. That gate is
+# `XABE_COSY_DEVICE=<free card> cargo test --workspace --release` on a box with
+# the checkpoints, and it stays a human step.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something panics, and a CI panic with no
+  # backtrace means running it again with the flag to learn anything.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Split out because it answers in ten seconds without compiling anything,
+  # and a badly formatted branch should not wait on a full build to hear so.
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        # `rust-toolchain.toml` names the channel and the components, so there
+        # is one source of truth and this step only makes rustup act on it.
+        run: rustup show
+      - run: cargo fmt --all --check
+
+  gate:
+    name: clippy, doc and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      # Worth the third-party action: a cold build of this workspace is most
+      # of the run, and `actions/cache` alone would mean hand-writing the key
+      # derivation and the target-directory pruning that this does correctly.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rustdoc
+        # Private items included: most of what is documented here is private,
+        # and a broken link in it is still a broken link.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      # Debug, not `--release`. The tests that actually execute here are pure
+      # logic; the numerical ones skip for want of a device. Paying for a
+      # thin-LTO single-codegen-unit build to run them would double the wall
+      # clock and prove nothing extra.
+      #
+      # This compiles `xabe-cuda` on a runner with no CUDA toolkit, which works
+      # because cudarc is built with `fallback-dynamic-loading`: it resolves
+      # libcuda and libnvrtc at run time, so nothing links against them here.
+      # Debug, not `--release`. The tests that actually execute here are pure
+      # logic; the numerical ones skip for want of a device. Paying for a
+      # thin-LTO single-codegen-unit build to run them would double the wall
+      # clock and prove nothing extra.
+      #
+      # This compiles `xabe-cuda` on a runner with no CUDA toolkit, which works
+      # because cudarc is built with `fallback-dynamic-loading`: it resolves
+      # libcuda and libnvrtc at run time, so nothing links against them here.
+      - name: Tests
+        # `shell: bash` rather than the default, because it sets `pipefail`.
+        # Without it the pipeline into `tee` reports *tee's* status and a
+        # failing test suite passes the job silently.
+        shell: bash
+        run: cargo test --workspace -- --nocapture 2>&1 | tee test.log
+
+      - name: What skipped, and why
+        # Never fails the job. It exists so a green tick is legible: a run
+        # where everything skipped looks identical to a run where everything
+        # passed unless somebody prints the difference.
+        if: always()
+        shell: bash
+        run: |
+          skipped=$(grep -c 'SKIP:' test.log || true)
+          {
+            echo "### Tests skipped on this runner"
+            echo
+            if [ "$skipped" -gt 0 ]; then
+              echo '```'
+              grep -o 'SKIP:.*' test.log | sort | uniq -c | sort -rn
+              echo '```'
+              echo
+              echo "$skipped tests skipped for want of a CUDA device or a"
+              echo "checkpoint. The numerical gate is \`cargo test --workspace"
+              echo "--release\` on a box that has both - see \`docs/TESTING.md\`."
+            else
+              echo "None - which on a hosted runner means the guards stopped"
+              echo "working, not that the models appeared."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
