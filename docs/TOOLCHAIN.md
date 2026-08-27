@@ -81,6 +81,33 @@ that walks the fields it needs and skips the rest by wire type. A protobuf
 crate would have been correct and would have been more code, more build, and a
 generated-source directory, for a format this workspace reads exactly once.
 
+## Every dependency is permissive, and that was checked rather than assumed
+
+This workspace is Apache-2.0, so a copyleft dependency anywhere in the tree
+would be a distribution problem rather than a preference. Audited across all
+166 transitive packages with `cargo metadata`:
+
+| licence | packages |
+| --- | --- |
+| `MIT OR Apache-2.0` and its spellings | 98 |
+| `MIT` | 39 |
+| `Unicode-3.0` | 18 |
+| BSD-2/3-Clause, ISC, Unlicense, BSL-1.0, LLVM-exception | 11 |
+
+Nothing copyleft. The single package that mentions the LGPL offers it as one
+arm of `MIT OR Apache-2.0 OR LGPL-2.1-or-later`, so the permissive arm is the
+one taken. Worth re-running when a dependency is added, which is rare here by
+policy anyway:
+
+```sh
+cargo metadata --format-version 1 --all-features |
+    jq -r '.packages[] | .license' | sort | uniq -c | sort -rn
+```
+
+The reason this is a section and not a footnote: the argument a new dependency
+needs in its commit body is about weight and maintenance, and it is easy to
+make that argument well and still miss the licence. Both have to hold.
+
 ## Build profiles
 
 `release` is `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `debug = 1` —

@@ -245,7 +245,22 @@ because a measurement asked for it.
 
 ## Licence
 
-MIT OR Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE), and [NOTICE](NOTICE) for what this was
+written against — every model here is a from-scratch implementation verified
+against a captured oracle, not a translation of someone's source, but the
+references are a real debt either way.
 
-The **model weights are not**. `facebook/mms-tts-nan` is CC-BY-NC 4.0 —
-non-commercial. This repository contains no weights; it reads a file you supply.
+**The model weights are not covered by it, and two of them are
+non-commercial.** This repository contains no weights: it reads files you
+supply, and their terms are between you and whoever published them.
+
+| checkpoint | licence, as its own model card states |
+| --- | --- |
+| `facebook/mms-tts-nan` | CC-BY-NC 4.0 — **non-commercial** |
+| `Taigi-Llama-2-Translator-13B` | CC-BY-NC-SA 4.0 — **non-commercial, share-alike** |
+| `Breeze-ASR-26` | Apache-2.0 |
+| `Fun-CosyVoice3-0.5B` | Apache-2.0 |
+
+The chat model and the VAD carry their own terms too; check the card before you
+ship anything. The non-commercial pair is the part that surprises people, which
+is why it is a table rather than a sentence.

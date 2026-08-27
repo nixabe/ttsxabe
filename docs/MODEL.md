@@ -344,7 +344,11 @@ accepted and then taking twenty minutes. See `docs/ARCHITECTURE.md`.
 # Llama-2, `Taigi-Llama-2-Translator-13B`
 
 A Llama-2 13 B fine-tune that translates between Mandarin, Han-script Taigi and
-POJ. 363 tensors, 13,261,870,080 parameters, BF16 on disk.
+POJ. 363 tensors, 13,261,870,080 parameters, BF16 on disk. Licence
+CC-BY-NC-SA 4.0: **non-commercial and share-alike**, and not redistributed
+here. That is the second non-commercial checkpoint in this pipeline and the
+easier one to miss, since the first announces itself in the model's name and
+this one does not.
 
 ## Geometry
 
@@ -660,7 +664,8 @@ that found, both of which produced real tokens that decoded back to the input.
 # CosyVoice3, `Fun-CosyVoice3-0.5B`
 
 Three networks on the per-request path, converted out of pickle by
-`tools/convert_cosyvoice.py` and bound in `xabe-cosy`.
+`tools/convert_cosyvoice.py` and bound in `xabe-cosy`. Licence Apache-2.0, and
+not redistributed here.
 
 ```
 text ──[Qwen2 BPE]──► ids ──[speech LM, 642 M]──► speech tokens (6561-way, 25 Hz)

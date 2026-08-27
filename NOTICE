@@ -1,0 +1,46 @@
+ttsxabe
+Copyright 2026 the ttsxabe contributors
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.
+
+
+This product includes no third-party source. Every model here is a
+from-scratch implementation, written against a reference rather than
+translated from it, and verified against a captured oracle. What the
+references contributed is described below, because "written against" is a real
+debt even where it is not a copyright one.
+
+  CosyVoice (Apache-2.0), https://github.com/FunAudioLLM/CosyVoice
+      The reference for `xabe-cosy`: the speech language model's prompt
+      assembly, `ras_sampling`, the flow's DiT and Euler solver, the HiFT
+      vocoder and its NSF source. `tools/convert_cosyvoice.py` reads its
+      checkpoints and `tools/oracle/capture_cosyvoice.py` runs it to produce
+      the oracle these are tested against.
+
+  whisper.cpp (MIT), https://github.com/ggml-org/whisper.cpp
+      The reference for the VAD segmenter's hysteresis constants and for
+      several ASR decoding details. Its divergences from upstream Silero and
+      from HuggingFace are recorded in `docs/MODEL.md` rather than copied.
+
+  llmxabe, the same author's LLM engine
+      The source of the NVRTC compile-and-cache pattern, the sm_75
+      reachability constraints on the tensor-core path, the shared-memory
+      stride arithmetic, and the serving crate's dependency set. See
+      `docs/KERNELS.md`, `docs/TOOLCHAIN.md` and `docs/OPTIMIZATION.md`.
+
+  Transformers, VITS, Silero VAD, Whisper, Llama
+      References for the geometries in `docs/MODEL.md`, and in several cases
+      the oracle a stage is compared against.
+
+Model weights are not covered by this licence and are not distributed here.
+See "Licence" in README.md; two of them are non-commercial.
