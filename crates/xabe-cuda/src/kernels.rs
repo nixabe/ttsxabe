@@ -937,6 +937,7 @@ extern "C" __global__ void silu_mul(
 // zero, so a decode step past a KV cache rotates by where the token really is.
 extern "C" __global__ void rope(
     float* __restrict__ x,
+    const float* __restrict__ freq_div, int has_div,
     int t, int heads, int head_dim, float theta, int first)
 {
     const int half = head_dim >> 1;
@@ -954,7 +955,17 @@ extern "C" __global__ void rope(
     // 6e-6 here. The reference computes this in f32 too, so the scalar twin
     // does the same rather than being more accurate than what it is a
     // reference for.
-    const float inv = powf(theta, -2.0f * (float)j / (float)head_dim);
+    // `freq_div` is Llama-3's per-pair frequency divisor, null for Llama-2.
+    // Dividing here rather than pre-scaling `theta` because the factors are
+    // not uniform: on Breeze2 they are 1.0 for the first 29 pairs and 8.0 for
+    // the last 29, with six interpolated between.
+    float inv = powf(theta, -2.0f * (float)j / (float)head_dim);
+    // A flag rather than a null check: the host always passes a real pointer,
+    // because a launch argument has to point at something and a one-element
+    // dummy is cheaper to reason about than a null that must never be read.
+    if (has_div) {
+        inv /= freq_div[j];
+    }
     const float angle = (float)(first + p) * inv;
     float sn, cs;
     sincosf(angle, &sn, &cs);
@@ -1096,4 +1107,27 @@ extern "C" __global__ void causal_mask(
     }
 }
 
+// Repeats each key/value head `group` times, widening a grouped-query cache
+// to the full query-head count.
+//
+// Input is `[kv_heads, t, head_dim]` as `split_heads` leaves it; output is
+// `[heads, t, head_dim]` with head `h` reading from `h / group`. The
+// alternative - teaching the batched matmul to advance its weight pointer
+// every `group` batches - would be faster and is a kernel change with a
+// differential test of its own; this is the same arithmetic with one extra
+// read of the cache, and the cache is small next to the projections.
+extern "C" __global__ void repeat_kv(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int heads, int group, int t, int head_dim)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t per_head = (size_t)t * head_dim;
+    if (i >= (size_t)heads * per_head) {
+        return;
+    }
+    const int h = (int)(i / per_head);
+    const size_t within = i - (size_t)h * per_head;
+    dst[i] = src[(size_t)(h / group) * per_head + within];
+}
 "#;

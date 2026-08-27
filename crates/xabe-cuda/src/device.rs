@@ -155,6 +155,7 @@ const NAMES: &[&str] = &[
     "rms_norm",
     "silu_mul",
     "rope",
+    "repeat_kv",
     "split_heads",
     "split_heads_t",
     "merge_heads",
@@ -1072,12 +1073,73 @@ impl Gpu {
         theta: f32,
         first: usize,
     ) -> Result<(), CudaError> {
+        self.rope_scaled(x, None, t, heads, head_dim, theta, first)
+    }
+
+    /// RoPE with an optional per-pair frequency divisor.
+    ///
+    /// `freq_div` is Llama-3's `rope_freqs.weight`, `head_dim / 2` long.
+    /// Mirrors [`xabe_dsp::rope_scaled`]. Llama-2 passes `None`; passing
+    /// `None` for a checkpoint that ships the tensor is a model that stays
+    /// fluent for a sentence and drifts after, with no shape to catch it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_scaled(
+        &self,
+        x: &mut CudaSlice<f32>,
+        freq_div: Option<&CudaSlice<f32>>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+        theta: f32,
+        first: usize,
+    ) -> Result<(), CudaError> {
         let n = t * heads * head_dim / 2;
         let (a, b_, c, d) = (t as i32, heads as i32, head_dim as i32, first as i32);
         let f = self.func("rope");
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(x).arg(&a).arg(&b_).arg(&c).arg(&theta).arg(&d);
+        // A flag, not a null pointer: every launch argument has to point at
+        // something real, so the no-scaling case passes a one-element dummy
+        // the kernel is told never to read.
+        let dummy = self.zeros(1)?;
+        let has = i32::from(freq_div.is_some());
+        let div = freq_div.unwrap_or(&dummy);
+        lb.arg(x)
+            .arg(div)
+            .arg(&has)
+            .arg(&a)
+            .arg(&b_)
+            .arg(&c)
+            .arg(&theta)
+            .arg(&d);
         launched("rope", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// Widens a grouped-query key or value cache to the full head count.
+    ///
+    /// `src` is `[kv_heads, t, head_dim]`, `dst` is `[heads, t, head_dim]`,
+    /// and head `h` reads from `h / group`.
+    pub fn repeat_kv(
+        &self,
+        src: &CudaSlice<f32>,
+        heads: usize,
+        kv_heads: usize,
+        t: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let n = heads * t * head_dim;
+        let mut dst = unsafe { self.uninit(n)? };
+        let group = (heads / kv_heads) as i32;
+        let (h, tt, hd) = (heads as i32, t as i32, head_dim as i32);
+        let f = self.func("repeat_kv");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(src)
+            .arg(&mut dst)
+            .arg(&h)
+            .arg(&group)
+            .arg(&tt)
+            .arg(&hd);
+        launched("repeat_kv", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(dst)
     }
 
     /// Lays a convolution out as a matrix: `[t, in_ch]` to `[out_t, in_ch*k]`.

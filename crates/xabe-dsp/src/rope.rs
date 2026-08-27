@@ -64,6 +64,31 @@ pub fn silu_mul(a: &mut [f32], b: &[f32]) {
 ///
 /// If `x` is not `t * heads * head_dim` long, or `head_dim` is odd.
 pub fn rope(x: &mut [f32], t: usize, heads: usize, head_dim: usize, theta: f32, first: usize) {
+    rope_scaled(x, t, heads, head_dim, theta, first, None);
+}
+
+/// RoPE with an optional per-dimension frequency divisor.
+///
+/// Llama-2 has none and passes `None`. Llama-3.1 carries one as
+/// `rope_freqs.weight`: `head_dim / 2` factors that divide the inverse
+/// frequency of each rotating pair, stretching the low-frequency dimensions so
+/// a model trained at 8k reaches 128k. On Breeze2 the factors run 1.0 for the
+/// first 29 pairs, rise through 1.21, 1.55, 2.03, 2.69, 3.68, 5.26, and sit at
+/// 8.0 for the rest.
+///
+/// Passing `None` for a checkpoint that ships the tensor is the failure this
+/// exists to prevent, and it has no shape to catch it: the model stays fluent
+/// for a sentence and drifts once the context grows past what the unscaled
+/// frequencies cover.
+pub fn rope_scaled(
+    x: &mut [f32],
+    t: usize,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    first: usize,
+    freq_div: Option<&[f32]>,
+) {
     assert_eq!(
         x.len(),
         t * heads * head_dim,
@@ -71,6 +96,9 @@ pub fn rope(x: &mut [f32], t: usize, heads: usize, head_dim: usize, theta: f32, 
     );
     assert!(head_dim.is_multiple_of(2), "head_dim {head_dim} is odd");
     let half = head_dim / 2;
+    if let Some(d) = freq_div {
+        assert_eq!(d.len(), half, "one divisor per rotating pair");
+    }
     for p in 0..t {
         for h in 0..heads {
             let base = (p * heads + h) * head_dim;
@@ -83,7 +111,10 @@ pub fn rope(x: &mut [f32], t: usize, heads: usize, head_dim: usize, theta: f32, 
                 // 2.4e-4 radians because that is the spacing of f32 up there.
                 // A twin that is better than what it is a twin for turns a
                 // faithful implementation into a failing test.
-                let inv = theta.powf(-2.0 * i as f32 / head_dim as f32);
+                let mut inv = theta.powf(-2.0 * i as f32 / head_dim as f32);
+                if let Some(d) = freq_div {
+                    inv /= d[i];
+                }
                 let angle = (first + p) as f32 * inv;
                 let (sin, cos) = (angle.sin(), angle.cos());
                 let (a, b) = (x[base + i], x[base + i + half]);

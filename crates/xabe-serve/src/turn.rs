@@ -344,7 +344,10 @@ async fn reply(
     let worker = tokio::spawn(synthesis_worker(
         backend,
         state.translator.clone(),
-        state.translator_target.clone(),
+        // The script follows the engine, not the process. Resolved from the
+        // engine the frame asked for, so mms and CosyVoice can be served by
+        // one translator and still each get what they read.
+        state.script_for(engine.as_deref()).to_string(),
         jobs_rx,
         audio_tx,
     ));

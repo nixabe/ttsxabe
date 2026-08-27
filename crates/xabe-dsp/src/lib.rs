@@ -35,7 +35,7 @@ pub use erf::{erf, gelu};
 pub use fft::{Fft, dft};
 pub use linear::linear;
 pub use norm::layer_norm;
-pub use rope::{rms_norm, rope, silu, silu_mul};
+pub use rope::{rms_norm, rope, rope_scaled, silu, silu_mul};
 pub use spline::spline_inverse;
 pub use tensor::{flip_channels, reflect_pad, transpose};
 pub use weight_norm::{fuse_weight_norm, gated_activation};

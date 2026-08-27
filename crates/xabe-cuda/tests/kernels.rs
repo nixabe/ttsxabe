@@ -1102,3 +1102,89 @@ fn rope_matches_at_every_offset() {
         );
     }
 }
+
+#[test]
+fn scaled_rope_matches_the_twin_with_llama3_factors() {
+    let Some(g) = gpu() else { return };
+    // Breeze2's real shape of divisor: ones for the low pairs, a short ramp,
+    // then a flat 8.0. A uniform factor would not catch a kernel that indexed
+    // the divisor by the wrong axis, because every entry would be the same.
+    let hd = 128usize;
+    let half = hd / 2;
+    let div: Vec<f32> = (0..half)
+        .map(|i| match i {
+            0..=28 => 1.0,
+            29 => 1.207_484,
+            30 => 1.553_415,
+            31 => 2.026_313,
+            32 => 2.694_53,
+            33 => 3.684_253,
+            34 => 5.257_327,
+            _ => 8.0,
+        })
+        .collect();
+
+    for &first in &[0usize, 1, 4095] {
+        let (t, heads) = (4usize, 3usize);
+        let x = seq(t * heads * hd, 91);
+        let mut want = x.clone();
+        xabe_dsp::rope_scaled(&mut want, t, heads, hd, 500_000.0, first, Some(&div));
+
+        let mut dev = g.upload(&x).expect("upload");
+        let d = g.upload(&div).expect("upload div");
+        g.rope_scaled(&mut dev, Some(&d), t, heads, hd, 500_000.0, first)
+            .expect("rope_scaled");
+        let got = g.download(&dev).expect("download");
+
+        // The same tolerance the unscaled test uses and for the same reason:
+        // both sides compute the angle in f32, and a 1-ulp disagreement in
+        // `inv_freq` becomes 2.4e-4 of phase at position 4095.
+        let tol = 1e-5 + first as f32 * f32::EPSILON;
+        assert_close_to(&format!("rope_scaled first={first}"), &want, &got, tol);
+    }
+}
+
+#[test]
+fn scaled_rope_with_no_divisor_is_the_unscaled_one() {
+    // The flag path, which is what every Llama-2 call takes. If `None` ever
+    // started reading the dummy buffer this would drift immediately.
+    let Some(g) = gpu() else { return };
+    let (t, heads, hd) = (3usize, 2usize, 64usize);
+    let x = seq(t * heads * hd, 12);
+
+    let mut a = g.upload(&x).expect("upload");
+    g.rope(&mut a, t, heads, hd, 10_000.0, 7).expect("rope");
+    let mut b = g.upload(&x).expect("upload");
+    g.rope_scaled(&mut b, None, t, heads, hd, 10_000.0, 7)
+        .expect("rope_scaled");
+
+    assert_eq!(
+        g.download(&a).expect("a"),
+        g.download(&b).expect("b"),
+        "the unscaled path must be bit-identical, not merely close"
+    );
+}
+
+#[test]
+fn repeat_kv_widens_a_grouped_cache() {
+    let Some(g) = gpu() else { return };
+    // Breeze2's ratio: 32 query heads over 8 key-value heads.
+    let (heads, kv_heads, t, hd) = (8usize, 2usize, 3usize, 4usize);
+    let group = heads / kv_heads;
+    let src = seq(kv_heads * t * hd, 33);
+
+    let dev = g.upload(&src).expect("upload");
+    let out = g.repeat_kv(&dev, heads, kv_heads, t, hd).expect("repeat");
+    let got = g.download(&out).expect("download");
+
+    assert_eq!(got.len(), heads * t * hd);
+    // Head h must be a byte-for-byte copy of kv head h / group. Anything else
+    // is a model whose queries attend to the wrong keys - which produces
+    // fluent output, so it has to be checked exactly rather than by norm.
+    for h in 0..heads {
+        let per = t * hd;
+        let want = &src[(h / group) * per..(h / group + 1) * per];
+        let have = &got[h * per..(h + 1) * per];
+        assert_eq!(have, want, "head {h} should copy kv head {}", h / group);
+    }
+}

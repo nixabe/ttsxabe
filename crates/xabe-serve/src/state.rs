@@ -232,8 +232,16 @@ pub struct Inner {
     pub llm: Option<Upstream>,
     /// Mandarin to Taigi, if configured.
     pub translator: Option<TranslatorBackend>,
-    /// Which target the translator is asked for: `POJ`, `HAN` or `HL`.
+    /// Which target the translator is asked for when an engine says nothing:
+    /// `POJ`, `HAN` or `HL`.
     pub translator_target: String,
+    /// The script a named engine wants, when it differs from the default.
+    ///
+    /// Two synthesisers in one process need not read the same script, and the
+    /// two this pipeline runs do not. Being wrong here is silent rather than
+    /// loud - mms handed Han tokenises to nothing and says nothing - so the
+    /// mapping is explicit instead of inferred from the engine's name.
+    pub tts_scripts: std::collections::HashMap<String, String>,
     /// Synthesisers by engine name.
     pub tts: BTreeMap<String, TtsBackend>,
     /// The page this server serves, held in memory.
@@ -258,6 +266,13 @@ impl Inner {
             .and_then(|name| self.tts.get(name))
             .or_else(|| self.tts.get(&self.config.tts_default))
             .or_else(|| self.tts.values().next())
+    }
+
+    /// The script the named engine wants, or the default.
+    pub fn script_for(&self, engine: Option<&str>) -> &str {
+        engine
+            .and_then(|name| self.tts_scripts.get(name))
+            .unwrap_or(&self.translator_target)
     }
 
     /// Whether this process can answer a whole voice turn.

@@ -160,7 +160,7 @@ fn a_format_outside_the_table_is_still_refused_by_name_and_id() {
     // The table grew; the refusal did not go away. Id 16 is `Q2_K`'s
     // neighbour `IQ2_XXS`, an importance-weighted format with no file in this
     // project - refused rather than mis-sized.
-    match GgufFile::from_bytes(image_raw("t", &[256], 16, &vec![0u8; 66])) {
+    match GgufFile::from_bytes(image_raw("t", &[256], 16, &[0u8; 66])) {
         Err(GgufError::UnsupportedGgmlType { name, ggml_type }) => {
             assert_eq!(name, "t");
             assert_eq!(ggml_type, 16);

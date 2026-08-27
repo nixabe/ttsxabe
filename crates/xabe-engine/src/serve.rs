@@ -151,6 +151,20 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         config.tts_default = name.clone();
     }
 
+    let mut tts_scripts = std::collections::HashMap::new();
+    for spec in &args.tts_scripts {
+        let Some((name, script)) = spec.split_once('=') else {
+            return Err(EngineError::BadScript(spec.clone()));
+        };
+        if !tts.contains_key(name) {
+            return Err(EngineError::UnknownEngine {
+                name: name.to_string(),
+                known: tts.keys().cloned().collect::<Vec<_>>().join(", "),
+            });
+        }
+        tts_scripts.insert(name.to_string(), script.to_string());
+    }
+
     Ok(AppState(Arc::new(Inner {
         config,
         asr,
@@ -158,6 +172,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         llm,
         translator,
         translator_target: args.translator_target.clone(),
+        tts_scripts,
         tts,
         page: xabe_serve::PAGE,
     })))

@@ -25,6 +25,23 @@ pub enum EngineError {
         stage: Kind,
     },
 
+    /// A `--tts-script` argument was not `name=script`.
+    #[error("--tts-script wants NAME=SCRIPT, got `{0}`")]
+    BadScript(String),
+
+    /// A `--tts-script` named an engine this process does not have.
+    ///
+    /// Refused rather than ignored: a script set on a misspelled engine is a
+    /// silent turn later, since a synthesiser handed the wrong script says
+    /// nothing at all rather than failing.
+    #[error("--tts-script names `{name}`, which is not a registered engine; have: {known}")]
+    UnknownEngine {
+        /// What was asked for.
+        name: String,
+        /// What exists.
+        known: String,
+    },
+
     /// The serving layer failed.
     #[error(transparent)]
     Serve(#[from] xabe_serve::ServeError),

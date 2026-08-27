@@ -128,9 +128,25 @@ pub struct Args {
 
     /// What the translator is asked to produce: POJ, HAN or HL.
     ///
-    /// mms consumes romanisation, so it needs POJ; CosyVoice reads Han.
+    /// mms consumes romanisation, so it needs POJ; CosyVoice reads Han. This
+    /// is the default for every engine; `--tts-script` overrides it per engine.
     #[arg(long, env = "XABE_TRANSLATOR_TARGET", default_value = "POJ")]
     pub translator_target: String,
+
+    /// The script one engine wants, as `name=POJ|HAN|HL`. Repeatable.
+    ///
+    /// Two synthesisers in one process do not have to read the same script,
+    /// and the two this pipeline runs do not: mms consumes romanisation and
+    /// CosyVoice reads Han. A single `--translator-target` can only be right
+    /// for one of them, and being wrong is not an error anywhere - mms handed
+    /// Han tokenises to nothing and simply says nothing at all.
+    #[arg(
+        long = "tts-script",
+        env = "XABE_TTS_SCRIPTS",
+        value_name = "NAME=SCRIPT",
+        value_delimiter = ','
+    )]
+    pub tts_scripts: Vec<String>,
 
     /// Language given to the ASR. Never `en`.
     ///
