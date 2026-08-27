@@ -17,18 +17,35 @@ dependency. Nothing downstream can tell which was used, so the same binary is a
 monolith, a single-stage worker, or anything between. The six-port topology the
 Python pipeline runs today is one configuration of these flags.
 
-Stages are `asr`, `vad`, `tts` and `translator`. `llm` is **URL-only at
-runtime** — it stays in llama.cpp by decision, so there is no `--llm-model`.
+Stages are `asr`, `vad`, `tts`, `translator` and `llm`.
 
-That decision is now partly retracted, and the boundary is worth stating
-exactly. The chat model's **weights are readable in this workspace**:
-`xabe-gguf` reads the GGUF container and `xabe-llama` binds all 292 tensors of
-`Llama-Breeze2-8B-Instruct-text-only.f16.gguf` against its own metadata. What
-does not exist is a forward pass for it, so there is still no `--llm-model` and
-`--llm-url` is still the only way to reach a chat model at runtime. The loader
-came first on purpose: it is the half that proves the geometry is understood,
-and it is the half that costs nothing to keep if the inference is never
-written.
+**`llm` was URL-only, and is not any more.** The plan said the chat model stays
+in llama.cpp by decision and there is no `--llm-model`; that is now retracted in
+full, in two steps that are worth keeping apart because the first shipped long
+before the second.
+
+The loader came first: `xabe-gguf` reads the GGUF container and `xabe-llama`
+binds all 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` against
+its own metadata. That is the half that proves the geometry is understood and
+the half that costs nothing to keep if the arithmetic never follows.
+
+The arithmetic followed. `--llm-model` runs the weights here, and it is the same
+symmetry as every other stage — `--llm-url` still delegates to llama-server and
+nothing downstream can tell which was used. What changed the decision was not
+that the forward pass got easier but that delegating the last stage kept a
+second runtime, a second copy of the weights and a second GPU allocation alive
+for it. Measured against the llama-server it replaces: 124 of 125 token
+decisions identical, the one disagreement at the tightest margin in the corpus.
+See `docs/ORACLE.md`.
+
+Two limits are real and are not going away soon:
+
+- **GGUF only.** Every other stage takes a 🤗 directory; this one does not,
+  because this model is published as a GGUF and its vocabulary lives inside the
+  file. A directory would load 16 GB of weights and then have nothing to
+  tokenize with, so it is refused at open.
+- **`--llm-device cpu` is refused.** 8 B is 16 GFLOP a token against scalar
+  kernels that manage under 2 GFLOP/s. Not a slow option, a fictional one.
 
 ```sh
 # everything in one process
@@ -36,7 +53,8 @@ xabe-engine --serve 127.0.0.1:8000 \
             --asr-model    models/asr/breeze-asr-26   --asr-device 0 \
             --vad-model    models/vad/silero-v5.1.2.safetensors \
             --tts-model    models/tts/mms-tts-nan     --tts-device 1 \
-            --llm-url      http://127.0.0.1:8082
+            --llm-model    models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+            --llm-device   0
 
 # split across processes and GPUs, as run.sh does today
 xabe-engine --serve 127.0.0.1:8080 --asr-model models/asr/breeze-asr-26 \
@@ -68,7 +86,9 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint: a 🤗 directory or a `.gguf` file |
 | `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
 | `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
-| `--llm-url` | `XABE_LLM_URL` | — | chat model; its weights load but it has no forward pass, so there is no `--llm-model` |
+| `--llm-model` | `XABE_LLM_MODEL` | — | chat model, as a `.gguf`; GGUF only, see above |
+| `--llm-url` | `XABE_LLM_URL` | — | delegate the chat model to a llama-server |
+| `--llm-device` | `XABE_LLM_DEVICE` | `0` | a CUDA device ordinal; `cpu` is refused |
 | `--direct-taigi` | `XABE_DIRECT_TAIGI` | off | chat model answers in Taigi Han itself |
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |

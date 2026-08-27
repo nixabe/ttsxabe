@@ -67,9 +67,19 @@ pub struct Args {
     #[arg(long, env = "XABE_TRANSLATOR_DEVICE", value_name = "DEV")]
     pub translator_device: Option<String>,
 
-    /// Chat model, as a llama-server base URL. There is no --llm-model.
+    /// Chat model checkpoint, as a GGUF.
+    ///
+    /// GGUF only, unlike every other stage: this model is published as one and
+    /// its vocabulary lives inside the file, so a checkpoint directory would
+    /// load 16 GB of weights and then have nothing to tokenize with.
+    #[arg(long, env = "XABE_LLM_MODEL", value_name = "PATH")]
+    pub llm_model: Option<PathBuf>,
+    /// Delegate the chat model to a llama-server at this base URL.
     #[arg(long, env = "XABE_LLM_URL", value_name = "URL")]
     pub llm_url: Option<String>,
+    /// Where to run the chat model: a CUDA device ordinal.
+    #[arg(long, env = "XABE_LLM_DEVICE", value_name = "DEV")]
+    pub llm_device: Option<String>,
 
     /// Have the chat model answer in Taigi Han itself, skipping the translator.
     ///
@@ -219,7 +229,11 @@ impl Args {
                 url: self.translator_url.clone(),
                 device: self.translator_device.clone(),
             },
-            self.llm_url.clone(),
+            &Requested {
+                model: self.llm_model.clone(),
+                url: self.llm_url.clone(),
+                device: self.llm_device.clone(),
+            },
             self.serve.is_some(),
         )
     }

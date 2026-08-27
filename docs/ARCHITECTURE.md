@@ -32,6 +32,7 @@ configuration of the same flags, not a different program.
       ├── xabe-asr      the Whisper forward pass, CUDA only
       ├── xabe-whisper  Whisper geometry, weight schema, BPE, mel
       ├── xabe-translate the Llama-2 forward pass, CUDA only, either container
+      ├── xabe-chat     the Llama-3 forward pass, CUDA only, grouped-query
       ├── xabe-llama    Llama geometry from either container, two tokenizers
       ├── xabe-tts      the VITS forward pass and synthesis API
       ├── xabe-audio    WAV, mel spectrogram, PCM framing
@@ -144,6 +145,7 @@ crates above it.
 | `xabe-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
 | `xabe-llama` | Llama geometry from either container, weight schema, SentencePiece and byte-level BPE | doing model arithmetic |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | running anywhere but a card |
+| `xabe-chat` | the Llama-3 forward pass, the sampler and streaming completion | the prompt format, which is `xabe-serve`'s |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
 

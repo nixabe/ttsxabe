@@ -305,7 +305,19 @@ impl Bpe {
     }
 
     /// Decodes ids back to text.
+    ///
+    /// Lossy, because a partial id sequence *is* partial text: one Han
+    /// character is often two or three tokens, and the bytes of the first
+    /// alone are not valid UTF-8. A streaming caller wants
+    /// [`Bpe::decode_bytes`] instead, so it can hold an incomplete character
+    /// back rather than emit a replacement character that the next token
+    /// turns into something else.
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids, skip_special)).into_owned()
+    }
+
+    /// The same, stopping at bytes.
+    pub fn decode_bytes(&self, ids: &[u32], skip_special: bool) -> Vec<u8> {
         let reverse: FxHashMap<char, u8> = self
             .alphabet
             .iter()
@@ -331,6 +343,6 @@ impl Bpe {
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 }

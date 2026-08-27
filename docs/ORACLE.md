@@ -445,3 +445,71 @@ awkward cases: Han (which is what this model writes), POJ with combining marks
 that have no precomposed form, emoji and a zero-width space through the byte
 alphabet, contractions in both cases, punctuation runs, and the pipeline's own
 system prompt so at least one input has realistic length.
+
+# The chat model's oracle
+
+The one model here with **one** reference instead of two, and the reason is not
+a shortcut. Every other model in this workspace is compared against a float32 🤗
+oracle with per-layer taps *and* against the service it replaces. There is no 🤗
+checkpoint for `Llama-Breeze2-8B-Instruct-text-only` on this machine at all — it
+exists as a GGUF and nothing else — so llama-server running that same GGUF is
+both what the pipeline uses today and the only thing to compare against.
+
+That makes this a *product* comparison rather than a numerical one. Agreeing
+with llama-server proves the replacement is a replacement; it does not prove
+either of them computes the reference arithmetic. Per-layer taps are what would,
+and they need an oracle this model has none of. The gap is named here rather
+than papered over.
+
+```sh
+python tools/oracle/capture_chat_server.py --url http://127.0.0.1:8082 \
+    --out .golden/chat/llama_server.json
+```
+
+## Comparing replies is the weak test; comparing decisions is the strong one
+
+Free-running text is what the product does and it is a poor measurement. One
+token going the other way forks the rest of the sentence, so a single near-tie
+reads as a whole reply disagreeing — and eight replies is eight observations no
+matter how long they are.
+
+So the main check is **teacher forcing**: llama-server's reply is fed back in
+and every position is asked what this engine would have chosen there. That is
+125 decisions across the same eight prompts instead of eight, it keeps measuring
+past the first divergence, and a fork stops hiding everything behind it.
+Measured: **124 of 125 identical**.
+
+## The capture records how close each decision was
+
+`n_probs = 2`, so the golden carries the margin by which llama-server's chosen
+token beat the runner-up at every step. That turns "our reply differs" from a
+verdict into a question the file already answers: a disagreement at a step it
+won by three nats is an arithmetic bug, and one at a step it won by five
+hundredths is two f16 implementations with different reduction orders. The
+single disagreement is at 0.056 nats, against a corpus whose margins run to 3.0.
+
+Recording the reference's own margins is what lets the test separate those
+populations without inventing a tolerance.
+
+## Two traps, both of which produce plausible output
+
+**A generated sequence is not the canonical segmentation of its own text.**
+Re-encoding the reply gives a different, equally valid cut — measured, 17 pieces
+against the 15 that were generated. A per-position comparison built on
+re-encoding is comparing two differently-cut sequences and calling the mismatch
+an error. So the capture stores `return_tokens`, and the ids that were actually
+produced are what is compared.
+
+**llama-server is not request-independent.** It reuses a KV prefix across
+requests, so the same prompt at temperature 0 can produce different text
+depending on what was asked before it — and these prompts share a 170-token
+common prefix, so the effect has every chance to bite. Each case is sent twice
+and the pair must agree before it is recorded.
+
+## Everything is captured greedy
+
+`gateway.py` samples at 0.3, and a sampled reply is not comparable: two correct
+implementations drawing from the same distribution give different text. The
+capture pins `temperature: 0` with the repetition penalty off, which makes the
+reply a function of the prompt alone. The sampler is tested separately, against
+the distribution rather than against a draw.

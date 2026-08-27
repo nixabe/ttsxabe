@@ -98,9 +98,6 @@ fn announce(stages: &Stages) {
             Stage::Off => {}
         }
     }
-    if let Some(url) = &stages.llm {
-        tracing::info!(stage = "llm", %url, "delegated");
-    }
     if stages.full_chain() {
         tracing::info!("this process can answer a whole voice turn");
     }

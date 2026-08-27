@@ -141,7 +141,7 @@ Or as the whole assistant, with a web page at the address given:
 xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
             --tts-model models/tts/mms-tts-nan --tts-device 1 \
             --asr-url http://127.0.0.1:8080 \
-            --llm-url http://127.0.0.1:8082
+            --llm-model models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf
 ```
 
 Each stage is satisfied either locally or by another process, and nothing
@@ -183,7 +183,9 @@ made only of them tokenises to nothing and is refused rather than returned as
 silence. Producing POJ from Mandarin is the translator's job, and the
 translator is a separate stage with its own model and its own flag.
 
-The chat model is reachable only as `--llm-url`; there is no `--llm-model`.
+The chat model runs either way: `--llm-model` loads the GGUF here,
+`--llm-url` delegates it to a llama-server. GGUF only, and no `cpu` device —
+see `docs/CLI.md`.
 Its **weights** do load here — `xabe-gguf` reads the GGUF and `xabe-llama`
 binds all 292 tensors of the 8 B Breeze2 — but nothing runs them, so serving it
 is still llama.cpp's job. Quantized checkpoints load too: `Q4_0`, `Q4_1`,

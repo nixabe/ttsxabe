@@ -126,6 +126,74 @@ impl AsrBackend {
     }
 }
 
+/// One request to complete a prompt, and where the text should go.
+///
+/// The reply arrives as a stream rather than a value because the whole
+/// pipeline is built on it: the first clause is synthesised while the model is
+/// still writing the second, which `gateway.py` measured at 4.1 s -> 2.7 s to
+/// first audio.
+#[derive(Debug)]
+pub struct CompletionJob {
+    /// The transcript prompt, already assembled.
+    pub prompt: String,
+    /// Where to send text as it is produced.
+    ///
+    /// **Dropping the receiver cancels the job.** That is not a convention to
+    /// remember, it is how the worker finds out: its send fails, it stops
+    /// generating and it releases the card. It is what makes a barged-in turn
+    /// stop costing GPU time at the next token rather than at the end of the
+    /// sentence.
+    pub pieces: mpsc::Sender<String>,
+}
+
+/// The sending half of a local chat model's work queue.
+pub type LocalLlm = mpsc::Sender<CompletionJob>;
+
+/// Where the chat model lives.
+#[derive(Clone)]
+pub enum LlmBackend {
+    /// In this process, behind a work queue.
+    Local(LocalLlm),
+    /// In another process, over HTTP.
+    Remote(Upstream),
+}
+
+impl std::fmt::Debug for LlmBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmBackend::Local(_) => f.write_str("local"),
+            LlmBackend::Remote(u) => write!(f, "remote({})", u.base()),
+        }
+    }
+}
+
+impl LlmBackend {
+    /// Streams a reply into `pieces`, wherever the model happens to be.
+    pub async fn stream(
+        &self,
+        prompt: String,
+        config: &GatewayConfig,
+        pieces: mpsc::Sender<String>,
+    ) -> Result<(), crate::ServeError> {
+        match self {
+            // The body carries the sampling knobs; a local model reads them
+            // off the same config, so the two paths cannot drift apart.
+            LlmBackend::Remote(u) => {
+                u.stream_completion(config.completion_body(&prompt), pieces)
+                    .await
+            }
+            LlmBackend::Local(tx) => {
+                tx.send(CompletionJob { prompt, pieces })
+                    .await
+                    .map_err(|_| crate::ServeError::Upstream {
+                        stage: "llm",
+                        message: "the local chat model stopped".into(),
+                    })
+            }
+        }
+    }
+}
+
 /// One request to translate, and where the answer should go.
 #[derive(Debug)]
 pub struct TranslateJob {
@@ -228,8 +296,8 @@ pub struct Inner {
     /// Always local: the VAD is 15 tensors and a millisecond of CPU, so
     /// delegating it over HTTP would cost more than running it.
     pub vad: Option<LocalVad>,
-    /// The chat model, which is always another process.
-    pub llm: Option<Upstream>,
+    /// The chat model, in this process or another.
+    pub llm: Option<LlmBackend>,
     /// Mandarin to Taigi, if configured.
     pub translator: Option<TranslatorBackend>,
     /// Which target the translator is asked for when an engine says nothing:

@@ -36,6 +36,8 @@ exists.
 | RMS norm | translator, every layer twice | `xabe_dsp::rms_norm` | `rms_norm` | `xabe-cuda` kernels |
 | SiLU, and SiLU-gated multiply | translator MLP | `xabe_dsp::silu`, `silu_mul` | `silu_mul` | `xabe-cuda` kernels |
 | rotary position embedding | translator attention | `xabe_dsp::rope` | `rope` | `xabe-cuda` kernels |
+| scaled rotary embedding | chat-model attention | `xabe_dsp::rope_scaled` | `rope` | `xabe-cuda` kernels |
+| key-value head expansion | chat-model attention | — | `repeat_kv` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -240,3 +242,35 @@ to make the test pass.
 The scalar twin computes `inv_freq` in **f32**, deliberately, even though f64
 would be more accurate. The reference computes it in f32. A twin that is more
 accurate than the thing it is checking is not a twin.
+
+
+## Two kernels the chat model needed, and what each is guarding against
+
+**`rope_scaled` is `rope` with a per-pair divisor**, which is Llama-3.1's
+frequency scaling. It is the same kernel — the divisor arrives as a pointer plus
+a flag, so the unscaled path costs one branch — and the flag is there rather
+than a null pointer because every launch argument has to point at something
+real, so the no-scaling case passes a one-element dummy the kernel is told never
+to read.
+
+The reason it is load-bearing is that Breeze2's `rope_freqs.weight` is **not all
+ones**: 1.0 for the first 29 pairs, a ramp through six, then 8.0 for the rest.
+A defaulted divisor gives a model fluent for one sentence and drifting after it,
+which no shape check catches and no short test notices.
+
+**`repeat_kv` expands 8 key-value heads to 32 query heads.** It is a gather and
+nothing more, and it is deliberately indifferent to what is inside a head: a
+whole head is `t * head_dim` contiguous floats whether the block is `[t, hd]` or
+the transposed `[hd, t]` the value side wants, so one kernel serves both sides
+of the attention.
+
+The cache is held at the **narrow** width and expanded on the way in, not stored
+expanded. Storing the expansion would quadruple it for no information — the four
+query heads in a group read the same key-value head — which at 8k tokens across
+32 layers is 6 GB against 1.5.
+
+The trap next to it has no kernel of its own: **`rope` on `k` runs over
+`kv_heads`, not `heads`.** The kernel walks the tensor as `heads * head_dim` per
+position, so passing the query count reads 4096 floats out of a 1024-wide row
+and rotates four positions' keys as if they were one position's heads. The
+buffer is the right length in total, so nothing checks it and nothing crashes.

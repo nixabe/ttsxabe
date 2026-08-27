@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 xabe-asr.workspace = true
+xabe-chat.workspace = true
 xabe-audio.workspace = true
 xabe-serve.workspace = true
 xabe-vad.workspace = true

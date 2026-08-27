@@ -334,13 +334,13 @@ async fn reply(
 
     let t1 = Instant::now();
     let prompt = state.config.build_prompt(history, user_text);
-    let body = state.config.completion_body(&prompt);
 
     let (piece_tx, mut piece_rx) = mpsc::channel::<String>(64);
     let (jobs_tx, jobs_rx) = mpsc::channel::<String>(8);
     let (audio_tx, mut audio_rx) = mpsc::channel::<TtsChunk>(AUDIO_BUFFER);
 
-    let llm_task = tokio::spawn(async move { llm.stream_completion(body, piece_tx).await });
+    let config = state.config.clone();
+    let llm_task = tokio::spawn(async move { llm.stream(prompt, &config, piece_tx).await });
     let worker = tokio::spawn(synthesis_worker(
         backend,
         state.translator.clone(),

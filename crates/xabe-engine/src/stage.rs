@@ -19,8 +19,12 @@ use std::path::PathBuf;
 
 /// The stages the engine knows about.
 ///
-/// `llm` is deliberately absent: it stays in llama.cpp by decision, so it is
-/// reachable only as a URL and has no `Stage` of its own.
+/// `Llm` was once absent from this list on purpose - the plan said the chat
+/// model stays in llama.cpp and there is no `--llm-model`. It is here now, and
+/// it is the same symmetry as every other stage rather than a special case:
+/// `--llm-url` still delegates to llama-server, `--llm-model` runs the weights
+/// here, and nothing downstream can tell which. `docs/MILESTONES.md` carries
+/// the reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Speech to text.
@@ -31,6 +35,8 @@ pub enum Kind {
     Tts,
     /// Mandarin to Taigi.
     Translator,
+    /// The chat model that writes the reply.
+    Llm,
 }
 
 impl Kind {
@@ -47,15 +53,16 @@ impl Kind {
 
     /// Whether this stage has a CPU implementation at all.
     ///
-    /// Neither the ASR nor the translator does. One 30-second window is about
-    /// 2.2 TFLOP through Whisper's encoder alone, and the 13 B translator is
-    /// 26 GFLOP a token against scalar kernels that run at something under
-    /// 2 GFLOP/s. Neither is a slow option; both are fictional ones. The
+    /// The ASR, the translator and the chat model do not. One 30-second
+    /// window is about 2.2 TFLOP through Whisper's encoder alone, the 13 B
+    /// translator is 26 GFLOP a token and the 8 B chat model 16, against
+    /// scalar kernels that run at something under 2 GFLOP/s. None is a slow
+    /// option; all three are fictional ones. The
     /// mirror of [`Kind::has_cuda`], and for the mirror-image reason:
     /// accepting `--asr-device cpu` and then taking twenty minutes is worse
     /// than saying so at preflight.
     pub fn has_cpu(self) -> bool {
-        !matches!(self, Kind::Asr | Kind::Translator)
+        !matches!(self, Kind::Asr | Kind::Translator | Kind::Llm)
     }
 
     /// Where this stage runs when no device is named.
@@ -74,6 +81,7 @@ impl Kind {
             Kind::Vad => "vad",
             Kind::Tts => "tts",
             Kind::Translator => "translator",
+            Kind::Llm => "llm",
         }
     }
 }
@@ -149,8 +157,8 @@ pub struct Stages {
     pub tts: Stage,
     /// Mandarin to Taigi.
     pub translator: Stage,
-    /// The chat model, which is never local.
-    pub llm: Option<String>,
+    /// The chat model that writes the reply.
+    pub llm: Stage,
 }
 
 /// One stage's two flags, before resolution.
@@ -206,7 +214,8 @@ pub enum StageError {
     #[error(
         "no stage configured; give at least one of \
          --asr-model/--asr-url, --vad-model/--vad-url, \
-         --tts-model/--tts-url, --translator-model/--translator-url"
+         --tts-model/--tts-url, --translator-model/--translator-url, \
+         --llm-model/--llm-url"
     )]
     Nothing,
 }
@@ -221,7 +230,7 @@ impl Stages {
         vad: &Requested,
         tts: &Requested,
         translator: &Requested,
-        llm: Option<String>,
+        llm: &Requested,
         serving: bool,
     ) -> Result<Stages, StageError> {
         let stages = Stages {
@@ -229,7 +238,7 @@ impl Stages {
             vad: one(Kind::Vad, vad)?,
             tts: one(Kind::Tts, tts)?,
             translator: one(Kind::Translator, translator)?,
-            llm,
+            llm: one(Kind::Llm, llm)?,
         };
 
         if !stages.any_on() {
@@ -243,7 +252,11 @@ impl Stages {
 
     /// Whether any stage at all is configured.
     pub fn any_on(&self) -> bool {
-        self.asr.is_on() || self.vad.is_on() || self.tts.is_on() || self.translator.is_on()
+        self.asr.is_on()
+            || self.vad.is_on()
+            || self.tts.is_on()
+            || self.translator.is_on()
+            || self.llm.is_on()
     }
 
     /// Whether this process can answer a whole voice turn by itself.
@@ -252,7 +265,7 @@ impl Stages {
     /// not in the list: `--direct-taigi` takes it out of the reply path, and
     /// that is the default the measured pipeline runs.
     pub fn full_chain(&self) -> bool {
-        self.asr.is_on() && self.tts.is_on() && self.llm.is_some()
+        self.asr.is_on() && self.tts.is_on() && self.llm.is_on()
     }
 
     /// Every configured stage, for logging what this process turned out to be.
@@ -262,6 +275,7 @@ impl Stages {
             (Kind::Vad, &self.vad),
             (Kind::Tts, &self.tts),
             (Kind::Translator, &self.translator),
+            (Kind::Llm, &self.llm),
         ]
         .into_iter()
         .filter(|(_, s)| s.is_on())

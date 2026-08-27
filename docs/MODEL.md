@@ -495,11 +495,31 @@ option, and the f32 weights would not fit anyway.
 
 # Llama-3, `Llama-Breeze2-8B-Instruct-text-only`
 
-The chat model. Loaded and tokenizable, not yet run: `xabe-gguf` reads the
-container, `xabe-llama` binds all 292 tensors and reproduces llama.cpp's
-tokenization id-for-id, and `xabe-cuda` has the two kernels the geometry needs
-(`rope_scaled`, `repeat_kv`) — but nothing in this workspace puts them together
-into a forward pass. Serving it is still llama.cpp's job.
+The chat model, and it runs here now. `xabe-gguf` reads the container,
+`xabe-llama` binds all 292 tensors and reproduces llama.cpp's tokenization
+id-for-id, and `xabe-chat` runs the forward pass on CUDA — reachable as
+`--llm-model`, measured at 124 of 125 token decisions identical to the
+llama-server it replaces.
+
+## Three things that are not Llama-2, and are all silent when missed
+
+The translator is Llama-2 and this is Llama-3, and the family resemblance is
+the hazard: each difference below leaves the model producing fluent text from
+wrong arithmetic rather than failing.
+
+**Grouped-query attention**, 32 query heads over 8 key-value heads. `k` and `v`
+project to 1024 rather than 4096, and one key-value head serves four query
+heads. The cache is a quarter the size; the attention is not.
+
+**A rope base of 500000**, not 10000. A defaulted base gives a model fluent for
+one sentence and drifting after it.
+
+**`rope_freqs.weight`**, Llama-3.1's per-pair frequency divisor, which has no
+safetensors counterpart — and on this checkpoint is **not all ones**: 1.0 for
+pairs 0–28, a ramp through 1.207, 1.553, 2.026, 2.695, 3.684, 5.257, then 8.0
+for 35–63. Ignoring it fails the same way the rope base does and at the same
+place: long context. A schema that skipped it would bind 291 of 292 tensors and
+call it done.
 
 ## Geometry
 

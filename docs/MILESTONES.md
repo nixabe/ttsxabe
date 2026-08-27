@@ -301,11 +301,37 @@ kept apart.
 | — | All 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` bind | ✅ |
 | — | `rope_scaled` and `repeat_kv` kernels, for Llama-3's rope and its grouped-query heads | ✅ |
 | — | The byte-level BPE, matching llama.cpp id-for-id on 60 captured cases | ✅ |
-| — | A forward pass for it | not started |
+| — | The grouped-query forward pass, sampler and streaming completion | ✅ |
+| — | `--llm-model`, wired through the engine like every other stage | ✅ |
 
-So the weights are readable, the text is tokenizable, the two kernels the
-geometry needs exist — and nothing runs them end to end yet. `--llm-url` is
-still the only way to reach a chat model at runtime. The loader was worth building on its own
+So the retraction is complete: `--llm-url` still delegates to llama-server, and
+`--llm-model` now runs the weights here. What changed the decision was not the
+forward pass getting easier — it was that delegating the last stage kept a
+second runtime, a second copy of the weights and a second GPU allocation alive
+for it.
+
+### What the measurement actually says
+
+124 of 125 token decisions identical to llama-server on the same GGUF. That
+number is teacher-forced, and the shape of the test matters more than the
+number: comparing free-running *replies* is a poor measurement, because one
+token going the other way forks the rest of the sentence and eight replies is
+eight observations however long they are. Feeding the reference reply back and
+asking what this engine would have chosen at every position is 125 observations,
+keeps measuring past the first divergence, and stops a fork from hiding
+everything behind it.
+
+The one disagreement is at the tightest margin in the corpus — llama-server's
+own `n_probs` records it winning by 0.056 nats, against a corpus that runs up to
+3.0 — so it is two f16 implementations with different reduction orders, which no
+version of this engine would not have. Recording the reference's margins is what
+makes that a fact rather than an argument.
+
+**The gap worth naming**: this model has *one* reference, not two. Every other
+model here has a float32 🤗 oracle with per-layer taps beside its product
+comparison; there is no 🤗 checkpoint for this one on this machine at all. So
+agreeing with llama-server proves the replacement is a replacement, and does not
+prove either of them computes the reference arithmetic. The loader was worth building on its own
 terms for the same reason phase 5a was: it is the half that proves the geometry
 is understood, and the half that costs nothing to keep if the arithmetic never
 follows.

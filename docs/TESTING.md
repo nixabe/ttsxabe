@@ -114,6 +114,20 @@ and says which variable to set.
 | `XABE_LLM_GGUF` | the Breeze2 chat GGUF | `models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
 | `XABE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/llm/taigi-translator-13b-f16.gguf` |
 | `XABE_QUANT_DIR` | a directory of quantized Breeze2 copies | none; those tests skip |
+| `XABE_CHAT_DEVICE` | the card to load the 8 B chat model onto | none; that test skips |
+
+`XABE_CHAT_DEVICE` has no default either, and for a different reason: this box
+has three cards and two of them are running somebody's pipeline. `run.sh` says
+to check `nvidia-smi` before taking one, and a test that silently lands on a
+busy card is exactly what that is warning about. Every other GPU test defaults
+to `0` because it needs a few hundred megabytes; this one needs sixteen
+gigabytes, which is enough to evict a neighbour.
+
+It is also why the whole chat comparison is **one test with sections** rather
+than several. `cargo test` runs a file's tests on separate threads, and four
+tests each loading their own copy of the weights is 64 GB onto a 48 GB card.
+Requiring `--test-threads=1` instead would have been an invisible condition
+that fails as an out-of-memory error rather than as a message.
 
 `XABE_QUANT_DIR` has no default on purpose. The files are several gigabytes
 each, they are derived rather than downloaded, and checking a multi-gigabyte

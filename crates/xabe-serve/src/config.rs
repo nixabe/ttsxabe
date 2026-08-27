@@ -116,6 +116,19 @@ impl GatewayConfig {
         lines.join("\n")
     }
 
+    /// The stop strings, which both backends need and only one serialises.
+    ///
+    /// Without these the model writes the user's next turn for them, then
+    /// answers it, and the browser speaks both halves of a conversation it was
+    /// only supposed to be one side of.
+    pub fn stops(&self) -> Vec<String> {
+        vec![
+            format!("{}:", self.person),
+            format!("{}:", self.bot),
+            "\n\n".to_string(),
+        ]
+    }
+
     /// The body for a streamed reply.
     pub fn completion_body(&self, prompt: &str) -> serde_json::Value {
         serde_json::json!({
@@ -125,8 +138,7 @@ impl GatewayConfig {
             "top_p": 0.9,
             "repeat_penalty": 1.1,
             "n_predict": self.max_tokens,
-            // Without these the model writes the user's next turn for them.
-            "stop": [format!("{}:", self.person), format!("{}:", self.bot), "\n\n"],
+            "stop": self.stops(),
         })
     }
 }

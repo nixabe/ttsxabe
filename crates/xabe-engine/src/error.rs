@@ -103,4 +103,8 @@ pub enum EngineError {
     /// The translator stage failed.
     #[error(transparent)]
     Translate(#[from] xabe_translate::TranslateError),
+
+    /// The chat model could not be loaded or run.
+    #[error(transparent)]
+    Chat(#[from] xabe_chat::ChatError),
 }

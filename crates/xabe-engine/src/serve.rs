@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use xabe_serve::{
-    AppState, AsrBackend, GatewayConfig, Inner, SpeechSpan, SynthesisJob, TranscribeJob,
-    TranslateJob, TranslatorBackend, TtsBackend, Upstream, VadJob,
+    AppState, AsrBackend, CompletionJob, GatewayConfig, Inner, LlmBackend, SpeechSpan,
+    SynthesisJob, TranscribeJob, TranslateJob, TranslatorBackend, TtsBackend, Upstream, VadJob,
 };
 
 /// The longest translation the engine will produce for one chunk.
@@ -109,8 +109,13 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     };
 
     let llm = match &stages.llm {
-        Some(url) => Some(Upstream::new(url)?),
-        None => None,
+        Stage::Remote { url } => Some(LlmBackend::Remote(Upstream::new(url)?)),
+        Stage::Local { path, device } => Some(LlmBackend::Local(spawn_chat(
+            path,
+            *device,
+            config.stops(),
+        )?)),
+        Stage::Off => None,
     };
 
     let vad = match &stages.vad {
@@ -316,6 +321,60 @@ fn spawn_translator(
         })
         .map_err(|source| EngineError::Io {
             what: "starting the translator thread",
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(tx)
+}
+
+/// Starts the chat model's thread and returns its work queue.
+///
+/// One OS thread, started before the listener binds, exactly as the ASR, the
+/// synthesiser and the translator are - a GPU step must not run on a tokio
+/// executor thread. The load is about 16 GB of transfers and takes as long as
+/// that sounds, which is the point of doing it at preflight: a service is
+/// started once and answers for hours.
+fn spawn_chat(
+    path: &std::path::Path,
+    device: Device,
+    // Taken from the same `GatewayConfig` the remote path serialises into its
+    // request body, so the two backends stop on the same strings. Building
+    // them here from `person` and `bot` a second time is how they would drift.
+    stops: Vec<String>,
+) -> Result<mpsc::Sender<CompletionJob>, EngineError> {
+    // `Kind::has_cpu` refuses `--llm-device cpu` at preflight: the 8 B is
+    // 16 GFLOP a token against scalar kernels that manage under 2 GFLOP/s.
+    let Device::Cuda(ordinal) = device else {
+        unreachable!("--llm-device cpu is refused when the stages resolve");
+    };
+    let model = xabe_chat::ChatModel::open(path, ordinal)?;
+
+    let (tx, mut rx) = mpsc::channel::<CompletionJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-chat".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                // The sampler is `gateway.py`'s by default, which is what the
+                // remote path sends in its request body - so switching a
+                // running pipeline between `--llm-url` and `--llm-model` does
+                // not quietly change how the model is sampled.
+                let sampling = xabe_chat::Sampling::default();
+                let out = model.complete(&job.prompt, &sampling, &stops, &mut |piece| {
+                    // `blocking_send` failing means the receiver is gone,
+                    // which is the browser having cancelled the turn. Returning
+                    // false stops generation at the next token rather than at
+                    // the end of the sentence, so a barged-in reply stops
+                    // costing GPU time immediately.
+                    job.pieces.blocking_send(piece.to_string()).is_ok()
+                });
+                if let Err(e) = out {
+                    tracing::warn!(error = %e, "the chat model refused a turn");
+                }
+            }
+            tracing::debug!("chat thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the chat thread",
             path: path.display().to_string(),
             source,
         })?;

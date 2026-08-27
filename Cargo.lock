@@ -1547,6 +1547,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xabe-chat"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-cuda",
+ "xabe-gguf",
+ "xabe-llama",
+]
+
+[[package]]
 name = "xabe-cuda"
 version = "0.0.0"
 dependencies = [
@@ -1578,6 +1591,7 @@ dependencies = [
  "tracing-subscriber",
  "xabe-asr",
  "xabe-audio",
+ "xabe-chat",
  "xabe-serve",
  "xabe-translate",
  "xabe-tts",
@@ -1613,6 +1627,7 @@ name = "xabe-llama"
 version = "0.0.0"
 dependencies = [
  "half",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",

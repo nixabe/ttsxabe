@@ -38,10 +38,13 @@ models/vad/                     models/translator/taigi-llama2-13b/
 models/llm/                     models/tts/cosyvoice3-0.5b/
 ```
 
-`models/llm/` holds GGUFs. It is where `--llm-url`'s llama-server reads from,
-and `--translator-model` accepts a `.gguf` from there directly - the translator
-takes either container, so a deployment that only wants one copy of those
-weights can drop the safetensors directory and point at the GGUF.
+`models/llm/` holds GGUFs, and both models in it are now readable by this
+engine directly. `--llm-model` takes the chat GGUF - which is also where a
+delegated `--llm-url` llama-server would read from - and `--translator-model`
+accepts a `.gguf` from the same directory, since the translator takes either
+container. So a deployment that only wants one copy of those weights can drop
+the safetensors directory and point at the GGUFs, and one that wants no second
+runtime at all can drop llama-server with it.
 
 ## Environment
 
