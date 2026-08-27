@@ -36,3 +36,21 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
         }
     }
 }
+
+/// Snake in place: `x + sin^2(a*x)/a`, one alpha per channel.
+///
+/// HiFTNet's activation. `x` is `[channels, t]`, `alpha` is one value per
+/// channel, and the guard sits on the *divisor* exactly where upstream puts
+/// it - an alpha trained to zero makes this the identity plus a very large
+/// term, which is the reference's behaviour and not something to improve
+/// quietly.
+pub fn snake(x: &mut [f32], alpha: &[f32], ch: usize, t: usize) {
+    debug_assert_eq!(x.len(), ch * t);
+    debug_assert_eq!(alpha.len(), ch);
+    for (c, a) in alpha.iter().enumerate() {
+        for v in &mut x[c * t..(c + 1) * t] {
+            let s = (*v * a).sin();
+            *v += s * s / (a + 1e-9);
+        }
+    }
+}

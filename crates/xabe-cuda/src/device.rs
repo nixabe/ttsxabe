@@ -135,6 +135,7 @@ const NAMES: &[&str] = &[
     "softmax_rows",
     "act_relu",
     "act_leaky_relu",
+    "act_snake",
     "act_tanh",
     "act_gelu",
     "gated_activation",
@@ -156,6 +157,10 @@ const NAMES: &[&str] = &[
     "silu_mul",
     "rope",
     "repeat_kv",
+    "stft_dft",
+    "istft_ola",
+    "upsample_nearest",
+    "strided_conv1d",
     "split_heads",
     "split_heads_t",
     "merge_heads",
@@ -923,6 +928,170 @@ impl Gpu {
     }
 
     /// Fuses weight normalisation. Mirrors [`xabe_dsp::fuse_weight_norm`].
+    /// Snake in place: `x + sin^2(a*x)/a`, one alpha per channel.
+    ///
+    /// HiFTNet's activation and the reason its vocoder is not a plain
+    /// HiFi-GAN. Periodic, so the network can represent a harmonic signal
+    /// without learning one - which is also why `alpha` is trained per channel
+    /// rather than fixed.
+    pub fn snake(
+        &self,
+        x: &mut CudaSlice<f32>,
+        alpha: &CudaSlice<f32>,
+        ch: usize,
+        t: usize,
+    ) -> Result<(), CudaError> {
+        let (c, tt) = (ch as i32, t as i32);
+        let f = self.func("act_snake");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(alpha).arg(&c).arg(&tt);
+        launched("act_snake", unsafe { lb.launch(Self::flat(ch * t)) })
+    }
+
+    /// A centred real STFT, as a direct DFT. Returns `(real, imag)`, each
+    /// `[n_fft / 2 + 1, frames]`.
+    ///
+    /// A direct transform rather than an FFT because `n_fft` is 16 in the only
+    /// caller: sixteen points is below the size at which a butterfly pays for
+    /// its plan and its twiddle table.
+    pub fn stft(
+        &self,
+        x: &CudaSlice<f32>,
+        window: &CudaSlice<f32>,
+        n: usize,
+        n_fft: usize,
+        hop: usize,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>, usize), CudaError> {
+        // torch's `center=True`: the signal is reflect-padded by `n_fft / 2`
+        // either side, which is what makes this the frame count.
+        let frames = n / hop + 1;
+        let bins = n_fft / 2 + 1;
+        let mut re = self.zeros(bins * frames)?;
+        let mut im = self.zeros(bins * frames)?;
+        let (a, b, c, d) = (n as i32, n_fft as i32, hop as i32, frames as i32);
+        let f = self.func("stft_dft");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(&mut re)
+            .arg(&mut im)
+            .arg(window)
+            .arg(&a)
+            .arg(&b)
+            .arg(&c)
+            .arg(&d);
+        launched("stft_dft", unsafe { lb.launch(Self::flat(bins * frames)) })?;
+        Ok((re, im, frames))
+    }
+
+    /// The inverse, as overlap-add with torch's window-envelope division.
+    ///
+    /// One thread per *output* sample, gathering the frames that cover it,
+    /// rather than one per frame scattering with atomics. The gather is
+    /// deterministic; a scatter's summation order is whatever the scheduler
+    /// chose that run, and a vocoder whose output moves between runs cannot be
+    /// diffed against anything.
+    pub fn istft(
+        &self,
+        re: &CudaSlice<f32>,
+        im: &CudaSlice<f32>,
+        window: &CudaSlice<f32>,
+        frames: usize,
+        n_fft: usize,
+        hop: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let out_n = (frames - 1) * hop;
+        let mut out = self.zeros(out_n)?;
+        let (a, b, c, d) = (out_n as i32, n_fft as i32, hop as i32, frames as i32);
+        let f = self.func("istft_ola");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(re)
+            .arg(im)
+            .arg(&mut out)
+            .arg(window)
+            .arg(&a)
+            .arg(&b)
+            .arg(&c)
+            .arg(&d);
+        launched("istft_ola", unsafe { lb.launch(Self::flat(out_n)) })?;
+        Ok(out)
+    }
+
+    /// Repeats each timestep `factor` times: `[ch, t]` to `[ch, t * factor]`.
+    ///
+    /// The half of HiFT's `ups` that is not a convolution. Upstream upsamples
+    /// by repetition and *then* convolves; a transposed convolution with the
+    /// same weight interleaves zeros instead. Same output length, different
+    /// function - which is exactly the kind of difference a shape check will
+    /// never catch.
+    pub fn upsample_nearest(
+        &self,
+        x: &CudaSlice<f32>,
+        ch: usize,
+        t: usize,
+        factor: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let n = ch * t * factor;
+        let mut out = self.zeros(n)?;
+        let (a, b, c) = (ch as i32, t as i32, factor as i32);
+        let f = self.func("upsample_nearest");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&a).arg(&b).arg(&c);
+        launched("upsample_nearest", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
+    }
+
+    /// A strided convolution with left padding only. Returns the output and
+    /// its length.
+    ///
+    /// [`Gpu::conv1d`] is stride-one; this exists for the vocoder's excitation
+    /// branch, which decimates one spectrum to three different rates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn strided_conv1d(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        in_ch: usize,
+        t: usize,
+        out_ch: usize,
+        k: usize,
+        stride: usize,
+        pad_left: usize,
+    ) -> Result<(CudaSlice<f32>, usize), CudaError> {
+        let out_t = (t + pad_left).saturating_sub(k) / stride + 1;
+        let mut out = self.zeros(out_ch * out_t)?;
+        let dummy = self.zeros(1)?;
+        let has = i32::from(bias.is_some());
+        let b = bias.unwrap_or(&dummy);
+        let (p, q, r, s, u, v, y) = (
+            in_ch as i32,
+            t as i32,
+            out_ch as i32,
+            k as i32,
+            stride as i32,
+            pad_left as i32,
+            out_t as i32,
+        );
+        let f = self.func("strided_conv1d");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(w)
+            .arg(b)
+            .arg(&mut out)
+            .arg(&p)
+            .arg(&q)
+            .arg(&r)
+            .arg(&s)
+            .arg(&u)
+            .arg(&v)
+            .arg(&y)
+            .arg(&has);
+        launched("strided_conv1d", unsafe {
+            lb.launch(Self::flat(out_ch * out_t))
+        })?;
+        Ok((out, out_t))
+    }
+
     pub fn fuse_weight_norm(
         &self,
         v: &CudaSlice<f32>,

@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 xabe-cuda.workspace = true
+xabe-dsp.workspace = true
 xabe-st.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

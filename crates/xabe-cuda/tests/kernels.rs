@@ -1188,3 +1188,136 @@ fn repeat_kv_widens_a_grouped_cache() {
         assert_eq!(have, want, "head {h} should copy kv head {}", h / group);
     }
 }
+
+#[test]
+fn snake_matches_its_scalar_twin() {
+    let Some(g) = gpu() else { return };
+    // Shapes chosen so the per-channel alpha lookup is exercised: a channel
+    // count that does not divide the block size, and a `t` that does not
+    // either, so `i / t` has to be right rather than incidentally right.
+    for (ch, t) in [(1, 1), (3, 7), (256, 129), (64, 1024), (17, 5)] {
+        let x = seq(ch * t, 11 + ch as u64);
+        // Alphas around one, never zero: the guard is tested separately.
+        let alpha: Vec<f32> = seq(ch, 97).iter().map(|v| v.abs() + 0.25).collect();
+
+        let mut want = x.clone();
+        xabe_dsp::snake(&mut want, &alpha, ch, t);
+
+        let mut d = g.upload(&x).expect("upload");
+        g.snake(&mut d, &g.upload(&alpha).expect("alpha"), ch, t)
+            .expect("snake");
+        assert_close_to(
+            &format!("snake {ch}x{t}"),
+            &want,
+            &g.download(&d).expect("download"),
+            2e-5,
+        );
+    }
+}
+
+#[test]
+fn snake_with_a_vanishing_alpha_does_what_the_reference_does() {
+    // Upstream guards the *divisor*, so an alpha at zero gives `x + 1e9*sin^2`
+    // rather than a NaN or a passthrough. That is a strange thing to want and
+    // it is what the reference does; the point of pinning it is that a
+    // "sensible" guard on the result would diverge only on a checkpoint whose
+    // alpha had trained to zero, which is not a case anyone would think to
+    // test later.
+    let Some(g) = gpu() else { return };
+    let (ch, t) = (2, 8);
+    let x = seq(ch * t, 3);
+    let alpha = vec![0.0, 1.0];
+
+    let mut want = x.clone();
+    xabe_dsp::snake(&mut want, &alpha, ch, t);
+    let mut d = g.upload(&x).expect("upload");
+    g.snake(&mut d, &g.upload(&alpha).expect("alpha"), ch, t)
+        .expect("snake");
+    let got = g.download(&d).expect("download");
+
+    assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+    // Relative, because the values are around 1e9 and an absolute tolerance
+    // would be meaningless there.
+    for (a, b) in want.iter().zip(&got) {
+        let scale = a.abs().max(1.0);
+        assert!(
+            (a - b).abs() / scale < 1e-4,
+            "want {a}, got {b} (relative {})",
+            (a - b).abs() / scale
+        );
+    }
+}
+
+#[test]
+fn the_stft_pair_matches_its_scalar_twin() {
+    let Some(g) = gpu() else { return };
+    let (n_fft, hop) = (16, 4);
+    let window = xabe_dsp::hann_periodic(n_fft);
+    let gw = g.upload(&window).expect("window");
+
+    for n in [64usize, 128, 1024, 4096] {
+        let x = seq(n, 5 + n as u64);
+        let (wr, wi, frames) = xabe_dsp::stft(&x, &window, n_fft, hop);
+
+        let (gr, gi, gframes) = g
+            .stft(&g.upload(&x).expect("x"), &gw, n, n_fft, hop)
+            .expect("stft");
+        assert_eq!(gframes, frames, "frame count at n={n}");
+        assert_close_to(
+            &format!("stft re n={n}"),
+            &wr,
+            &g.download(&gr).expect("re"),
+            3e-4,
+        );
+        assert_close_to(
+            &format!("stft im n={n}"),
+            &wi,
+            &g.download(&gi).expect("im"),
+            3e-4,
+        );
+
+        let want = xabe_dsp::istft(&wr, &wi, &window, frames, n_fft, hop);
+        let got = g.istft(&gr, &gi, &gw, frames, n_fft, hop).expect("istft");
+        assert_close_to(
+            &format!("istft n={n}"),
+            &want,
+            &g.download(&got).expect("wave"),
+            3e-4,
+        );
+    }
+}
+
+#[test]
+fn the_stft_round_trip_reconstructs_the_signal_it_was_given() {
+    // The property that says the pair is a *transform* and not just two
+    // kernels that agree with two other kernels. A Hann window at hop
+    // `n_fft / 4` satisfies the constant-overlap-add condition, so a forward
+    // transform followed by an inverse returns the input - away from the
+    // edges, where the envelope is genuinely smaller and the reference does
+    // not reconstruct either.
+    let Some(g) = gpu() else { return };
+    let (n_fft, hop) = (16, 4);
+    let window = xabe_dsp::hann_periodic(n_fft);
+    let gw = g.upload(&window).expect("window");
+
+    let n = 2048;
+    let x: Vec<f32> = (0..n)
+        .map(|i| (0.017 * i as f32).sin() * 0.6 + (0.31 * i as f32).sin() * 0.2)
+        .collect();
+
+    let (re, im, frames) = g
+        .stft(&g.upload(&x).expect("x"), &gw, n, n_fft, hop)
+        .expect("stft");
+    let back = g
+        .download(&g.istft(&re, &im, &gw, frames, n_fft, hop).expect("istft"))
+        .expect("download");
+
+    assert_eq!(back.len(), n, "a round trip should return its own length");
+    let edge = n_fft;
+    let worst = x[edge..n - edge]
+        .iter()
+        .zip(&back[edge..n - edge])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 2e-3, "round trip differs by {worst}");
+}

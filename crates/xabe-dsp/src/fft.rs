@@ -177,3 +177,98 @@ pub fn dft(x: &[f32]) -> Vec<[f32; 2]> {
         })
         .collect()
 }
+
+/// A centred real STFT, computed as a direct DFT.
+///
+/// The scalar twin of `xabe_cuda::Gpu::stft`. Returns `(real, imag, frames)`,
+/// each spectrum laid out `[bins, frames]`.
+///
+/// Direct rather than a butterfly because the caller's `n_fft` is 16, and the
+/// reflect padding reproduces torch's `center=True` default: frame `f` is
+/// *centred* on sample `f * hop` rather than starting there. A version that
+/// starts there shifts every frame by half a window, which sounds like a delay
+/// and measures like noise.
+pub fn stft(x: &[f32], window: &[f32], n_fft: usize, hop: usize) -> (Vec<f32>, Vec<f32>, usize) {
+    let n = x.len();
+    let frames = n / hop + 1;
+    let bins = n_fft / 2 + 1;
+    let half = n_fft / 2;
+    let (mut re, mut im) = (vec![0.0; bins * frames], vec![0.0; bins * frames]);
+
+    for bin in 0..bins {
+        for f in 0..frames {
+            let (mut sr, mut si) = (0.0f32, 0.0f32);
+            for (j, &w) in window.iter().enumerate().take(n_fft) {
+                let mut at = (f * hop + j) as isize - half as isize;
+                if at < 0 {
+                    at = -at;
+                }
+                if at >= n as isize {
+                    at = 2 * (n as isize - 1) - at;
+                }
+                let at = at.clamp(0, n as isize - 1) as usize;
+                let v = x[at] * w;
+                let ang = -std::f32::consts::TAU * bin as f32 * j as f32 / n_fft as f32;
+                sr += v * ang.cos();
+                si += v * ang.sin();
+            }
+            re[bin * frames + f] = sr;
+            im[bin * frames + f] = si;
+        }
+    }
+    (re, im, frames)
+}
+
+/// The inverse, as overlap-add with torch's window-envelope division.
+///
+/// The scalar twin of `xabe_cuda::Gpu::istft`.
+pub fn istft(
+    re: &[f32],
+    im: &[f32],
+    window: &[f32],
+    frames: usize,
+    n_fft: usize,
+    hop: usize,
+) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
+    let half = n_fft / 2;
+    let out_n = (frames - 1) * hop;
+    let mut out = vec![0.0; out_n];
+
+    for (s, o) in out.iter_mut().enumerate() {
+        let p = s + half;
+        let (mut acc, mut env) = (0.0f32, 0.0f32);
+        let first = (p + 1).saturating_sub(n_fft).div_ceil(hop);
+        for f in first..=(p / hop).min(frames.saturating_sub(1)) {
+            let j = p - f * hop;
+            if j >= n_fft {
+                continue;
+            }
+            let mut v = 0.0f32;
+            for b in 0..bins {
+                let ang = std::f32::consts::TAU * b as f32 * j as f32 / n_fft as f32;
+                let term = re[b * frames + f] * ang.cos() - im[b * frames + f] * ang.sin();
+                // Bin 0 and, for even `n_fft`, Nyquist stand for themselves;
+                // every other bin stands for a conjugate pair and counts
+                // twice. Treating them alike is a constant offset on the
+                // waveform.
+                let edge = b == 0 || (n_fft.is_multiple_of(2) && b == bins - 1);
+                v += if edge { term } else { 2.0 * term };
+            }
+            v /= n_fft as f32;
+            let w = window[j];
+            acc += v * w;
+            env += w * w;
+        }
+        *o = if env > 1e-11 { acc / env } else { 0.0 };
+    }
+    out
+}
+
+/// A periodic Hann window, which is what `get_window("hann", n, fftbins=True)`
+/// produces - the `fftbins` variant, dividing by `n` and not by `n - 1`.
+pub fn hann_periodic(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos())
+        .collect()
+}

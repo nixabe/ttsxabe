@@ -245,9 +245,85 @@ def main() -> None:
     T["mel"] = save(out, "mel", mel)
     print(f"  {'mel':26} {T['mel']['shape']}")
 
-    # 4. The vocoder.
+    # 4. The vocoder, with its own boundaries.
+    #
+    # `f0_predictor` is run in **float64** by upstream - "precision is crucial
+    # for causal inference" - and then cast back. That is captured as it is
+    # rather than corrected: whatever this engine does, it has to reproduce the
+    # numbers the reference actually produces.
+    hift = m.model.hift
     with torch.no_grad():
-        wav, _ = m.model.hift.inference(speech_feat=mel.to(dev), finalize=True)
+        hift.f0_predictor.to(torch.float64)
+        f0 = hift.f0_predictor(mel.to(dev).to(torch.float64), finalize=True).to(mel)
+        source = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
+        source, _, _ = hift.m_source(source)
+        source = source.transpose(1, 2)
+    T["f0"] = save(out, "f0", f0)
+    T["source"] = save(out, "source", source)
+    print(f"  {'f0':26} {T['f0']['shape']}")
+    print(f"  {'source':26} {T['source']['shape']}")
+
+    # The three buffers that are **not in the checkpoint**.
+    #
+    # `SineGen2` and `SourceModuleHnNSF` each call `torch.rand` in `__init__`
+    # and keep the result as a plain attribute - not a parameter, not a
+    # registered buffer - so it never reaches `hift.pt`. They are regenerated
+    # from torch's global RNG every time the model is constructed, which means
+    # upstream itself does not reproduce across load orderings.
+    #
+    # They are dither: an initial phase offset per harmonic, a bank of sine
+    # noise, and the unvoiced noise. Perceptually they are nothing; numerically
+    # they decide every sample. So a comparison against the reference has to be
+    # fed the same ones, and they are captured here, sliced to this utterance
+    # rather than at their full 300 seconds - 288 MB against 5 MB.
+    gen = hift.m_source.l_sin_gen
+    n = source.shape[2]
+    for name, t in [
+        ("sine_rand_ini", gen.rand_ini),
+        ("sine_waves", gen.sine_waves[:, :n]),
+        ("uv_noise", hift.m_source.uv[:, :n]),
+    ]:
+        T[name] = save(out, name, t)
+        print(f"  {name:26} {T[name]['shape']}  (constructed, not in hift.pt)")
+
+    # Inside `decode`, stage by stage. "The waveform is wrong" localises to
+    # nothing; "stage 1 is wrong" localises to twelve tensors.
+    with torch.no_grad():
+        import torch.nn.functional as F
+
+        sr_, si_ = hift._stft(source.to(dev).squeeze(1))
+        s_stft = torch.cat([sr_, si_], dim=1)
+        T["s_stft"] = save(out, "s_stft", s_stft)
+        print(f"  {'s_stft':26} {T['s_stft']['shape']}")
+
+        xt = hift.conv_pre(mel.to(dev))
+        T["conv_pre"] = save(out, "conv_pre", xt)
+        print(f"  {'conv_pre':26} {T['conv_pre']['shape']}")
+
+        for i in range(hift.num_upsamples):
+            xt = F.leaky_relu(xt, hift.lrelu_slope)
+            xt = hift.ups[i](xt)
+            if i == hift.num_upsamples - 1:
+                xt = hift.reflection_pad(xt)
+            sd = hift.source_downs[i](s_stft)
+            T[f"source_down{i}"] = save(out, f"source_down{i}", sd)
+            sd = hift.source_resblocks[i](sd)
+            xt = xt + sd
+            xs = None
+            for j in range(hift.num_kernels):
+                xs = hift.resblocks[i * hift.num_kernels + j](xt) if xs is None \
+                    else xs + hift.resblocks[i * hift.num_kernels + j](xt)
+            xt = xs / hift.num_kernels
+            T[f"stage{i}"] = save(out, f"stage{i}", xt)
+            print(f"  {f'stage{i}':26} {T[f'stage{i}']['shape']}")
+
+        xt = F.leaky_relu(xt)
+        xt = hift.conv_post(xt)
+        T["conv_post"] = save(out, "conv_post", xt)
+        print(f"  {'conv_post':26} {T['conv_post']['shape']}")
+
+    with torch.no_grad():
+        wav, _ = hift.inference(speech_feat=mel.to(dev), finalize=True)
     T["wav"] = save(out, "wav", wav)
     print(f"  {'wav':26} {T['wav']['shape']}  {wav.shape[1] / m.sample_rate:.2f}s")
 

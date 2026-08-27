@@ -28,11 +28,11 @@ mod spline;
 mod tensor;
 mod weight_norm;
 
-pub use activation::{leaky_relu, relu, softmax_rows};
+pub use activation::{leaky_relu, relu, snake, softmax_rows};
 pub use attention::self_attention;
 pub use conv::{conv1d, conv1d_strided, depthwise_conv1d, same_padding, transposed_conv1d};
 pub use erf::{erf, gelu};
-pub use fft::{Fft, dft};
+pub use fft::{Fft, dft, hann_periodic, istft, stft};
 pub use linear::linear;
 pub use norm::layer_norm;
 pub use rope::{rms_norm, rope, rope_scaled, silu, silu_mul};

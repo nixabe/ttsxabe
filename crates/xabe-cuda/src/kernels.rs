@@ -672,6 +672,27 @@ __global__ void act_leaky_relu(float* x, int n, float slope)
     if (i < n && x[i] < 0.0f) x[i] *= slope;
 }
 
+/* Snake: x + sin^2(a*x)/a, with one alpha per channel.
+ *
+ * HiFTNet's activation, and the reason the vocoder is not a plain HiFi-GAN.
+ * It is periodic, which is what lets the network represent a harmonic signal
+ * without having to learn one - and it is why `alpha` is a trained parameter
+ * per channel rather than a constant.
+ *
+ * `1e-9` guards the division exactly where upstream puts it: on the divisor,
+ * not on the result. An alpha that has trained to zero makes this the identity
+ * plus a very large term, which is upstream's behaviour and not something to
+ * quietly improve. */
+__global__ void act_snake(float* x, const float* __restrict__ alpha, int ch, int t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ch * t) {
+        float a = alpha[i / t];
+        float s = __sinf(x[i] * a);
+        x[i] += s * s / (a + 1e-9f);
+    }
+}
+
 __global__ void act_tanh(float* x, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1129,5 +1150,149 @@ extern "C" __global__ void repeat_kv(
     const int h = (int)(i / per_head);
     const size_t within = i - (size_t)h * per_head;
     dst[i] = src[(size_t)(h / group) * per_head + within];
+}
+
+// ------------------------------------------------------------------- spectra
+
+/* A real forward STFT, computed as a direct DFT.
+ *
+ * `n_fft` is **16** here, so an FFT would be the wrong tool: sixteen points is
+ * below the size at which a butterfly beats a straight sum, and a direct
+ * transform needs no plan, no twiddle table and no second code path for the
+ * odd frame at the end. One thread per (bin, frame).
+ *
+ * `center` is torch's default and is reproduced: the signal is reflect-padded
+ * by `n_fft / 2` on both sides, so frame `f` is centred on sample `f * hop`
+ * rather than starting there. Getting this wrong shifts every frame by eight
+ * samples, which sounds like a delay and measures like noise. */
+extern "C" __global__ void stft_dft(
+    const float* __restrict__ x, float* __restrict__ re, float* __restrict__ im,
+    const float* __restrict__ window, int n, int n_fft, int hop, int frames)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int bins = n_fft / 2 + 1;
+    if (i >= bins * frames) return;
+    int bin = i / frames, f = i % frames;
+
+    float sr = 0.0f, si = 0.0f;
+    int half = n_fft / 2;
+    for (int j = 0; j < n_fft; ++j) {
+        // Reflect padding, as `torch.stft(pad_mode='reflect')` does it: the
+        // edge sample is not repeated, so index -1 is sample 1.
+        int at = f * hop + j - half;
+        if (at < 0) at = -at;
+        if (at >= n) at = 2 * (n - 1) - at;
+        // A degenerate signal shorter than the window would fold past both
+        // ends; clamping keeps the read in bounds rather than reading nothing.
+        if (at < 0) at = 0;
+        if (at >= n) at = n - 1;
+
+        float v = x[at] * window[j];
+        float ang = -6.283185307179586f * (float)bin * (float)j / (float)n_fft;
+        sr += v * __cosf(ang);
+        si += v * __sinf(ang);
+    }
+    re[bin * frames + f] = sr;
+    im[bin * frames + f] = si;
+}
+
+/* The inverse, as overlap-add with torch's window-envelope normalisation.
+ *
+ * One thread per output sample, gathering every frame that covers it, rather
+ * than one thread per frame scattering with atomics. The gather is
+ * deterministic; the scatter's summation order is whatever the scheduler
+ * chose that run, and a vocoder whose output changes between runs cannot be
+ * diffed against anything.
+ *
+ * The envelope is the sum of the squared window over the frames covering each
+ * sample, which is what `torch.istft` divides by. It is constant in the middle
+ * for a Hann window at this hop and is *not* constant at the edges, so it is
+ * computed rather than assumed. */
+extern "C" __global__ void istft_ola(
+    const float* __restrict__ re, const float* __restrict__ im,
+    float* __restrict__ out, const float* __restrict__ window,
+    int out_n, int n_fft, int hop, int frames)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= out_n) return;
+
+    int half = n_fft / 2;
+    int bins = n_fft / 2 + 1;
+    // `center` again: output sample `s` sits at `s + half` in the padded
+    // signal that the frames tile.
+    int p = s + half;
+
+    float acc = 0.0f, env = 0.0f;
+    int first = (p - n_fft + 1 + hop - 1) / hop;
+    if (first < 0) first = 0;
+    for (int f = first; f <= p / hop && f < frames; ++f) {
+        int j = p - f * hop;
+        if (j < 0 || j >= n_fft) continue;
+
+        // The inverse DFT of a half-spectrum: bin 0 and, for even `n_fft`, the
+        // Nyquist bin appear once; every other bin stands for a conjugate pair
+        // and so counts twice. Treating all bins alike doubles the DC term and
+        // is a constant offset on the waveform.
+        float v = 0.0f;
+        for (int b = 0; b < bins; ++b) {
+            float ang = 6.283185307179586f * (float)b * (float)j / (float)n_fft;
+            float c = __cosf(ang), sn = __sinf(ang);
+            float term = re[b * frames + f] * c - im[b * frames + f] * sn;
+            bool edge = (b == 0) || (n_fft % 2 == 0 && b == bins - 1);
+            v += edge ? term : 2.0f * term;
+        }
+        v /= (float)n_fft;
+
+        float w = window[j];
+        acc += v * w;
+        env += w * w;
+    }
+    out[s] = env > 1e-11f ? acc / env : 0.0f;
+}
+
+/* Nearest-neighbour upsampling along time: `out[c][t*u + j] = x[c][t]`.
+ *
+ * The other half of what makes HiFT's `ups` not a transposed convolution.
+ * Upstream upsamples by repetition and *then* convolves; a transposed
+ * convolution with the same weight interleaves zeros instead and learns a
+ * different function. Both give the same output length, which is why this is
+ * worth its own kernel rather than a comment. */
+extern "C" __global__ void upsample_nearest(
+    const float* __restrict__ x, float* __restrict__ out,
+    int ch, int t, int factor)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_t = t * factor;
+    if (i >= ch * out_t) return;
+    int c = i / out_t, j = i % out_t;
+    out[i] = x[c * t + j / factor];
+}
+
+/* A strided 1-D convolution with left padding only.
+ *
+ * `conv1d` asserts stride one, and the excitation branch needs a stride: the
+ * source spectrum is decimated by fifteen and then by three to reach each
+ * stage's rate. One thread per output element, which is what the shapes here
+ * want - the widest is 256 channels over a few thousand frames. */
+extern "C" __global__ void strided_conv1d(
+    const float* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int in_ch, int t, int out_ch, int k, int stride, int pad_left, int out_t,
+    int has_bias)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_ch * out_t) return;
+    int o = i / out_t, s = i % out_t;
+
+    float acc = has_bias ? bias[o] : 0.0f;
+    for (int c = 0; c < in_ch; ++c) {
+        const float* wr = w + ((size_t)o * in_ch + c) * k;
+        const float* xr = x + (size_t)c * t;
+        for (int j = 0; j < k; ++j) {
+            int at = s * stride + j - pad_left;
+            if (at >= 0 && at < t) acc += wr[j] * xr[at];
+        }
+    }
+    out[i] = acc;
 }
 "#;
