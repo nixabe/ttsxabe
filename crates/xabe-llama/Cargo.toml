@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 xabe-st.workspace = true
 xabe-gguf.workspace = true
+regex.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

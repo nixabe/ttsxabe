@@ -495,9 +495,11 @@ option, and the f32 weights would not fit anyway.
 
 # Llama-3, `Llama-Breeze2-8B-Instruct-text-only`
 
-The chat model. Loaded but not run: `xabe-gguf` reads the container and
-`xabe-llama` binds all 292 tensors, and nothing in this workspace does
-arithmetic with them. Serving it is still llama.cpp's job.
+The chat model. Loaded and tokenizable, not yet run: `xabe-gguf` reads the
+container, `xabe-llama` binds all 292 tensors and reproduces llama.cpp's
+tokenization id-for-id, and `xabe-cuda` has the two kernels the geometry needs
+(`rope_scaled`, `repeat_kv`) — but nothing in this workspace puts them together
+into a forward pass. Serving it is still llama.cpp's job.
 
 ## Geometry
 
@@ -605,8 +607,32 @@ one that is wrong everywhere.
 ## The tokenizer is GPT-2 byte-level BPE
 
 `tokenizer.ggml.model = gpt2`, `pre = llama-bpe`, 128,256 tokens and 280,147
-merges, all carried inside the GGUF rather than in files beside it. So the
-closer precedent here is `xabe-whisper`'s byte-level BPE, not `xabe-llama`'s
-SentencePiece — the translator and the chat model share an architecture family
-and not a tokenizer. It is **not written yet**: the metadata is read and the
-arrays are reachable, and nothing turns them into a tokenizer.
+merges, all carried inside the GGUF rather than in files beside it. The
+translator and the chat model share an architecture family and **not** a
+tokenizer: one is SentencePiece, this one is byte-level BPE.
+
+It is `xabe_llama::Bpe`, and the `pre` field is the reason it is not
+`xabe-whisper`'s. Same family, three differences, each of which changes the
+output:
+
+| | `gpt2` (Whisper) | `llama-bpe` (this) |
+| --- | --- | --- |
+| digit runs | one token | groups of at most three |
+| contractions | case-sensitive | `(?i:'s\|'t\|'re\|…)` |
+| newline runs | fall to `\s+` | their own alternative, `\s*[\r\n]+` |
+
+The vocabulary also lives somewhere else — two metadata arrays inside the file,
+not a `vocab.json` and a `merges.txt` beside it — and the special tokens are
+declared by `tokenizer.ggml.token_type` (kinds 3 and 4) rather than listed in a
+separate file. Taking the kind rather than a hard-coded list means a checkpoint
+that adds a control token is handled instead of quietly mis-tokenized.
+
+What that leaves genuinely shared with Whisper's is the merge loop and the byte
+alphabet, about eighty lines, written twice on purpose: a fourth crate to hold
+them and be depended on by two would be more machinery than the duplication
+costs, and each copy is tested against its own reference.
+
+The reference is llama.cpp reading the same GGUF, not 🤗 — there is no 🤗
+checkpoint for this model on this machine, and `llama-server` is the thing being
+replaced anyway. 60 captured cases, exact. See `docs/ORACLE.md` for the two bugs
+that found, both of which produced real tokens that decoded back to the input.

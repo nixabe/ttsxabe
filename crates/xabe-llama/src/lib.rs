@@ -18,12 +18,14 @@
 //!
 //! Start at [`LlamaConfig`], then [`LlamaWeights`], then [`Tokenizer`].
 
+mod bpe;
 mod config;
 mod error;
 pub mod gguf;
 mod tokenizer;
 mod weights;
 
+pub use bpe::{Bpe, pre_tokenize};
 pub use config::LlamaConfig;
 pub use error::LlamaError;
 pub use tokenizer::{Kind, Piece, Tokenizer, UNDERLINE};

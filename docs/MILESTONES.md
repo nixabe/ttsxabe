@@ -299,10 +299,13 @@ kept apart.
 | --- | --- | --- |
 | — | `xabe-gguf` reads the GGUF container: v3, three widths and nine block formats | ✅ |
 | — | All 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` bind | ✅ |
-| — | A forward pass for it | not started, and not planned |
+| — | `rope_scaled` and `repeat_kv` kernels, for Llama-3's rope and its grouped-query heads | ✅ |
+| — | The byte-level BPE, matching llama.cpp id-for-id on 60 captured cases | ✅ |
+| — | A forward pass for it | not started |
 
-So the weights are readable and nothing runs them. `--llm-url` is still the only
-way to reach a chat model at runtime. The loader was worth building on its own
+So the weights are readable, the text is tokenizable, the two kernels the
+geometry needs exist — and nothing runs them end to end yet. `--llm-url` is
+still the only way to reach a chat model at runtime. The loader was worth building on its own
 terms for the same reason phase 5a was: it is the half that proves the geometry
 is understood, and the half that costs nothing to keep if the arithmetic never
 follows.
@@ -340,9 +343,35 @@ The limit to hold in mind is that unpacking is not running quantized: weights
 land at full width, so a 4-bit 13 B is a 7 GB file and still 26.5 GB of f16 on
 the card. That buys disk and load bandwidth, not memory. See `docs/MODEL.md`.
 
+### The tokenizer, and why it is not `xabe-whisper`'s
+
 The GPT-2 byte-level BPE the Breeze2 file carries — 128,256 tokens and 280,147
-merges, all inside the GGUF — is read as metadata and is **not** built into a
-tokenizer. That is the next thing anyone continuing the *chat* model would want.
+merges, all inside the GGUF — is now `xabe_llama::Bpe`. It looks like the one
+`xabe-whisper` already has, and reusing it would have been wrong: the GGUF
+declares `tokenizer.ggml.pre = "llama-bpe"`, a **different pre-tokenizer** than
+GPT-2's. Llama-3 splits digit runs at three, matches contractions
+case-insensitively, and lets a newline run take a whole alternative of its own.
+
+The reference is **llama.cpp's `test-tokenizer-0` reading the same GGUF**, not
+🤗 — the chat model exists on this machine as a GGUF and nothing else, and
+llama-server is the thing being replaced, so matching it exactly is the property
+that matters. 60 cases, id-for-id, chosen for where a reimplementation diverges
+rather than for being representative text.
+
+Two things fell out of it that a shape check could never have found:
+
+**Digit grouping.** `1234567890` is four tokens, not one. A tokenizer that
+borrowed GPT-2's pattern agrees on every sentence of prose and disagrees on
+every number — which is the failure mode this whole capture discipline exists
+for, since the model still produces fluent text from slightly-wrong ids.
+
+**`\s+(?!\S)` applies to one alternative, not to whitespace generally.** Rust's
+`regex` has no lookahead, so the rule is reconstructed explicitly: a run of *k*
+spaces before a word is *k-1* spaces plus a word owning the last. Written
+without the distinction it also stole a newline from `\s*[\r\n]+`, so a blank
+line tokenized as two newlines instead of one. Both readings are real tokens and
+both round-trip through `decode`, so nothing but the comparison against
+llama.cpp caught it.
 
 ## Outside the numbering: the translator reads either container
 

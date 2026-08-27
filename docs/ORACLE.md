@@ -380,3 +380,68 @@ not.
 It also checks that a `_M` mix carries more than one format in one file, which
 is what `Q4_K_M` means — llama-quantize picks per tensor role. A reader that
 assumed one type per file would open it and mis-size most of it.
+
+# The chat tokenizer oracle
+
+The one oracle in this document that is **not** PyTorch, and the one place that
+choice is not a compromise.
+
+`Llama-Breeze2-8B-Instruct-text-only.f16.gguf` exists on this machine as a GGUF
+and nothing else. Its vocabulary — 128,256 tokens and 280,147 merges — lives
+*inside* that file as two metadata arrays, with no `tokenizer.json` beside it
+for `AutoTokenizer` to read. So the reference is llama.cpp's `test-tokenizer-0`,
+reading the same bytes:
+
+```sh
+python tools/oracle/capture_chat_tokenizer.py \
+    --model models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+    --out .golden/chat/tokenizer.json
+```
+
+`llama-server` is what serves this model today, which makes its tokenizer the
+thing being replaced rather than a stand-in for it. Agreeing with it exactly is
+the product claim, not an approximation of one.
+
+Note it is slow — about ninety seconds for sixty cases — because
+`test-tokenizer-0` loads the model's vocabulary from a 16 GB file once per
+invocation and it takes one input file at a time. That is fine for a capture
+that runs when the corpus changes; it is the reason the corpus is captured
+rather than consulted live.
+
+## `parse_special` is captured off
+
+`test-tokenizer-0` tokenizes with `parse_special = false`, so `<|eot_id|>` in
+the input is seven ordinary tokens rather than one. The corpus is captured
+against that reading, and it is the one that has to be exact: every character of
+user text takes it.
+
+The other reading is a table lookup over ids the capture also records, and
+`Bpe::encode` takes it as an argument rather than picking a default, because
+either default is wrong half the time. A chat template needs specials parsed; a
+user who types `<|eot_id|>` into the box must not be able to end the model's
+turn from inside the prompt.
+
+## What the corpus is for
+
+Not representative text. Sixty inputs chosen for where a byte-level BPE with the
+`llama-bpe` pre-tokenizer diverges from the GPT-2 one it resembles — and the two
+that actually caught something are worth naming, because both produce *real
+tokens that decode back to the input*, so nothing short of an id-for-id
+comparison would have found either.
+
+**Digit runs split at three.** `1234567890` is four tokens. GPT-2 keeps it as
+one. A tokenizer that borrowed the GPT-2 pattern passes every sentence of prose
+in the corpus and fails every number in it.
+
+**`\s+(?!\S)` belongs to one alternative.** Rust's `regex` has no lookahead, so
+the rule is reconstructed by hand: a run of *k* spaces before a word is *k-1*
+spaces plus a word owning the last. Written as a rule about whitespace
+*generally*, it also stole a character from `\s*[\r\n]+` — so a blank line
+tokenized as two newlines instead of the single token Llama-3 has for it, and
+`\r\n` split in half.
+
+The rest of the corpus is there to make a total failure visible before the
+awkward cases: Han (which is what this model writes), POJ with combining marks
+that have no precomposed form, emoji and a zero-width space through the byte
+alphabet, contractions in both cases, punctuation runs, and the pipeline's own
+system prompt so at least one input has realistic length.
