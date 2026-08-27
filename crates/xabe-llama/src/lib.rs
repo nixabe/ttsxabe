@@ -20,6 +20,7 @@
 
 mod config;
 mod error;
+pub mod gguf;
 mod tokenizer;
 mod weights;
 

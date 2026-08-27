@@ -17,6 +17,10 @@ pub enum TranslateError {
     #[error(transparent)]
     St(#[from] xabe_st::StError),
 
+    /// The GGUF container failed to read.
+    #[error(transparent)]
+    Gguf(#[from] xabe_gguf::GgufError),
+
     /// The sequence outran the positions RoPE was trained over.
     ///
     /// Llama-2's context is 4096 and this checkpoint has no rope scaling. Past

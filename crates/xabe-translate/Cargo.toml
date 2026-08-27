@@ -10,9 +10,13 @@ authors.workspace = true
 xabe-cuda.workspace = true
 xabe-llama.workspace = true
 xabe-st.workspace = true
+xabe-gguf.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+xabe-gguf.workspace = true
+xabe-llama.workspace = true
+xabe-st.workspace = true
 serde.workspace = true
 serde_json.workspace = true

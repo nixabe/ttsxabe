@@ -329,9 +329,39 @@ is a fact about that engine. So `check` now accepts it and
 defaulted rope base gives a model fluent for one sentence and drifting after,
 and a skipped tensor gives a schema that binds 291 of 292 and calls it done.
 
-The GPT-2 byte-level BPE the file carries — 128,256 tokens and 280,147 merges,
-all inside the GGUF — is read as metadata and is **not** built into a tokenizer.
-That is the next thing anyone continuing this would want.
+The GPT-2 byte-level BPE the Breeze2 file carries — 128,256 tokens and 280,147
+merges, all inside the GGUF — is read as metadata and is **not** built into a
+tokenizer. That is the next thing anyone continuing the *chat* model would want.
+
+## Outside the numbering: the translator reads either container
+
+`Translator::open` takes a 🤗 directory or a `.gguf` file. The 13 B translator
+was already on this disk twice — 25 GB of safetensors for this engine and 25 GB
+of GGUF for `llama-server` — so this is one model, two containers, and now one
+reader.
+
+Checked before wiring, because "same weights" was an assumption and not a fact:
+
+| | |
+| --- | --- |
+| geometry | identical on every field |
+| tensors / parameters | 363 and 13,261,870,080, both ways |
+| weights | bit-identical, **except `attn_q` and `attn_k`** |
+| tokenizer | identical on all 56,020 pieces; the GGUF adds 4 named padding rows |
+
+The exception is the whole finding. llama.cpp bakes its interleaved rope
+convention into the query and key projections by permuting their rows, so those
+two tensors differ from the checkpoint in about 98% of their elements while
+everything else matches exactly. `attn_v` is untouched, since values are not
+rotated — which is the asymmetry that identifies the cause. Left alone it gives
+a model that passes every shape check and speaks fluent nonsense.
+`xabe_llama::gguf::unpermute_rope` undoes it at load and the tests assert the
+round trip in **both** directions, bit for bit. See `docs/MODEL.md`.
+
+The bf16-to-f16 conversion turned out to be a non-issue and is worth recording
+as one: bf16 carries 7 mantissa bits against f16's 10, so the mantissa widens
+and nothing is rounded at all. Only the exponent range can overflow, and that is
+already refused by name.
 
 ## What the numbering does not cover
 

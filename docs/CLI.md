@@ -65,7 +65,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--tts-model` | `XABE_TTS_MODEL` | — | directory, or the safetensors file itself |
 | `--tts-url` | `XABE_TTS_URL` | — | delegate text-to-speech |
 | `--tts-device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
-| `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint |
+| `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint: a 🤗 directory or a `.gguf` file |
 | `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
 | `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
 | `--llm-url` | `XABE_LLM_URL` | — | chat model; its weights load but it has no forward pass, so there is no `--llm-model` |
@@ -167,7 +167,7 @@ CPU.
 | `--vad-model` | works, CPU only |
 | `--vad-url` | never: the VAD is a millisecond of CPU, so a round trip would cost more than the work |
 | `--asr-model` | works, CUDA only |
-| `--translator-model` | works, CUDA only |
+| `--translator-model` | works, CUDA only, safetensors or GGUF |
 
 ## What `--serve` publishes
 

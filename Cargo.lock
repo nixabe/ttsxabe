@@ -1658,6 +1658,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "xabe-cuda",
+ "xabe-gguf",
  "xabe-llama",
  "xabe-st",
 ]

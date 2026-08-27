@@ -266,6 +266,14 @@ impl GgufFile {
         }
     }
 
+    /// A metadata value as an `f32` array.
+    pub fn get_f32s(&self, key: &str) -> Option<&[f32]> {
+        match self.metadata.get(key)? {
+            GgufValue::Array(GgufArray::F32(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// A metadata value as an `i32` array.
     pub fn get_i32s(&self, key: &str) -> Option<&[i32]> {
         match self.metadata.get(key)? {

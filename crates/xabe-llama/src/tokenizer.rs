@@ -205,6 +205,88 @@ impl Tokenizer {
             });
         }
 
+        // Control and unknown pieces are special by their own declaration.
+        // `<pad>` is not among them - it is a NORMAL piece that the checkpoint
+        // promotes in `special_tokens_map.json` - which is exactly the trap
+        // `<|endoftext|>` sets in the ASR's tokenizer, in the other direction.
+        let declared = declared_specials(dir)?;
+        Ok(Self::assemble(pieces, None, None, &declared))
+    }
+
+    /// Builds the vocabulary from a GGUF's embedded arrays.
+    ///
+    /// A GGUF carries the tokenizer inside the file rather than beside it:
+    /// `tokenizer.ggml.tokens`, `.scores` and `.token_type`, which are exactly
+    /// the three fields a `ModelProto` piece has. So this is the same
+    /// vocabulary reached through a different door, and
+    /// `tests/gguf_tokenizer.rs` asserts the two agree piece for piece.
+    ///
+    /// One difference is real and is not a disagreement. The GGUF holds
+    /// **56,024** pieces where `tokenizer.model` holds 56,020, and the four
+    /// extra are spelled `[PAD56020]` through `[PAD56023]`. Those are the
+    /// padding rows of the embedding, which llama.cpp names so that its
+    /// vocabulary and its tensor agree; SentencePiece simply does not mention
+    /// them. Both readings are right about their own file, and neither can
+    /// emit one - they are `Unused`.
+    pub fn from_gguf(f: &xabe_gguf::GgufFile) -> Result<Self, LlamaError> {
+        let path = f.path().to_path_buf();
+        let vocab = f
+            .get_str("tokenizer.ggml.model")
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.model"))?;
+        // `llama` is SentencePiece; `gpt2` is byte-level BPE and a different
+        // algorithm entirely, so it is refused here rather than half-read.
+        if vocab != "llama" {
+            return Err(LlamaError::Vocab {
+                path,
+                what: format!("tokenizer.ggml.model is `{vocab}`, not `llama`"),
+            });
+        }
+
+        let texts = f
+            .get_strings("tokenizer.ggml.tokens")
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.tokens"))?;
+        let scores = f
+            .get_f32s("tokenizer.ggml.scores")
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.scores"))?;
+        let kinds = f
+            .get_i32s("tokenizer.ggml.token_type")
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.token_type"))?;
+        if texts.len() != scores.len() || texts.len() != kinds.len() {
+            return Err(LlamaError::Vocab {
+                path,
+                what: format!(
+                    "{} tokens, {} scores, {} types",
+                    texts.len(),
+                    scores.len(),
+                    kinds.len()
+                ),
+            });
+        }
+
+        let pieces: Vec<Piece> = texts
+            .iter()
+            .zip(scores)
+            .zip(kinds)
+            .map(|((text, &score), &kind)| Piece {
+                text: text.clone(),
+                score,
+                kind: Kind::from_wire(kind.max(0) as u64),
+            })
+            .collect();
+
+        let bos = f.get_u32("tokenizer.ggml.bos_token_id");
+        let eos = f.get_u32("tokenizer.ggml.eos_token_id");
+        Ok(Self::assemble(pieces, bos, eos, &[]))
+    }
+
+    /// The half of construction that does not depend on where the pieces came
+    /// from: the lookup tables, the byte fallbacks and the special set.
+    fn assemble(
+        pieces: Vec<Piece>,
+        bos: Option<u32>,
+        eos: Option<u32>,
+        declared: &[String],
+    ) -> Self {
         let mut by_text = FxHashMap::default();
         by_text.reserve(pieces.len());
         let mut byte_ids = vec![u32::MAX; 256];
@@ -221,32 +303,28 @@ impl Tokenizer {
             }
         }
 
-        // Control and unknown pieces are special by their own declaration.
-        // `<pad>` is not among them - it is a NORMAL piece that the checkpoint
-        // promotes in `special_tokens_map.json` - which is exactly the trap
-        // `<|endoftext|>` sets in the ASR's tokenizer, in the other direction.
         let mut specials: FxHashMap<String, u32> = pieces
             .iter()
             .enumerate()
             .filter(|(_, p)| matches!(p.kind, Kind::Control | Kind::Unknown))
             .map(|(id, p)| (p.text.clone(), id as u32))
             .collect();
-        for name in declared_specials(dir)? {
-            if let Some(&id) = by_text.get(&name) {
-                specials.insert(name, id);
+        for name in declared {
+            if let Some(&id) = by_text.get(name) {
+                specials.insert(name.clone(), id);
             }
         }
 
         let id_of = |name: &str| by_text.get(name).copied();
-        Ok(Self {
-            bos: id_of("<s>").unwrap_or(1),
-            eos: id_of("</s>").unwrap_or(2),
+        Self {
+            bos: bos.or_else(|| id_of("<s>")).unwrap_or(1),
+            eos: eos.or_else(|| id_of("</s>")).unwrap_or(2),
             unk: id_of("<unk>").unwrap_or(0),
             pieces,
             by_text,
             byte_ids,
             specials,
-        })
+        }
     }
 
     /// How many pieces the vocabulary holds.

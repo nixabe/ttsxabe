@@ -3,8 +3,110 @@
 use crate::TranslateError;
 use std::path::Path;
 use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
+
+/// The checkpoint, in whichever container it happens to be.
+///
+/// The 13 B translator exists on this machine twice: as the 🤗 safetensors
+/// directory it was published as, and as the f16 GGUF `llama-server` runs.
+/// They hold the same 363 tensors and the same 13,261,870,080 parameters, and
+/// this engine reads either.
+///
+/// Two things differ, and only two:
+///
+/// - **Width.** The safetensors is bf16 and is rounded to f16 on the way in;
+///   the GGUF is already f16, so the same call is a byte copy. Measured
+///   bit-identical on every tensor that is not permuted, which is what makes
+///   the containers interchangeable rather than merely similar.
+/// - **Layout of `q` and `k`.** llama.cpp bakes its interleaved rope
+///   convention into those two tensors. [`xabe_llama::gguf`] explains it and
+///   undoes it here, so nothing downstream learns which container it came
+///   from.
+enum Source {
+    /// A 🤗 checkpoint directory.
+    Safetensors(StSet),
+    /// A single GGUF file.
+    Gguf(Box<GgufFile>),
+}
+
+impl Source {
+    /// Opens whichever container `path` names.
+    ///
+    /// A `.gguf` extension picks the GGUF reader and anything else is treated
+    /// as a checkpoint directory. Dispatching on the extension rather than
+    /// sniffing the magic keeps the error useful: a mistyped directory should
+    /// say the config is missing, not that the magic was not `GGUF`.
+    fn open(path: &Path) -> Result<Self, TranslateError> {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            Ok(Self::Gguf(Box::new(GgufFile::open(path)?)))
+        } else {
+            Ok(Self::Safetensors(StSet::open(path)?))
+        }
+    }
+
+    fn config(&self) -> Result<LlamaConfig, TranslateError> {
+        Ok(match self {
+            Self::Safetensors(st) => LlamaConfig::from_dir(st.root())?,
+            Self::Gguf(f) => LlamaConfig::from_gguf(f)?,
+        })
+    }
+
+    fn tokenizer(&self) -> Result<Tokenizer, TranslateError> {
+        Ok(match self {
+            Self::Safetensors(st) => Tokenizer::from_dir(st.root())?,
+            Self::Gguf(f) => Tokenizer::from_gguf(f)?,
+        })
+    }
+
+    fn weights(&self, cfg: &LlamaConfig) -> Result<LlamaWeights, TranslateError> {
+        Ok(match self {
+            Self::Safetensors(st) => LlamaWeights::load(st, cfg)?,
+            Self::Gguf(f) => LlamaWeights::from_gguf(f, cfg)?,
+        })
+    }
+
+    /// One tensor as f16, with the GGUF's rope permutation undone.
+    fn f16(&self, b: &Bound, cfg: &LlamaConfig) -> Result<Vec<u16>, TranslateError> {
+        Ok(match self {
+            Self::Safetensors(st) => st.tensor_f16(&b.name)?,
+            Self::Gguf(f) => {
+                let raw = f.tensor_f16(&b.name)?;
+                if xabe_llama::gguf::is_rope_permuted(&b.name) {
+                    // `q` is divided into query heads and `k` into key-value
+                    // heads. They are the same number on this checkpoint, so
+                    // the distinction costs nothing here and is the whole
+                    // difference on a grouped-query one.
+                    let heads = if b.name.ends_with(".attn_q.weight") {
+                        cfg.num_attention_heads
+                    } else {
+                        cfg.num_key_value_heads
+                    };
+                    xabe_llama::gguf::unpermute_rope(&raw, b.shape[0], b.shape[1], heads)
+                } else {
+                    raw
+                }
+            }
+        })
+    }
+
+    /// One tensor as f32. Never a permuted one - the embedding, the norms and
+    /// nothing else reach this.
+    fn f32(&self, b: &Bound) -> Result<Vec<f32>, TranslateError> {
+        debug_assert!(
+            !xabe_llama::gguf::is_rope_permuted(&b.name),
+            "a permuted tensor must go through f16, which is where the permutation is undone"
+        );
+        Ok(match self {
+            Self::Safetensors(st) => st.tensor_f32(&b.name)?,
+            Self::Gguf(f) => f.tensor_f32(&b.name)?,
+        })
+    }
+}
 
 /// The prompt this checkpoint was fine-tuned on.
 ///
@@ -85,25 +187,24 @@ impl Translator {
     /// alternative - mapping and letting the kernels fault pages in - would
     /// move the cost to the first translation instead of the load, which is
     /// the wrong place for a service that is started once.
-    pub fn open(dir: &Path, ordinal: usize) -> Result<Self, TranslateError> {
+    pub fn open(path: &Path, ordinal: usize) -> Result<Self, TranslateError> {
         let gpu = Gpu::open(ordinal)?;
-        let cfg = LlamaConfig::from_dir(dir)?;
+        let src = Source::open(path)?;
+        let cfg = src.config()?;
         // The schema binds grouped-query checkpoints; this forward pass does
         // not map several query heads onto one key-value head, so it refuses
         // one here rather than indexing off the end of the cache later. The
         // check lives at the engine and not in `check()` because a shape is a
         // fact about the file and this is a fact about the arithmetic.
         cfg.refuse_grouped_query()?;
-        let tokenizer = Tokenizer::from_dir(dir)?;
-        let st = StSet::open(dir)?;
-        let w = LlamaWeights::load(&st, &cfg)?;
+        let tokenizer = src.tokenizer()?;
+        let w = src.weights(&cfg)?;
 
         let narrow = |b: &Bound| -> Result<CudaSlice<u16>, TranslateError> {
-            Ok(gpu.upload_u16(&st.tensor_f16(&b.name)?)?)
+            Ok(gpu.upload_u16(&src.f16(b, &cfg)?)?)
         };
-        let wide = |b: &Bound| -> Result<CudaSlice<f32>, TranslateError> {
-            Ok(gpu.upload(&st.tensor_f32(&b.name)?)?)
-        };
+        let wide =
+            |b: &Bound| -> Result<CudaSlice<f32>, TranslateError> { Ok(gpu.upload(&src.f32(b)?)?) };
         let lin = |b: &Bound| -> Result<GLinear, TranslateError> {
             Ok(GLinear {
                 w: narrow(b)?,

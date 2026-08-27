@@ -427,6 +427,64 @@ The template comes from the model card and the whitespace is load-bearing: this
 is a fine-tune, not an instruction model, and it has no fallback behaviour for a
 prompt shaped differently.
 
+## The same checkpoint, in two containers
+
+The 13 B translator is on this machine twice: as the 🤗 safetensors directory it
+was published as, and as the f16 GGUF `llama-server` runs. `Translator::open`
+reads either — a `.gguf` extension picks the GGUF reader, anything else is
+treated as a checkpoint directory.
+
+They are the same 363 tensors and the same 13,261,870,080 parameters, and the
+weights are **bit-identical** — with two exceptions, one boring and one not.
+
+The boring one: the safetensors is bf16 and is rounded to f16 on the way in,
+while the GGUF is already f16. That costs nothing, because bf16 has 7 mantissa
+bits against f16's 10, so the mantissa *widens* and no rounding happens at all.
+Only the exponent range can bite, and `tensor_f16` refuses an overflow rather
+than saturating.
+
+### llama.cpp permutes the query and key projections
+
+This is the one that matters, and it is invisible to every shape check.
+
+Both conventions compute the same rotation and disagree about which two
+elements of a head form a rotating pair. 🤗 pairs element `i` with
+`i + head_dim/2` — the **halves** convention, which is what `xabe_dsp::rope`
+implements. ggml pairs `2i` with `2i+1` — **interleaved**. Rather than carry
+two rope kernels, llama.cpp's converter bakes the difference into the weights,
+permuting the *rows* of `attn_q` and `attn_k` on the way into a GGUF.
+
+`attn_v` is untouched, because no rotation is applied to values. That asymmetry
+is the fingerprint. Measured on `taigi-translator-13b-f16.gguf`:
+
+| tensor | differing elements, before un-permuting |
+| --- | --- |
+| `blk.0.attn_q.weight` | 25,779,757 of 26,214,400 |
+| `blk.0.attn_k.weight` | 25,777,603 of 26,214,400 |
+| `blk.0.attn_v.weight` | **0** |
+| `blk.0.ffn_down.weight` | 0 |
+| `token_embd.weight`, `output.weight` | 0 |
+
+`xabe_llama::gguf::unpermute_rope` takes both to zero. So reading a GGUF Llama
+without undoing this gives a model whose values, norms, feed-forward and
+embedding are all exactly right and whose `q` and `k` are shuffled within every
+head — shapes all correct, output fluent and wrong. It is the precise failure
+this project's whole oracle discipline exists to catch, and no amount of shape
+checking would have found it.
+
+The permutation is undone at load, so one rope kernel serves both containers
+and nothing downstream learns which one it came from.
+
+### The GGUF names the four padding rows
+
+`tokenizer.model` holds 56,020 pieces and the GGUF holds 56,024. The four extra
+are spelled `[PAD56020]` through `[PAD56023]`: llama.cpp names the embedding's
+padding rows so that its vocabulary and its tensor agree, where SentencePiece
+simply does not mention them. That is independent confirmation of the four
+unused rows recorded above, from a tool that had to solve the same problem.
+Both readings are right about their own file, and neither can emit one — they
+are `Unused`.
+
 ## There is no CPU implementation
 
 `--translator-device cpu` is refused at preflight. See
