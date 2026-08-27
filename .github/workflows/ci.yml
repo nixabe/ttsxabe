@@ -48,7 +48,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install the pinned toolchain
         # `rust-toolchain.toml` names the channel and the components, so there
         # is one source of truth and this step only makes rustup act on it.
@@ -59,7 +59,7 @@ jobs:
     name: clippy, doc and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the pinned toolchain
         run: rustup show
