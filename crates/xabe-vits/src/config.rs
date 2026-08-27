@@ -2,8 +2,8 @@
 //!
 //! # What is (and isn't) here
 //!
-//! Numbers and the relationships between them. [`VitsConfig::new`] rejects a
-//! geometry this implementation cannot express — a hidden size that does not
+//! Numbers and the relationships between them. [`VitsConfig::from_json_str`]
+//! rejects a geometry this implementation cannot express — a hidden size that does not
 //! divide into heads, upsample rates and kernels of different lengths — so that
 //! every consumer downstream can index without checking.
 //!
@@ -16,7 +16,8 @@ use crate::error::ConfigError;
 /// The fields of `config.json` this implementation reads.
 ///
 /// Deserialised permissively — the file carries training-time settings that are
-/// irrelevant at inference — then validated by [`VitsConfig::new`].
+/// irrelevant at inference — then validated by [`VitsConfig::from_json_str`],
+/// which both constructors go through.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VitsConfig {
     /// Model width. 192 for mms-tts-nan.

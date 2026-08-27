@@ -19,7 +19,7 @@
 //!
 //! Start at [`ChatModel::open`], then [`ChatModel::complete`].
 //!
-//! # The three things that differ from [`xabe_translate`]
+//! # The three things that differ from `xabe_translate`
 //!
 //! Same architecture family, and each difference is silent when missed - the
 //! model keeps producing fluent text from wrong arithmetic, which is why each

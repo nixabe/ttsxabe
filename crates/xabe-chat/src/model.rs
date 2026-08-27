@@ -28,7 +28,7 @@ struct GLayer {
 
 /// The chat model, resident on one card.
 ///
-/// # How this differs from [`xabe_translate`]
+/// # How this differs from `xabe_translate`
 ///
 /// Same architecture family, three changes, and every one of them is silent if
 /// missed - the model keeps producing fluent text from wrong arithmetic:

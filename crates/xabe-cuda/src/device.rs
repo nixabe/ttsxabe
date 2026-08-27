@@ -401,7 +401,7 @@ fn launched<T>(
 /// kernel expects `const float*` is how that is expressed, since there is no
 /// device pointer for an empty allocation.
 impl Gpu {
-    /// General 1-D convolution. Mirrors [`xabe_dsp::conv1d`].
+    /// General 1-D convolution. Mirrors `xabe_dsp::conv1d`.
     #[allow(clippy::too_many_arguments)]
     pub fn conv1d(
         &self,
@@ -473,7 +473,7 @@ impl Gpu {
         Ok((out, out_t))
     }
 
-    /// Depthwise convolution. Mirrors [`xabe_dsp::depthwise_conv1d`].
+    /// Depthwise convolution. Mirrors `xabe_dsp::depthwise_conv1d`.
     #[allow(clippy::too_many_arguments)]
     pub fn depthwise_conv1d(
         &self,
@@ -519,7 +519,7 @@ impl Gpu {
         Ok((out, out_t))
     }
 
-    /// Transposed convolution. Mirrors [`xabe_dsp::transposed_conv1d`].
+    /// Transposed convolution. Mirrors `xabe_dsp::transposed_conv1d`.
     #[allow(clippy::too_many_arguments)]
     pub fn transposed_conv1d(
         &self,
@@ -566,7 +566,7 @@ impl Gpu {
         Ok((out, out_t))
     }
 
-    /// Dense projection. Mirrors [`xabe_dsp::linear`].
+    /// Dense projection. Mirrors `xabe_dsp::linear`.
     pub fn linear(
         &self,
         x: &CudaSlice<f32>,
@@ -709,7 +709,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Layer normalisation over each row. Mirrors [`xabe_dsp::layer_norm`].
+    /// Layer normalisation over each row. Mirrors `xabe_dsp::layer_norm`.
     pub fn layer_norm(
         &self,
         x: &CudaSlice<f32>,
@@ -733,7 +733,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Softmax over each row, in place. Mirrors [`xabe_dsp::softmax_rows`].
+    /// Softmax over each row, in place. Mirrors `xabe_dsp::softmax_rows`.
     pub fn softmax_rows(
         &self,
         x: &mut CudaSlice<f32>,
@@ -771,7 +771,7 @@ impl Gpu {
         self.activate("act_relu", x, n, None)
     }
 
-    /// Leaky ReLU, in place. Mirrors [`xabe_dsp::leaky_relu`].
+    /// Leaky ReLU, in place. Mirrors `xabe_dsp::leaky_relu`.
     pub fn leaky_relu(
         &self,
         x: &mut CudaSlice<f32>,
@@ -786,7 +786,7 @@ impl Gpu {
         self.activate("act_tanh", x, n, None)
     }
 
-    /// Exact GELU, in place. Mirrors [`xabe_dsp::gelu`].
+    /// Exact GELU, in place. Mirrors `xabe_dsp::gelu`.
     ///
     /// The device has an IEEE-accurate `erff`, so this needs none of the
     /// rational approximation the CPU twin carries.
@@ -794,7 +794,7 @@ impl Gpu {
         self.activate("act_gelu", x, n, None)
     }
 
-    /// WaveNet's gated activation. Mirrors [`xabe_dsp::gated_activation`].
+    /// WaveNet's gated activation. Mirrors `xabe_dsp::gated_activation`.
     pub fn gated_activation(
         &self,
         x: &CudaSlice<f32>,
@@ -878,7 +878,7 @@ impl Gpu {
         launched("copy_into", unsafe { lb.launch(Self::flat(n)) })
     }
 
-    /// Transposes a row-major `[rows, cols]`. Mirrors [`xabe_dsp::transpose`].
+    /// Transposes a row-major `[rows, cols]`. Mirrors `xabe_dsp::transpose`.
     pub fn transpose(
         &self,
         x: &CudaSlice<f32>,
@@ -894,7 +894,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Reverses the channel axis. Mirrors [`xabe_dsp::flip_channels`].
+    /// Reverses the channel axis. Mirrors `xabe_dsp::flip_channels`.
     pub fn flip_channels(
         &self,
         x: &CudaSlice<f32>,
@@ -933,7 +933,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Fuses weight normalisation. Mirrors [`xabe_dsp::fuse_weight_norm`].
+    /// Fuses weight normalisation. Mirrors `xabe_dsp::fuse_weight_norm`.
     /// SiLU in place, unfused.
     pub fn silu(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
         self.activate("act_silu", x, n, None)
@@ -1291,7 +1291,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Root-mean-square normalisation. Mirrors [`xabe_dsp::rms_norm`].
+    /// Root-mean-square normalisation. Mirrors `xabe_dsp::rms_norm`.
     pub fn rms_norm(
         &self,
         x: &CudaSlice<f32>,
@@ -1318,7 +1318,7 @@ impl Gpu {
         Ok(out)
     }
 
-    /// `a = silu(a) * b`. Mirrors [`xabe_dsp::silu_mul`].
+    /// `a = silu(a) * b`. Mirrors `xabe_dsp::silu_mul`.
     pub fn silu_mul(
         &self,
         a: &mut CudaSlice<f32>,
@@ -1332,7 +1332,7 @@ impl Gpu {
         launched("silu_mul", unsafe { lb.launch(Self::flat(n)) })
     }
 
-    /// Rotary position embedding, in place. Mirrors [`xabe_dsp::rope`].
+    /// Rotary position embedding, in place. Mirrors `xabe_dsp::rope`.
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
@@ -1349,7 +1349,7 @@ impl Gpu {
     /// RoPE with an optional per-pair frequency divisor.
     ///
     /// `freq_div` is Llama-3's `rope_freqs.weight`, `head_dim / 2` long.
-    /// Mirrors [`xabe_dsp::rope_scaled`]. Llama-2 passes `None`; passing
+    /// Mirrors `xabe_dsp::rope_scaled`. Llama-2 passes `None`; passing
     /// `None` for a checkpoint that ships the tensor is a model that stays
     /// fluent for a sentence and drifts after, with no shape to catch it.
     #[allow(clippy::too_many_arguments)]

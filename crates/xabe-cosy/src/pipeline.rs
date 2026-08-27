@@ -22,7 +22,7 @@
 //!
 //! # Three devices' worth of state on one card
 //!
-//! The LLM, the flow and the vocoder each open their own [`Gpu`]. They pass
+//! The LLM, the flow and the vocoder each open their own [`xabe_cuda::Gpu`]. They pass
 //! host vectors between them, which is a few megabytes per utterance against a
 //! 642 M-parameter decode - and it is what lets each stage be opened, tested
 //! and benchmarked on its own.

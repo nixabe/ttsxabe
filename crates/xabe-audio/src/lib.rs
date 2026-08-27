@@ -11,7 +11,7 @@
 //! reached by any of the others without pointing a dependency edge the wrong
 //! way. See `docs/ARCHITECTURE.md` for the one-way rule this is obeying.
 //!
-//! Start at [`wav`], or at [`mel_power`] for the ASR frontend.
+//! Start at [`read_wav`], or at [`mel_power`] for the ASR frontend.
 
 mod error;
 mod mel;

@@ -332,7 +332,7 @@ impl Vocoder {
     /// Turns a mel and its excitation into a waveform.
     ///
     /// `source` is the excitation at the output rate - one sample per output
-    /// sample - which is what [`crate::source`] produces.
+    /// sample - which is what the `source` module produces.
     pub fn decode(
         &self,
         mel: &CudaSlice<f32>,

@@ -186,7 +186,7 @@ impl Synthesizer {
     /// Synthesises audio from text, drawing its own noise.
     ///
     /// The same seed gives the same audio on any machine. It does *not* give
-    /// the same audio as PyTorch at that seed - see [`crate::rng`].
+    /// the same audio as PyTorch at that seed - see the `rng` module.
     pub fn synthesize(&self, text: &str, seed: u64) -> Result<Vec<f32>, SynthesisError> {
         let mut rng = Rng::new(seed);
         let prepared = self.prepare(text)?;
