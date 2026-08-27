@@ -81,6 +81,34 @@ that walks the fields it needs and skips the rest by wire type. A protobuf
 crate would have been correct and would have been more code, more build, and a
 generated-source directory, for a format this workspace reads exactly once.
 
+## `cudarc` panics when a library is absent, and that is caught
+
+Built with `fallback-dynamic-loading`, so `libcuda` and `libnvrtc` are resolved
+at first use rather than linked. That is what lets this workspace compile on a
+machine with no CUDA toolkit at all — which CI does, on every run.
+
+The trap is what happens on such a machine at *run* time: cudarc's
+`panic_no_lib_found` returns `!`. It panics rather than erroring, so
+`CudaError::NoDevice` was unreachable and every caller's careful "skip when
+there is no device" branch was dead code. `Gpu::open` catches both loads and
+converts them:
+
+| machine | what happens |
+| --- | --- |
+| driver and toolkit | opens |
+| driver, **no toolkit** | `NoDevice`: NVRTC is missing — an ordinary install |
+| neither | `NoDevice`: the driver library is missing |
+| both, bad ordinal | `NoDevice`: cudarc already returned an error here |
+
+Unwinding across FFI is not the risk it looks like: the panic is raised by Rust
+code in cudarc *before* any call into the driver, because the library it would
+have called was never loaded. The verdict is remembered in a `OnceLock`, since
+it cannot change while the process lives and catching it once per test filled
+the log with the same backtrace thirty-four times.
+
+Found by CI, on the third red run in a row. Every one of those runs was a real
+defect and none of them was new.
+
 ## Every dependency is permissive, and that was checked rather than assumed
 
 This workspace is Apache-2.0, so a copyleft dependency anywhere in the tree

@@ -11,6 +11,10 @@ use cudarc::driver::PushKernelArg;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Set once if `libcuda` turned out not to exist; see [`Gpu::context`].
+static DRIVER_MISSING: OnceLock<String> = OnceLock::new();
 
 /// Threads per block for the flat element-wise kernels.
 const BLOCK: u32 = 256;
@@ -176,7 +180,7 @@ const NAMES: &[&str] = &[
 impl Gpu {
     /// Opens device `ordinal` and compiles the kernels.
     pub fn open(ordinal: usize) -> Result<Self, CudaError> {
-        let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::NoDevice(format!("{e:?}")))?;
+        let ctx = Self::context(ordinal)?;
         let stream = ctx.default_stream();
 
         // Compiled for the development target. NVRTC will happily target a
@@ -186,8 +190,21 @@ impl Gpu {
             arch: Some("compute_75"),
             ..Default::default()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
-            .map_err(|e| CudaError::Compile(format!("{e:?}")))?;
+        // Caught for the same reason as the driver above, and it is not the
+        // same machine that hits it: a box with the NVIDIA *driver* and no
+        // CUDA *toolkit* loads `libcuda` and then panics on `libnvrtc`. That
+        // is an ordinary install, not a broken one, so it gets an error.
+        let ptx =
+            match std::panic::catch_unwind(|| cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)) {
+                Ok(r) => r.map_err(|e| CudaError::Compile(format!("{e:?}")))?,
+                Err(_) => {
+                    return Err(CudaError::NoDevice(
+                        "the NVRTC library is not on this machine; \
+                     the driver is installed but the CUDA toolkit is not"
+                            .to_string(),
+                    ));
+                }
+            };
         let module = ctx.load_module(ptx).map_err(|source| CudaError::Driver {
             what: "loading the compiled module",
             source,
@@ -209,6 +226,39 @@ impl Gpu {
             module,
             funcs,
         })
+    }
+
+    /// Creates the context, turning "there is no CUDA here" into an error.
+    ///
+    /// `cudarc` is built with `fallback-dynamic-loading`, which resolves
+    /// `libcuda` at first use and **panics** if it is not on the machine -
+    /// `panic_no_lib_found` in `cudarc/src/lib.rs`, which returns `!`. A panic
+    /// is the wrong shape for that answer. "This box has no CUDA" is an
+    /// ordinary configuration, not a bug: every caller in this workspace
+    /// already handles [`CudaError::NoDevice`], and the tests skip on it.
+    ///
+    /// Unwinding across the FFI boundary is not the risk it looks like here:
+    /// the panic is raised by Rust code in `cudarc`, before any call into the
+    /// driver, because the library it would call was never loaded.
+    ///
+    /// The verdict is remembered because it cannot change while the process
+    /// lives, and because catching the same panic once per test fills a log
+    /// with the same backtrace thirty-four times.
+    fn context(ordinal: usize) -> Result<Arc<CudaContext>, CudaError> {
+        if let Some(why) = DRIVER_MISSING.get() {
+            return Err(CudaError::NoDevice(why.clone()));
+        }
+        match std::panic::catch_unwind(|| CudaContext::new(ordinal)) {
+            Ok(Ok(ctx)) => Ok(ctx),
+            // A driver that is present and refuses: no such ordinal, no
+            // device, a version mismatch. Already the right shape.
+            Ok(Err(e)) => Err(CudaError::NoDevice(format!("{e:?}"))),
+            Err(_) => {
+                let why = "the CUDA driver library is not on this machine";
+                let _ = DRIVER_MISSING.set(why.to_string());
+                Err(CudaError::NoDevice(why.to_string()))
+            }
+        }
     }
 
     /// Opens the first device that works, or reports why none did.
