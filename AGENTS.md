@@ -29,8 +29,10 @@ so the plan's "optional" is spent rather than pending.
 An earlier version of this file said porting Whisper or the LLM here was
 explicitly out of scope. That was the right rule while the synthesiser was
 unfinished; it is retracted now that it is finished and measured. The chat LLM
-remains out of scope permanently — llama.cpp is not a rewrite that buys
-anything.
+remains out of scope for *inference* — llama.cpp is not a rewrite that buys
+anything — but its **weights are now readable here**, which is a smaller claim
+and a real one: `xabe-gguf` reads the GGUF container and `xabe-llama` binds all
+292 tensors of the 8 B Breeze2 against its own metadata. Nothing runs them.
 
 ## Current standing
 
@@ -85,13 +87,14 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | Crate | Owns | Depends on |
 | --- | --- | --- |
 | `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
+| `xabe-gguf` | GGUF container parsing, mmap, metadata, tensor addressing | — |
 | `xabe-dsp` | CPU reference kernels + differential compare harness | — |
 | `xabe-golden` | reading captures and comparing tensors | — |
 | `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |
 | `xabe-cuda` | CUDA kernels and the device handle | `xabe-dsp` |
 | `xabe-vits` | VITS config, weight schema, shape validation | `xabe-st`, `xabe-golden` |
 | `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | `xabe-st`, `xabe-dsp`, `xabe-audio` |
-| `xabe-llama` | Llama geometry, weight schema, SentencePiece | `xabe-st` |
+| `xabe-llama` | Llama geometry, weight schema, SentencePiece | `xabe-st`, `xabe-gguf` |
 | `xabe-vad` | Silero geometry, weights and forward pass | `xabe-st`, `xabe-dsp`, `xabe-audio` |
 | `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-golden` |
 | `xabe-asr` | the Whisper forward pass and greedy decoding | `xabe-whisper`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-audio` |

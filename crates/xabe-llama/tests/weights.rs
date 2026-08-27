@@ -114,19 +114,74 @@ fn the_geometry_is_the_one_this_schema_is_written_for() {
 }
 
 #[test]
-fn grouped_query_attention_is_refused_rather_than_bound_wrongly() {
-    // Llama-2 13B has as many key-value heads as query heads, so all four
-    // projections are square. A checkpoint with fewer would bind here with the
-    // wrong expected shape and be refused for the wrong reason - "k_proj is
-    // [1280, 5120], expected [5120, 5120]" tells a reader nothing about what
-    // is actually going on.
+fn grouped_query_is_a_shape_the_schema_binds_and_an_engine_may_refuse() {
+    // This used to assert that `check()` rejected grouped-query attention.
+    // It does not any more, and the split is deliberate: `k` and `v` being
+    // narrower than `q` is a fact about the file, and every such file binds
+    // perfectly well. Whether a *forward pass* maps several query heads onto
+    // one key-value head is a fact about that engine. So the geometry is
+    // accepted here and `refuse_grouped_query` is what an engine calls.
+    //
+    // Getting this wrong in the other direction is what the Breeze2 GGUF
+    // showed: refusing at `check()` made an 8B model that binds cleanly
+    // unreadable for no reason a shape could justify.
     let cfg: LlamaConfig = serde_json::from_str(
-        r#"{"hidden_size":5120,"intermediate_size":13824,"num_hidden_layers":40,
-            "num_attention_heads":40,"num_key_value_heads":8,"vocab_size":56024,
-            "max_position_embeddings":4096,"rms_norm_eps":1e-5,"rope_theta":10000.0,
+        r#"{"hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
+            "num_attention_heads":32,"num_key_value_heads":8,"vocab_size":128256,
+            "max_position_embeddings":131072,"rms_norm_eps":1e-5,"rope_theta":500000.0,
+            "tie_word_embeddings":false,"bos_token_id":128000,"eos_token_id":128009}"#,
+    )
+    .expect("parse");
+
+    cfg.check()
+        .expect("32 query heads over 8 key-value heads is a real geometry");
+    assert_eq!(cfg.head_dim(), 128);
+    assert_eq!(
+        cfg.group_size(),
+        4,
+        "four query heads share each key-value head"
+    );
+    assert_eq!(
+        cfg.kv_dim(),
+        1024,
+        "k and v are 1024 wide, not 4096; binding them square is the mistake"
+    );
+
+    let e = cfg
+        .refuse_grouped_query()
+        .expect_err("an engine without the head mapping must say so");
+    assert!(e.to_string().contains("key-value heads"), "{e}");
+}
+
+#[test]
+fn key_value_heads_that_do_not_divide_are_refused_as_impossible() {
+    // Unlike grouped-query, this is not a capability question: sharing one
+    // key-value head across a fractional number of query heads is not a thing
+    // any engine could implement, so it fails at `check()`.
+    let cfg: LlamaConfig = serde_json::from_str(
+        r#"{"hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
+            "num_attention_heads":32,"num_key_value_heads":7,"vocab_size":128256,
+            "max_position_embeddings":131072,"rms_norm_eps":1e-5,"rope_theta":500000.0,
             "tie_word_embeddings":false,"bos_token_id":1,"eos_token_id":2}"#,
     )
     .expect("parse");
-    let e = cfg.check().expect_err("8 kv heads against 40 query heads");
-    assert!(e.to_string().contains("key-value heads"), "{e}");
+    let e = cfg.check().expect_err("7 does not divide 32");
+    assert!(e.to_string().contains("do not divide"), "{e}");
+}
+
+#[test]
+fn a_stated_head_width_must_agree_with_the_division() {
+    // A GGUF states `key_length` outright. When it disagrees with
+    // hidden/heads, one of the two numbers has been misread, and continuing
+    // would lay out every head at the wrong stride.
+    let cfg: LlamaConfig = serde_json::from_str(
+        r#"{"hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
+            "num_attention_heads":32,"num_key_value_heads":8,"vocab_size":128256,
+            "max_position_embeddings":131072,"rms_norm_eps":1e-5,"rope_theta":500000.0,
+            "tie_word_embeddings":false,"bos_token_id":1,"eos_token_id":2,
+            "head_dim":64}"#,
+    )
+    .expect("parse");
+    let e = cfg.check().expect_err("64 * 32 is not 4096");
+    assert!(e.to_string().contains("head width"), "{e}");
 }

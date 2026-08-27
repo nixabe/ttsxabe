@@ -14,6 +14,7 @@ members = [
     "crates/xabe-whisper",
     "crates/xabe-asr",
     "crates/xabe-llama",
+    "crates/xabe-gguf",
     "crates/xabe-translate",
 ]
 
@@ -37,6 +38,7 @@ xabe-vad = { path = "crates/xabe-vad" }
 xabe-whisper = { path = "crates/xabe-whisper" }
 xabe-asr = { path = "crates/xabe-asr" }
 xabe-llama = { path = "crates/xabe-llama" }
+xabe-gguf = { path = "crates/xabe-gguf" }
 xabe-translate = { path = "crates/xabe-translate" }
 
 clap = { version = "4", features = ["derive", "env"] }

@@ -53,6 +53,18 @@ and the difference falls exactly on the combining marks POJ uses. Guessing
 there would have been a tokenizer that is subtly wrong on Taigi and right on
 everything used to test it.
 
+`xabe-gguf` takes no dependency either, and that is worth a sentence because
+the obvious alternative exists. The container was adapted from
+`llmxabe/crates/xabe-gguf`, the same author's LLM engine, which has been
+reading GGUF on this hardware for a while: the bounds-checked cursor, the value
+model and the parse order came from there. Two things changed on the way in.
+The quantized type table was **dropped** - F32, F16 and BF16 are read and every
+block format is refused by name and id, because this workspace runs f16
+throughout and has no dequantizer, so a `Q4_K` tensor has no correct reading
+downstream. And the accessors were reshaped to mirror `xabe-st`'s
+`tensor`/`tensor_f16`, so that a crate above cannot tell the two containers
+apart.
+
 No ML framework. No `candle`, `tch`, `ort`, `ndarray`, or bindings to
 whisper.cpp or llama.cpp. If one appears, it needs an argument in a commit body.
 No `sentencepiece` or `tokenizers` crate either: all three tokenizers are

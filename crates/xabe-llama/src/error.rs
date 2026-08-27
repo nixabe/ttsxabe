@@ -42,19 +42,53 @@ pub enum LlamaError {
         heads: usize,
     },
 
-    /// Grouped-query attention, which this schema does not describe.
+    /// Grouped-query attention, raised by an engine that cannot run it.
     ///
-    /// Llama-2 13B has as many key-value heads as query heads, so `k_proj` and
-    /// `q_proj` are the same shape. A checkpoint with fewer would bind here
-    /// with the wrong expected shape and be refused for the wrong reason, so
-    /// it is refused for the right one instead.
-    #[error("{kv} key-value heads against {q} query heads; this schema assumes they match")]
+    /// The *schema* binds grouped-query checkpoints fine - `k` and `v` are
+    /// simply narrower than `q`. This is what a forward pass without the head
+    /// mapping calls at open, so the refusal names the real reason instead of
+    /// surfacing later as a head index out of range.
+    #[error("{kv} key-value heads against {q} query heads; this engine needs them to match")]
     GroupedQuery {
         /// Key-value heads.
         kv: usize,
         /// Query heads.
         q: usize,
     },
+
+    /// Key-value heads that do not divide the query heads.
+    ///
+    /// Structurally impossible rather than merely unsupported: grouped-query
+    /// attention shares one key-value head across a whole number of query
+    /// heads, so a remainder means the geometry was misread.
+    #[error("{q} query heads do not divide into {kv} key-value heads")]
+    RaggedGroups {
+        /// Key-value heads.
+        kv: usize,
+        /// Query heads.
+        q: usize,
+    },
+
+    /// A stated head width that disagrees with the division.
+    ///
+    /// A GGUF states `key_length` outright while `config.json` leaves it to be
+    /// derived. When both are available they must agree, because a checkpoint
+    /// where they do not is one whose geometry has been misread somewhere.
+    #[error("the file states a head width of {stated}, but the geometry divides to {divided}")]
+    HeadDim {
+        /// What the file said.
+        stated: usize,
+        /// What `hidden_size / num_attention_heads` gives.
+        divided: usize,
+    },
+
+    /// The GGUF container could not be read.
+    #[error(transparent)]
+    Gguf(#[from] xabe_gguf::GgufError),
+
+    /// A GGUF metadata key the schema needs is absent or the wrong type.
+    #[error("the GGUF has no usable `{0}`")]
+    MissingMetadata(&'static str),
 
     /// A tensor the schema requires is not in the checkpoint.
     #[error("no tensor named {0}")]

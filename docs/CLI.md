@@ -17,8 +17,18 @@ dependency. Nothing downstream can tell which was used, so the same binary is a
 monolith, a single-stage worker, or anything between. The six-port topology the
 Python pipeline runs today is one configuration of these flags.
 
-Stages are `asr`, `vad`, `tts` and `translator`. `llm` is **URL-only** — it
-stays in llama.cpp by decision, so there is no `--llm-model`.
+Stages are `asr`, `vad`, `tts` and `translator`. `llm` is **URL-only at
+runtime** — it stays in llama.cpp by decision, so there is no `--llm-model`.
+
+That decision is now partly retracted, and the boundary is worth stating
+exactly. The chat model's **weights are readable in this workspace**:
+`xabe-gguf` reads the GGUF container and `xabe-llama` binds all 292 tensors of
+`Llama-Breeze2-8B-Instruct-text-only.f16.gguf` against its own metadata. What
+does not exist is a forward pass for it, so there is still no `--llm-model` and
+`--llm-url` is still the only way to reach a chat model at runtime. The loader
+came first on purpose: it is the half that proves the geometry is understood,
+and it is the half that costs nothing to keep if the inference is never
+written.
 
 ```sh
 # everything in one process
@@ -58,7 +68,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint |
 | `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
 | `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
-| `--llm-url` | `XABE_LLM_URL` | — | chat model; there is no `--llm-model` |
+| `--llm-url` | `XABE_LLM_URL` | — | chat model; its weights load but it has no forward pass, so there is no `--llm-model` |
 | `--direct-taigi` | `XABE_DIRECT_TAIGI` | off | chat model answers in Taigi Han itself |
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |

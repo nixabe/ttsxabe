@@ -39,7 +39,8 @@ configuration of the same flags, not a different program.
       ├── xabe-dsp      scalar reference kernels
       ├── xabe-cuda     CUDA kernels, tested against xabe-dsp
       ├── xabe-golden   reads the captured oracle
-      └── xabe-st       safetensors container, mmap, addressing
+      ├── xabe-st       safetensors container, mmap, addressing
+      └── xabe-gguf     GGUF container, mmap, metadata, addressing
 ```
 
 The bracketed crate does not exist yet. Its flags do:
@@ -122,6 +123,7 @@ crates above it.
 | Crate | Owns | Refuses |
 | --- | --- | --- |
 | `xabe-st` | byte addressing inside a safetensors file | any idea what a tensor means |
+| `xabe-gguf` | byte addressing inside a GGUF file | any idea what a tensor means |
 | `xabe-vits` | model geometry, tensor names, shape contracts | doing arithmetic |
 | `xabe-dsp` | scalar f32 reference kernels | being fast |
 | `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
@@ -131,7 +133,7 @@ crates above it.
 | `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
 | `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | doing model arithmetic |
 | `xabe-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
-| `xabe-llama` | Llama geometry, weight schema, SentencePiece | doing model arithmetic |
+| `xabe-llama` | Llama geometry from either container, weight schema, SentencePiece | doing model arithmetic |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | running anywhere but a card |
 | `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
 | `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |

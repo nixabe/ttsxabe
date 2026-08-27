@@ -88,6 +88,12 @@ impl Translator {
     pub fn open(dir: &Path, ordinal: usize) -> Result<Self, TranslateError> {
         let gpu = Gpu::open(ordinal)?;
         let cfg = LlamaConfig::from_dir(dir)?;
+        // The schema binds grouped-query checkpoints; this forward pass does
+        // not map several query heads onto one key-value head, so it refuses
+        // one here rather than indexing off the end of the cache later. The
+        // check lives at the engine and not in `check()` because a shape is a
+        // fact about the file and this is a fact about the arithmetic.
+        cfg.refuse_grouped_query()?;
         let tokenizer = Tokenizer::from_dir(dir)?;
         let st = StSet::open(dir)?;
         let w = LlamaWeights::load(&st, &cfg)?;

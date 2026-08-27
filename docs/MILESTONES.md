@@ -289,6 +289,50 @@ different kind of work — deriving a network from an ONNX graph rather than fro
 reference source — and is the one that should be re-scoped when it is reached
 rather than estimated now.
 
+## Outside the numbering: the chat model's loader
+
+Not a plan phase. The plan said the chat LLM stays in llama.cpp and there is no
+`--llm-model`; that is retracted **by half**, deliberately and with the halves
+kept apart.
+
+| | State | Done |
+| --- | --- | --- |
+| — | `xabe-gguf` reads the GGUF container, v3, unquantized types only | ✅ |
+| — | All 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` bind | ✅ |
+| — | A forward pass for it | not started, and not planned |
+
+So the weights are readable and nothing runs them. `--llm-url` is still the only
+way to reach a chat model at runtime. The loader was worth building on its own
+terms for the same reason phase 5a was: it is the half that proves the geometry
+is understood, and the half that costs nothing to keep if the arithmetic never
+follows.
+
+Three findings, each of which would have been a silent wrong answer rather than
+an error:
+
+**GGUF stores shapes transposed.** Dimensions are fastest-varying first, so
+`blk.0.attn_k.weight` is `[4096, 1024]` on disk and `[1024, 4096]` row-major.
+Binding against the stored order would agree for every square projection and
+transpose only `k`, `v` and the feed-forward — a model correct in most places,
+which is harder to diagnose than one wrong everywhere.
+
+**The refusal of grouped-query attention was in the wrong crate.** Breeze2 is 32
+query heads over 8 key-value heads, and `LlamaConfig::check` refused that
+outright, which made a model that binds perfectly cleanly unreadable. A shape is
+a fact about the file; whether a forward pass maps several query heads onto one
+is a fact about that engine. So `check` now accepts it and
+`refuse_grouped_query` is what an engine without the head mapping calls at open.
+`xabe-translate` calls it, so nothing regressed.
+
+**`rope_freqs.weight` has no safetensors counterpart**, and `rope_theta` is
+500000 rather than 10000. Neither has a shape check that would catch it: a
+defaulted rope base gives a model fluent for one sentence and drifting after,
+and a skipped tensor gives a schema that binds 291 of 292 and calls it done.
+
+The GPT-2 byte-level BPE the file carries — 128,256 tokens and 280,147 merges,
+all inside the GGUF — is read as metadata and is **not** built into a tokenizer.
+That is the next thing anyone continuing this would want.
+
 ## What the numbering does not cover
 
 Batching and streaming synthesis are still deliberately absent. They are

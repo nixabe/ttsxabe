@@ -432,3 +432,73 @@ prompt shaped differently.
 `--translator-device cpu` is refused at preflight. See
 `docs/ARCHITECTURE.md` — 40 layers of 13 B at under 2 GFLOP/s is not a slow
 option, and the f32 weights would not fit anyway.
+
+---
+
+# Llama-3, `Llama-Breeze2-8B-Instruct-text-only`
+
+The chat model. Loaded but not run: `xabe-gguf` reads the container and
+`xabe-llama` binds all 292 tensors, and nothing in this workspace does
+arithmetic with them. Serving it is still llama.cpp's job.
+
+## Geometry
+
+| | |
+| --- | --- |
+| hidden size | 4096 |
+| layers | 32 |
+| attention heads | 32, head dim 128 |
+| key/value heads | **8** — grouped-query, four query heads per kv head |
+| intermediate size | 14336 |
+| RMS norm epsilon | 1e-5 |
+| RoPE theta | **500000** |
+| context length | 131072 |
+| vocabulary | 128,256 |
+| tied embeddings | no — `output.weight` is its own tensor |
+| parameters | 8,030,261,312 |
+| storage | 226 tensors f16, 66 f32 |
+
+## Three things that differ from the Llama-2 translator
+
+**Grouped-query attention.** 32 query heads share 8 key-value heads, so `k` and
+`v` are `[1024, 4096]` where `q` and `o` are `[4096, 4096]`. This is what made
+`xabe-llama` stop refusing grouped-query outright. The refusal moved rather than
+disappearing: a *shape* is a fact about the file and every grouped-query file
+binds fine, so `LlamaConfig::check` accepts it and
+`LlamaConfig::refuse_grouped_query` is what an engine without the head mapping
+calls at open. `xabe-translate` calls it. The old arrangement made an 8 B model
+that binds cleanly unreadable for no reason a shape could justify.
+
+**RoPE theta is 500000, not 10000.** Llama-3 stretched the base by fifty times
+to reach a 128k context. A loader that defaulted this would produce a model
+fluent for one sentence and drifting after that — which is exactly the class of
+bug that has no shape check to catch it.
+
+**`rope_freqs.weight` has no safetensors counterpart.** 64 f32, one per rotating
+pair of a 128-wide head: Llama-3.1's per-frequency rope scaling. It is bound
+rather than skipped, because a schema that binds 291 of 292 tensors is not a
+proof that the geometry is understood, and the one left over is precisely the
+one nothing else would have told you about.
+
+## GGUF stores shapes transposed
+
+The single easiest thing to get wrong. GGUF writes dimensions fastest-varying
+first, so `blk.0.attn_k.weight` is `[4096, 1024]` on disk and `[1024, 4096]` as
+a row-major matrix. `TensorInfo::dims` is what the file said and
+`TensorInfo::shape()` is the row-major reading; the binding compares against
+`shape()`.
+
+Getting this wrong has the worst possible failure shape, which is why it has a
+test of its own: every square projection agrees under either reading, so `q`,
+`o` and both norms bind correctly and only `k`, `v` and the feed-forward come
+out transposed. A model that is right in most places is harder to diagnose than
+one that is wrong everywhere.
+
+## The tokenizer is GPT-2 byte-level BPE
+
+`tokenizer.ggml.model = gpt2`, `pre = llama-bpe`, 128,256 tokens and 280,147
+merges, all carried inside the GGUF rather than in files beside it. So the
+closer precedent here is `xabe-whisper`'s byte-level BPE, not `xabe-llama`'s
+SentencePiece — the translator and the chat model share an architecture family
+and not a tokenizer. It is **not written yet**: the metadata is read and the
+arrays are reachable, and nothing turns them into a tokenizer.

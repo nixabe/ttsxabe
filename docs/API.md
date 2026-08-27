@@ -35,6 +35,29 @@ at synthesis time.
 Every accessor borrows from the mapping. Opening a 139 MB checkpoint is one
 `mmap` and no allocation.
 
+## `xabe-gguf`
+
+```rust
+use xabe_gguf::GgufFile;
+
+let f = GgufFile::open("models/llm/Llama-Breeze2-8B...f16.gguf")?;
+
+f.len();                                  // tensor count
+f.tensors();                              // &[TensorInfo], in directory order
+f.info("blk.0.attn_k.weight");            // Option<&TensorInfo>
+f.get_u32("llama.block_count");           // metadata, typed
+f.get_strings("tokenizer.ggml.tokens");   // the vocabulary lives in the file
+f.tensor_bytes("output_norm.weight")?;    // borrowed from the mapping
+f.tensor_f32("output_norm.weight")?;      // Vec<f32>, widened if needed
+f.tensor_f16("blk.0.attn_q.weight")?;     // Vec<u16>, rounded if needed
+```
+
+The same contract as `xabe-st` over a different container, with one thing that
+has no safetensors equivalent: `TensorInfo::dims` is what the file stores,
+fastest-varying first, and `TensorInfo::shape()` is the row-major reading. Bind
+against `shape()`. Binding against `dims` agrees for every square matrix and
+silently transposes the rest.
+
 ## The geometry crates
 
 `xabe-vits`, `xabe-whisper` and `xabe-llama` all have the same shape: a config
@@ -49,8 +72,12 @@ let weights = VitsWeights::load(&file, &cfg)?;   // every tensor shape-checked
 let cfg = WhisperConfig::from_dir(dir)?;
 let weights = WhisperWeights::load(&set, &cfg)?; // 1,259 tensors
 
-let cfg = LlamaConfig::from_dir(dir)?;           // refuses GQA, ragged heads
+let cfg = LlamaConfig::from_dir(dir)?;           // refuses ragged heads
 let weights = LlamaWeights::load(&set, &cfg)?;   // 363 tensors, no bytes read
+
+let cfg = LlamaConfig::from_gguf(&gguf)?;        // the same geometry, from metadata
+let weights = LlamaWeights::from_gguf(&gguf, &cfg)?;  // 292 tensors, no bytes read
+cfg.refuse_grouped_query()?;                     // what an engine calls, not the schema
 ```
 
 `VitsWeights::load` reads only the inference subset; `posterior_encoder` is
