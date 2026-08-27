@@ -54,3 +54,12 @@ pub fn snake(x: &mut [f32], alpha: &[f32], ch: usize, t: usize) {
         }
     }
 }
+
+/// ELU in place, with alpha 1.
+pub fn elu(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        if *v < 0.0 {
+            *v = v.exp() - 1.0;
+        }
+    }
+}

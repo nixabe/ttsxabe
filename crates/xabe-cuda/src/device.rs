@@ -136,6 +136,7 @@ const NAMES: &[&str] = &[
     "act_relu",
     "act_leaky_relu",
     "act_snake",
+    "act_elu",
     "act_tanh",
     "act_gelu",
     "gated_activation",
@@ -928,6 +929,11 @@ impl Gpu {
     }
 
     /// Fuses weight normalisation. Mirrors [`xabe_dsp::fuse_weight_norm`].
+    /// ELU in place, with alpha 1 - torch's default and the only one used.
+    pub fn elu(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
+        self.activate("act_elu", x, n, None)
+    }
+
     /// Snake in place: `x + sin^2(a*x)/a`, one alpha per channel.
     ///
     /// HiFTNet's activation and the reason its vocoder is not a plain

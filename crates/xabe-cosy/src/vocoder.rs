@@ -34,12 +34,38 @@ use xabe_cuda::{CudaSlice, Gpu};
 use xabe_st::StFile;
 
 /// A convolution whose weight normalisation has been fused at load.
-struct Conv {
-    w: CudaSlice<f32>,
-    bias: CudaSlice<f32>,
-    in_ch: usize,
-    out_ch: usize,
-    k: usize,
+pub(crate) struct Conv {
+    pub(crate) w: CudaSlice<f32>,
+    pub(crate) bias: CudaSlice<f32>,
+    pub(crate) in_ch: usize,
+    pub(crate) out_ch: usize,
+    pub(crate) k: usize,
+}
+
+impl Conv {
+    /// Binds one weight-normalised convolution.
+    ///
+    /// The checkpoint stores a direction and a magnitude; the convolution
+    /// wants their product, and it does not change between utterances - so it
+    /// is fused once here rather than at every call.
+    pub(crate) fn bind_wn(
+        f: &StFile,
+        gpu: &Gpu,
+        prefix: &str,
+        out: usize,
+        inp: usize,
+        k: usize,
+    ) -> Result<Self, CosyError> {
+        let v = gpu.upload(f.tensor_shaped(&format!("{prefix}.weight_v"), &[out, inp, k])?)?;
+        let g = gpu.upload(f.tensor_shaped(&format!("{prefix}.weight_g"), &[out, 1, 1])?)?;
+        Ok(Self {
+            w: gpu.fuse_weight_norm(&v, &g, out, inp, k)?,
+            bias: gpu.upload(f.tensor_shaped(&format!("{prefix}.bias"), &[out])?)?,
+            in_ch: inp,
+            out_ch: out,
+            k,
+        })
+    }
 }
 
 /// One residual block: three (Snake, conv, Snake, conv) pairs, each added back.
@@ -125,7 +151,7 @@ pub struct Vocoder {
 /// `int((k*d - d)/2)*2 + (k+1)%2`, which is `(k-1)*d` for odd `k` and one more
 /// than that rounded down for even `k`. Simplifying it to `(k-1)*d` agrees on
 /// every odd kernel in this model and is wrong on `conv_pre`'s even one.
-fn causal_pad(k: usize, dilation: usize) -> usize {
+pub(crate) fn causal_pad(k: usize, dilation: usize) -> usize {
     (k * dilation - dilation) / 2 * 2 + (k + 1) % 2
 }
 
@@ -149,15 +175,7 @@ impl Vocoder {
         // checkpoint stores a direction and a magnitude; the convolution wants
         // their product, and it does not change between utterances.
         let wn = |p: &str, out: usize, inp: usize, k: usize| -> Result<Conv, CosyError> {
-            let v = gpu.upload(f.tensor_shaped(&format!("{p}.weight_v"), &[out, inp, k])?)?;
-            let g = gpu.upload(f.tensor_shaped(&format!("{p}.weight_g"), &[out, 1, 1])?)?;
-            Ok(Conv {
-                w: gpu.fuse_weight_norm(&v, &g, out, inp, k)?,
-                bias: gpu.upload(f.tensor_shaped(&format!("{p}.bias"), &[out])?)?,
-                in_ch: inp,
-                out_ch: out,
-                k,
-            })
+            Conv::bind_wn(&f, &gpu, p, out, inp, k)
         };
         // The excitation's downsamplers are the one place with no weight norm.
         let plain = |p: &str, out: usize, inp: usize, k: usize| -> Result<Conv, CosyError> {

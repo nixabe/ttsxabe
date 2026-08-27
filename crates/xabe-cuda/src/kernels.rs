@@ -693,6 +693,13 @@ __global__ void act_snake(float* x, const float* __restrict__ alpha, int ch, int
     }
 }
 
+/* ELU with alpha 1, which is torch's default and the only one used here. */
+__global__ void act_elu(float* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && x[i] < 0.0f) x[i] = __expf(x[i]) - 1.0f;
+}
+
 __global__ void act_tanh(float* x, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
