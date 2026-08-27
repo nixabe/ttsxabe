@@ -1560,6 +1560,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xabe-cosy"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-cuda",
+ "xabe-st",
+]
+
+[[package]]
 name = "xabe-cuda"
 version = "0.0.0"
 dependencies = [
