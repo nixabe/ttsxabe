@@ -557,11 +557,20 @@ impl Translator {
     /// agree with disagree with each other: the captured 🤗 oracle is pure
     /// greedy, and the `llama-server` the pipeline runs today passes 1.1. Both
     /// comparisons are worth making, so both are reachable.
+    /// `stops` are substrings of the *decoded* answer that end it. They are the
+    /// same ones the caller would cut at afterwards, and checking them here is
+    /// the difference between paying for the tokens after the answer and not:
+    /// this checkpoint closes its tag and then keeps going, and nothing in the
+    /// loop below notices, because `</s>` never arrives. With `max_new` at 256
+    /// that is most of a translation's cost spent on text about to be thrown
+    /// away. Decoding the answer again each step is O(n) on n <= 256 tokens
+    /// against a 28 ms forward pass, so it does not register.
     pub fn generate(
         &self,
         ids: &[u32],
         max_new: usize,
         penalty: f32,
+        stops: &[&str],
     ) -> Result<Vec<u32>, TranslateError> {
         let mut cache = self.cache();
         let mut pending = ids.to_vec();
@@ -613,6 +622,12 @@ impl Translator {
                 break;
             }
             out.push(next);
+            if !stops.is_empty() {
+                let so_far = self.tokenizer.decode(&out, true);
+                if stops.iter().any(|s| so_far.contains(s)) {
+                    break;
+                }
+            }
             pending = vec![next];
         }
         Ok(out)
@@ -632,14 +647,16 @@ impl Translator {
         max_new: usize,
         penalty: f32,
     ) -> Result<String, TranslateError> {
+        const STOPS: [&str; 2] = ["[/", "\n["];
         let ids = self.prompt_ids(source, target);
-        let out = self.generate(&ids, max_new, penalty)?;
+        let out = self.generate(&ids, max_new, penalty, &STOPS)?;
         let text = self.tokenizer.decode(&out, true);
-        let cut = ["[/", "\n["]
+        let cut = STOPS
             .iter()
             .filter_map(|s| text.find(s))
             .min()
             .unwrap_or(text.len());
+        tracing::debug!(tokens = out.len(), "translated");
         Ok(text[..cut].trim().to_string())
     }
 }

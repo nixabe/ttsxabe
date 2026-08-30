@@ -167,6 +167,48 @@ made f16 worth considering is gone. f16 still wins prefill by 1.55x, because
 prefill is a `gemm` with as many rows as there are prompt tokens and reaches the
 tensor cores, which the packed path does not - that one is real and unaddressed.
 
+## A spoken turn: where the 7 s went
+
+`xabe-engine --serve`, one typed turn, the reply chunked as it streams and each
+clause translated then synthesised. Measured over the WebSocket, so these are
+what a listener waits through rather than what a stage costs in isolation.
+Three clauses, Tacotron2, Breeze2 8 B chat, Taigi 13 B translator; medians
+of three runs of the same prompt.
+
+| | one card, sequential | translator on card 1, pipelined |
+| --- | ---: | ---: |
+| first audio | 2659 ms | **1930 ms** |
+| whole turn | 6951 ms | **5620 ms** |
+
+Two changes, and the order matters because the first one is a flag.
+
+**The translator was sharing a card with the chat model that feeds it.** Not
+idly: the reply is chunked as it streams, so the first clause is translated
+while the second is still being written, and the two decode loops interleave on
+one set of SMs. Moving the translator to `--translator-device 1` took first
+audio to 2000 ms on its own. The later clauses did not move, which is the tell -
+by then the chat model has finished and there was nothing to contend with.
+
+**Translation and synthesis were strictly sequential.** They are different
+models on now-different cards, so clause N+1 is translated while clause N is
+still becoming a waveform. Synthesis stays a single ordered consumer, because
+audio has to reach the browser in playback order.
+
+### The split, and why the synthesiser is not the thing to optimise
+
+Per clause, with the translator on its own card:
+
+| clause | translate | synthesise |
+| --- | ---: | ---: |
+| 9 characters | 1145 ms | 214 ms |
+| 15 characters | 1373 ms | 389 ms |
+| 16 characters | 1883 ms | 581 ms |
+
+Synthesis is a sixth to a quarter of a clause and runs at about twelve times
+realtime. Halving it would take roughly 200 ms off a turn; halving the
+translator would take nearly a second. The remaining lever on a turn is the
+13 B translator's decode rate, not Tacotron2.
+
 ## Residency: the whole pipeline on one card
 
 One Quadro RTX 8000 (49152 MiB), measured with `xabe-vram`, which reads
@@ -512,6 +554,24 @@ time and VRAM budgets should be computed on the inference subset.
 ## WHY NOT
 
 Measured rejections. Things that looked like they should help and did not.
+
+### Stopping the translator at its stop string saved nothing measurable
+
+`Translator::translate` generates up to `max_new` and then cuts the answer at
+`[/` or a newline followed by `[`, so any token after the stop string is decoded
+and thrown away. With `max_new` at 256 and decode at 28 ms a token that looked
+like most of a translation's cost.
+
+It is not. Checking the stop strings inside the loop instead of after it left
+translation at 1145, 1373 and 1883 ms on the three clauses that had cost 1154,
+1361 and 1865 - flat, because this checkpoint emits `</s>` or `<pad>` at the end
+of the answer and the loop already stopped there. The answers measured 24, 34
+and 53 tokens, which is what the text is worth.
+
+The check was kept anyway, and this is why it is recorded here rather than as a
+speedup: the cut in `translate` exists precisely because the model *sometimes*
+closes its tag instead of ending, and on those turns the loop had no way to
+know. It bounds a tail that does not show up in a median.
 
 ### Two micro-optimisations of the K-quant gemv, both measured flat
 

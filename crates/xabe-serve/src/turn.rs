@@ -450,11 +450,36 @@ async fn reply(
     .await
 }
 
-/// Drains the chunk queue, synthesising one chunk at a time.
+/// How many chunks may be translated ahead of the one being synthesised.
 ///
-/// One worker, not several: audio has to reach the browser in the order it will
-/// be played, and a second worker would finish a short later clause before a
-/// long earlier one.
+/// One is the whole benefit: it keeps the translator busy across the gap while
+/// a waveform is produced. More would only buy latency on a queue that is
+/// already bounded by how fast the chat model writes.
+const TRANSLATE_AHEAD: usize = 1;
+
+/// A chunk that has been translated and is waiting to be spoken.
+struct Ready {
+    /// What the synthesiser reads.
+    text: String,
+    /// The Taigi to show beside the audio, empty when nothing translated it.
+    taigi: String,
+    /// Characters of source, for the timing line.
+    chars: usize,
+    /// How long the translation took.
+    translate_ms: u64,
+}
+
+/// Drains the chunk queue, translating one chunk ahead of the one being spoken.
+///
+/// Two stages, not one: translation and synthesis are different models and, in
+/// the layout `docs/CLI.md` recommends, different cards, so chunk N+1 can be
+/// translated while chunk N is still becoming a waveform. Measured on a
+/// three-clause turn, translation is four times the cost of synthesis, so the
+/// overlap hides the synthesis of every chunk after the first.
+///
+/// Synthesis stays a single ordered consumer. Audio has to reach the browser in
+/// the order it will be played, and a second synthesiser would finish a short
+/// later clause before a long earlier one.
 async fn synthesis_worker(
     backend: TtsBackend,
     translator: Option<TranslatorBackend>,
@@ -462,25 +487,65 @@ async fn synthesis_worker(
     mut jobs: mpsc::Receiver<String>,
     audio: mpsc::Sender<TtsChunk>,
 ) -> Result<(), ServeError> {
-    while let Some(chunk) = jobs.recv().await {
-        // A translator in front of the synthesiser is optional. With
-        // --direct-taigi the chat model has already answered in Taigi Han, and
-        // this hop is skipped entirely - measured 3.8 s -> 1.6 s on a turn.
-        let (text, taigi) = match &translator {
-            None => (chunk, String::new()),
-            Some(t) => match t.translate(&chunk, &target).await {
-                Ok(out) if !out.is_empty() => (out.clone(), out),
-                Ok(_) => (chunk, String::new()),
-                Err(e) => {
-                    // Speaking the untranslated Mandarin is wrong but audible;
-                    // silence is wrong and looks like a crash.
-                    tracing::warn!(%e, "translator failed, speaking the source text");
-                    (chunk, String::new())
-                }
-            },
-        };
+    let (ready_tx, mut ready) = mpsc::channel::<Ready>(TRANSLATE_AHEAD);
+    let translating = tokio::spawn(async move {
+        while let Some(chunk) = jobs.recv().await {
+            // Timed per chunk because the two stages are bound by different
+            // things and only measurement says which one a listener is waiting
+            // on. Reported once per chunk at info, by the stage below.
+            let queued = Instant::now();
+            let chars = chunk.chars().count();
+            // A translator in front of the synthesiser is optional. With
+            // --direct-taigi the chat model has already answered in Taigi Han,
+            // and this hop is skipped entirely - measured 3.8 s -> 1.6 s.
+            let (text, taigi) = match &translator {
+                None => (chunk, String::new()),
+                Some(t) => match t.translate(&chunk, &target).await {
+                    Ok(out) if !out.is_empty() => (out.clone(), out),
+                    Ok(_) => (chunk, String::new()),
+                    Err(e) => {
+                        // Speaking the untranslated Mandarin is wrong but
+                        // audible; silence is wrong and looks like a crash.
+                        tracing::warn!(%e, "translator failed, speaking the source text");
+                        (chunk, String::new())
+                    }
+                },
+            };
+            let ready = Ready {
+                text,
+                taigi,
+                chars,
+                translate_ms: queued.elapsed().as_millis() as u64,
+            };
+            if ready_tx.send(ready).await.is_err() {
+                break;
+            }
+        }
+    });
 
-        match &backend {
+    let result = speak_in_order(&backend, &audio, &mut ready).await;
+    // The receiver is dropped by now either way, so the stage above has been
+    // told to stop; this only waits for it to notice.
+    drop(ready);
+    let _ = translating.await;
+    result
+}
+
+/// Synthesises translated chunks one at a time, in order.
+async fn speak_in_order(
+    backend: &TtsBackend,
+    audio: &mpsc::Sender<TtsChunk>,
+    ready: &mut mpsc::Receiver<Ready>,
+) -> Result<(), ServeError> {
+    while let Some(Ready {
+        text,
+        taigi,
+        chars,
+        translate_ms,
+    }) = ready.recv().await
+    {
+        let translated = Instant::now();
+        match backend {
             TtsBackend::Remote(up) => {
                 let (tx, mut rx) = mpsc::channel::<TtsChunk>(AUDIO_BUFFER);
                 let up = up.clone();
@@ -520,6 +585,12 @@ async fn synthesis_worker(
                 }
             }
         }
+        tracing::info!(
+            chars,
+            translate_ms,
+            synth_ms = translated.elapsed().as_millis() as u64,
+            "chunk spoken"
+        );
     }
     Ok(())
 }

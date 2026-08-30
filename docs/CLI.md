@@ -159,6 +159,41 @@ xabe-engine --serve 127.0.0.1:8000 \
             --tts-script tacotron2=POJ
 ```
 
+## Which card each stage goes on
+
+Every `--*-device` defaults to `0`, which puts the whole pipeline on one card.
+That fits - the packed checkpoints leave room - but it is not the fastest
+layout, because the chat model and the translator are **both decoding at the
+same time**: the reply is chunked as it streams, so clause one is being
+translated while clause two is still being written.
+
+Measured on a three-clause turn, moving only the translator off the chat
+model's card:
+
+| | one card | translator on its own |
+| --- | ---: | ---: |
+| first audio | 2659 ms | **2000 ms** |
+| first clause, translate | 1618 ms | 1154 ms |
+| first clause, synthesise | 440 ms | 210 ms |
+
+The later clauses barely move, because by then the chat model has finished and
+there was nothing to contend with. It is the *first* clause - the one a listener
+is actually waiting through - that is paying for the overlap.
+
+```sh
+# the chat model and everything cheap on card 0, the translator alone on card 1
+xabe-engine --serve 127.0.0.1:8000 \
+            --llm-model        models/breeze2-8b-Q4_K_M.gguf           --llm-device 0 \
+            --translator-model models/taigi-translator-13b-Q4_K_M.gguf --translator-device 1 \
+            --asr-model        models/asr/breeze-asr-26                --asr-device 0 \
+            --tts-engine       tacotron2=models/tts/tacotron2-nan \
+            --tts-script       tacotron2=POJ --tts-default tacotron2
+```
+
+On one card, put the translator there anyway and expect the first clause to
+cost what the table's left column says. On two, this is the split that matters;
+a third card has nothing left to move onto it that is worth the VRAM.
+
 CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms and
 Tacotron2 read romanisation and get POJ from `--translator-target`. Tacotron2
 was trained on Tâi-lô with the tone as a trailing digit rather than on POJ with
