@@ -103,6 +103,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--tts-engine` | `XABE_TTS_ENGINES` | — | extra engines as `name=url` or `name=path`, repeatable |
 | `--cosy-voice` | `XABE_COSY_VOICE` | `<checkpoint>/voices/taigi-ref.safetensors` | speaker bundle for a local CosyVoice |
 | `--cosy-instruct` | `XABE_COSY_INSTRUCT` | a Taigi instruction | what a local CosyVoice is told; must end on `<|endofprompt|>` |
+| `--taco-sigma` | `XABE_TACO_SIGMA` | `tacotron2.json`'s `0.666` | WaveGlow's noise scale for a local Tacotron2 |
 | `--tts-default` | `XABE_TTS_DEFAULT` | `mms` | which engine the page selects |
 | `--translator-target` | `XABE_TRANSLATOR_TARGET` | `POJ` | `POJ`, `HAN` or `HL` |
 | `--asr-lang` | `XABE_ASR_LANG` | `zh` | never `en`; see below |
@@ -132,25 +133,56 @@ to no purpose.
 ### `--tts-engine` takes a URL or a directory
 
 A value beginning `http://` or `https://` is another process. Anything else is
-a directory, opened **in this one**: a CosyVoice3 checkpoint if it holds
-`llm.safetensors`, `flow.safetensors` and `hift.safetensors`, and a VITS one
-otherwise. All three files, not one — a half-converted directory would
-otherwise be opened as CosyVoice and fail deep inside a weight schema instead
+a directory, opened **in this one**, and which model it holds is read off the
+filenames:
+
+| It holds | It is opened as |
+| --- | --- |
+| `llm.safetensors`, `flow.safetensors`, `hift.safetensors` | CosyVoice3 |
+| `tacotron2.safetensors`, `waveglow.safetensors`, `tacotron2.json` | Tacotron2 + WaveGlow |
+| anything else | VITS |
+
+All of a set, not one of it — a half-converted directory would otherwise be
+opened as the model it is half of and fail deep inside a weight schema instead
 of here, where the path is still in hand.
 
 `--tts-model` sniffs the same way, so it takes either checkpoint. Which one it
 is, is a property of the directory rather than of a second flag.
 
 ```sh
-# mms and CosyVoice3 in one process, both on card 2
+# all three synthesisers in one process, on card 2
 xabe-engine --serve 127.0.0.1:8000 \
             --tts-model  models/tts/mms-tts-nan       --tts-device 2 \
             --tts-engine cosyvoice=models/tts/cosyvoice3-0.5b \
-            --tts-script cosyvoice=HAN
+            --tts-engine tacotron2=models/tts/tacotron2-nan \
+            --tts-script cosyvoice=HAN \
+            --tts-script tacotron2=POJ
 ```
 
-CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms reads
-romanisation and gets POJ from `--translator-target`. A local engine registered
+CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms and
+Tacotron2 read romanisation and get POJ from `--translator-target`. Tacotron2
+was trained on Tâi-lô with the tone as a trailing digit rather than on POJ with
+diacritics, and `xabe-taco` transliterates between them — that is a fact about
+the checkpoint, so it is not a flag.
+
+Each engine answers at its own sample rate: mms at 16 kHz, Tacotron2 at
+22.05 kHz, CosyVoice at its own.
+
+`xabe-taco-bench` times the Tacotron2 path and prints where the time goes:
+
+```sh
+xabe-taco-bench --model models/tts/tacotron2-nan --device 0 --rounds 9
+```
+
+`xabe-llm-bench` does the same for the two Llama stages, separating prefill from
+decode - they are bound by different things, and decode is what a listener waits
+through. `--packing f16` widens a quantized checkpoint at load, which is how the
+packed path's remaining headroom was measured:
+
+```sh
+xabe-llm-bench --model models/breeze2-8b-Q4_K_M.gguf --kind chat --device 0
+xabe-llm-bench --model models/taigi-translator-13b-Q4_K_M.gguf --kind translate --device 0
+``` A local engine registered
 through `--tts-engine` shares `--tts-device` with `--tts-model`, and CosyVoice
 is CUDA only — there is no scalar path for a 642 M-parameter decode plus a
 22-layer diffusion transformer, and offering one would give a configuration

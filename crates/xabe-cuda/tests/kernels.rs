@@ -453,6 +453,11 @@ fn the_elementwise_kernels_match() {
     g.add_inplace(&mut d, &db, n).unwrap();
     assert_close("add_inplace", &want, &g.download(&d).unwrap());
 
+    let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+    let mut d = g.upload(&a).unwrap();
+    g.mul_inplace(&mut d, &db, n).unwrap();
+    assert_close("mul_inplace", &want, &g.download(&d).unwrap());
+
     let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x - y).collect();
     let mut d = g.upload(&a).unwrap();
     g.sub_inplace(&mut d, &db, n).unwrap();
@@ -782,9 +787,15 @@ fn im2col_then_gemm_is_a_convolution() {
     // convolution the rest of the workspace uses, which takes its input
     // channel-major - so the test transposes, and a layout mistake in either
     // direction shows up as a diff rather than as a plausible spectrogram.
-    for &(in_ch, out_ch, t, k, stride, pad) in &[
-        (8usize, 12usize, 20usize, 3usize, 1usize, 1usize),
-        (12, 12, 20, 3, 2, 1),
+    // The last three are WaveGlow's coupling network, whose dilation doubles
+    // per layer: padding tracks it so the length is unchanged, and a dilation
+    // read as a stride would still produce a tensor of the right shape.
+    for &(in_ch, out_ch, t, k, stride, pad, dil) in &[
+        (8usize, 12usize, 20usize, 3usize, 1usize, 1usize, 1usize),
+        (12, 12, 20, 3, 2, 1, 1),
+        (16, 32, 40, 3, 1, 1, 1),
+        (16, 32, 40, 3, 1, 2, 2),
+        (16, 32, 40, 3, 1, 4, 4),
     ] {
         let x_tc = seq(t * in_ch, 21); // [t, in_ch], the transformer layout
         let w = seq(out_ch * in_ch * k, 22); // [out_ch, in_ch, k]
@@ -793,7 +804,7 @@ fn im2col_then_gemm_is_a_convolution() {
         // is the same as rounding the gathered matrix - which is what the
         // tiled matmul will do to it. Below GEMV_MAX_M rows the path is exact
         // instead, and the reference has to follow; see `reference_gemm`.
-        let out_t = (t + 2 * pad - k) / stride + 1;
+        let out_t = (t + 2 * pad - (dil * (k - 1) + 1)) / stride + 1;
         let (x_ref, w_ref) = if out_t <= xabe_cuda::GEMV_MAX_M {
             (x_tc.clone(), w.clone())
         } else {
@@ -801,13 +812,21 @@ fn im2col_then_gemm_is_a_convolution() {
         };
         let x_ct = xabe_dsp::transpose(&x_ref, t, in_ch); // [in_ch, t]
         let want_ct = xabe_dsp::conv1d_strided(
-            &x_ct, in_ch, t, &w_ref, None, out_ch, k, stride, pad, pad, 1,
+            &x_ct, in_ch, t, &w_ref, None, out_ch, k, stride, pad, pad, dil,
         );
         assert_eq!(want_ct.len(), out_ch * out_t, "out_t");
         let want = xabe_dsp::transpose(&want_ct, out_ch, out_t); // [out_t, out_ch]
 
         let (col, got_t) = g
-            .im2col(&g.upload(&x_tc).expect("upload"), t, in_ch, k, stride, pad)
+            .im2col(
+                &g.upload(&x_tc).expect("upload"),
+                t,
+                in_ch,
+                k,
+                stride,
+                pad,
+                dil,
+            )
             .expect("im2col");
         assert_eq!(got_t, out_t, "out_t from the kernel");
         let got = g
@@ -823,7 +842,7 @@ fn im2col_then_gemm_is_a_convolution() {
                 .expect("gemm"),
             )
             .expect("download");
-        assert_close_gemm(&format!("conv stride {stride}"), &want, &got);
+        assert_close_gemm(&format!("conv stride {stride} dilation {dil}"), &want, &got);
     }
 }
 
@@ -1320,4 +1339,64 @@ fn the_stft_round_trip_reconstructs_the_signal_it_was_given() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(worst < 2e-3, "round trip differs by {worst}");
+}
+
+#[test]
+fn gated_activation_rows_is_the_transpose_of_gated_activation() {
+    let Some(g) = gpu() else { return };
+    let (ch, t) = (24usize, 37usize);
+    // Compared against the twin rather than a fresh reference, because that is
+    // the actual requirement: the two must be the same function seen through a
+    // transpose, and a sign or an index error in either shows up as a diff.
+    let x_ct = seq(2 * ch * t, 76);
+    let want_ct = xabe_dsp::gated_activation(&x_ct, ch, t);
+
+    let x_tc = xabe_dsp::transpose(&x_ct, 2 * ch, t); // [t, 2 * ch]
+    let got_tc = g
+        .download(
+            &g.gated_activation_rows(&g.upload(&x_tc).unwrap(), ch, t)
+                .unwrap(),
+        )
+        .unwrap();
+    let got_ct = xabe_dsp::transpose(&got_tc, t, ch);
+    assert_close("gated_activation_rows", &want_ct, &got_ct);
+}
+
+#[test]
+fn lstm_gates_matches() {
+    let Some(g) = gpu() else { return };
+    let hidden = 137usize;
+    let (gi, gh) = (seq(4 * hidden, 71), seq(4 * hidden, 72));
+    // A non-zero starting cell, because a zero one hides the forget gate
+    // entirely - the one term that only shows up when there is state to keep.
+    let c0 = seq(hidden, 73);
+
+    let (mut c, mut h) = (c0.clone(), vec![0.0f32; hidden]);
+    xabe_dsp::lstm_gates(&gi, &gh, &mut c, &mut h, hidden);
+
+    let (dgi, dgh) = (g.upload(&gi).unwrap(), g.upload(&gh).unwrap());
+    let (mut dc, mut dh) = (g.upload(&c0).unwrap(), g.zeros(hidden).unwrap());
+    g.lstm_gates(&dgi, &dgh, &mut dc, &mut dh, hidden).unwrap();
+
+    // `__expf` in the sigmoid, so the same loosened tolerance the llama
+    // kernels use rather than the shared one.
+    assert_close_to("lstm_gates cell", &c, &g.download(&dc).unwrap(), 1e-4);
+    assert_close_to("lstm_gates hidden", &h, &g.download(&dh).unwrap(), 1e-4);
+}
+
+#[test]
+fn coupling_inverse_matches() {
+    let Some(g) = gpu() else { return };
+    let (half, t) = (4usize, 61usize);
+    let x = seq(half * t, 74);
+    // Scaled down: `st` holds a *log* scale, and seq spans [-2, 2], so an
+    // unscaled second half would divide by e^2 and swamp the shift.
+    let st: Vec<f32> = seq(2 * half * t, 75).iter().map(|v| v * 0.5).collect();
+
+    let mut want = vec![0.0f32; half * t];
+    xabe_dsp::coupling_inverse(&x, &st, &mut want, half, t);
+
+    let (dx, dst) = (g.upload(&x).unwrap(), g.upload(&st).unwrap());
+    let out = g.coupling_inverse(&dx, &dst, half, t).unwrap();
+    assert_close("coupling_inverse", &want, &g.download(&out).unwrap());
 }

@@ -66,6 +66,13 @@ in `docs/BENCHMARKS.md` and nowhere else.
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.
 
+One stage reads **converted** weights rather than the published checkpoint, and
+it is the only one: WaveGlow ships as a pickled `nn.Module` object graph in the
+pre-1.6 torch format, which cannot be parsed without PyTorch and the model's own
+class definitions. `tools/convert_tacotron2.py` does that once, offline. The
+claim at the top of this file holds everywhere except `xabe-taco`, and that
+exception is a property of how NVIDIA saved the file in 2019.
+
 ## Non-negotiable design rules
 
 1. **Reject invalid state in the constructor, not at use.** A checkpoint of the
@@ -115,6 +122,8 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-golden` |
 | `xabe-asr` | the Whisper forward pass and greedy decoding | `xabe-whisper`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-audio` |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | `xabe-llama`, `xabe-cuda`, `xabe-st` |
+| `xabe-cosy` | CosyVoice3: geometry and forward pass | `xabe-cuda`, `xabe-dsp`, `xabe-st` |
+| `xabe-taco` | Tacotron2 + WaveGlow: geometry, forward pass, POJ to Tâi-lô | `xabe-cuda`, `xabe-st` |
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | `xabe-audio` |
 | `xabe-engine` | flags, stage wiring, orchestration, the binary | every stage crate |
 
@@ -122,6 +131,13 @@ The pattern to keep: each model is **two** crates, one that says what the
 tensors are and refuses to do arithmetic, and one that runs them. `xabe-vits` to
 `xabe-tts`, `xabe-whisper` to `xabe-asr`, `xabe-llama` to `xabe-translate`. A
 geometry crate that grows a matmul has broken the rule.
+
+`xabe-cosy` and `xabe-taco` are one crate each, and that is a deviation rather
+than a second pattern. Neither model's geometry is read by anything but its own
+forward pass - there is no third consumer the split would serve - so the
+boundary is drawn between modules instead: `config` and `weights` know the
+shapes and never touch an activation, the rest does arithmetic and never parses
+a file. Split them if a second consumer ever appears.
 
 `xabe-asr` and `xabe-translate` are CUDA-only and have no scalar twin of the
 whole model - see `docs/ARCHITECTURE.md` for why, which is arithmetic rather

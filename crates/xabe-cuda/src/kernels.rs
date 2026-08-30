@@ -1130,6 +1130,23 @@ __global__ void act_gelu(float* x, int n)
 }
 
 // tanh(first half) * sigmoid(second half), 2*ch in and ch out.
+// The same gate, for data laid out `[t, 2 * ch]` rather than `[2 * ch, t]`.
+//
+// WaveGlow's coupling network is a chain of matmuls, and a matmul wants the
+// contracted axis last - which puts the channels innermost. Transposing into
+// the channel-major form just to gate would undo that once per layer.
+__global__ void gated_activation_rows(
+    const float* __restrict__ x, float* __restrict__ out, int ch, int t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch * t) return;
+    int p = i / ch;
+    int c = i - p * ch;
+    float a = x[(size_t)p * 2 * ch + c];
+    float b = x[(size_t)p * 2 * ch + ch + c];
+    out[i] = tanhf(a) * (1.0f / (1.0f + __expf(-b)));
+}
+
 __global__ void gated_activation(
     const float* __restrict__ x, float* __restrict__ out, int ch, int t)
 {
@@ -1154,6 +1171,12 @@ __global__ void sub_inplace(float* a, const float* b, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] -= b[i];
+}
+
+__global__ void mul_inplace(float* a, const float* b, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] *= b[i];
 }
 
 __global__ void scale_inplace(float* a, int n, float s)
@@ -1435,7 +1458,7 @@ extern "C" __global__ void rope(
 extern "C" __global__ void im2col(
     const float* __restrict__ x,
     float* __restrict__ out,
-    int t, int in_ch, int k, int stride, int pad, int out_t)
+    int t, int in_ch, int k, int stride, int pad, int dilation, int out_t)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int cols = in_ch * k;
@@ -1446,7 +1469,9 @@ extern "C" __global__ void im2col(
     int r  = i % cols;
     int c  = r / k;
     int kk = r % k;
-    int src = ti * stride + kk - pad;
+    // The column index is `c * k + kk`, which is exactly how a `[out, in, k]`
+    // weight flattens - so the matmul that follows needs no reshaping.
+    int src = ti * stride + kk * dilation - pad;
     out[i] = (src >= 0 && src < t) ? x[(size_t)src * in_ch + c] : 0.0f;
 }
 
@@ -1778,4 +1803,44 @@ extern "C" __global__ void grouped_conv1d(
     }
     out[i] = acc;
 }
+
+// PyTorch lays an LSTM's four gates along one `4H` axis in the order input,
+// forget, cell, output, and splits the pre-activation into an input-side and a
+// hidden-side half so the input side can be computed for every step at once.
+// Both halves arrive here rather than being summed first: one launch instead of
+// two, and the sum is a register add either way.
+extern "C" __global__ void lstm_gates(
+    const float* __restrict__ gi, const float* __restrict__ gh,
+    float* __restrict__ c, float* __restrict__ h, int hidden)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= hidden) return;
+    float ig = 1.0f / (1.0f + __expf(-(gi[j] + gh[j])));
+    float fg = 1.0f / (1.0f + __expf(-(gi[hidden + j] + gh[hidden + j])));
+    float gg = tanhf(gi[2 * hidden + j] + gh[2 * hidden + j]);
+    float og = 1.0f / (1.0f + __expf(-(gi[3 * hidden + j] + gh[3 * hidden + j])));
+    float cn = fg * c[j] + ig * gg;
+    c[j] = cn;
+    h[j] = og * tanhf(cn);
+}
+
+// WaveGlow's affine coupling run backwards: `x = (x - b) / exp(s)`, where the
+// coupling network emits `b` as the first half of `st` and `s` as the second.
+//
+// A division by `expf` rather than a multiply by `__expf(-s)`, which is the
+// same arithmetic and not the same numbers: twelve flows compose this, so the
+// cheaper intrinsic's error compounds where the reference's does not.
+extern "C" __global__ void coupling_inverse(
+    const float* __restrict__ x, const float* __restrict__ st,
+    float* __restrict__ out, int half, int t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= half * t) return;
+    int c = i / t;
+    int p = i - c * t;
+    float b = st[(size_t)c * t + p];
+    float s = st[(size_t)(half + c) * t + p];
+    out[i] = (x[i] - b) / expf(s);
+}
+
 "#;

@@ -1612,6 +1612,7 @@ dependencies = [
  "xabe-cosy",
  "xabe-cuda",
  "xabe-serve",
+ "xabe-taco",
  "xabe-translate",
  "xabe-tts",
  "xabe-vad",
@@ -1683,6 +1684,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "xabe-taco"
+version = "0.0.0"
+dependencies = [
+ "rustc-hash",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "xabe-audio",
+ "xabe-cuda",
+ "xabe-dsp",
+ "xabe-st",
 ]
 
 [[package]]

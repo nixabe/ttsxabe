@@ -18,6 +18,7 @@ members = [
     "crates/xabe-chat",
     "crates/xabe-cosy",
     "crates/xabe-translate",
+    "crates/xabe-taco",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ xabe-audio = { path = "crates/xabe-audio" }
 xabe-serve = { path = "crates/xabe-serve" }
 xabe-vad = { path = "crates/xabe-vad" }
 xabe-whisper = { path = "crates/xabe-whisper" }
+xabe-taco = { path = "crates/xabe-taco" }
 xabe-asr = { path = "crates/xabe-asr" }
 xabe-llama = { path = "crates/xabe-llama" }
 xabe-gguf = { path = "crates/xabe-gguf" }

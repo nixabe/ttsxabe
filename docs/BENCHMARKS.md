@@ -239,6 +239,104 @@ make `Q8_0` *faster* rather than merely smaller is still not in this workspace.
 Whether unpacking per use costs measurable time on the decode loop has not been
 measured and is not claimed either way.
 
+## Tacotron2 + WaveGlow: 3.07x, and where it went
+
+Measured on card 0, Quadro RTX 8000, medians over nine rounds after two warmups,
+with `xabe-taco-bench`. Synthesis is stochastic, so the frame count moves
+between runs on the same text and a mean would mostly be measuring that.
+
+| Text | Audio | Before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `li2 ho2` | 5.57 s | 1381.6 ms | 453.3 ms | 3.05x |
+| `gua2 si7 tai5-uan5-lang5` | 1.60 s | 407.9 ms | 133.0 ms | 3.07x |
+| a two-clause line | 5.57 s | 1399.4 ms | 467.4 ms | 2.99x |
+
+**3.90x realtime to 12.04x realtime** on the middle line. Through a warm server,
+against the engine already running beside it:
+
+| Engine | Round trip | Audio | Realtime |
+| --- | ---: | ---: | ---: |
+| mms (VITS) | 36.7 ms | 1.38 s @ 16 kHz | 37.4x |
+| tacotron2 | 132.6 ms | 1.59 s @ 22.05 kHz | 12.0x |
+
+Still 3.6x behind the synthesiser this repository started with, which is what an
+autoregressive decoder and an 87.9 M-parameter flow vocoder cost against a
+one-shot 36.3 M-parameter VITS. It is not what decides a turn.
+
+### What the four changes were worth
+
+Every one of them is the same observation: the work was being done by a general
+kernel where a specialised one already existed.
+
+| Change | Median | Note |
+| --- | ---: | --- |
+| baseline | 407.9 ms | |
+| 1x1 convolutions to `gemm` | 296.8 ms | `wn cond` alone, 117.8 to 35.6 ms |
+| the decode loop's one-row projections to `gemm` | 215.0 ms | dispatches to `gemv` |
+| the dilated convolution to `im2col` + `gemm` | 176.4 ms | |
+| the coupling network kept in `[steps, channels]` | 133.9 ms | |
+| the matmul path's weights stored f16 | 132.2 ms | ~1%, kept for the width |
+
+**A 1x1 convolution is a matmul.** `conv1d` is a windowed kernel that stages a
+halo in shared memory, for a window of one. Four of WaveGlow's five projections
+per layer are 1x1.
+
+**One row is a `gemv`.** The decoder's per-step projections were going through
+`linear`; `gemm` dispatches to `gemv` below seventeen rows, which keeps f32 end
+to end - only the *tiled* kernel stages f16. So this one was free of any
+accuracy question, and the encoder's agreement with the reference improved
+slightly, from 1.252e-6 to 1.222e-6.
+
+**The layout was the last third of it.** Every operation in a coupling network
+is a matmul, and a matmul wants its contracted axis last. Holding the data
+channel-major meant transposing around each of them - about thirty per flow,
+three hundred and sixty per utterance. Keeping the whole network in `[steps,
+channels]` leaves two, at the boundary with the flow. That needed the
+conditioning and residual/skip weights split at load, because in this layout
+their output slices are strides rather than ranges, and a `gated_activation`
+that splits along the inner axis.
+
+**f16 weights bought about one percent.** Kept anyway: the tiled kernel rounds
+both operands to f16 inside itself regardless, so storing them rounded is
+strictly less work and half the width at identical numerics. The measured effect
+on speed was inside the noise, and is reported as such rather than rounded up.
+
+### What it cost in accuracy: -54 dB
+
+The vocoder now reaches the tensor cores, which round both operands to f16.
+Against the original f32 path, on the same seed:
+
+- identical length, 36096 samples
+- correlation **0.999998**
+- rms difference **1.94e-3 of rms signal, -54.3 dB**
+
+Below WaveGlow's own sampling noise. The mel is bit-identical either way - the
+decoder's arithmetic did not change precision, only kernel - so this is the
+vocoder alone.
+
+### The profile that is left, and why it stops here
+
+Of 156 ms on the timed run of the middle line: the coupling networks are 75 ms
+and are now real tensor-core work, and the decode loop is 69 ms and is **launch
+bound**. Thirty-five launches a step, 138 steps, at ten to fifteen microseconds
+of latency each - the arithmetic in a step is a handful of `gemv`s over
+kilobytes. Fusing them, or replaying the step as a CUDA graph, is the next
+lever and is a project rather than a change.
+
+### A measurement trap in the harness itself
+
+The per-stage breakdown attributed 23.9 ms to `coupling_inverse`, a kernel that
+measures 6.6 us in isolation on the same shapes - a factor of three hundred. It
+was not that kernel. Timing a stage means synchronising after it, and the
+transposes being timed elsewhere were queueing work that some later sync had to
+drain; the breakdown moved it to whichever stage happened to sync. It vanished
+when the transposes did.
+
+So the totals in these tables are from runs with timing **off**, and the
+breakdown is only ever used to decide where to look next. `taco_bench` prints
+both and labels the timed one as not comparable, which is the honest way to
+show a number that is useful and wrong.
+
 ## Headroom
 
 The decoder is 100.2 GFLOP for this utterance - 6.15e8 per input frame, 2.4e6

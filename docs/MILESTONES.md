@@ -539,6 +539,58 @@ reads packed blocks. The embedding table is a gather with its own kernel and is
 still widened to f32 at load, which at 8 B is 2.1 GB whatever the file says.
 That is the next lever and is not claimed as done.
 
+## Outside the numbering: a third synthesiser, Tacotron2 + WaveGlow
+
+Not a plan phase. It is here because the person who speaks the language judged
+its output better than either of the two engines that were already running, and
+that is the one axis the engine could not measure for itself.
+
+| | State |
+| --- | --- |
+| `tools/convert_tacotron2.py` | both checkpoints to safetensors, geometry validated, round trip bit-identical |
+| `xabe-taco` | config, weight binding, tokeniser, POJ to Tâi-lô, both forward passes |
+| `lstm_gates`, `coupling_inverse`, `mul_inplace` | three new CUDA kernels, each against a twin |
+| `--tts-engine name=<dir>`, `--taco-sigma` | registered like any other engine, sniffed by filename |
+| encoder vs the reference | max-abs **1.22e-6**, cosine **1.000000000** |
+| `xabe-taco-bench` | per-stage breakdown, and the totals it is not allowed to claim |
+| speed | **3.07x** after optimisation; 12.04x realtime |
+
+Four things are worth carrying forward.
+
+**It is the first stage that reads converted weights.** WaveGlow ships as a
+pickled `nn.Module` object graph in the pre-1.6 torch format and cannot be
+parsed without PyTorch and the model's own class definitions. That is a
+property of how the file was saved, not a shortcut taken here, but the claim
+that this workspace reads published checkpoints directly now has exactly one
+exception and it is this one.
+
+**Only the encoder is verified against the reference.** The prenet keeps its
+dropout at inference - `training=True`, hardcoded, and load-bearing rather than
+a bug - and WaveGlow starts from noise, so the decoder and the vocoder cannot be
+compared to anything sample for sample without capturing and replaying the
+reference's own draws. The encoder is deterministic and holds the three things
+most likely to be silently wrong: the batch-norm folding, the LSTM gate order,
+and the direction-concatenation order.
+
+**The tone digits are not optional.** The checkpoint's whole vocabulary is 71
+symbols - pad, `-`, `!,.:;? `, `A-Za-z`, `0-9` - and its tokeniser drops
+everything else without a word. POJ handed to it unconverted loses every
+diacritic and every tone with them, which is the same silence as handing it Han.
+`poj_to_tlpa` is therefore part of the model, not a convenience.
+
+**It was optimised afterwards, and measured: 3.07x.** 407.9 ms to 133.0 ms on
+a 1.60 s line, 3.90x realtime to 12.04x, at a cost of -54 dB against the f32
+path. Four changes, all of them the same observation - the work was going
+through a general kernel where a specialised one already existed - and the
+detail is in `docs/BENCHMARKS.md`, which is also where the trap in the timing
+harness is written down. It remains 3.6x behind mms per clause, which is what
+an autoregressive decoder and a flow vocoder cost.
+
+The denoiser is the known omission: the reference follows the vocoder with a
+bias-spectral-subtraction post-filter at strength 0.01. It is not part of
+WaveGlow, it needs a 1024-point STFT and its inverse, and at that strength it is
+a polish rather than a fix.
+
 ## Outside the numbering: the packed matmul stopped unpacking per element
 
 The packed-weight work recorded above bought residency and was never measured

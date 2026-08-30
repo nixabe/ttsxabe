@@ -127,8 +127,11 @@ pub struct Args {
     /// others, which is how the page offers mms and cosyvoice side by side.
     ///
     /// A value that begins `http://` or `https://` is another process. Anything
-    /// else is a directory, opened **in this one**: a CosyVoice3 checkpoint if
-    /// it holds `llm.safetensors`, `flow.safetensors` and `hift.safetensors`,
+    /// else is a directory, opened **in this one**, and which model it holds is
+    /// read off the filenames rather than asked for in a second flag: a
+    /// CosyVoice3 checkpoint if it holds `llm.safetensors`, `flow.safetensors`
+    /// and `hift.safetensors`, a Tacotron2 one if it holds
+    /// `tacotron2.safetensors`, `waveglow.safetensors` and `tacotron2.json`,
     /// and a VITS one otherwise. Local engines from here run on
     /// `--tts-device`, the same card as `--tts-model`.
     #[arg(
@@ -158,6 +161,16 @@ pub struct Args {
         default_value = "You are a helpful assistant. \u{8acb}\u{7528}\u{95a9}\u{5357}\u{8a71}\u{8868}\u{9054}\u{3002}<|endofprompt|>"
     )]
     pub cosy_instruct: String,
+
+    /// How much noise a local Tacotron2 engine's vocoder starts from.
+    ///
+    /// WaveGlow samples the waveform from a Gaussian and this is its standard
+    /// deviation. The reference infers at 0.666 rather than the 1.0 it trained
+    /// on, which trades a little variety for a lot less hiss; lower is
+    /// flatter and cleaner, higher is breathier. Defaults to whatever
+    /// `tacotron2.json` records.
+    #[arg(long, env = "XABE_TACO_SIGMA", value_name = "SIGMA")]
+    pub taco_sigma: Option<f32>,
 
     /// Which engine the page selects on load.
     #[arg(long, env = "XABE_TTS_DEFAULT", value_name = "NAME")]

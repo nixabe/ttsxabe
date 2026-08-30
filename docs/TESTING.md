@@ -274,3 +274,39 @@ somebody else's pipeline, and these models are not small. `nvidia-smi` first.
 ```sh
 XABE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
 ```
+
+## `XABE_TACO_DEVICE`, and what Tacotron2 can be tested against
+
+Same rule, same reason: `nvidia-smi` first.
+
+```sh
+XABE_TACO_DEVICE=2 cargo test --release -p xabe-taco
+```
+
+The text tests need no card and always run. Of the rest, **only the encoder is
+compared against the reference**, and that is not a gap in the tests but a
+property of the model: `Prenet.forward` passes `training=True` to `F.dropout`
+unconditionally, so every decoder step multiplies by a fresh random mask, and
+WaveGlow then starts from Gaussian noise. Two correct implementations do not
+agree sample for sample, and neither do two runs of one.
+
+The encoder has no dropout at inference and is therefore deterministic, which
+also puts the three riskiest things in the crate inside it: the batch-norm
+folding, the LSTM gate order, and the order the two LSTM directions are
+concatenated in. Each of those produces bounded, plausible output when wrong.
+
+```sh
+python tools/oracle/capture_tacotron2.py \
+    --src /path/to/taiwanese_tonal_tlpa_tacotron2/tacotron2 \
+    --text "gua2 si7 tai5-uan5-lang5" --out .golden/tacotron2/nan
+```
+
+Measured at **max-abs 1.22e-6 and cosine 1.000000000** on that capture. The
+test's bound is 1e-5, an order of magnitude above the observation rather than
+the 2e-4 the arithmetic would permit: a tolerance far looser than the observed
+error is a test that passes through the bug it exists to catch.
+
+What the decoder and vocoder get instead is arithmetic with no tolerance at
+all - the waveform is a whole number of 256-sample frames, the peak is at full
+scale, the variance is not zero - plus a seed-reproducibility test, which is
+what turns the stochasticity into a property rather than an excuse.

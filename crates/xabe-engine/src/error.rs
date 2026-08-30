@@ -54,6 +54,10 @@ pub enum EngineError {
     #[error(transparent)]
     Audio(#[from] xabe_audio::AudioError),
 
+    /// A Tacotron2 stage could not be loaded or run.
+    #[error(transparent)]
+    Taco(#[from] xabe_taco::TacoError),
+
     /// A CosyVoice stage could not be loaded or run.
     #[error(transparent)]
     Cosy(#[from] xabe_cosy::CosyError),

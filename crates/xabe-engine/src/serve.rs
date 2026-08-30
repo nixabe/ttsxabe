@@ -135,10 +135,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         Stage::Local { path, device } => {
             // `--tts-model` takes either checkpoint; which one it is, is a
             // property of the directory rather than of a second flag.
-            let local = match is_cosyvoice(path) {
-                true => spawn_cosy(args, path, *device)?,
-                false => spawn_synthesiser(args, path, *device)?,
-            };
+            let local = spawn_local(args, path, *device)?;
             tts.insert(
                 xabe_serve::LOCAL_ENGINE.to_string(),
                 TtsBackend::Local(local),
@@ -172,11 +169,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
                 .device()
                 .or_else(|| args.tts_device.as_deref().and_then(Device::parse))
                 .unwrap_or(Device::Cpu);
-            let local = match is_cosyvoice(&dir) {
-                true => spawn_cosy(args, &dir, device)?,
-                false => spawn_synthesiser(args, &dir, device)?,
-            };
-            TtsBackend::Local(local)
+            TtsBackend::Local(spawn_local(args, &dir, device)?)
         };
         tts.insert(name.to_string(), backend);
     }
@@ -464,6 +457,114 @@ fn is_cosyvoice(dir: &std::path::Path) -> bool {
     ["llm.safetensors", "flow.safetensors", "hift.safetensors"]
         .iter()
         .all(|f| dir.join(f).is_file())
+}
+
+/// Whether a directory holds a converted Tacotron2 + WaveGlow pair.
+///
+/// All three files for the same reason `is_cosyvoice` wants all of its: a
+/// directory with the weights and no `tacotron2.json` is a half-run of
+/// `tools/convert_tacotron2.py`, and saying so here beats failing inside a
+/// symbol table with the path already out of scope.
+pub fn is_tacotron(dir: &std::path::Path) -> bool {
+    xabe_taco::FILES.iter().all(|f| dir.join(f).is_file())
+}
+
+/// Opens whichever synthesiser a directory holds.
+///
+/// Which model it is, is a property of the directory rather than of a flag.
+/// The three checks are disjoint - no checkpoint carries another's filenames -
+/// so the order is readability, not precedence.
+fn spawn_local(
+    args: &Args,
+    dir: &std::path::Path,
+    device: Device,
+) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
+    if is_cosyvoice(dir) {
+        spawn_cosy(args, dir, device)
+    } else if is_tacotron(dir) {
+        spawn_taco(args, dir, device)
+    } else {
+        spawn_synthesiser(args, dir, device)
+    }
+}
+
+/// Starts a Tacotron2 + WaveGlow synthesiser on its own thread.
+///
+/// Mirrors [`spawn_cosy`] and differs in two things, both properties of the
+/// model:
+///
+/// - It is **CUDA only**, for the same reason CosyVoice is: WaveGlow is 87.9 M
+///   parameters of dilated convolution run at the sample rate.
+/// - It reads **romanisation**, like mms rather than like CosyVoice, so pair it
+///   with `--tts-script <name>=POJ`. POJ is transliterated to the Tâi-lô the
+///   checkpoint was trained on inside the crate, since that is a fact about
+///   this checkpoint and not about the pipeline.
+fn spawn_taco(
+    args: &Args,
+    dir: &std::path::Path,
+    device: Device,
+) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
+    let Device::Cuda(ordinal) = device else {
+        return Err(EngineError::LocalOnly {
+            stage: crate::stage::Kind::Tts,
+        });
+    };
+
+    // Opened on the calling thread, so a geometry this crate cannot run is a
+    // preflight failure rather than a first turn of silence.
+    let taco = xabe_taco::Taco::open(dir, ordinal, args.taco_sigma, args.seed)?;
+    let rate = taco.sample_rate() as u32;
+
+    let (tx, mut rx) = mpsc::channel::<SynthesisJob>(JOB_QUEUE);
+    std::thread::Builder::new()
+        .name("xabe-taco".into())
+        .spawn(move || {
+            while let Some(job) = rx.blocking_recv() {
+                speak_taco(&taco, &job, rate);
+            }
+            tracing::debug!("tacotron2 thread stopping");
+        })
+        .map_err(|source| EngineError::Io {
+            what: "starting the tacotron2 thread",
+            path: dir.display().to_string(),
+            source,
+        })?;
+
+    Ok(tx)
+}
+
+/// Speaks one job with Tacotron2, sending each clause as it is produced.
+///
+/// Chunked on romanisation like the VITS path rather than on Han like the
+/// CosyVoice one, and for a second reason besides getting first audio out
+/// sooner: this decoder is autoregressive with a learned stop, and a long
+/// input is where an attention that has lost its place runs to the step limit.
+fn speak_taco(taco: &xabe_taco::Taco, job: &SynthesisJob, rate: u32) {
+    let text = xabe_serve::clean(&job.text);
+    if text.is_empty() {
+        return;
+    }
+
+    for (i, chunk) in xabe_serve::split_poj(&text, 120).iter().enumerate() {
+        match taco.synthesize(chunk) {
+            Ok(audio) if !audio.is_empty() => {
+                let wav = xabe_audio::wav_bytes(&audio, rate);
+                let msg = xabe_serve::TtsChunk {
+                    seq: i as u64 + 1,
+                    wav: B64.encode(&wav),
+                    taigi: String::new(),
+                    roman: chunk.clone(),
+                };
+                if job.reply.blocking_send(msg).is_err() {
+                    return;
+                }
+            }
+            // Nothing in the clause was in the 71-symbol alphabet.
+            Ok(_) => {}
+            // One unspeakable clause should not silence the whole reply.
+            Err(e) => tracing::warn!(%e, chunk = %chunk, "could not synthesise a clause"),
+        }
+    }
 }
 
 /// Starts a CosyVoice3 synthesiser on its own thread.

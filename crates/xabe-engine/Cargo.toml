@@ -15,6 +15,7 @@ xabe-cuda.workspace = true
 xabe-serve.workspace = true
 xabe-vad.workspace = true
 xabe-translate.workspace = true
+xabe-taco.workspace = true
 xabe-tts.workspace = true
 xabe-vits.workspace = true
 clap.workspace = true
@@ -39,3 +40,7 @@ path = "src/bin/vram_report.rs"
 [[bin]]
 name = "xabe-llm-bench"
 path = "src/bin/llm_bench.rs"
+
+[[bin]]
+name = "xabe-taco-bench"
+path = "src/bin/taco_bench.rs"

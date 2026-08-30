@@ -277,8 +277,10 @@ const NAMES: &[&str] = &[
     "act_tanh",
     "act_gelu",
     "gated_activation",
+    "gated_activation_rows",
     "add_inplace",
     "sub_inplace",
+    "mul_inplace",
     "scale_inplace",
     "copy_range",
     "copy_into",
@@ -305,6 +307,8 @@ const NAMES: &[&str] = &[
     "split_heads_t",
     "merge_heads",
     "causal_mask",
+    "lstm_gates",
+    "coupling_inverse",
 ];
 
 impl Gpu {
@@ -1035,6 +1039,75 @@ impl Gpu {
         Ok(out)
     }
 
+    /// WaveNet's gated activation for `[t, 2 * ch]` data.
+    ///
+    /// The row-major twin of [`Gpu::gated_activation`]: same arithmetic, the
+    /// other layout. Both exist because the two callers keep their data
+    /// differently, and a transpose to share one kernel costs more than the
+    /// kernel does.
+    pub fn gated_activation_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        ch: usize,
+        t: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let mut out = self.zeros(ch * t)?;
+        let (a, b_) = (ch as i32, t as i32);
+        let f = self.func("gated_activation_rows");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&a).arg(&b_);
+        launched("gated_activation_rows", unsafe {
+            lb.launch(Self::flat(ch * t))
+        })?;
+        Ok(out)
+    }
+
+    /// One LSTM step. Mirrors `xabe_dsp::lstm_gates`.
+    ///
+    /// `gi` and `gh` are the input-side and hidden-side pre-activations, each
+    /// `[4 * hidden]` in PyTorch's input/forget/cell/output order. `c` is
+    /// updated in place and `h` written; both are `[hidden]`.
+    ///
+    /// Split that way because the input side does not depend on the recurrence:
+    /// a bidirectional encoder can project its whole sequence with one
+    /// [`Gpu::linear`] and then loop over nothing but this.
+    pub fn lstm_gates(
+        &self,
+        gi: &CudaSlice<f32>,
+        gh: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        h: &mut CudaSlice<f32>,
+        hidden: usize,
+    ) -> Result<(), CudaError> {
+        let n = hidden as i32;
+        let f = self.func("lstm_gates");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(gi).arg(gh).arg(c).arg(h).arg(&n);
+        launched("lstm_gates", unsafe { lb.launch(Self::flat(hidden)) })
+    }
+
+    /// WaveGlow's affine coupling, inverted. Mirrors `xabe_dsp::coupling_inverse`.
+    ///
+    /// `x` is `[half, t]`, `st` is `[2 * half, t]` holding the shift then the
+    /// log scale, and the result is `(x - b) / exp(s)`.
+    pub fn coupling_inverse(
+        &self,
+        x: &CudaSlice<f32>,
+        st: &CudaSlice<f32>,
+        half: usize,
+        t: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let mut out = self.zeros(half * t)?;
+        let (a, b_) = (half as i32, t as i32);
+        let f = self.func("coupling_inverse");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(st).arg(&mut out).arg(&a).arg(&b_);
+        launched("coupling_inverse", unsafe {
+            lb.launch(Self::flat(half * t))
+        })?;
+        Ok(out)
+    }
+
     /// Element-wise `a += b`.
     pub fn add_inplace(
         &self,
@@ -1047,6 +1120,24 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(a).arg(b).arg(&len);
         launched("add_inplace", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// Element-wise `a *= b`.
+    ///
+    /// Sits next to the add and the subtract because Tacotron2's prenet keeps
+    /// its dropout on at inference - the mask is a vector, not a scalar, so
+    /// `scale_inplace` cannot express it.
+    pub fn mul_inplace(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        let len = n as i32;
+        let f = self.func("mul_inplace");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(b).arg(&len);
+        launched("mul_inplace", unsafe { lb.launch(Self::flat(n)) })
     }
 
     /// Element-wise `a -= b`.
@@ -1654,16 +1745,19 @@ impl Gpu {
         k: usize,
         stride: usize,
         pad: usize,
+        dilation: usize,
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
-        let out_t = (t + 2 * pad - k) / stride + 1;
+        let span = dilation * (k - 1) + 1;
+        let out_t = (t + 2 * pad - span) / stride + 1;
         let cols = in_ch * k;
         let mut out = self.zeros(out_t * cols)?;
-        let (a, b_, c, d, e, g) = (
+        let (a, b_, c, d, e, dl, g) = (
             t as i32,
             in_ch as i32,
             k as i32,
             stride as i32,
             pad as i32,
+            dilation as i32,
             out_t as i32,
         );
         let f = self.func("im2col");
@@ -1675,6 +1769,7 @@ impl Gpu {
             .arg(&c)
             .arg(&d)
             .arg(&e)
+            .arg(&dl)
             .arg(&g);
         launched("im2col", unsafe { lb.launch(Self::flat(out_t * cols)) })?;
         Ok((out, out_t))

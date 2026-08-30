@@ -55,6 +55,28 @@ pub fn speak(
     out: &Path,
 ) -> Result<(), EngineError> {
     let text = read_text(text)?;
+
+    // Tacotron2 first, and by filename: `Checkpoint::locate` below assumes a
+    // VITS layout, and a directory holding `tacotron2.json` is not one.
+    if crate::serve::is_tacotron(path) {
+        let Device::Cuda(ordinal) = device else {
+            return Err(EngineError::LocalOnly {
+                stage: crate::stage::Kind::Tts,
+            });
+        };
+        let taco = xabe_taco::Taco::open(path, ordinal, args.taco_sigma, args.seed)?;
+        let rate = taco.sample_rate() as u32;
+        let audio = taco.synthesize(&text)?;
+        tracing::info!(
+            seconds = format!("{:.2}", audio.len() as f32 / rate as f32),
+            samples = audio.len(),
+            "synthesised",
+        );
+        write_out(out, &audio, rate)?;
+        tracing::info!(out = %out.display(), "wrote");
+        return Ok(());
+    }
+
     let ck = Checkpoint::locate(path, args.config.as_deref());
 
     let (rate, audio) = match device {

@@ -438,7 +438,7 @@ impl AsrModel {
             let t = h.len() / c.in_ch;
             // Width 3 with one of padding on each side: "same" at stride 1, and
             // exactly half the frames at stride 2.
-            let (col, out_t) = self.gpu.im2col(&h, t, c.in_ch, c.k, c.stride, 1)?;
+            let (col, out_t) = self.gpu.im2col(&h, t, c.in_ch, c.k, c.stride, 1, 1)?;
             h = self.gpu.gemm_batched(
                 Operand::F32(&col),
                 Operand::F16(&c.w),
