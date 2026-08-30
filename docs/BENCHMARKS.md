@@ -83,6 +83,44 @@ delta, or an "improved from X" narrative. The change story belongs in the commit
 message; durable reasoning belongs in WHY below, and measured rejections in
 WHY NOT.
 
+## Against llama.cpp, which is the baseline and is still ahead
+
+This section used to say the measurement to take was decode tokens per second
+against `llama-server`. It had never been taken. It has now, with `llama-bench`
+on the same card and the same two files, `-ngl 99`, and it is not a comfortable
+number.
+
+| Checkpoint | | llama.cpp | this engine | |
+| --- | --- | ---: | ---: | ---: |
+| Breeze2 8 B Q4_K_M | prefill, 128 tok | **1950 tok/s** | 551 tok/s | 3.5x behind |
+| | decode, 64 tok | **101.2 tok/s** | 60.8 tok/s | 1.66x behind |
+| Taigi 13 B Q4_K_M | prefill, 128 tok | **1327 tok/s** | 399 tok/s | 3.3x behind |
+| | decode, 64 tok | **61.5 tok/s** | 35.8 tok/s | 1.72x behind |
+
+**Behind on all four.** The 6.4x below is real and is against where this engine
+started, not against llama.cpp; nothing here has ever beaten it, and the earlier
+absence of this table is the reason that was easy to miss.
+
+Decode is bandwidth. llama.cpp moves about 480 GB/s of Q4_K against this
+engine's 300 in-model and 372 for the matmul alone, on a card whose streaming
+roof for the same buffer measures 587. So roughly a fifth of the gap is
+everything that is not the matmul, and the rest is the matmul.
+
+Their mat-vec differs structurally rather than in one trick, and the source says
+why: `mmvq.cu` notes that on Turing a thread running too few k-iterations
+"cannot keep enough loads in flight to reach the bandwidth roof", and it splits
+one output row across a whole thread block, reducing through shared memory, with
+`rows_per_cuda_block` tuned per quantisation type. This engine gives one warp
+one output column. Six attempts to close the gap without adopting that shape are
+in WHY NOT below, all measured worse.
+
+Prefill is arithmetic, and 3.5x is the larger gap of the two. It is not the
+unpacking: the f16 path, which does no unpacking at all, runs at 322 tok/s
+against llama.cpp's 1950. The tiled `gemm` reaches 15-17 TFLOP/s on the shapes
+`bench-gemm` covers and about 6 on a 128-row prefill, where the whole `m`
+dimension is one tile and the staging has nothing to amortise against. That is a
+tiling problem and it has not been worked on.
+
 ## The two Llama stages: 6.4x, and the ceiling that is left
 
 One Quadro RTX 8000, `xabe-llm-bench`, 128 prompt tokens then 64 decoded,
@@ -668,7 +706,7 @@ speedup: the cut in `translate` exists precisely because the model *sometimes*
 closes its tag instead of ending, and on those turns the loop had no way to
 know. It bounds a tail that does not show up in a median.
 
-### Four more attempts at the decode gemv, all measured worse
+### Six attempts at the decode gemv, all measured worse
 
 Decode reads every weight once a token, so its `gemv` is the whole of what a
 clause costs once prefill is fixed. It runs at 372 GB/s. A kernel that reads the
@@ -688,10 +726,21 @@ against the shipped kernel's 88.1 us:
   80.0 us. That is the whole of what the activation loads cost: 9%. They are not
   the limiter, which is why the first two could not have worked.
 
-What is left is the format. Between the header decode and reading 144-byte
-blocks in two pieces rather than as a stream, 372 GB/s against 587 is close to
-what unpacking Q4_K on the fly is worth on this card. The next honest step is a
-cheaper format, not a cheaper kernel.
+Two more, added when llama.cpp was measured and turned out to be 1.66x ahead:
+
+- **An int8-quantised activation with `__dp4a`**, which is where llama.cpp's
+  mat-vec gets its integer throughput - 101.6 us against the float path's 106.0
+  in the same harness, 4%, for 3.7e-3 relative error. Worth knowing before
+  someone spends a week on it: `dp4a` is not the thing that makes their kernel
+  fast, and on this shape the arithmetic was never the limit.
+- **Four super-blocks of loads issued before any is consumed**, aimed straight
+  at the memory-level parallelism their source names - 394.8 us, 4.5x *slower*.
+  Four headers and eight `float4` in flight is far past what 64 registers hold,
+  and it spills to local memory.
+
+What is left is the shape of the kernel, not the arithmetic in it. Closing the
+gap means one output row per thread block with a shared-memory reduction, which
+is a rewrite of the dispatch rather than an edit to the inner loop.
 
 ### Two micro-optimisations of the K-quant gemv, both measured flat
 

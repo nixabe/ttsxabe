@@ -57,11 +57,14 @@ detection, speech recognition and Mandarin-to-Taigi translation. CosyVoice is
 scoped and not started — `docs/MILESTONES.md` has the state of every item, and
 is the file to read before starting work rather than this paragraph.
 
-Two standings are worth knowing here because they are easy to assume wrongly.
+Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
 medians. The ASR is **0.55x** against `whisper-server` — a stated milestone that
-is not met, recorded as a miss. Those numbers and every other comparison belong
-in `docs/BENCHMARKS.md` and nowhere else.
+is not met, recorded as a miss. And both Llama stages are **behind llama.cpp on
+this hardware**: 0.60x and 0.58x on decode, and about 0.29x on prefill. The
+large speedups recorded for them are against where this engine started, not
+against llama.cpp, which has never been beaten here. Those numbers and every
+other comparison belong in `docs/BENCHMARKS.md` and nowhere else.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.
