@@ -2,7 +2,7 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Quant};
+use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -241,9 +241,18 @@ pub struct Translator {
 
 /// The keys and values a decode step reuses.
 pub struct Cache {
-    /// Per layer, `[len, hidden]`, rotated before storing.
+    /// Per layer, head-major and rotated before storing: keys are
+    /// `[heads, capacity, head_dim]` and values `[heads, head_dim, capacity]`,
+    /// which are the two shapes attention reads. Rearranging them per step was
+    /// four kernels and four allocations a layer.
     k: Vec<CudaSlice<f32>>,
     v: Vec<CudaSlice<f32>>,
+    /// Tokens the buffers have room for, which is not how many they hold.
+    ///
+    /// Doubled on growth. Growing by exactly the tokens added meant an
+    /// allocation, a zeroing and a full copy of the cache for every layer of
+    /// every token - quadratic in the context.
+    cap: usize,
     len: usize,
 }
 
@@ -303,7 +312,7 @@ impl Translator {
                 None
             } {
                 Some((bytes, ty)) => GWeight::Packed {
-                    data: gpu.upload_u8(&bytes)?,
+                    data: gpu.upload_quant(ty, &bytes)?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -371,7 +380,40 @@ impl Translator {
         Cache {
             k: Vec::new(),
             v: Vec::new(),
+            cap: 0,
             len: 0,
+        }
+    }
+
+    /// Normalises, and takes the int8 twin at the same time when the shape
+    /// admits it.
+    ///
+    /// `None` is not a failure: `gemm_batched` quantises for itself when it has
+    /// to, so the only thing lost is the sharing.
+    fn normed(
+        &self,
+        h: &mut CudaSlice<f32>,
+        add: Option<&CudaSlice<f32>>,
+        rows: usize,
+        k: usize,
+        weight: &CudaSlice<f32>,
+    ) -> Result<(CudaSlice<f32>, Option<Q8>), TranslateError> {
+        let eps = self.cfg.rms_norm_eps;
+        if rows > GEMV_MAX_M || !k.is_multiple_of(1024) {
+            if let Some(a) = add {
+                self.gpu.add_inplace(h, a, rows * k)?;
+            }
+            return Ok((self.gpu.rms_norm(h, rows, k, weight, eps)?, None));
+        }
+        let (x, q8) = self.gpu.rms_norm_q(h, add, rows, k, weight, eps)?;
+        Ok((x, Some(q8)))
+    }
+
+    /// Pairs an activation with its twin, when there is one.
+    fn operand<'a>(x: &'a CudaSlice<f32>, q8: Option<&'a Q8>) -> Operand<'a> {
+        match q8 {
+            Some(q8) => Operand::F32Q { data: x, q8 },
+            None => Operand::F32(x),
         }
     }
 
@@ -428,15 +470,29 @@ impl Translator {
             self.gpu
                 .embed_scaled(&self.embed, &self.gpu.upload_i64(&ids64)?, n, h_dim, 1.0)?;
 
+        // The block output the next normalisation still has to add; see where
+        // it is set. The residual add and the normalisation read the same row,
+        // so they are one pass.
+        let mut residual: Option<CudaSlice<f32>> = None;
         let first = cache.k.is_empty();
+        if cache.cap < past + n {
+            let want = (past + n).next_power_of_two().max(256);
+            for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
+                let mut grown = self.gpu.zeros(want * h_dim)?;
+                self.gpu.copy_into(&mut grown, slot, 0, past * h_dim)?;
+                *slot = grown;
+            }
+            cache.cap = want;
+        }
         let mut tapped = Vec::with_capacity(taps);
         for (i, l) in self.layers.iter().enumerate() {
-            let x = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.attn_norm, self.cfg.rms_norm_eps)?;
-            let mut q = self.project(Operand::F32(&x), &l.q, n)?;
-            let mut k = self.project(Operand::F32(&x), &l.k, n)?;
-            let v = self.project(Operand::F32(&x), &l.v, n)?;
+            // One int8 twin for three projections, taken by the normalisation
+            // that produced the activation.
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.attn_norm)?;
+            let xo = Self::operand(&x, xq.as_ref());
+            let mut q = self.project(xo, &l.q, n)?;
+            let mut k = self.project(xo, &l.k, n)?;
+            let v = self.project(xo, &l.v, n)?;
 
             // Rotated before caching, because the position is absolute: a key
             // stored unrotated would be rotated again by the wrong offset on
@@ -446,79 +502,107 @@ impl Translator {
             self.gpu
                 .rope(&mut k, n, heads, hd, self.cfg.rope_theta, past)?;
 
+            // Scattered straight into the layout attention reads.
             if first {
-                cache.k.push(k);
-                cache.v.push(v);
-            } else {
-                for (slot, new) in [(&mut cache.k[i], k), (&mut cache.v[i], v)] {
-                    let mut grown = self.gpu.zeros((past + n) * h_dim)?;
-                    self.gpu.copy_into(&mut grown, slot, 0, past * h_dim)?;
-                    self.gpu
-                        .copy_into(&mut grown, &new, past * h_dim, n * h_dim)?;
-                    *slot = grown;
-                }
+                cache.k.push(self.gpu.zeros(cache.cap * h_dim)?);
+                cache.v.push(self.gpu.zeros(cache.cap * h_dim)?);
             }
+            let cap = cache.cap;
+            self.gpu
+                .cache_append(&k, &mut cache.k[i], n, heads, hd, cap, past, false)?;
+            self.gpu
+                .cache_append(&v, &mut cache.v[i], n, heads, hd, cap, past, true)?;
             let tk = past + n;
 
-            let qh = self.gpu.split_heads(&q, n, heads, hd)?;
-            let kh = self.gpu.split_heads(&cache.k[i], tk, heads, hd)?;
-            let vt = self.gpu.split_heads_t(&cache.v[i], tk, heads, hd)?;
+            // A single step's queries are already `[head][1][d]`; only a
+            // multi-row pass has anything to split.
+            let qh = match n {
+                1 => None,
+                _ => Some(self.gpu.split_heads(&q, n, heads, hd)?),
+            };
 
             let mut scores = self.gpu.gemm_batched(
-                Operand::F32(&qh),
-                Operand::F32(&kh),
+                Operand::F32(qh.as_ref().unwrap_or(&q)),
+                Operand::F32(&cache.k[i]),
                 None,
                 Batch {
                     count: heads,
                     a: n * hd,
-                    w: tk * hd,
+                    w: cap * hd,
                     out: n * tk,
+                    w_row: 0,
                 },
                 n,
                 hd,
                 tk,
             )?;
             // Llama scales the *scores*, not the query - the opposite of
-            // Whisper, and the same algebra. Copy each where it belongs.
-            self.gpu
-                .scale_inplace(&mut scores, heads * n * tk, (hd as f32).powf(-0.5))?;
-            self.gpu.causal_mask(&mut scores, heads, n, tk, tk - n)?;
-            self.gpu.softmax_rows(&mut scores, heads * n, tk)?;
+            // Whisper, and the same algebra. The scale, the mask and the
+            // softmax are one pass; see `Gpu::softmax_causal`.
+            self.gpu.softmax_causal(
+                &mut scores,
+                heads * n,
+                tk,
+                n,
+                tk - n,
+                (hd as f32).powf(-0.5),
+            )?;
 
             let ctx = self.gpu.gemm_batched(
                 Operand::F32(&scores),
-                Operand::F32(&vt),
+                Operand::F32(&cache.v[i]),
                 None,
+                // `w_row` is `cap`, not `tk`: the values sit in a buffer with
+                // room for more positions than are in it.
                 Batch {
                     count: heads,
                     a: n * tk,
-                    w: hd * tk,
+                    w: hd * cap,
                     out: n * hd,
+                    w_row: cap,
                 },
                 n,
                 tk,
                 hd,
             )?;
-            let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
+            let ctx = match n {
+                1 => ctx,
+                _ => self.gpu.merge_heads(&ctx, n, heads, hd)?,
+            };
+            // Not added here: the next normalisation reads `h + out` and
+            // nothing between now and then does.
             let out = self.project(Operand::F32(&ctx), &l.o, n)?;
-            self.gpu.add_inplace(&mut h, &out, n * h_dim)?;
+            residual = Some(out);
 
-            let x = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.ffn_norm, self.cfg.rms_norm_eps)?;
-            let mut gate = self.project(Operand::F32(&x), &l.gate, n)?;
-            let up = self.project(Operand::F32(&x), &l.up, n)?;
-            self.gpu
-                .silu_mul(&mut gate, &up, n * self.cfg.intermediate_size)?;
-            let down = self.project(Operand::F32(&gate), &l.down, n)?;
-            self.gpu.add_inplace(&mut h, &down, n * h_dim)?;
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
+            let xo = Self::operand(&x, xq.as_ref());
+            let mut gate = self.project(xo, &l.gate, n)?;
+            let up = self.project(xo, &l.up, n)?;
+            let inter = n * self.cfg.intermediate_size;
+            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(1024) {
+                true => Some(self.gpu.silu_mul_q(&mut gate, &up, inter)?),
+                false => {
+                    self.gpu.silu_mul(&mut gate, &up, inter)?;
+                    None
+                }
+            };
+            let down = self.project(Self::operand(&gate, gq.as_ref()), &l.down, n)?;
+            residual = Some(down);
 
+            // A tap is the block's output, so the pending add has to be settled
+            // before it is read.
             if i < taps {
+                if let Some(r) = residual.take() {
+                    self.gpu.add_inplace(&mut h, &r, n * h_dim)?;
+                }
                 tapped.push(self.gpu.download(&h)?);
             }
         }
         cache.len = past + n;
 
+        if let Some(r) = residual.take() {
+            self.gpu.add_inplace(&mut h, &r, n * h_dim)?;
+        }
         let h = self
             .gpu
             .rms_norm(&h, n, h_dim, &self.norm, self.cfg.rms_norm_eps)?;

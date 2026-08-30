@@ -2,7 +2,7 @@
 
 use crate::ChatError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Quant};
+use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, Bpe, LlamaConfig, LlamaWeights};
 
@@ -119,6 +119,15 @@ pub struct ChatModel {
 pub struct Cache {
     k: Vec<CudaSlice<f32>>,
     v: Vec<CudaSlice<f32>>,
+    /// Tokens the buffers have room for, which is not how many they hold.
+    ///
+    /// The first version of this grew by exactly the tokens being added, which
+    /// meant an allocation, a zeroing and a full copy of the whole cache for
+    /// every layer of every token - 128 allocations and 16 MB of copying a
+    /// token at 64 of context, and quadratic in the context after that. It is
+    /// doubled instead, so a decode of any length pays for the growth a
+    /// logarithmic number of times and appends in place the rest.
+    cap: usize,
     len: usize,
 }
 
@@ -137,6 +146,7 @@ impl Cache {
     pub fn clear(&mut self) {
         self.k.clear();
         self.v.clear();
+        self.cap = 0;
         self.len = 0;
     }
 }
@@ -187,7 +197,7 @@ impl ChatModel {
                 .flatten();
             let w = match packed {
                 Some(ty) => GWeight::Packed {
-                    data: gpu.upload_u8(&Self::packed(&f, b, &cfg, ty)?)?,
+                    data: gpu.upload_quant(ty, &Self::packed(&f, b, &cfg, ty)?)?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -312,6 +322,7 @@ impl ChatModel {
         Cache {
             k: Vec::new(),
             v: Vec::new(),
+            cap: 0,
             len: 0,
         }
     }
@@ -332,6 +343,38 @@ impl ChatModel {
             l.in_dim,
             l.out_dim,
         )?)
+    }
+
+    /// Normalises, and takes the int8 twin at the same time when the shape
+    /// admits it.
+    ///
+    /// `None` is not a failure: `gemm_batched` quantises for itself when it has
+    /// to, so the only thing lost is the sharing.
+    fn normed(
+        &self,
+        h: &mut CudaSlice<f32>,
+        add: Option<&CudaSlice<f32>>,
+        rows: usize,
+        k: usize,
+        weight: &CudaSlice<f32>,
+    ) -> Result<(CudaSlice<f32>, Option<Q8>), ChatError> {
+        let eps = self.cfg.rms_norm_eps;
+        if rows > GEMV_MAX_M || !k.is_multiple_of(1024) {
+            if let Some(a) = add {
+                self.gpu.add_inplace(h, a, rows * k)?;
+            }
+            return Ok((self.gpu.rms_norm(h, rows, k, weight, eps)?, None));
+        }
+        let (x, q8) = self.gpu.rms_norm_q(h, add, rows, k, weight, eps)?;
+        Ok((x, Some(q8)))
+    }
+
+    /// Pairs an activation with its twin, when there is one.
+    fn operand<'a>(x: &'a CudaSlice<f32>, q8: Option<&'a Q8>) -> Operand<'a> {
+        match q8 {
+            Some(q8) => Operand::F32Q { data: x, q8 },
+            None => Operand::F32(x),
+        }
     }
 
     /// Runs `ids` through the model and returns the logits, `[n, vocab]`.
@@ -369,15 +412,34 @@ impl ChatModel {
             self.gpu
                 .embed_scaled(&self.embed, &self.gpu.upload_i64(&ids64)?, n, h_dim, 1.0)?;
 
+        // Room for `past + n` before any layer touches it, so the loop below
+        // never allocates. Doubling from a floor of 256 means a 64-token decode
+        // grows once and a 4096-token one grows five times.
+        // The block output that the next normalisation still has to add. See
+        // the note where it is set: the residual add and the normalisation read
+        // the same row, so they are one pass.
+        let mut residual: Option<CudaSlice<f32>> = None;
         let first = cache.k.is_empty();
+        if cache.cap < past + n {
+            let want = (past + n).next_power_of_two().max(256);
+            for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
+                let mut grown = self.gpu.zeros(want * kv_dim)?;
+                self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
+                *slot = grown;
+            }
+            cache.cap = want;
+        }
         let mut tapped = Vec::with_capacity(taps);
         for (i, l) in self.layers.iter().enumerate() {
-            let x = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.attn_norm, self.cfg.rms_norm_eps)?;
-            let mut q = self.project(Operand::F32(&x), &l.q, n)?;
-            let mut k = self.project(Operand::F32(&x), &l.k, n)?;
-            let v = self.project(Operand::F32(&x), &l.v, n)?;
+            // One int8 twin for three projections, taken by the normalisation
+            // that produced the activation. The packed mat-vec would otherwise
+            // take the same one three times, in three launches that each re-read
+            // a row this kernel had just written.
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.attn_norm)?;
+            let xo = Self::operand(&x, xq.as_ref());
+            let mut q = self.project(xo, &l.q, n)?;
+            let mut k = self.project(xo, &l.k, n)?;
+            let v = self.project(xo, &l.v, n)?;
 
             // Rotated before caching, because the position is absolute: a key
             // stored unrotated would be rotated again by the wrong offset on
@@ -395,85 +457,129 @@ impl ChatModel {
             self.gpu
                 .rope_scaled(&mut k, d, n, kv_heads, hd, self.cfg.rope_theta, past)?;
 
+            // Appended in place. `grow` has already made room for `past + n`
+            // and copied what was there, so at steady state this is two copies
+            // a layer and no allocation at all.
+            // Scattered straight into the layout attention reads, rather than
+            // appended and rearranged. See `Gpu::cache_append`.
             if first {
-                cache.k.push(k);
-                cache.v.push(v);
-            } else {
-                for (slot, new) in [(&mut cache.k[i], k), (&mut cache.v[i], v)] {
-                    let mut grown = self.gpu.zeros((past + n) * kv_dim)?;
-                    self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
-                    self.gpu
-                        .copy_into(&mut grown, &new, past * kv_dim, n * kv_dim)?;
-                    *slot = grown;
-                }
+                cache.k.push(self.gpu.zeros(cache.cap * kv_dim)?);
+                cache.v.push(self.gpu.zeros(cache.cap * kv_dim)?);
             }
+            let cap = cache.cap;
+            self.gpu
+                .cache_append(&k, &mut cache.k[i], n, kv_heads, hd, cap, past, false)?;
+            self.gpu
+                .cache_append(&v, &mut cache.v[i], n, kv_heads, hd, cap, past, true)?;
             let tk = past + n;
 
-            // Split at the narrow head count, then expand. `repeat_kv` works
-            // on whole heads, so it is indifferent to whether the head's block
-            // is `[t, hd]` or the transposed `[hd, t]` that the value side
-            // wants - both are `t * hd` contiguous floats per head.
-            let qh = self.gpu.split_heads(&q, n, heads, hd)?;
-            let kh = self.gpu.split_heads(&cache.k[i], tk, kv_heads, hd)?;
-            let kh = self.gpu.repeat_kv(&kh, heads, kv_heads, tk, hd)?;
-            let vt = self.gpu.split_heads_t(&cache.v[i], tk, kv_heads, hd)?;
-            let vt = self.gpu.repeat_kv(&vt, heads, kv_heads, tk, hd)?;
-
+            // The grouped heads *are* the batch. A batch of `kv_heads`
+            // products, each covering the `group` query heads that share one
+            // key head, replaces expanding the keys and values to the query
+            // head count: `repeat_kv` materialised four identical copies of
+            // every cached head, every layer, every token, and this reads the
+            // one copy four times instead.
+            //
+            // The query rows line up for free. `split_heads` lays them out
+            // `[head][t][d]`, so the `group * n` rows one key head serves are
+            // contiguous, and for a single step they are contiguous already -
+            // which is why the split is skipped there.
+            let group = heads / kv_heads;
+            let qh = if n == 1 {
+                None
+            } else {
+                Some(self.gpu.split_heads(&q, n, heads, hd)?)
+            };
             let mut scores = self.gpu.gemm_batched(
-                Operand::F32(&qh),
-                Operand::F32(&kh),
+                Operand::F32(qh.as_ref().unwrap_or(&q)),
+                Operand::F32(&cache.k[i]),
                 None,
                 Batch {
-                    count: heads,
-                    a: n * hd,
-                    w: tk * hd,
-                    out: n * tk,
+                    count: kv_heads,
+                    a: group * n * hd,
+                    w: cap * hd,
+                    out: group * n * tk,
+                    w_row: 0,
                 },
-                n,
+                group * n,
                 hd,
                 tk,
             )?;
             // Llama scales the *scores*, not the query - the opposite of
             // Whisper, and the same algebra. Copy each where it belongs.
-            self.gpu
-                .scale_inplace(&mut scores, heads * n * tk, (hd as f32).powf(-0.5))?;
-            self.gpu.causal_mask(&mut scores, heads, n, tk, tk - n)?;
-            self.gpu.softmax_rows(&mut scores, heads * n, tk)?;
+            self.gpu.softmax_causal(
+                &mut scores,
+                heads * n,
+                tk,
+                n,
+                tk - n,
+                (hd as f32).powf(-0.5),
+            )?;
 
+            // `w_row` is `cap`, not `tk`: the values sit in a buffer with room
+            // for more positions than are in it, so a row of the operand is a
+            // capacity apart. Contracting over `tk` of it is what makes the
+            // untouched tail of the cache irrelevant rather than wrong.
             let ctx = self.gpu.gemm_batched(
                 Operand::F32(&scores),
-                Operand::F32(&vt),
+                Operand::F32(&cache.v[i]),
                 None,
                 Batch {
-                    count: heads,
-                    a: n * tk,
-                    w: hd * tk,
-                    out: n * hd,
+                    count: kv_heads,
+                    a: group * n * tk,
+                    w: hd * cap,
+                    out: group * n * hd,
+                    w_row: cap,
                 },
-                n,
+                group * n,
                 tk,
                 hd,
             )?;
-            let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
+            // `[kv_head][group * n][hd]` is `[head][t][hd]`, which for a single
+            // step is already `[heads * hd]` - the shape the output projection
+            // wants. Only a multi-row pass has anything to merge.
+            let ctx = match n {
+                1 => ctx,
+                _ => self.gpu.merge_heads(&ctx, n, heads, hd)?,
+            };
+            // Not added here. The next normalisation reads `h + out` and
+            // nothing between now and then does, so the sum is left for it to
+            // take in the pass it was going to make anyway.
             let out = self.project(Operand::F32(&ctx), &l.o, n)?;
-            self.gpu.add_inplace(&mut h, &out, n * h_dim)?;
+            residual = Some(out);
 
-            let x = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.ffn_norm, self.cfg.rms_norm_eps)?;
-            let mut gate = self.project(Operand::F32(&x), &l.gate, n)?;
-            let up = self.project(Operand::F32(&x), &l.up, n)?;
-            self.gpu
-                .silu_mul(&mut gate, &up, n * self.cfg.intermediate_size)?;
-            let down = self.project(Operand::F32(&gate), &l.down, n)?;
-            self.gpu.add_inplace(&mut h, &down, n * h_dim)?;
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
+            let xo = Self::operand(&x, xq.as_ref());
+            let mut gate = self.project(xo, &l.gate, n)?;
+            let up = self.project(xo, &l.up, n)?;
+            let inter = n * self.cfg.intermediate_size;
+            // The gate is projected back down by a packed weight, so its twin
+            // comes from the gating rather than from a kernel of its own.
+            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(1024) {
+                true => Some(self.gpu.silu_mul_q(&mut gate, &up, inter)?),
+                false => {
+                    self.gpu.silu_mul(&mut gate, &up, inter)?;
+                    None
+                }
+            };
+            let down = self.project(Self::operand(&gate, gq.as_ref()), &l.down, n)?;
+            residual = Some(down);
 
+            // A tap is the block's output, which is the residual stream *with*
+            // this block's contribution - so the pending add has to be settled
+            // before it is read. Only when a tap is asked for.
             if i < taps {
+                if let Some(r) = residual.take() {
+                    self.gpu.add_inplace(&mut h, &r, n * h_dim)?;
+                }
                 tapped.push(self.gpu.download(&h)?);
             }
         }
         cache.len = past + n;
 
+        if let Some(r) = residual.take() {
+            self.gpu.add_inplace(&mut h, &r, n * h_dim)?;
+        }
         let h = self
             .gpu
             .rms_norm(&h, n, h_dim, &self.norm, self.cfg.rms_norm_eps)?;
