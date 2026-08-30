@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Convert the Taiwanese Tacotron2 + WaveGlow checkpoints to safetensors.
 
+The checkpoints, and the class definitions `--glow-src` points at, come from
+yfliao/taiwanese_tonal_tlpa_tacotron2 (BSD-3-Clause, itself derived from
+NVIDIA's Tacotron2 and WaveGlow). See NOTICE.
+
     python tools/convert_tacotron2.py \
         --tacotron /path/to/tacotron2/model/checkpoint_100000 \
         --waveglow /path/to/tacotron2/model/waveglow/waveglow_main.pt \

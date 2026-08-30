@@ -1,14 +1,17 @@
 //! Getting text into the 71 symbols this model was trained on.
 //!
+//! The reference throughout is yfliao/taiwanese_tonal_tlpa_tacotron2
+//! (BSD-3-Clause); see NOTICE.
+//!
 //! Two jobs, and the second is the one that decides whether it speaks at all.
 //!
 //! # The alphabet is small and silent about what it drops
 //!
-//! `symbols.py` in the reference builds a 71-entry table - pad, `-`, `!,.:;? `,
-//! `A-Za-z`, `0-9` - and its `text_to_sequence` discards everything else
-//! without a word. The same file *defines* 20,950 Han characters and an ARPAbet
-//! set and exports neither, so Han fed to this model tokenises to nothing and
-//! it synthesises near-silence instead of failing. [`Tokenizer::encode`] keeps
+//! `text/symbols.py` in the reference builds a 71-entry table - pad, `-`,
+//! `!,.:;? `, `A-Za-z`, `0-9` - and its `text_to_sequence` discards everything
+//! else without a word. The same file *defines* 20,950 Han characters and an
+//! ARPAbet set and exports neither, so Han fed to this model tokenises to
+//! nothing and it synthesises near-silence instead of failing. [`Tokenizer::encode`] keeps
 //! that behaviour, because it is the checkpoint's, and reports the count so a
 //! caller can tell the difference between a short line and a dropped one.
 //!

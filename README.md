@@ -19,7 +19,9 @@ locally (`--<stage>-model`) or by another process over HTTP (`--<stage>-url`)
 between.
 
 Finished: the synthesiser, the serving layer, voice activity detection, speech
-recognition, Mandarin-to-Taigi translation, the chat model, and CosyVoice3.
+recognition, Mandarin-to-Taigi translation, the chat model, CosyVoice3, and a
+third synthesiser, Tacotron2 + WaveGlow, from
+[taiwanese_tonal_tlpa_tacotron2](https://github.com/yfliao/taiwanese_tonal_tlpa_tacotron2).
 Remaining inside CosyVoice: deriving a **new** voice still runs two ONNX models
 once, through `tools/make_cosyvoice_voice.py`. `docs/MILESTONES.md` has the
 phases and `docs/CLI.md` the flag surface.
@@ -111,9 +113,10 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 47 CUDA kernels, each diffed against its scalar twin |
+| `xabe-cuda` | 51 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
+| `xabe-taco` | Tacotron2 + WaveGlow, POJ to Tâi-lô, converted weights |
 | `xabe-audio` | WAV reading and writing, sample handling |
 | `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
 | `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
@@ -287,6 +290,7 @@ supply, and their terms are between you and whoever published them.
 | `Taigi-Llama-2-Translator-13B` | CC-BY-NC-SA 4.0 — **non-commercial, share-alike** |
 | `Breeze-ASR-26` | Apache-2.0 |
 | `Fun-CosyVoice3-0.5B` | Apache-2.0 |
+| `taiwanese_tonal_tlpa_tacotron2` | BSD-3-Clause, from NVIDIA's Tacotron2 |
 
 The chat model and the VAD carry their own terms too; check the card before you
 ship anything. The non-commercial pair is the part that surprises people, which

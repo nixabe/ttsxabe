@@ -27,6 +27,19 @@ debt even where it is not a copyright one.
       checkpoints and `tools/oracle/capture_cosyvoice.py` runs it to produce
       the oracle these are tested against.
 
+  taiwanese_tonal_tlpa_tacotron2 (BSD-3-Clause),
+  https://github.com/yfliao/taiwanese_tonal_tlpa_tacotron2
+      The reference for `xabe-taco`, and the source of the checkpoints it
+      reads: a Taiwanese tonal-TLPA retraining of NVIDIA's Tacotron2 and
+      WaveGlow, whose BSD-3-Clause notice it carries (Copyright 2018 NVIDIA
+      Corporation). Its `text/symbols.py` defines the 71-symbol alphabet
+      `xabe_taco::text` reproduces, including what that alphabet silently
+      drops; its `hparams.py` fixes the geometry; and its vendored `waveglow`
+      supplies the class definitions `tools/convert_tacotron2.py` needs to
+      unpickle a pre-1.6 torch object graph at all. It is also run, by
+      `tools/oracle/capture_tacotron2.py`, to produce the oracle `xabe-taco`
+      is tested against.
+
   whisper.cpp (MIT), https://github.com/ggml-org/whisper.cpp
       The reference for the VAD segmenter's hysteresis constants and for
       several ASR decoding details. Its divergences from upstream Silero and
