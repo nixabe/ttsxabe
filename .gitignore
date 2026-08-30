@@ -2,3 +2,5 @@ target/
 *.safetensors
 .golden/
 models/
+__pycache__/
+.omc/
