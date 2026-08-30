@@ -552,13 +552,13 @@ impl ChatModel {
             let xo = Self::operand(&x, xq.as_ref());
             let mut gate = self.project(xo, &l.gate, n)?;
             let up = self.project(xo, &l.up, n)?;
-            let inter = n * self.cfg.intermediate_size;
+            let inter = self.cfg.intermediate_size;
             // The gate is projected back down by a packed weight, so its twin
             // comes from the gating rather than from a kernel of its own.
             let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(1024) {
-                true => Some(self.gpu.silu_mul_q(&mut gate, &up, inter)?),
+                true => Some(self.gpu.silu_mul_q(&mut gate, &up, n, inter)?),
                 false => {
-                    self.gpu.silu_mul(&mut gate, &up, inter)?;
+                    self.gpu.silu_mul(&mut gate, &up, n * inter)?;
                     None
                 }
             };

@@ -498,3 +498,55 @@ fn the_wide_kquant_matvec_agrees_with_the_f32_product() {
         }
     }
 }
+
+/// What the tiled matmul's f16 staging costs at the scale a prefill runs it.
+///
+/// Not a rejection and not a gate - a number, printed, because "the operands
+/// are rounded to f16" is a description and the question that matters is how
+/// far that moves a projection of the width these models use.
+#[test]
+fn the_tiled_matmul_reports_its_own_staging_error() {
+    let Some(g) = gpu() else { return };
+    let (m, k, n) = (64usize, 4096usize, 512usize);
+    // Centred, which `seq` is not - it spans [-2, 6]. That matters more than it
+    // looks: an operand with a mean makes the dot product a large positive
+    // number that no rounding threatens, and reports an error a hundred times
+    // smaller than the same kernel makes on an activation, which cancels.
+    let a: Vec<f32> = seq(m * k, 11).iter().map(|v| v - 2.0).collect();
+    let w: Vec<f32> = seq(n * k, 12).iter().map(|v| v - 2.0).collect();
+    let da = g.upload(&a).unwrap();
+    let dw = g.upload(&w).unwrap();
+    let got = g
+        .download(
+            &g.gemm_batched(
+                Operand::F32(&da),
+                Operand::F32(&dw),
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let mut worst = 0.0f64;
+    let mut scale = 0.0f64;
+    for r in 0..m {
+        for c in 0..n {
+            let want: f64 = (0..k)
+                .map(|i| f64::from(a[r * k + i]) * f64::from(w[c * k + i]))
+                .sum();
+            worst = worst.max((want - f64::from(got[r * n + c])).abs());
+            scale = scale.max(want.abs());
+        }
+    }
+    println!(
+        "gemm {m}x{k}x{n}: worst {worst:.5} against a span of {scale:.5} ({:.3}%)",
+        100.0 * worst / scale
+    );
+    // Loose: this exists to report, and a regression of an order of magnitude
+    // is what it would catch.
+    assert!(worst < 0.05 * scale, "staging error {worst} of {scale}");
+}

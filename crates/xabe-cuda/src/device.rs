@@ -2123,7 +2123,7 @@ impl Gpu {
         b: &CudaSlice<f32>,
         n: usize,
     ) -> Result<(), CudaError> {
-        self.silu_mul_inner(a, b, n, false).map(|_| ())
+        self.silu_mul_inner(a, b, 1, n, false).map(|_| ())
     }
 
     /// The same, also emitting the int8 twin the packed mat-vec wants.
@@ -2131,20 +2131,26 @@ impl Gpu {
     /// The gated result is projected straight back down by a packed weight, so
     /// this is the same saving [`Gpu::rms_norm_q`] makes at the other end of
     /// the block.
+    /// `rows` and `k` are given separately even though the kernel walks a flat
+    /// index, because the twin is addressed as `[rows, k]` by the matmul that
+    /// reads it. Passing `rows * k` as the width produces a twin that is the
+    /// right length and the wrong shape - which `gemm_batched` refuses, and
+    /// which nothing downstream would have noticed.
     pub fn silu_mul_q(
         &self,
         a: &mut CudaSlice<f32>,
         b: &CudaSlice<f32>,
-        n: usize,
+        rows: usize,
+        k: usize,
     ) -> Result<Q8, CudaError> {
-        if !n.is_multiple_of(BLOCK as usize) {
+        if !(rows * k).is_multiple_of(BLOCK as usize) || !k.is_multiple_of(32) {
             return Err(CudaError::RaggedBlock {
-                k: n,
+                k: rows * k,
                 block: BLOCK as usize,
             });
         }
         Ok(self
-            .silu_mul_inner(a, b, n, true)?
+            .silu_mul_inner(a, b, rows, k, true)?
             .expect("asked for the twin"))
     }
 
@@ -2153,16 +2159,18 @@ impl Gpu {
         &self,
         a: &mut CudaSlice<f32>,
         b: &CudaSlice<f32>,
-        n: usize,
+        rows: usize,
+        k: usize,
         quantize: bool,
     ) -> Result<Option<Q8>, CudaError> {
+        let n = rows * k;
         // SAFETY: one thread per element writes every code, and its group's
         // first lane every scale.
         let mut q8 = match quantize {
             true => Some(Q8 {
                 buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
-                rows: 1,
-                k: n,
+                rows,
+                k,
             }),
             false => None,
         };
