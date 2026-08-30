@@ -2,7 +2,7 @@
 """Capture llama.cpp's own tokenization of the chat model, as JSON.
 
     python tools/oracle/capture_chat_tokenizer.py \
-        --model models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+        --model models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
         --out .golden/chat/tokenizer.json
 
 # Why llama.cpp and not 🤗

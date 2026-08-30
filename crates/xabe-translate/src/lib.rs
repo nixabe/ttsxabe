@@ -11,4 +11,4 @@ mod error;
 mod model;
 
 pub use error::TranslateError;
-pub use model::{Cache, TEMPLATE, Translator};
+pub use model::{Cache, Packing, TEMPLATE, Translator};

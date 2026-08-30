@@ -111,10 +111,12 @@ and says which variable to set.
 | --- | --- | --- |
 | `XABE_TEST_DEVICE` | CUDA ordinal for tests that need a card | `0` |
 | `XABE_TTS_MODEL` | the VITS checkpoint | `models/tts/mms-tts-nan` |
-| `XABE_LLM_GGUF` | the Breeze2 chat GGUF | `models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
-| `XABE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/llm/taigi-translator-13b-f16.gguf` |
-| `XABE_QUANT_DIR` | a directory of quantized Breeze2 copies | none; those tests skip |
+| `XABE_LLM_GGUF` | the Breeze2 chat GGUF | `models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
+| `XABE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/taigi-translator-13b-f16.gguf` |
+| `XABE_QUANT_DIR` | a directory of quantized copies | none; those tests skip. `models` is where they live |
 | `XABE_CHAT_DEVICE` | the card to load the 8 B chat model onto | none; that test skips |
+| `XABE_QUANT_FILE` | which file in `XABE_QUANT_DIR` the packed test reads | `breeze-Q4_K_M.gguf` |
+| `XABE_TACO_DEVICE` | the card to load Tacotron2 + WaveGlow onto | none; those tests skip |
 
 `XABE_CHAT_DEVICE` has no default either, and for a different reason: this box
 has three cards and two of them are running somebody's pipeline. `run.sh` says
@@ -135,9 +137,52 @@ artefact into a fixed path that a test then silently depends on is how a suite
 becomes unrunnable on a second machine. One command reproduces any of them:
 
 ```sh
-llama-quantize models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+llama-quantize models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
     $XABE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
 ```
+
+### The packed matmul is tested at two distances
+
+`Operand::Q` lets a quantized weight stay packed in VRAM, and being wrong about
+a block layout produces a *permuted* tensor rather than an error - a model that
+loads, runs, and speaks fluent nonsense. So it is checked twice, at different
+distances from the bytes, and neither check subsumes the other.
+
+**Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
+`xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
+at exact equality. It extracts weights *element for element* through a one-hot
+activation on the exact f32 path, so the comparison is equality rather than a
+tolerance and a permutation inside a block cannot hide behind a dot product. It
+also runs the whole product on both kernels, and pins the two size tables that
+`xabe-cuda` duplicates because it may not depend on `xabe-gguf`.
+
+**Further out**, `xabe-chat`'s `tests/packed.rs` loads the same quantized file
+twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
+only check on the *wiring*: that the ggml type maps to the right layout, that
+the rope permutation reaches the packed bytes as well as the f16 ones, and that
+the packed operand gets to every projection rather than most of them. It needs
+`XABE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
+comparison is the unpacked 16 GB.
+
+The two paths are close rather than identical, and the asymmetry has a reason:
+on the tiled kernel both stage the same f16 bits, while on the scalar kernel
+the packed path keeps the exact dequantized f32 and the f16 path has already
+rounded it. Decode runs on the scalar kernel, so that is where any difference
+shows.
+
+Measured, and the two crates landed on opposite sides of exactly that:
+
+| | prompt | worst logit difference | logit span |
+| --- | --- | --- | --- |
+| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | **0.000000** | 28.655 |
+| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.004566 | 25.323 |
+
+The translator's prompt is past `GEMV_MAX_M`, so every projection takes the
+tiled kernel and the two paths are bit-identical - and its translation is
+character-identical as well. The chat prompt is not, so its projections run on
+the exact-f32 scalar kernel where the packed operand is genuinely the more
+precise of the two. Neither number is a tolerance being met; they are the two
+kernels behaving as the design says they do.
 
 The synthetic quantization corpus under `.golden/gguf/quants` is different: it
 is kilobytes, and it covers all ten block formats where the real file covers

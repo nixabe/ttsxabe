@@ -63,6 +63,115 @@ impl std::fmt::Debug for Gpu {
 /// know which side of it a shape falls on.
 pub const GEMV_MAX_M: usize = 16;
 
+/// A block-quantized weight format, by its ggml type id.
+///
+/// This mirrors `xabe_gguf::GgmlType`'s quantized half and deliberately does
+/// not reuse it: the crate map has `xabe-cuda` depending on `xabe-dsp` alone,
+/// and a GPU crate that had to open a GGUF to name a block layout would be the
+/// wrong edge. The duplication is three small tables, and
+/// `quant_sizes_match_the_container_crate` pins them together so a drift is a
+/// test failure rather than a wrong answer.
+///
+/// The unquantized widths are absent on purpose. F32 and F16 are
+/// [`Operand::F32`] and [`Operand::F16`], which have their own kernel paths;
+/// a `Quant::F16` would be a second spelling of one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quant {
+    /// 4-bit, centred, one f16 scale per 32.
+    Q4_0,
+    /// 4-bit, offset, an f16 scale and minimum per 32.
+    Q4_1,
+    /// 5-bit, centred, one f16 scale per 32.
+    Q5_0,
+    /// 5-bit, offset, an f16 scale and minimum per 32.
+    Q5_1,
+    /// 8-bit, one f16 scale per 32.
+    Q8_0,
+    /// "K-quant" 2-bit: 256-element superblock, 4-bit scales and minimums.
+    Q2K,
+    /// "K-quant" 3-bit: 6-bit scales, plus a high-bit mask.
+    Q3K,
+    /// "K-quant" 4-bit: 6-bit scales and minimums, eight sub-blocks of 32.
+    Q4K,
+    /// "K-quant" 5-bit: `Q4_K` plus one high bit per element.
+    Q5K,
+    /// "K-quant" 6-bit: 8-bit signed scales, no minimum.
+    Q6K,
+}
+
+impl Quant {
+    /// The ggml type id, which is what the kernel switches on.
+    pub const fn id(self) -> i32 {
+        match self {
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+        }
+    }
+
+    /// The format for a ggml type id, or `None` if no kernel path reads it.
+    ///
+    /// Takes a bare id rather than a container type so that a caller holding a
+    /// `GgmlType` can map it without this crate depending on the crate that
+    /// defines one. `None` covers both the unquantized widths - which have
+    /// their own operands - and the families this workspace refuses, `IQ*`,
+    /// `TQ*` and `Q8_K`.
+    pub const fn from_id(id: u32) -> Option<Self> {
+        Some(match id {
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            10 => Self::Q2K,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
+            13 => Self::Q5K,
+            14 => Self::Q6K,
+            _ => return None,
+        })
+    }
+
+    /// Elements per block.
+    pub const fn block_size(self) -> usize {
+        match self {
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+        }
+    }
+
+    /// Bytes per block.
+    pub const fn type_size(self) -> usize {
+        match self {
+            Self::Q4_0 => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q8_0 => 34,
+            Self::Q2K => 84,
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+        }
+    }
+
+    /// Bytes a tensor of `elements` occupies in this format.
+    ///
+    /// `elements` must be a whole number of blocks; the callers that size an
+    /// upload have already checked that against the tensor's own shape.
+    pub const fn bytes(self, elements: usize) -> usize {
+        elements / self.block_size() * self.type_size()
+    }
+}
+
 /// One side of a matmul, in whichever precision it is stored.
 ///
 /// The tiled kernel rounds *both* operands to f16 on the way into shared
@@ -82,12 +191,33 @@ pub enum Operand<'a> {
     /// Rounded once. Two halves to a 32-bit word, so the contraction must be
     /// even - every one in a transformer is.
     F16(&'a CudaSlice<u16>),
+    /// Block-quantized, and unpacked *inside* the matmul rather than at load.
+    ///
+    /// This is the variant that changes what fits on a card. The others store
+    /// one number per element; this one stores the checkpoint's own packed
+    /// blocks and pays a dozen integer ops per element to read them, which on
+    /// a bandwidth-bound kernel is the cheaper half of the trade. A weight and
+    /// only a weight can be stored this way - see [`CudaError::QuantizedActivation`].
+    Q {
+        /// The packed blocks, byte for byte as they sit in the container.
+        data: &'a CudaSlice<u8>,
+        /// Which layout to read them with.
+        ty: Quant,
+    },
 }
 
 impl Operand<'_> {
     /// Whether this side is packed, as the kernel's flag.
     fn half(self) -> i32 {
         i32::from(matches!(self, Operand::F16(_)))
+    }
+
+    /// The block format, if this side is quantized.
+    fn quant(self) -> Option<Quant> {
+        match self {
+            Operand::Q { ty, .. } => Some(ty),
+            _ => None,
+        }
     }
 }
 
@@ -364,6 +494,21 @@ impl Gpu {
             .clone_htod(x)
             .map_err(|source| CudaError::Driver {
                 what: "uploading f16 weights",
+                source,
+            })
+    }
+
+    /// Copies packed quantization blocks to the device, byte for byte.
+    ///
+    /// No conversion of any kind: the bytes that sit in the GGUF are the bytes
+    /// that sit in VRAM, and `q_elem` in the kernel is the only thing that ever
+    /// interprets them. That is the point - a conversion here would put the
+    /// weights back at full width and give the whole exercise away.
+    pub fn upload_u8(&self, x: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
+        self.stream
+            .clone_htod(x)
+            .map_err(|source| CudaError::Driver {
+                what: "uploading quantized weights",
                 source,
             })
     }
@@ -697,6 +842,25 @@ impl Gpu {
         if (a.half() == 1 || w.half() == 1) && !k.is_multiple_of(2) {
             return Err(CudaError::RaggedContraction { k });
         }
+        // Only a weight is ever stored packed. An activation is produced by the
+        // previous kernel at f32 and consumed by this one, so there is nothing
+        // to quantize and no kernel path that would read it.
+        if a.quant().is_some() {
+            return Err(CudaError::QuantizedActivation);
+        }
+        // A row must start on a block boundary, or `q_at` would read across the
+        // edge into the previous row's last block and be wrong rather than out
+        // of bounds. GGUF guarantees it for the fastest-varying dimension,
+        // which is this `k`; the check is here because "guaranteed by the
+        // format" is exactly the assumption worth failing loudly on.
+        if let Some(q) = w.quant()
+            && !k.is_multiple_of(q.block_size())
+        {
+            return Err(CudaError::RaggedBlock {
+                k,
+                block: q.block_size(),
+            });
+        }
         // SAFETY: both kernels write every element of the tile they own, with
         // the predication covering exactly the (m, n) range - see the store
         // loop in kernels.rs, and `every_output_element_is_written_exactly_once`
@@ -705,6 +869,10 @@ impl Gpu {
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
         let (sa, sw, so) = (batch.a as i64, batch.w as i64, batch.out as i64);
         let (a_half, w_half) = (a.half(), w.half());
+        let (w_quant, q_bs, q_ts) = match w.quant() {
+            Some(q) => (q.id(), q.block_size() as i32, q.type_size() as i32),
+            None => (0, 0, 0),
+        };
         let null: u64 = 0;
 
         // 128 rows of `a` and 128 of `w` per block, across 8 warps, or one warp
@@ -718,10 +886,14 @@ impl Gpu {
         match a {
             Operand::F32(v) => lb.arg(v),
             Operand::F16(v) => lb.arg(v),
+            // Refused above, but the arm has to exist. Passing the pointer
+            // keeps this a rejected input rather than an unreachable panic.
+            Operand::Q { data, .. } => lb.arg(data),
         };
         match w {
             Operand::F32(v) => lb.arg(v),
             Operand::F16(v) => lb.arg(v),
+            Operand::Q { data, .. } => lb.arg(data),
         };
         match bias {
             Some(v) => lb.arg(v),
@@ -735,7 +907,10 @@ impl Gpu {
             .arg(&sw)
             .arg(&so)
             .arg(&a_half)
-            .arg(&w_half);
+            .arg(&w_half)
+            .arg(&w_quant)
+            .arg(&q_bs)
+            .arg(&q_ts);
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: if small {

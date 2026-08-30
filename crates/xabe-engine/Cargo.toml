@@ -11,6 +11,7 @@ xabe-asr.workspace = true
 xabe-chat.workspace = true
 xabe-audio.workspace = true
 xabe-cosy.workspace = true
+xabe-cuda.workspace = true
 xabe-serve.workspace = true
 xabe-vad.workspace = true
 xabe-translate.workspace = true
@@ -30,3 +31,11 @@ path = "src/main.rs"
 [[bin]]
 name = "xabe-asr-bench"
 path = "src/bin/asr_bench.rs"
+
+[[bin]]
+name = "xabe-vram"
+path = "src/bin/vram_report.rs"
+
+[[bin]]
+name = "xabe-llm-bench"
+path = "src/bin/llm_bench.rs"

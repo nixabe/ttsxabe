@@ -35,10 +35,20 @@ and a real one: `xabe-gguf` reads the GGUF container - nine block formats
 included, checked against `gguf-py` at exact equality - and `xabe-llama` binds
 all 292 tensors of the 8 B Breeze2 against its own metadata. Nothing runs them.
 
-Unpacking a quantized file is not running quantized: the weights land at full
-width, so it buys disk and load bandwidth and not memory. Packed-in-VRAM
-inference would mean teaching every matmul the block layouts, which is a kernel
-project and not a loader change.
+This file used to end that paragraph by saying unpacking a quantized file is
+not running quantized - the weights landed at full width, so it bought disk and
+load bandwidth and not memory - and that packed-in-VRAM inference would mean
+teaching every matmul the block layouts, a kernel project rather than a loader
+change. **That is now done, and the description of what it would take was
+accurate.** `Operand::Q` hands the matmul the checkpoint's own blocks and
+unpacks them inside the kernel, so a quantized model occupies its file's size
+on the card rather than its unpacked size. `docs/KERNELS.md` has the design and
+the two findings that cost time; `docs/BENCHMARKS.md` has what it measures.
+
+The limit that remains is narrower and worth stating in its place. Only the
+**matmul** reads packed blocks. The embedding table is still gathered at f32,
+because a gather is not a matmul and it has its own kernel; and quantizing at
+*runtime* is not here at all, which is why an activation may not be packed.
 
 ## Current standing
 

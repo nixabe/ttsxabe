@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 fn f16_model() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
+        .join("../../models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
     p.is_file().then_some(p)
 }
 

@@ -40,7 +40,7 @@ Every accessor borrows from the mapping. Opening a 139 MB checkpoint is one
 ```rust
 use xabe_gguf::GgufFile;
 
-let f = GgufFile::open("models/llm/Llama-Breeze2-8B...f16.gguf")?;
+let f = GgufFile::open("models/Llama-Breeze2-8B...f16.gguf")?;
 
 f.len();                                  // tensor count
 f.tensors();                              // &[TensorInfo], in directory order

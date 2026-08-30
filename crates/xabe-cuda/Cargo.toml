@@ -17,6 +17,11 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 half.workspace = true
 xabe-dsp.workspace = true
+# For `tests/quant.rs` only: the packed matmul is a second transcription of
+# the block layouts and is compared against the container crate's decoder,
+# which is the one checked against `gguf-py`. Not a runtime edge - the crate
+# map has `xabe-cuda` depending on `xabe-dsp` alone.
+xabe-gguf.workspace = true
 
 [[bin]]
 name = "bench-gemm"

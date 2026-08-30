@@ -31,7 +31,7 @@ fn root() -> PathBuf {
 }
 
 fn model() -> Option<PathBuf> {
-    let p = root().join("models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
+    let p = root().join("models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
     p.is_file().then_some(p)
 }
 
@@ -224,7 +224,7 @@ fn a_sentencepiece_vocabulary_is_refused_rather_than_half_read() {
     // a different algorithm with no merge table. Reading it here would build
     // an empty rank map and silently tokenize every input one byte at a time,
     // which is fluent-looking nonsense rather than an error.
-    let p = root().join("models/llm/taigi-translator-13b-f16.gguf");
+    let p = root().join("models/taigi-translator-13b-f16.gguf");
     if !p.is_file() {
         println!("SKIP: the translator GGUF is missing");
         return;

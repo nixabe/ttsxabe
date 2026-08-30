@@ -1,7 +1,7 @@
 //! Completes one prompt with the chat model, for a look at the output.
 //!
 //!     cargo run --release -p xabe-chat --example chat -- \
-//!         models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf 2 "使用者: 你好\n小助理:"
+//!         models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf 2 "使用者: 你好\n小助理:"
 //!
 //! Not a test - there is nothing here to assert against. It is the thing to
 //! run when a test says the model is wrong and the next question is what it

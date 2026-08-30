@@ -485,6 +485,83 @@ as one: bf16 carries 7 mantissa bits against f16's 10, so the mantissa widens
 and nothing is rounded at all. Only the exponent range can overflow, and that is
 already refused by name.
 
+## Outside the numbering: quantized weights that stay packed
+
+Not a plan phase, and a retraction of something this repository stated twice as
+a limit rather than as a plan.
+
+`docs/MODEL.md` and `AGENTS.md` both said that reading a quantized GGUF is not
+running quantized - the weights were unpacked to full width at load, so a 4-bit
+13 B was a 7.9 GB file and still 26.5 GB of f16 on the card - and both said
+what closing that would take: teaching every matmul the block layouts, a kernel
+project rather than a loader change. The description was accurate and the
+project is done.
+
+| | State | Done |
+| --- | --- | --- |
+| — | `Operand::Q`, and `q_elem` unpacking all ten block formats inside `gemm` and `gemv` | ✅ |
+| — | Element-for-element equality against `xabe_gguf::dequantize_blocks`, all ten formats | ✅ |
+| — | The rope permutation applied to packed bytes, pinned against the element version | ✅ |
+| — | `xabe-chat` and `xabe-translate` hold quantized matrices packed; `Packing` chooses | ✅ |
+| — | The whole pipeline resident on one card, measured | ✅ |
+
+Measured: every stage this engine runs - TTS, ASR, the 8 B chat model, the 13 B
+translator and CosyVoice - is **21 771 MiB together on one 48 GiB card**, 44%
+of it. The same five at f16 come to **49 277 MiB against a 49 152 MiB card**,
+so they do not merely leave too little headroom, they exceed the card and fail
+to load. That is the difference this bought. `docs/BENCHMARKS.md` has the
+per-stage table.
+
+What it is *not* is a speed claim. The unpacking feeds the same f16
+tensor-core path the f32 weights always fed; the int8 path that would make
+`Q8_0` faster rather than merely smaller is still not here. What was bought is
+residency, and `docs/BENCHMARKS.md` carries the measurement.
+
+Two things fell out of it that no shape check would have found, and one
+non-finding worth recording:
+
+- **A negative scale times a zero quantum is `-0.0`,** and the warp reduction
+  turns it into `+0.0`. The numbers are equal and the bit patterns are not, so
+  the element-for-element test compares values. Everything else reproduces
+  exactly, so it stayed an equality rather than becoming a tolerance.
+- **A cancelling dot product needs its tolerance on the terms, not the sum.** A
+  `Q5_0` row of 512 terms of magnitude 0.3 summed to -3.7e-4, so a reordering
+  difference of 1.1e-5 was 3% of the answer with nothing wrong. Judging against
+  `k * eps * sum|terms|` is the right rule and is still nowhere near loose
+  enough to hide a permuted block.
+- **`xabe-llama` did not need a repacking quantizer,** which was the thing that
+  looked expensive. llama.cpp's rope permutation moves *whole rows*, and a
+  quantized row is a whole number of blocks, so the same shuffle applies to
+  byte ranges and `attn_q` and `attn_k` never have to be unpacked at all.
+
+The limit that remains is narrower than the one it replaces: only the **matmul**
+reads packed blocks. The embedding table is a gather with its own kernel and is
+still widened to f32 at load, which at 8 B is 2.1 GB whatever the file says.
+That is the next lever and is not claimed as done.
+
+## Outside the numbering: the packed matmul stopped unpacking per element
+
+The packed-weight work recorded above bought residency and was never measured
+for speed, because at the time neither Llama stage was on the reply path. Both
+are now, and the first measurement said 9.5 and 5.6 decode tokens per second -
+47 GB/s of effective bandwidth against a card that streams 672.
+
+The cause was in the kernel rather than in the model, in two parts. `q_elem`
+decodes a block's header for every element it returns, which at 256 elements to
+a K-quant super-block is 256 decodes where one is needed; a specialised path for
+Q4_K and Q6_K - between them every weight byte in both checkpoints - hoists it to
+one per eight elements, and every divisor becomes a shift. That alone was 2.5x.
+The rest was that a lane took eight *adjacent* elements, which is not how a
+K-quant byte packs them: every packed byte was being fetched two or four times
+and half or three-quarters of each fetch discarded. Regrouping which eight
+elements a lane owns fetches each byte once.
+
+**6.4x on the chat model and 6.3x on the translator**, with the numbers, the
+per-format microbenchmarks and the rejected follow-ups in `docs/BENCHMARKS.md`.
+The packed path is now faster than the f16 one at decode as well as smaller, so
+the residency-versus-speed trade-off that used to sit here is gone. What remains
+is prefill, where f16 is still 1.55x ahead because it reaches the tensor cores.
+
 ## What the numbering does not cover
 
 Batching and streaming synthesis are still deliberately absent. They are

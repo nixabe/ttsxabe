@@ -165,7 +165,7 @@ Or as the whole assistant, with a web page at the address given:
 xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
             --tts-model models/tts/mms-tts-nan --tts-device 1 \
             --asr-url http://127.0.0.1:8080 \
-            --llm-model models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf
+            --llm-model models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf
 ```
 
 Two synthesisers in one process, and the page chooses between them:
@@ -239,8 +239,12 @@ translator is a separate stage with its own model and its own flag.
 The chat model runs either way: `--llm-model` loads the GGUF and runs it here,
 `--llm-url` delegates it to a llama-server. GGUF only, and no `cpu` device —
 see `docs/CLI.md`. Quantized checkpoints load too: `Q4_0`, `Q4_1`, `Q5_0`,
-`Q5_1`, `Q8_0` and `Q2_K` through `Q6_K` are unpacked on read. That is a smaller
-file, not a smaller model — the weights land at full width either way.
+`Q5_1`, `Q8_0` and `Q2_K` through `Q6_K`. That used to be a smaller file and not
+a smaller model, because the weights were unpacked on read and landed at full
+width. They now stay **packed on the card** and are unpacked inside the matmul,
+so a quantized model costs about what its file costs — which is what lets every
+stage share one card. It buys residency and is not a speed claim; the embedding
+table is still widened at load. See `docs/KERNELS.md` and `docs/BENCHMARKS.md`.
 
 There is no KV cache and no request scheduler here; an utterance is a single
 forward pass with no state carried between calls. If batching arrives it will be

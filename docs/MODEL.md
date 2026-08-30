@@ -571,13 +571,30 @@ one nothing else would have told you about.
 So a `Q4_K_M` checkpoint opens and binds exactly like an f16 one, and nothing
 above the container knows the difference.
 
-**What that buys is disk and load bandwidth, not memory.** The weights are
-unpacked on the way in, so a 4-bit 13 B is a 7 GB file and still 26.5 GB of f16
-once it is on the card. Running *quantized* — keeping blocks packed in VRAM and
-unpacking inside the matmul — is a different piece of work: every kernel would
-have to learn every block layout, and on this card the tensor-core path that
-makes it worthwhile is the int8 one, not f16. `llmxabe` has that path for Q8_0;
-this workspace does not, and adding it is not a loader change.
+That used to buy disk and load bandwidth and **not memory**: the weights were
+unpacked on the way in, so a 4-bit 13 B was a 7.9 GB file and still 26.5 GB of
+f16 once it was on the card. Running *quantized* — keeping blocks packed in
+VRAM and unpacking inside the matmul — was named here as a different piece of
+work, and it was.
+
+**It is now done for the matmul.** `Operand::Q` hands `gemm` and `gemv` the
+checkpoint's own blocks; `q_elem` unpacks them per use. So a quantized model
+occupies roughly its file's size on the card instead of its unpacked size, and
+that is what lets every stage share one. `docs/KERNELS.md` has the design.
+
+Three limits are worth keeping straight, because it is easy to read more into
+this than it says:
+
+- **Memory is what it buys.** The unpacking happens on the f16 tensor-core
+  path, not the int8 one — the operands are dequantized and staged as f16
+  exactly as an f32 weight always was. `llmxabe` has an int8 path for `Q8_0`;
+  this workspace still does not, so nothing here should be read as a *speed*
+  claim. `docs/BENCHMARKS.md` carries what was actually timed.
+- **Only the matmul.** The embedding table is a gather with its own kernel and
+  is still widened to f32 at load, so at 8 B it is 2.1 GB of the residency
+  whatever the file says. That is the next lever, not a finished one.
+- **Nothing quantizes at runtime.** An activation may not be packed; only a
+  weight that arrived packed.
 
 Two limits remain, both by decision. The `IQ*` and `TQ*` families are refused —
 importance-weighted and ternary formats this project has no file in. `Q8_K` is

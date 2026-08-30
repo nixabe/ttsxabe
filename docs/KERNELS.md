@@ -140,6 +140,86 @@ F32 operand exactly, and rounding one costs about 3.5e-4 relative over a
 64-long contraction, measured. That is why `Operand` is a type the caller
 chooses rather than something the upload decides.
 
+### And a weight may stay packed
+
+`Operand::Q` hands the kernel the checkpoint's own block-quantized bytes and
+unpacks them *inside* the matmul. It is the third storage for the same operand
+and the only one that changes what fits on a card.
+
+The distinction it removes is the one `docs/MODEL.md` used to end on. Reading a
+quantized GGUF was already possible - `xabe-gguf` decodes nine block formats -
+but it decoded them to f32 at load, so a 4-bit checkpoint bought disk and load
+bandwidth and *nothing else*: the weights landed at full width and occupied
+what f16 occupies. Unpacking per use instead makes the resident copy the packed
+one.
+
+The trade is ALU for bandwidth, which is the right way round here because both
+kernels are bandwidth-bound. A `Q4_K` element is 4.5 bits against f16's 16, so
+weight traffic falls by 3.6x while the arithmetic per element grows by about a
+dozen integer ops that overlap with the loads.
+
+**Which elements a lane owns follows the packing, not the contraction.** This is
+the whole of the difference between a packed matmul at 86 GB/s and one at 372,
+and it is easy to get wrong because the natural choice looks free: give each
+lane a contiguous run of the contraction, the way every other kernel here does.
+A K-quant byte does not hold contiguous elements. A `Q4_K` byte holds two 32
+apart; a `Q6_K` `ql` byte holds two 64 apart and a `qh` byte four 32 apart. So a
+lane taking eight adjacent elements loads a byte, uses a nibble or two bits of
+it, and drops the rest - which the neighbouring lane then loads again. The read
+is coalesced and looks healthy, and the warp still moves two to four times the
+bytes it needs.
+
+The fix is to let a lane own whole bytes and take whichever elements those bytes
+happen to encode, which for `Q4_K` is four adjacent elements and the four 32
+along, and for `Q6_K` two adjacent columns across all four 2-bit fields. It
+costs extra scale-group decoding, because the elements of one byte can straddle
+sub-blocks, and that is much cheaper than the duplicate fetches. Anything else
+added here - a new format, a wider load - should start from the same question:
+how many times does the warp read each packed byte?
+
+**Only a weight, never an activation.** A weight comes from a checkpoint and is
+already in blocks; an activation is produced at f32 by the previous kernel, so
+quantizing one would mean quantizing at runtime, which is a different piece of
+work. `CudaError::QuantizedActivation` refuses it rather than growing a path
+nothing asks for.
+
+**A row must start on a block boundary.** `q_at` finds an element's block by
+dividing, so a contraction that is not a whole number of blocks would read into
+the previous row's last block - in bounds, and wrong.
+`CudaError::RaggedBlock` refuses that shape. GGUF guarantees the
+fastest-varying dimension is a whole number of blocks and this checks it
+anyway, because "guaranteed by the format" is exactly the assumption worth
+failing loudly on.
+
+**The layouts are transcribed twice, so they are pinned to each other.**
+`q_elem` in `kernels.rs` is a second transcription of the same block formats
+`xabe_gguf::dequant` already carries, and a second transcription is a second
+chance to permute a block - which produces a plausible tensor rather than an
+error. So `xabe-cuda`'s `tests/quant.rs` compares against that decoder, which
+is itself checked against `gguf-py` at exact equality, and does it *element for
+element* through the exact f32 path rather than only through a dot product,
+because a permutation inside a block is invisible to any check on magnitudes.
+
+Two things the tests found that are worth keeping:
+
+- **A negative scale times a zero quantum is `-0.0`,** and the warp reduction
+  adds it to `0.0` and gets `+0.0`. The bit patterns differ and the numbers do
+  not, so the element comparison is `==` and not `to_bits()`. Every other value
+  is reproduced exactly.
+- **A cancelling dot product needs a tolerance on the terms, not the sum.** A
+  `Q5_0` row of 512 terms of magnitude 0.3 summed to -3.7e-4, so an ordinary
+  reordering difference of 1.1e-5 was 3% of the answer and nothing was wrong.
+  The bound used is `k * eps * sum|terms|`, which is still far too tight to
+  hide a permuted block: permuting one moves the result by the size of the
+  terms, not the size of the rounding.
+
+The rope permutation survives packing for a reason worth naming.
+`xabe_llama::gguf::unpermute_rope` never looks *inside* a row - it moves `cols`
+contiguous elements at a time - so it is a permutation of whole rows, and
+`unpermute_rope_bytes` applies the same shuffle to byte ranges. Without that,
+`attn_q` and `attn_k` would have to be unpacked, permuted and repacked, which
+would need a quantizer this workspace does not have.
+
 ### Any contraction length, and why that took three tries
 
 `k` is unrestricted for F32 operands. It was twice wrongly restricted:

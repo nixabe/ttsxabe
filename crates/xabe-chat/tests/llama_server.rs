@@ -112,7 +112,7 @@ fn device() -> Option<usize> {
 }
 
 fn model() -> Option<PathBuf> {
-    let p = root().join("models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
+    let p = root().join("models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf");
     p.is_file().then_some(p)
 }
 

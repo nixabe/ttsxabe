@@ -18,7 +18,7 @@ fn workspace(rel: &str) -> PathBuf {
 fn gguf() -> Option<PathBuf> {
     let p = match std::env::var("XABE_TRANSLATOR_GGUF") {
         Ok(v) => PathBuf::from(v),
-        Err(_) => workspace("models/llm/taigi-translator-13b-f16.gguf"),
+        Err(_) => workspace("models/taigi-translator-13b-f16.gguf"),
     };
     p.is_file().then_some(p)
 }
@@ -55,7 +55,7 @@ macro_rules! gguf_or_skip {
         match gguf() {
             Some(p) => p,
             None => {
-                println!("SKIP: models/llm/taigi-translator-13b-f16.gguf is missing");
+                println!("SKIP: models/taigi-translator-13b-f16.gguf is missing");
                 return;
             }
         }

@@ -9,10 +9,10 @@ use xabe_gguf::GgufFile;
 use xabe_llama::{LlamaConfig, LlamaWeights};
 
 fn model() -> Option<PathBuf> {
-    let p =
-        PathBuf::from(std::env::var("XABE_LLM_GGUF").unwrap_or_else(|_| {
-            "models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf".to_string()
-        }));
+    let p = PathBuf::from(
+        std::env::var("XABE_LLM_GGUF")
+            .unwrap_or_else(|_| "models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf".to_string()),
+    );
     // Resolve against the workspace root, since tests run in the crate dir.
     let p = if p.is_absolute() {
         p
@@ -183,4 +183,37 @@ fn a_tensor_reads_back_at_both_widths() {
         half::f16::from_f32(wide[0]),
         "the two accessors must agree on the same element"
     );
+}
+
+/// The packed permutation is the element permutation, on byte ranges.
+///
+/// `unpermute_rope_bytes` exists so that `attn_q` and `attn_k` can stay packed
+/// in VRAM: unpacking them to permute and repacking would need a quantizer
+/// this workspace does not have. It is only correct because
+/// [`xabe_llama::gguf::unpermute_rope`] never looks inside a row - it moves
+/// `cols` contiguous elements at a time - so the two must agree exactly when
+/// the same data is viewed as elements and as bytes.
+///
+/// Needs no checkpoint: this is a permutation, and what it permutes is
+/// arbitrary.
+#[test]
+fn unpermuting_bytes_agrees_with_unpermuting_elements() {
+    // Rows divisible by the head count, and a head_dim that is even, which is
+    // what the permutation needs. 24 rows over 3 heads is head_dim 8.
+    for &(rows, cols, heads) in &[(24usize, 5usize, 3usize), (32, 1, 8), (8, 17, 1)] {
+        let w: Vec<u16> = (0..rows * cols).map(|i| (i * 2654435761) as u16).collect();
+        let want = xabe_llama::gguf::unpermute_rope(&w, rows, cols, heads);
+
+        // The same buffer as bytes. A u16 row is 2 * cols bytes, and the byte
+        // version is told that rather than deriving it - a quantized row's
+        // byte width has nothing to do with its element count.
+        let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let got = xabe_llama::gguf::unpermute_rope_bytes(&bytes, rows, cols * 2, heads);
+
+        let want_bytes: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            got, want_bytes,
+            "{rows}x{cols} over {heads} heads: the two permutations disagree",
+        );
+    }
 }

@@ -47,13 +47,20 @@ Two limits are real and are not going away soon:
 - **`--llm-device cpu` is refused.** 8 B is 16 GFLOP a token against scalar
   kernels that manage under 2 GFLOP/s. Not a slow option, a fictional one.
 
+A **quantized** GGUF is accepted here and by `--translator-model`, and since
+`Operand::Q` it costs what the file costs rather than what the file unpacks to.
+That is the difference between one stage per card and the whole pipeline on
+one; `docs/BENCHMARKS.md` has the residency table and `docs/KERNELS.md` the
+kernel. Nothing about the flag changes - the same path takes an f16 or a
+`Q4_K_M` file and the engine reads the format out of the container.
+
 ```sh
 # everything in one process
 xabe-engine --serve 127.0.0.1:8000 \
             --asr-model    models/asr/breeze-asr-26   --asr-device 0 \
             --vad-model    models/vad/silero-v5.1.2.safetensors \
             --tts-model    models/tts/mms-tts-nan     --tts-device 1 \
-            --llm-model    models/llm/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
+            --llm-model    models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
             --llm-device   0
 
 # split across processes and GPUs, as run.sh does today

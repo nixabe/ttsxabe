@@ -34,17 +34,24 @@ point at the same relative paths either way:
 
 ```
 models/asr/breeze-asr-26/       models/tts/mms-tts-nan/
-models/vad/                     models/translator/taigi-llama2-13b/
-models/llm/                     models/tts/cosyvoice3-0.5b/
+models/vad/                     models/tts/cosyvoice3-0.5b/
+models/*.gguf
 ```
 
-`models/llm/` holds GGUFs, and both models in it are now readable by this
-engine directly. `--llm-model` takes the chat GGUF - which is also where a
-delegated `--llm-url` llama-server would read from - and `--translator-model`
-accepts a `.gguf` from the same directory, since the translator takes either
-container. So a deployment that only wants one copy of those weights can drop
-the safetensors directory and point at the GGUFs, and one that wants no second
-runtime at all can drop llama-server with it.
+**GGUFs sit at the top of `models/`, not in a subdirectory.** They are single
+files rather than checkpoint directories, and the two stages that read them -
+`--llm-model` and `--translator-model` - take a path to the file, so a folder
+per container bought nothing but a level of nesting.
+
+The three safetensors stages have no GGUF path at all: `xabe-tts`, `xabe-asr`
+and `xabe-vad` do not depend on `xabe-gguf` and never will, because their
+checkpoints are not published in that container. So the split above is not a
+convention to be tidied - it is which crates can read what.
+
+`--translator-model` accepts either container, so a deployment that wants one
+copy of those weights can keep the `.gguf` and drop
+`models/translator/taigi-llama2-13b/` entirely. The chat model has no such
+choice: it is GGUF-only, because its vocabulary lives inside the file.
 
 ## Environment
 

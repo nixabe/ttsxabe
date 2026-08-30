@@ -55,6 +55,41 @@ pub fn unpermute_rope(w: &[u16], rows: usize, cols: usize, heads: usize) -> Vec<
     out
 }
 
+/// The same permutation as [`unpermute_rope`], on packed blocks.
+///
+/// This is possible at all because [`unpermute_rope`] never looks *inside* a
+/// row: it moves `cols` contiguous elements at a time, so it is a permutation
+/// of whole rows and nothing else. A quantized row is a whole number of
+/// blocks - GGUF guarantees the fastest-varying dimension is - so moving
+/// `row_bytes` at a time moves exactly the same rows without unpacking
+/// anything, and the result is still a valid packed tensor.
+///
+/// That is what lets `attn_q` and `attn_k` stay packed in VRAM. The
+/// alternative would be to unpack them, permute, and repack, which would need
+/// a quantizer this workspace does not have and would not be bit-identical if
+/// it did.
+///
+/// `unpermuting_bytes_agrees_with_unpermuting_elements` pins the two against
+/// each other on the same data.
+pub fn unpermute_rope_bytes(w: &[u8], rows: usize, row_bytes: usize, heads: usize) -> Vec<u8> {
+    debug_assert_eq!(w.len(), rows * row_bytes);
+    debug_assert!(heads > 0 && rows.is_multiple_of(heads));
+    let head_dim = rows / heads;
+    let half = head_dim / 2;
+    let mut out = vec![0u8; w.len()];
+    for h in 0..heads {
+        for i in 0..half {
+            for k in 0..2 {
+                let src = h * head_dim + 2 * i + k;
+                let dst = h * head_dim + k * half + i;
+                out[dst * row_bytes..(dst + 1) * row_bytes]
+                    .copy_from_slice(&w[src * row_bytes..(src + 1) * row_bytes]);
+            }
+        }
+    }
+    out
+}
+
 /// Applies llama.cpp's rope permutation, the inverse of [`unpermute_rope`].
 ///
 /// Only the tests need this: it is what lets them start from the safetensors

@@ -16,6 +16,30 @@ pub enum CudaError {
         k: usize,
     },
 
+    /// A contraction that is not a whole number of quantization blocks.
+    ///
+    /// A packed row starts on a block boundary, so `q_at` derives the block
+    /// index by dividing. A `k` that is not a multiple of the block size makes
+    /// that division cross into the previous row's last block: in bounds, and
+    /// wrong. GGUF guarantees the fastest-varying dimension is a whole number
+    /// of blocks, and this refuses the shape rather than trusting it.
+    #[error("contraction length {k} is not a multiple of the {block}-element block")]
+    RaggedBlock {
+        /// The length asked for.
+        k: usize,
+        /// Elements per block in the format handed over.
+        block: usize,
+    },
+
+    /// A quantized left operand, which no kernel accepts.
+    ///
+    /// Weights come from a checkpoint and can be stored packed; activations are
+    /// produced by the previous kernel at f32. Quantizing one would mean
+    /// quantizing at runtime, which is a different piece of work and not one
+    /// this path pretends to do.
+    #[error("the left operand is quantized, and only a weight may be")]
+    QuantizedActivation,
+
     /// No usable CUDA device, or the driver could not be loaded.
     ///
     /// This is the variant every caller should be prepared for: the driver is

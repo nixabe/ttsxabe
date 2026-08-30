@@ -2,7 +2,7 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -94,6 +94,38 @@ impl Source {
         })
     }
 
+    /// One tensor's blocks, byte for byte, if it is stored in blocks at all.
+    ///
+    /// `None` for a safetensors checkpoint, which has no block formats, and
+    /// for the unquantized GGUF widths. The rope permutation is undone here
+    /// too and without unpacking, because it moves whole rows and a quantized
+    /// row is a whole number of blocks - see
+    /// [`xabe_llama::gguf::unpermute_rope_bytes`].
+    fn packed(
+        &self,
+        b: &Bound,
+        cfg: &LlamaConfig,
+    ) -> Result<Option<(Vec<u8>, Quant)>, TranslateError> {
+        let Self::Gguf(f) = self else {
+            return Ok(None);
+        };
+        let Some(ty) = b.packed.and_then(|t| Quant::from_id(t as u32)) else {
+            return Ok(None);
+        };
+        let raw = f.tensor_bytes(&b.name)?;
+        let bytes = if xabe_llama::gguf::is_rope_permuted(&b.name) {
+            let heads = if b.name.ends_with(".attn_q.weight") {
+                cfg.num_attention_heads
+            } else {
+                cfg.num_key_value_heads
+            };
+            xabe_llama::gguf::unpermute_rope_bytes(raw, b.shape[0], ty.bytes(b.shape[1]), heads)
+        } else {
+            raw.to_vec()
+        };
+        Ok(Some((bytes, ty)))
+    }
+
     /// One tensor as f32. Never a permuted one - the embedding, the norms and
     /// nothing else reach this.
     fn f32(&self, b: &Bound) -> Result<Vec<f32>, TranslateError> {
@@ -115,11 +147,58 @@ impl Source {
 /// the tokenizer's, added by [`Translator::prompt_ids`].
 pub const TEMPLATE: &str = "[TRANS]\n{src}\n[/TRANS]\n[{tgt}]\n";
 
-/// A projection, on the device, stored narrow.
+/// Whether a block-quantized checkpoint stays packed on the card.
+///
+/// The default is [`Packing::Packed`], which is what makes a quantized file
+/// occupy its own size in VRAM rather than its unpacked size. [`Packing::F16`]
+/// is what this engine did before the packed matmul existed, and it is kept
+/// for two reasons rather than removed: it is the control the packed path is
+/// tested against on identical weights, and it is the answer if a format ever
+/// turns out to cost more accuracy than a stage can afford.
+///
+/// It has no effect on an unquantized checkpoint, which has no blocks to keep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Packing {
+    /// Keep the checkpoint's blocks; unpack inside the matmul.
+    #[default]
+    Packed,
+    /// Unpack at load and store one f16 per element.
+    F16,
+}
+
+/// How one matrix is held on the device.
+///
+/// Both reach the same kernel and both are staged to f16 inside it; what
+/// differs is what occupies VRAM between calls. At 13 B that difference is the
+/// difference between 26.5 GB and 7.9 GB, which is the difference between
+/// needing a card to itself and sharing one with the rest of the pipeline.
+enum GWeight {
+    /// Rounded to f16 at load. What a safetensors or f16 checkpoint gives.
+    F16(CudaSlice<u16>),
+    /// The checkpoint's blocks, byte for byte, unpacked inside the matmul.
+    Packed {
+        /// The packed bytes.
+        data: CudaSlice<u8>,
+        /// Which layout reads them.
+        ty: Quant,
+    },
+}
+
+/// A projection, on the device.
 struct GLinear {
-    w: CudaSlice<u16>,
+    w: GWeight,
     in_dim: usize,
     out_dim: usize,
+}
+
+impl GLinear {
+    /// This matrix as the matmul's right operand.
+    fn operand(&self) -> Operand<'_> {
+        match &self.w {
+            GWeight::F16(w) => Operand::F16(w),
+            GWeight::Packed { data, ty } => Operand::Q { data, ty: *ty },
+        }
+    }
 }
 
 /// One transformer block, on the device.
@@ -157,7 +236,7 @@ pub struct Translator {
     norm: CudaSlice<f32>,
     /// The output projection, which this checkpoint does *not* tie to the
     /// embedding - `tie_word_embeddings` is false.
-    lm_head: CudaSlice<u16>,
+    lm_head: GLinear,
 }
 
 /// The keys and values a decode step reuses.
@@ -188,6 +267,15 @@ impl Translator {
     /// move the cost to the first translation instead of the load, which is
     /// the wrong place for a service that is started once.
     pub fn open(path: &Path, ordinal: usize) -> Result<Self, TranslateError> {
+        Self::open_with(path, ordinal, Packing::default())
+    }
+
+    /// The same, choosing how a quantized checkpoint is held.
+    pub fn open_with(
+        path: &Path,
+        ordinal: usize,
+        packing: Packing,
+    ) -> Result<Self, TranslateError> {
         let gpu = Gpu::open(ordinal)?;
         let src = Source::open(path)?;
         let cfg = src.config()?;
@@ -205,9 +293,23 @@ impl Translator {
         };
         let wide =
             |b: &Bound| -> Result<CudaSlice<f32>, TranslateError> { Ok(gpu.upload(&src.f32(b)?)?) };
+        // Packed when the container packs it and the kernel reads that layout;
+        // f16 otherwise. A safetensors checkpoint always takes the second
+        // branch, so this changes nothing about how the 🤗 directory loads.
         let lin = |b: &Bound| -> Result<GLinear, TranslateError> {
+            let w = match if packing == Packing::Packed {
+                src.packed(b, &cfg)?
+            } else {
+                None
+            } {
+                Some((bytes, ty)) => GWeight::Packed {
+                    data: gpu.upload_u8(&bytes)?,
+                    ty,
+                },
+                None => GWeight::F16(narrow(b)?),
+            };
             Ok(GLinear {
-                w: narrow(b)?,
+                w,
                 in_dim: b.shape[1],
                 out_dim: b.shape[0],
             })
@@ -232,7 +334,7 @@ impl Translator {
             embed: wide(&w.embed_tokens)?,
             layers,
             norm: wide(&w.norm)?,
-            lm_head: narrow(&w.lm_head)?,
+            lm_head: lin(&w.lm_head)?,
             cfg,
             tokenizer,
             gpu,
@@ -282,7 +384,7 @@ impl Translator {
     ) -> Result<CudaSlice<f32>, TranslateError> {
         Ok(self.gpu.gemm_batched(
             x,
-            Operand::F16(&l.w),
+            l.operand(),
             None,
             Batch::single(rows * l.out_dim),
             rows,
@@ -426,7 +528,7 @@ impl Translator {
         Ok((
             self.gpu.gemm_batched(
                 Operand::F32(&h),
-                Operand::F16(&self.lm_head),
+                self.lm_head.operand(),
                 None,
                 Batch::single(n * self.cfg.vocab_size),
                 n,

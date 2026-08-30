@@ -63,6 +63,7 @@ mod reader;
 mod types;
 mod value;
 
+pub use dequant::dequantize_blocks;
 pub use error::GgufError;
 pub use file::{GgufFile, TensorInfo};
 pub use types::GgmlType;

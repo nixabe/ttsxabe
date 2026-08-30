@@ -32,6 +32,40 @@
 use crate::error::GgufError;
 use crate::types::GgmlType;
 
+/// Unpacks `n` elements of a block-quantized tensor held outside a container.
+///
+/// [`crate::GgufFile::tensor_f32`] is the ordinary way in, and takes its
+/// arguments from the tensor entry so they cannot disagree. This one exists
+/// for callers holding the bytes already, and validates what that one gets for
+/// free.
+///
+/// It is public because the GPU carries a *second* transcription of these
+/// layouts: `q_elem` in `xabe-cuda`, which unpacks inside the matmul so the
+/// weights can stay packed in VRAM. A second transcription is a second chance
+/// to permute a block, so the differential tests there compare against this
+/// decoder, which is the one checked against `gguf-py` at exact equality. That
+/// pins the two transcriptions to each other rather than each to an argument.
+pub fn dequantize_blocks(ty: GgmlType, raw: &[u8], n: usize) -> Result<Vec<f32>, GgufError> {
+    let bs = ty.block_size() as usize;
+    let ts = ty.type_size() as usize;
+    if !ty.is_quantized() || !n.is_multiple_of(bs) {
+        return Err(GgufError::RaggedBlocks {
+            name: "<slice>".to_string(),
+            row: n as u64,
+            block: bs as u64,
+        });
+    }
+    let needed = n / bs * ts;
+    if raw.len() < needed {
+        return Err(GgufError::ShortBlockData {
+            ggml_type: ty,
+            needed,
+            found: raw.len(),
+        });
+    }
+    dequantize(ty, raw, n)
+}
+
 /// Reads a little-endian f16 at `b[i..i + 2]` as f32.
 #[inline]
 fn f16(b: &[u8], i: usize) -> f32 {

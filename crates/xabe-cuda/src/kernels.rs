@@ -146,6 +146,311 @@ __device__ __forceinline__ void gemm_mma_step(
 // operand rounding. That makes precision a function of shape, which is worth
 // knowing rather than hiding - see `GEMV_MAX_M`.
 
+// -------------------------------------------------------- quantized weights
+//
+// Block-quantized weights, unpacked *inside* the matmul instead of on the way
+// onto the card. That is the whole point: `xabe-gguf` already decodes these
+// formats, but it decodes them to f32 at load, so a 4-bit 13 B still occupied
+// 26.5 GB of f16 once resident. Unpacking per use makes the resident copy the
+// packed one - 7.9 GB for that same model - which is what lets the pipeline
+// fit on a single card.
+//
+// The trade is ALU for bandwidth, and these kernels are bandwidth-bound, so it
+// is the right way round: a Q4_K element is 4.5 bits against f16's 16, so the
+// weight traffic falls by 3.6x while the arithmetic per element grows by a
+// dozen integer ops that overlap with the loads.
+//
+// **Every layout below is transcribed from `xabe_gguf::dequant`**, which is
+// itself read off `gguf-py/gguf/quants.py` - the code that wrote these files -
+// and checked against it at exact equality on all ten formats. Transcribing a
+// second time is a second chance to get the element *ordering* wrong, which is
+// the trap `docs/MODEL.md` names and which produces a permuted tensor rather
+// than an error, so the differential tests in `tests/quant.rs` compare against
+// that same decoder rather than against reasoning.
+
+#define QT_Q4_0  2
+#define QT_Q4_1  3
+#define QT_Q5_0  6
+#define QT_Q5_1  7
+#define QT_Q8_0  8
+#define QT_Q2_K 10
+#define QT_Q3_K 11
+#define QT_Q4_K 12
+#define QT_Q5_K 13
+#define QT_Q6_K 14
+
+// A little-endian f16 at `b[i]`, as f32. NVRTC has no <cuda_fp16.h>, so this
+// is inline PTX like every other conversion in this file.
+__device__ __forceinline__ float q_f16(const unsigned char* b, int i) {
+    unsigned short h = (unsigned short)b[i] | ((unsigned short)b[i + 1] << 8);
+    float r;
+    asm("{ .reg .f16 x; mov.b16 x, %1; cvt.f32.f16 %0, x; }" : "=f"(r) : "h"(h));
+    return r;
+}
+
+// The 6-bit scale and minimum pair `q` of eight, shared by Q4_K and Q5_K.
+// Mirrors `xabe_gguf::dequant::scale_min`, which unrolls the same packing as
+// four assignments per iteration over 0..4.
+__device__ __forceinline__ void q_scale_min(
+    const unsigned char* s, int q, unsigned char& sc, unsigned char& mn)
+{
+    if (q < 4) {
+        sc = s[q] & 0x3F;
+        mn = s[q + 4] & 0x3F;
+    } else {
+        int i = q - 4;
+        sc = (s[i + 8] & 0x0F) | ((s[i] >> 2) & 0x30);
+        mn = (s[i + 8] >> 4) | ((s[i + 4] >> 2) & 0x30);
+    }
+}
+
+// Element `j` of the block at `blk`. One switch, one case per format, in the
+// same order as the Rust.
+__device__ __forceinline__ float q_elem(int ty, const unsigned char* blk, int j) {
+    switch (ty) {
+    // d(2) + 16 packed nibbles. Low nibbles of all 16 bytes first, then high -
+    // not low-then-high of each byte, which is the permutation trap.
+    case QT_Q4_0: {
+        float d = q_f16(blk, 0);
+        const unsigned char* qs = blk + 2;
+        unsigned char nib = (j < 16) ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+        return d * (float)((int)nib - 8);
+    }
+    // Offset rather than centred: no -8.
+    case QT_Q4_1: {
+        float d = q_f16(blk, 0), m = q_f16(blk, 2);
+        const unsigned char* qs = blk + 4;
+        unsigned char nib = (j < 16) ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+        return d * (float)nib + m;
+    }
+    // d(2) + qh(4, one bit per element) + nibbles.
+    case QT_Q5_0: {
+        float d = q_f16(blk, 0);
+        unsigned qh = (unsigned)blk[2] | ((unsigned)blk[3] << 8)
+                    | ((unsigned)blk[4] << 16) | ((unsigned)blk[5] << 24);
+        const unsigned char* qs = blk + 6;
+        unsigned char lo = (j < 16) ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+        unsigned char hi = (unsigned char)((qh >> j) & 1);
+        return d * (float)((int)(lo | (hi << 4)) - 16);
+    }
+    case QT_Q5_1: {
+        float d = q_f16(blk, 0), m = q_f16(blk, 2);
+        unsigned qh = (unsigned)blk[4] | ((unsigned)blk[5] << 8)
+                    | ((unsigned)blk[6] << 16) | ((unsigned)blk[7] << 24);
+        const unsigned char* qs = blk + 8;
+        unsigned char lo = (j < 16) ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+        unsigned char hi = (unsigned char)((qh >> j) & 1);
+        return d * (float)(lo | (hi << 4)) + m;
+    }
+    // The simple one: a scale and 32 signed bytes.
+    case QT_Q8_0: {
+        float d = q_f16(blk, 0);
+        return d * (float)((int)(signed char)blk[2 + j]);
+    }
+    // scales(16) + qs(64) + d(2) + dmin(2).
+    case QT_Q2_K: {
+        const unsigned char* scales = blk;
+        const unsigned char* qs = blk + 16;
+        float d = q_f16(blk, 80), dmin = q_f16(blk, 82);
+        int g = j / 16;
+        float dl = d * (float)(scales[g] & 0x0F);
+        float ml = dmin * (float)(scales[g] >> 4);
+        int hi = j / 128, r = j % 128, s = r / 32, kk = r % 32;
+        unsigned char q = (qs[hi * 32 + kk] >> (2 * s)) & 3;
+        return dl * (float)q - ml;
+    }
+    // hmask(32) + qs(64) + scales(12) + d(2). The high bit's sense is
+    // inverted - the offset applies when the mask bit is zero.
+    case QT_Q3_K: {
+        const unsigned char* hmask = blk;
+        const unsigned char* qs = blk + 32;
+        const unsigned char* sc = blk + 96;
+        float d = q_f16(blk, 108);
+        int g = j / 16;
+        unsigned char low  = (g < 8) ? (sc[g] & 0x0F) : (sc[g - 8] >> 4);
+        unsigned char high = (sc[8 + (g % 4)] >> (2 * (g / 4))) & 0x03;
+        int scale = (int)(low | (high << 4)) - 32;
+        int hi = j / 128, r = j % 128, s = r / 32, kk = r % 32;
+        int ql = (int)((qs[hi * 32 + kk] >> (2 * s)) & 3);
+        int qh = (int)(((hmask[kk] >> (j / 32)) & 1) ^ 1);
+        return d * (float)scale * (float)(ql - (qh << 2));
+    }
+    // d(2) + dmin(2) + scales(12) + qs(128). Eight sub-blocks of 32.
+    case QT_Q4_K: {
+        float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+        unsigned char sc, mn;
+        q_scale_min(blk + 4, j / 32, sc, mn);
+        const unsigned char* qs = blk + 16;
+        int hi = j / 64, r = j % 64, s = r / 32, kk = r % 32;
+        unsigned char q = (qs[hi * 32 + kk] >> (4 * s)) & 0x0F;
+        return d * (float)sc * (float)q - dmin * (float)mn;
+    }
+    // Q4_K plus one high bit per element.
+    case QT_Q5_K: {
+        float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+        int jj = j / 32;
+        unsigned char sc, mn;
+        q_scale_min(blk + 4, jj, sc, mn);
+        const unsigned char* qh = blk + 16;
+        const unsigned char* qs = blk + 48;
+        int hi = j / 64, r = j % 64, s = r / 32, kk = r % 32;
+        unsigned char lo = (qs[hi * 32 + kk] >> (4 * s)) & 0x0F;
+        unsigned char bit = (qh[j % 32] >> jj) & 1;
+        return d * (float)sc * (float)(lo | (bit << 4)) - dmin * (float)mn;
+    }
+    // ql(128) + qh(64) + scales(16, signed) + d(2). The low part runs in
+    // groups of 64 and the high part in groups of 32.
+    case QT_Q6_K: {
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const unsigned char* scales = blk + 192;
+        float d = q_f16(blk, 208);
+        int g = j / 16;
+        int hi = j / 128, r = j % 128;
+        int sl = r / 64, k64 = r % 64;
+        int sh = r / 32, k32 = r % 32;
+        unsigned char lo = (ql[hi * 64 + k64] >> (4 * sl)) & 0x0F;
+        unsigned char bits = (qh[hi * 32 + k32] >> (2 * sh)) & 0x03;
+        int q = (int)(lo | (bits << 4)) - 32;
+        return d * (float)((int)(signed char)scales[g]) * (float)q;
+    }
+    }
+    return 0.0f;
+}
+
+// Element (row, kk) of a quantized `[n, k]` weight.
+//
+// `k` is a whole number of blocks, so a row starts on a block boundary and the
+// division below is exact. GGUF guarantees that for the fastest-varying
+// dimension, and `Gpu::gemm_batched` refuses the shape when it does not hold
+// rather than reading across a row edge.
+// Eight elements of one K-quant super-block, dotted with eight activations.
+//
+// `q_elem` re-derives a block's header for every element it returns - two f16
+// scales, a six-bit sub-block scale, and four integer divisions - because it is
+// written to be read against the format tables one case at a time. At 256
+// elements to a super-block that is 256 header decodes where one is needed, and
+// it is why the packed path measured 47 GB/s against a card that streams 672.
+//
+// These two hoist it. Every divisor below is a power of two and every quotient
+// is loop-invariant, so the inner eight are a nibble extract and a fused
+// multiply-add. Thirty-two lanes at eight elements each is one super-block per
+// warp.
+//
+// Which eight differs between the formats, and for Q4_K that is the point. A
+// Q4_K byte packs two elements 32 apart, so handing each lane eight *adjacent*
+// elements fetches every byte twice - once per lane wanting one of its nibbles -
+// and discards half of each shift-and-mask. `q4k_pair` gives a lane four whole
+// bytes instead: one aligned 32-bit load and two float4 activation loads for
+// the same eight elements, against eight byte loads before. It costs a second
+// sub-block scale pair, because the two nibbles of a byte land in adjacent
+// sub-blocks, and that is the whole of the cost. Measured standalone on this
+// card at n=14336, k=4096: 384 us to 88 us.
+//
+// Q4_K and Q6_K only: between them they are every weight byte in both
+// checkpoints this pipeline loads. Anything else still goes through `q_at`.
+//
+// `AVEC` says the activation row is 16-byte aligned. It is a template parameter
+// rather than a test because the branch is loop-invariant and warp-uniform, and
+// leaving it inside the loop measured 27% slower than hoisting it.
+template <bool AVEC>
+__device__ __forceinline__ float q4k_pair(
+    const unsigned char* blk, const float* ap, int hi, int kk)
+{
+    float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+    unsigned char s0, m0, s1, m1;
+    // The low nibbles of these four bytes are elements hi * 64 + kk .. + 3 and
+    // the high nibbles are those plus 32, which is the next sub-block along.
+    q_scale_min(blk + 4, hi << 1, s0, m0);
+    q_scale_min(blk + 4, (hi << 1) | 1, s1, m1);
+    float ds0 = d * (float)s0, dm0 = dmin * (float)m0;
+    float ds1 = d * (float)s1, dm1 = dmin * (float)m1;
+
+    // Aligned: `blk` is a multiple of 144 bytes from a device allocation and
+    // `kk` is a multiple of four, so the 32-bit read is on a 4-byte boundary.
+    unsigned v = *(const unsigned*)(blk + 16 + (hi << 5) + kk);
+    float al[4], ah[4];
+    if (AVEC) {
+        *(float4*)al = *(const float4*)ap;
+        *(float4*)ah = *(const float4*)(ap + 32);
+    } else {
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            al[t] = ap[t];
+            ah[t] = ap[t + 32];
+        }
+    }
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        unsigned byte = (v >> (t << 3)) & 0xFFu;
+        acc += al[t] * (ds0 * (float)(byte & 0x0Fu) - dm0);
+        acc += ah[t] * (ds1 * (float)(byte >> 4) - dm1);
+    }
+    return acc;
+}
+
+// Eight elements of a Q6_K super-block, chosen so no packed byte is read twice.
+//
+// A Q6_K element takes a nibble of `ql` and a 2-bit field of `qh`. The nibbles
+// of one `ql` byte are 64 apart and the four fields of one `qh` byte are 32
+// apart, so eight *adjacent* elements touch eight `ql` bytes and eight `qh`
+// bytes and use an eighth of what they fetch: the warp reads every byte twice
+// over for `ql` and four times over for `qh`.
+//
+// A lane instead owns two adjacent columns across all four fields - elements
+// hi * 128 + sh * 32 + b + c for sh in 0..3 and c in 0..1. Those eight need
+// three 16-bit reads, two of `ql` and one of `qh`, and across the warp they
+// cover ql[0..127] and qh[0..63] exactly once. Sixteen byte loads become three
+// short ones. Measured standalone on this card at n=14336, k=4096: 410 us to
+// 129 us, agreeing with the layout above to 2.8e-07 relative.
+//
+// Shorts and not words because a Q6_K block is 210 bytes: the stride is even
+// but not a multiple of four, so successive blocks are 2-byte aligned and
+// nothing wider is safe.
+__device__ __forceinline__ float q6k_dot8(
+    const unsigned char* blk, const float* ap, int hi, int bb, int g0)
+{
+    float d = q_f16(blk, 208);
+    const signed char* scales = (const signed char*)(blk + 192);
+    unsigned h  = *(const unsigned short*)(blk + 128 + (hi << 5) + bb);
+    unsigned l0 = *(const unsigned short*)(blk + (hi << 6) + bb);
+    unsigned l1 = *(const unsigned short*)(blk + (hi << 6) + 32 + bb);
+
+    // Scale group j / 16 is hi * 8 + sh * 2 + b / 16, and the last term is the
+    // same for both columns because `bb` is even.
+    float ds[4];
+    #pragma unroll
+    for (int sh = 0; sh < 4; ++sh) {
+        ds[sh] = d * (float)((int)scales[g0 + (sh << 1)]);
+    }
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        unsigned hb = (h >> (c << 3)) & 0xFFu;
+        unsigned b0 = (l0 >> (c << 3)) & 0xFFu;
+        unsigned b1 = (l1 >> (c << 3)) & 0xFFu;
+        // sh 0 and 2 share a `ql` byte, as do sh 1 and 3; the low nibble is the
+        // lower field of the pair.
+        unsigned nib[4] = { b0 & 0x0Fu, b1 & 0x0Fu, b0 >> 4, b1 >> 4 };
+        #pragma unroll
+        for (int sh = 0; sh < 4; ++sh) {
+            int q = (int)(nib[sh] | (((hb >> (sh << 1)) & 3u) << 4)) - 32;
+            acc += ap[(sh << 5) + c] * (ds[sh] * (float)q);
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float q_at(
+    const unsigned char* w, int ty, int bs, int ts, long row, int k, int kk)
+{
+    long b = row * (long)(k / bs) + (long)(kk / bs);
+    return q_elem(ty, w + b * (long)ts, kk % bs);
+}
+
 #define GEMV_WARPS 8
 
 // `w` is either `const float*` or a packed `const __half*`, selected by
@@ -159,7 +464,10 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     float* __restrict__ out,
     int m, int k, int n,
     long sa, long sw, long so,
-    int a_half, int w_half)
+    int a_half, int w_half,
+    // Zero when `w` is F32 or F16. Otherwise the ggml type id, and `w` points
+    // at packed blocks: `q_bs` elements to a block, `q_ts` bytes to a block.
+    int w_quant, int q_bs, int q_ts)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -181,7 +489,56 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     const unsigned* ahr =
         (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1) + (size_t)row * (k >> 1);
     float acc = 0.0f;
-    if (w_half) {
+    if (w_quant) {
+        // Blocks tile along the contraction, so a row is `k / q_bs` of them.
+        // The stride `sw` counts elements of the logical matrix like every
+        // other path, and is converted to bytes here rather than at the call.
+        const unsigned char* wq = (const unsigned char*)w
+            + (size_t)blockIdx.z * (size_t)(sw / q_bs) * (size_t)q_ts;
+        // The two K-quants the checkpoints actually use get a path that decodes
+        // a header once per eight elements instead of once per element. One
+        // super-block per warp, eight contiguous elements per lane.
+        if (!a_half && q_bs == 256 && w_quant == QT_Q4_K) {
+            const int nb = k >> 8;
+            const int hi = lane >> 3, kk = (lane & 7) << 2;
+            const float* av = af + (hi << 6) + kk;
+            // Two loops rather than a test inside one: see `q4k_pair`.
+            if ((((unsigned long long)af) & 15ull) == 0ull) {
+                for (int b = 0; b < nb; ++b) {
+                    acc += q4k_pair<true>(
+                        wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                        av + (b << 8), hi, kk);
+                }
+            } else {
+                for (int b = 0; b < nb; ++b) {
+                    acc += q4k_pair<false>(
+                        wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                        av + (b << 8), hi, kk);
+                }
+            }
+        } else if (!a_half && q_bs == 256 && w_quant == QT_Q6_K) {
+            const int nb = k >> 8;
+            const int hi = lane >> 4, bb = (lane & 15) << 1;
+            const int g0 = (hi << 3) + (bb >> 4);
+            const float* av = af + (hi << 7) + bb;
+            for (int b = 0; b < nb; ++b) {
+                acc += q6k_dot8(wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                                av + (b << 8), hi, bb, g0);
+            }
+        } else {
+            for (int i = lane; i < k; i += 32) {
+                float av;
+                if (a_half) {
+                    float lo, hi;
+                    gemm_unpack(ahr[i >> 1], lo, hi);
+                    av = (i & 1) ? hi : lo;
+                } else {
+                    av = af[i];
+                }
+                acc += av * q_at(wq, w_quant, q_bs, q_ts, col, k, i);
+            }
+        }
+    } else if (w_half) {
         // Two halves to a word, and `k` is even whenever a weight is stored
         // this way - every contraction in the model is.
         const int kh = k >> 1;
@@ -227,7 +584,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     float* __restrict__ out,
     int m, int k, int n,
     long sa, long sw, long so,
-    int a_half, int w_half)
+    int a_half, int w_half,
+    // Zero when `w` is F32 or F16. Otherwise the ggml type id, and `w` points
+    // at packed blocks: `q_bs` elements to a block, `q_ts` bytes to a block.
+    int w_quant, int q_bs, int q_ts)
 {
     __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
     __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
@@ -238,6 +598,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     const unsigned* ah = (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1);
     const float*    wf = (const float*)w    + (size_t)blockIdx.z * sw;
     const unsigned* wh = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1);
+    // Guarded because `q_bs` is zero on the unquantized paths, where this
+    // pointer is never read.
+    const unsigned char* wq = (const unsigned char*)w
+        + (size_t)blockIdx.z * (size_t)(q_bs ? (sw / q_bs) * (long)q_ts : 0);
 
     const int lane = threadIdx.x;          // 0..31
     const int warp = threadIdx.y;          // 0..GEMM_WARPS-1
@@ -309,7 +673,17 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             int j   = i % (GEMM_KC / 2);
             int kk  = kc + 2 * j;
             unsigned packed = 0;
-            if (w_half) {
+            if (w_quant) {
+                // Two elements per staged word, each unpacked from its block.
+                // Out of range stays zero, for the same reason the other paths
+                // zero rather than clamp: zero contributes nothing.
+                float lo = 0.0f, hi = 0.0f;
+                if (n0 + row < n) {
+                    if (kk     < k) lo = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk);
+                    if (kk + 1 < k) hi = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + 1);
+                }
+                packed = gemm_pack(lo, hi);
+            } else if (w_half) {
                 // No conversion at all. `gemm_pack` produces {f16(lo), f16(hi)}
                 // in one b32, and two halves stored contiguously little-endian
                 // are those same 32 bits - so an f16 weight is staged with a

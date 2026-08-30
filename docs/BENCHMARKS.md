@@ -62,12 +62,11 @@ clip and a 29 s one cost the same encoder.
 
 ### Translator
 
-**Not measured, deliberately.** The translator has no timing table here because
-it is not on the reply path: `DIRECT_TAIGI=1` is the pipeline's default and was
-itself chosen on a measurement — 3.8 s end-to-end against 1.6 s with the
-translator bypassed. Benchmarking a stage that does not run, against a
-`llama-server` that also does not run, would produce a number nobody can act
-on.
+Measured now that it runs. It is on the reply path whenever `--direct-taigi` is
+absent, which is how the pipeline is served when Taigi output is wanted from a
+Mandarin-speaking chat model, and the paragraph that used to sit here said the
+measurement to take was decode tokens per second against `llama-server`. That
+number is below, with the chat model beside it.
 
 What is known: the weights are 26.5 GB at f16, and the three-test oracle binary
 takes 113 s end to end on one card with most of that a single load — which is
@@ -83,6 +82,162 @@ supersedes a cell, replace the cell — never append a dated note, a before/afte
 delta, or an "improved from X" narrative. The change story belongs in the commit
 message; durable reasoning belongs in WHY below, and measured rejections in
 WHY NOT.
+
+## The two Llama stages: 6.4x, and the ceiling that is left
+
+One Quadro RTX 8000, `xabe-llm-bench`, 128 prompt tokens then 64 decoded,
+medians over five rounds after one warm-up. Decode is what a listener waits
+through - a reply of N tokens is one prefill and N decodes - and it is what
+`llama-server` reports, so it is the number that can be compared.
+
+| Stage | Checkpoint | Prefill | Decode before | Decode after |
+| --- | --- | ---: | ---: | ---: |
+| chat | Breeze2 8 B Q4_K_M | 303 tok/s | 9.5 tok/s | **61.0 tok/s** |
+| translator | Taigi 13 B Q4_K_M | 210 tok/s | 5.6 tok/s | **35.1 tok/s** |
+
+**6.4x and 6.3x.** Effective bandwidth against the file on disk went from 47
+and 45 GB/s to 300 and 282.
+
+### What was wrong: a header decoded once per element
+
+Decode is a `gemv` per projection and should be bound by streaming the weights
+once. It was bound by unpacking them. `q_elem` re-derives a block's header for
+every element it returns - two f16 scales, a six-bit sub-block scale, and four
+integer divisions - because it is written to be read against the format tables
+one case at a time. At 256 elements to a K-quant super-block that is 256 header
+decodes where one is needed.
+
+The fix is a specialised path for **Q4_K and Q6_K**, which between them are every
+weight byte in both checkpoints - 74% and 26% of the chat file, 77% and 23% of
+the translator. Eight elements per lane makes every divisor a power of two and
+every quotient loop-invariant, so thirty-two lanes at eight elements is one
+super-block per warp. Anything else still goes through `q_at`.
+
+### What was also wrong: every packed byte fetched more than once
+
+Hoisting the header left the decode at 116 GB/s, and the second half of the gap
+was in *which* eight elements a lane took. Adjacent ones are the obvious choice
+and the wrong one, because a K-quant byte does not hold adjacent elements. A
+Q4_K byte packs two elements 32 apart, so a lane wanting eight adjacent elements
+loads eight bytes and throws away a nibble of each - and the byte it half-used
+is loaded again by the lane that wanted the other half. Q6_K is worse: its `ql`
+nibbles are 64 apart and its `qh` 2-bit fields 32 apart, so eight adjacent
+elements cost sixteen byte loads and every byte is fetched two or four times.
+
+Regrouping fixes both. A Q4_K lane takes four whole bytes - one aligned 32-bit
+load and two `float4` activation loads for the same eight elements, against ten
+loads before - at the cost of a second sub-block scale pair, because the two
+nibbles of a byte land in adjacent sub-blocks. A Q6_K lane takes two adjacent
+columns across all four 2-bit fields, which is three 16-bit loads against
+sixteen 8-bit ones, and across a warp covers `ql[0..127]` and `qh[0..63]`
+exactly once. Standalone on this card at n=14336, k=4096:
+
+| Format | Adjacent eight | Regrouped eight |
+| --- | ---: | ---: |
+| Q4_K | 384 us, 86 GB/s | **88 us, 372 GB/s** |
+| Q6_K | 410 us, 117 GB/s | **129 us, 373 GB/s** |
+
+Q6_K reads shorts and not words because its block is 210 bytes: the stride is
+even but not a multiple of four, so successive blocks are only 2-byte aligned.
+Q4_K's 144-byte block is a multiple of four and its load is a word.
+
+The `float4` activation read needs the row to start on a 16-byte boundary, which
+depends on strides the kernel is handed rather than anything it controls, so the
+kernel tests and keeps a scalar path for when it does not hold. The test is a
+template parameter and not a branch inside the loop: it is loop-invariant and
+warp-uniform either way, and leaving it in the loop measured 27% slower.
+
+### The ceiling that is left, and what it is not
+
+300 GB/s against a card that streams 672, and the isolated kernel reaches 372.
+The gap between those two is the rest of a decode - the small key and value
+projections, attention, the norms, and a launch per projection - not the matmul.
+
+`--packing f16` used to be the faster option and is not any more. It reads 2.6x
+more bytes per token for the same weights, and now that the packed path is no
+longer wasting its loads, that costs what it should:
+
+| Same file, same weights | Decode | Prefill | Residency |
+| --- | ---: | ---: | ---: |
+| `--packing packed` | **16.4 ms/tok, 61.0 tok/s** | 302 tok/s | 4.9 GB |
+| `--packing f16` | 28.5 ms/tok, 35.0 tok/s | **469 tok/s** | ~16 GB |
+
+So packed is 1.74x faster at decode *and* 3.3x smaller, and the trade-off that
+made f16 worth considering is gone. f16 still wins prefill by 1.55x, because
+prefill is a `gemm` with as many rows as there are prompt tokens and reaches the
+tensor cores, which the packed path does not - that one is real and unaddressed.
+
+## Residency: the whole pipeline on one card
+
+One Quadro RTX 8000 (49152 MiB), measured with `xabe-vram`, which reads
+`nvidia-smi` rather than the allocator - the CUDA context and the driver's own
+reservations count against the card, and a per-process figure would omit them.
+Stages are loaded **cumulatively in one process**, because that is the
+configuration being asked about; loading them separately and adding the peaks
+would answer a different question and give a smaller number.
+
+| stage | container | delta MiB | cumulative |
+| --- | --- | --- | --- |
+| TTS, VITS 36 M, + the CUDA context | safetensors, f32 | 297 | 297 |
+| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 200 | 3 497 |
+| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 6 400 | 9 897 |
+| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 8 608 | 18 505 |
+| CosyVoice3, LM + flow + vocoder | safetensors | 3 266 | **21 771** |
+
+**21 771 MiB — 21.3 GiB of a 48 GiB card**, 44% of it, leaving 27 375 MiB for
+KV caches and activations. Without CosyVoice, which is the alternative
+synthesiser rather than a second stage, the four remaining are 18 505 MiB.
+
+The context is charged to the TTS row because it is created by whichever stage
+opens the device first, and 36 M parameters is where it is obviously the
+context rather than the weights. CosyVoice is measured as its three
+GPU-resident sub-models opened directly; `Cosy::open` additionally wants a
+voice bundle, which is four small tensors and occupies nothing worth
+reporting.
+
+### What the packing is worth, same file loaded both ways
+
+`Packing::F16` unpacks at load, which is what this engine did before
+`Operand::Q`. Same bytes on disk, same arithmetic, different residency.
+
+| model | file | `Packing::F16` | `Packing::Packed` | ratio |
+| --- | --- | --- | --- | --- |
+| Breeze2 8 B `Q4_K_M` | 4 685 MiB | 16 489 MiB | 6 400 MiB | 2.58x |
+| Taigi Llama-2 13 B `Q4_K_M` | 7 663 MiB | 26 025 MiB | 8 608 MiB | 3.02x |
+
+The packed figures exceed the file sizes by 1 715 and 945 MiB, and that gap is
+the **embedding table**: a gather rather than a matmul, so it has its own kernel
+and is still widened to f32 at load. The gap is what widening costs *over*
+storing it packed - at 8 B, 128 256 x 4 096 as f32 is 2 004 MiB against about
+282 MiB as `Q4_K`, a difference of 1 722 MiB, which is the 1 715 measured. The
+13 B's smaller vocabulary gives 940 MiB by the same arithmetic against 945
+measured.
+
+It is also why the 8 B ratio is the worse of the two despite identical
+quantization: a larger vocabulary over a smaller model puts more of the
+checkpoint into the one tensor that is not packed.
+
+### Why this is the difference between fitting and not
+
+At f16 the same four stages come to **46 011 MiB** - 297 + 3 200 + 16 489 +
+26 025 - against a 49 152 MiB card. That is 93.6% full and leaves 3 141 MiB,
+which is *less than the 13 B's own KV cache* at any useful context length.
+
+Add CosyVoice, which is unquantized either way, and f16 comes to **49 277
+MiB** against a 49 152 MiB card: it does not merely leave too little headroom,
+it exceeds the card by 125 MiB and fails to load at all. Packed, the same five
+stages are 21 771 MiB and use 44% of one card.
+
+So the honest statement is not "f16 is tight". At f16 these stages do not share
+a card; packed, they share one with 27 GB to spare.
+
+### This is residency, not speed
+
+Nothing here was timed. The unpacking feeds the same f16 tensor-core path an
+f32 weight always fed, so `Q4_K_M` buys memory and the int8 path that would
+make `Q8_0` *faster* rather than merely smaller is still not in this workspace.
+Whether unpacking per use costs measurable time on the decode loop has not been
+measured and is not claimed either way.
 
 ## Headroom
 
@@ -259,6 +414,35 @@ time and VRAM budgets should be computed on the inference subset.
 ## WHY NOT
 
 Measured rejections. Things that looked like they should help and did not.
+
+### Two micro-optimisations of the K-quant gemv, both measured flat
+
+Once the header decode was hoisted, the two obvious next steps both changed
+nothing and were reverted rather than kept for the look of the thing.
+
+**An eight-byte vectorised load.** A Q4_K block is 144 bytes and every offset
+into its quants is a multiple of eight, so a lane's eight bytes are one `uint2`
+rather than eight `unsigned char`. 23.8 to 23.7 tok/s.
+
+**Two accumulators over an unrolled pair of super-blocks**, to break what is
+otherwise one dependent chain of fused multiply-adds down the whole row. 23.7
+tok/s, unchanged. Still flat after the regrouping above, and by then it also
+cost 8%, so it stayed out.
+
+The latency chain really is not the limit. The loads are, and the first of these
+is the more useful failure: it cut the *number* of load instructions without
+touching how many times each byte was fetched, because it kept one nibble per
+lane. Fetching each byte once needed the lane-to-element map to change, not the
+load width - see the regrouping above, which is 4.3x. A vectorised load over the
+wrong grouping is a faster way to do the redundant work.
+
+This entry used to end by concluding from those two flat results that the loop
+was arithmetic-bound and that occupancy and register pressure were what to look
+at next. Both halves were wrong. `ptxas -v` puts `gemv` at 64 registers with no
+spills, which is full occupancy on sm_75, and the variant that removed the
+arithmetic while keeping the loads ran at 431 GB/s against the shipped kernel's
+86. Two flat results are evidence about the two things tried and not about
+everything else.
 
 ### `torch.backends.cudnn.benchmark = True` makes the baseline 13x slower
 

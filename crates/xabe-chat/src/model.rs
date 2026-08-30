@@ -2,15 +2,61 @@
 
 use crate::ChatError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, Bpe, LlamaConfig, LlamaWeights};
 
-/// One `[out, in]` matrix on the device, at f16.
+/// Whether a block-quantized checkpoint stays packed on the card.
+///
+/// The default is [`Packing::Packed`], which is what makes a quantized file
+/// occupy its own size in VRAM rather than its unpacked size. [`Packing::F16`]
+/// is what this engine did before the packed matmul existed, and it is kept
+/// for two reasons rather than removed: it is the control the packed path is
+/// tested against on identical weights, and it is the answer if a format ever
+/// turns out to cost more accuracy than a stage can afford.
+///
+/// It has no effect on an unquantized checkpoint, which has no blocks to keep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Packing {
+    /// Keep the checkpoint's blocks; unpack inside the matmul.
+    #[default]
+    Packed,
+    /// Unpack at load and store one f16 per element.
+    F16,
+}
+
+/// How one matrix is held on the device.
+///
+/// The distinction is memory and nothing else: both reach the same kernel and
+/// both are staged to f16 inside it. What differs is what sits in VRAM between
+/// calls - one number per element, or the checkpoint's own packed blocks.
+enum GWeight {
+    /// Rounded to f16 at load. What an f16 or f32 checkpoint gives.
+    F16(CudaSlice<u16>),
+    /// The checkpoint's blocks, byte for byte, unpacked inside the matmul.
+    Packed {
+        /// The packed bytes.
+        data: CudaSlice<u8>,
+        /// Which layout reads them.
+        ty: Quant,
+    },
+}
+
+/// One `[out, in]` matrix on the device.
 struct GLinear {
-    w: CudaSlice<u16>,
+    w: GWeight,
     in_dim: usize,
     out_dim: usize,
+}
+
+impl GLinear {
+    /// This matrix as the matmul's right operand.
+    fn operand(&self) -> Operand<'_> {
+        match &self.w {
+            GWeight::F16(w) => Operand::F16(w),
+            GWeight::Packed { data, ty } => Operand::Q { data, ty: *ty },
+        }
+    }
 }
 
 /// One decoder block.
@@ -59,7 +105,7 @@ pub struct ChatModel {
     layers: Vec<GLayer>,
     norm: CudaSlice<f32>,
     /// The output projection. Llama-3 does not tie it to the embedding.
-    lm_head: CudaSlice<u16>,
+    lm_head: GLinear,
     /// Llama-3.1's per-pair rope divisor, if the checkpoint carries one.
     rope_freqs: Option<CudaSlice<f32>>,
 }
@@ -103,6 +149,11 @@ impl ChatModel {
     /// is smaller - and lands at the same 16 GB, because this engine unpacks
     /// on read rather than running packed blocks. See `docs/MODEL.md`.
     pub fn open(path: &Path, ordinal: usize) -> Result<Self, ChatError> {
+        Self::open_with(path, ordinal, Packing::default())
+    }
+
+    /// The same, choosing how a quantized checkpoint is held.
+    pub fn open_with(path: &Path, ordinal: usize, packing: Packing) -> Result<Self, ChatError> {
         if !path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
@@ -125,9 +176,24 @@ impl ChatModel {
         let wide = |b: &Bound| -> Result<CudaSlice<f32>, ChatError> {
             Ok(gpu.upload(&f.tensor_f32(&b.name)?)?)
         };
+        // A matrix stays in whatever the file stores it as, when the kernel has
+        // a path for that layout. This is the whole difference between a
+        // quantized checkpoint that loads faster and one that also *fits*: the
+        // f16 branch is 2 bytes an element, the packed branch is whatever the
+        // block format is - 4.5 bits for Q4_K.
         let lin = |b: &Bound| -> Result<GLinear, ChatError> {
+            let packed = (packing == Packing::Packed)
+                .then(|| b.packed.and_then(|t| Quant::from_id(t as u32)))
+                .flatten();
+            let w = match packed {
+                Some(ty) => GWeight::Packed {
+                    data: gpu.upload_u8(&Self::packed(&f, b, &cfg, ty)?)?,
+                    ty,
+                },
+                None => GWeight::F16(narrow(b)?),
+            };
             Ok(GLinear {
-                w: narrow(b)?,
+                w,
                 in_dim: b.shape[1],
                 out_dim: b.shape[0],
             })
@@ -163,7 +229,7 @@ impl ChatModel {
             embed: wide(&w.embed_tokens)?,
             layers,
             norm: wide(&w.norm)?,
-            lm_head: narrow(&w.lm_head)?,
+            lm_head: lin(&w.lm_head)?,
             rope_freqs,
             cfg,
             tokenizer,
@@ -201,6 +267,31 @@ impl ChatModel {
         ))
     }
 
+    /// A tensor's blocks, byte for byte, with the rope permutation undone.
+    ///
+    /// The sibling of [`Self::f16`] and it has to undo the same permutation,
+    /// or `q` and `k` are shuffled within every head and the model is fluent
+    /// and wrong - see `xabe_llama::gguf`. It can do so *without unpacking*
+    /// only because that permutation moves whole rows: a quantized row is a
+    /// whole number of blocks, so the same shuffle applies to byte ranges.
+    fn packed(f: &GgufFile, b: &Bound, cfg: &LlamaConfig, ty: Quant) -> Result<Vec<u8>, ChatError> {
+        let raw = f.tensor_bytes(&b.name)?;
+        if !xabe_llama::gguf::is_rope_permuted(&b.name) {
+            return Ok(raw.to_vec());
+        }
+        let heads = if b.shape[0] == cfg.hidden_size {
+            cfg.num_attention_heads
+        } else {
+            cfg.num_key_value_heads
+        };
+        Ok(xabe_llama::gguf::unpermute_rope_bytes(
+            raw,
+            b.shape[0],
+            ty.bytes(b.shape[1]),
+            heads,
+        ))
+    }
+
     /// The geometry this model was bound against.
     pub fn config(&self) -> &LlamaConfig {
         &self.cfg
@@ -234,7 +325,7 @@ impl ChatModel {
     ) -> Result<CudaSlice<f32>, ChatError> {
         Ok(self.gpu.gemm_batched(
             x,
-            Operand::F16(&l.w),
+            l.operand(),
             None,
             Batch::single(rows * l.out_dim),
             rows,
@@ -392,7 +483,7 @@ impl ChatModel {
         Ok((
             self.gpu.gemm_batched(
                 Operand::F32(&h),
-                Operand::F16(&self.lm_head),
+                self.lm_head.operand(),
                 None,
                 Batch::single(n * self.cfg.vocab_size),
                 n,

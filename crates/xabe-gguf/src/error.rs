@@ -109,6 +109,21 @@ pub enum GgufError {
     OffsetOverflow(String),
 
     /// A tensor was asked for by a name the file does not have.
+    /// Too few bytes to hold the blocks that were asked for.
+    ///
+    /// Only reachable through the free `dequantize`, where the caller supplies
+    /// both the bytes and the element count. Inside a container the two come
+    /// from the same tensor entry and cannot disagree.
+    #[error("{needed} bytes of {ggml_type:?} blocks were asked for, but only {found} were given")]
+    ShortBlockData {
+        /// The type being unpacked.
+        ggml_type: crate::GgmlType,
+        /// Bytes the block count requires.
+        needed: usize,
+        /// Bytes actually supplied.
+        found: usize,
+    },
+
     #[error("no tensor named `{0}`")]
     MissingTensor(String),
 
