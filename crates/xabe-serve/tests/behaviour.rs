@@ -113,6 +113,35 @@ fn a_boundary_that_arrives_too_early_does_not_produce_a_chunk() {
 }
 
 #[test]
+fn a_chunk_ends_at_the_boundary_and_not_at_the_end_of_the_piece() {
+    let mut c = Chunker::new(4, 6);
+    // A streamed piece is several characters, so it straddles the boundary.
+    // Emitting all of `你好！天` would tear `天` off `天氣`, and the orphan is
+    // then translated alone as "sky" and synthesised as its own segment -
+    // which is what a listener hears as speaking word by word.
+    let first = c.push("你好！天氣的確很好，").expect("the comma ends it");
+    assert_eq!(first, "你好！天氣的確很好，");
+    assert_eq!(c.push("我已經吃飽了，"), None, "a comma no longer suffices");
+    assert_eq!(
+        c.push("謝謝關心。").as_deref(),
+        Some("我已經吃飽了，謝謝關心。")
+    );
+}
+
+#[test]
+fn text_after_the_boundary_is_kept_for_the_next_chunk() {
+    let mut c = Chunker::new(4, 6);
+    // `了` arrives in the same piece as the full stop that ends the clause
+    // before it, and must still be spoken - as part of what follows, not alone.
+    assert_eq!(
+        c.push("今仔日好天。食飽").as_deref(),
+        Some("今仔日好天。"),
+        "the chunk stops at the full stop"
+    );
+    assert_eq!(c.finish().as_deref(), Some("食飽"), "and the rest survives");
+}
+
+#[test]
 fn the_minimum_length_is_counted_in_characters_not_bytes() {
     // Every Han character is three UTF-8 bytes, so a byte count would fire the
     // first chunk after one character and the whole tuning would be wrong.
@@ -192,6 +221,28 @@ fn romanised_text_splits_on_ascii_punctuation_and_never_mid_syllable() {
         assert!(!p.starts_with('-'), "cut mid-syllable: {p}");
         assert!(p.chars().count() <= 41, "chunk too long: {p}");
     }
+}
+
+#[test]
+fn a_chunk_already_short_enough_is_not_split_at_its_sentence_marks() {
+    // The limit is a ceiling, not a target. Two short sentences inside it are
+    // one waveform, not two with a gap in the middle.
+    let parts = split_poj("Li hó! Thinn-khì chin hó,", 120);
+    assert_eq!(parts, vec!["Li hó! Thinn-khì chin hó,"]);
+
+    let han = split_sentences("你好！天氣真好。", 60);
+    assert_eq!(han, vec!["你好！天氣真好。"]);
+}
+
+#[test]
+fn packing_never_carries_a_part_past_the_limit() {
+    // Three sentences of 10 characters against a limit of 25: the first two
+    // fit together and the third starts a new part rather than overflowing.
+    let parts = split_poj("aaaaaaaaa. bbbbbbbbb. ccccccccc.", 25);
+    for p in &parts {
+        assert!(p.chars().count() <= 25, "over the limit: {p}");
+    }
+    assert_eq!(parts.len(), 2, "{parts:?}");
 }
 
 #[test]

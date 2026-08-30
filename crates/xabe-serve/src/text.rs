@@ -142,26 +142,36 @@ impl Chunker {
     }
 
     /// Feeds one streamed piece, returning a chunk when one is ready.
+    ///
+    /// The chunk ends *at* the boundary. Emitting everything pending the moment
+    /// a boundary appeared anywhere in it looks equivalent and is not: a piece
+    /// arrives as several characters at once, so the tail of it belongs to the
+    /// next clause. `你好！天` was a real chunk produced that way - the `天` torn
+    /// off `天氣`, translated on its own as "sky" rather than as half of
+    /// "weather", and synthesised as its own three-quarter-second segment.
+    /// Every test here fed pieces that ended exactly on a boundary, which is
+    /// the one case where the difference does not show.
     pub fn push(&mut self, piece: &str) -> Option<String> {
         self.pending.push_str(piece);
-        let boundary = if self.dispatched {
-            &*SENT_END
+        let (boundary, min) = if self.dispatched {
+            (&*SENT_END, self.later_min)
         } else {
-            &*CLAUSE_END
+            (&*CLAUSE_END, self.first_min)
         };
-        let min = if self.dispatched {
-            self.later_min
-        } else {
-            self.first_min
-        };
-        let trimmed = self.pending.trim();
-        if boundary.is_match(&self.pending) && trimmed.chars().count() >= min {
-            let out = trimmed.to_string();
-            self.pending.clear();
-            self.dispatched = true;
-            return Some(out);
-        }
-        None
+        // The earliest boundary with enough text before it. A boundary that
+        // arrives too early is skipped rather than waited on, so `好，` merges
+        // into the clause after it instead of holding the whole reply back.
+        let cut = {
+            let pending = &self.pending;
+            boundary
+                .find_iter(pending)
+                .map(|m| m.end())
+                .find(|&end| pending[..end].trim().chars().count() >= min.max(1))
+        }?;
+        let head = self.pending[..cut].trim().to_string();
+        self.pending = self.pending[cut..].to_string();
+        self.dispatched = true;
+        Some(head)
     }
 
     /// Whatever is left when the stream ends.
@@ -215,7 +225,7 @@ pub fn split_sentences(text: &str, max_chars: usize) -> Vec<String> {
             out.push(part);
         }
     }
-    out
+    pack(out, max_chars, "")
 }
 
 /// Splits romanised text, which has ASCII punctuation rather than CJK.
@@ -239,7 +249,7 @@ pub fn split_poj(text: &str, max_chars: usize) -> Vec<String> {
             out.push(part);
         }
     }
-    out
+    pack(out, max_chars, " ")
 }
 
 /// Normalises Pe̍h-ōe-jī for `facebook/mms-tts-nan`.
@@ -253,6 +263,32 @@ pub fn split_poj(text: &str, max_chars: usize) -> Vec<String> {
 /// See `docs/MODEL.md` for the round-trip measurement that established this.
 pub fn normalize_for_mms(s: &str) -> String {
     s.replace(['\u{207f}', '\u{1d3a}'], "nn")
+}
+
+/// Rejoins adjacent parts that fit together inside `max_chars`.
+///
+/// `max_chars` is a ceiling, not a target. Splitting at every sentence mark
+/// regardless of length turns a chunk well under the limit into several
+/// waveforms with a gap between each, which is heard as clipped speech rather
+/// than as a sentence boundary. A real one: the reply below is 32 characters
+/// against a limit of 120 and was being spoken as two.
+///
+/// `sep` is what went missing when the parts were trimmed - a space for
+/// romanisation, nothing for Han, which does not write them.
+fn pack(parts: Vec<String>, max_chars: usize, sep: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        let fits = out.last().is_some_and(|last| {
+            last.chars().count() + sep.chars().count() + part.chars().count() <= max_chars
+        });
+        if fits && let Some(last) = out.last_mut() {
+            last.push_str(sep);
+            last.push_str(&part);
+        } else {
+            out.push(part);
+        }
+    }
+    out
 }
 
 /// Splits after any of `marks`, keeping the mark with the preceding part.
