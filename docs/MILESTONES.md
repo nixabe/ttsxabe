@@ -612,7 +612,10 @@ elements a lane owns fetches each byte once.
 per-format microbenchmarks and the rejected follow-ups in `docs/BENCHMARKS.md`.
 The packed path is now faster than the f16 one at decode as well as smaller, so
 the residency-versus-speed trade-off that used to sit here is gone. What remains
-is prefill, where f16 is still 1.55x ahead because it reaches the tensor cores.
+was prefill, where f16 was 1.55x ahead - the tiled kernel stages its operands
+to f16 and the packed staging was still decoding a block header per element.
+Eight elements a thread and one header closed it: 2.16x, and packed now leads
+f16 on prefill too.
 
 ## What the numbering does not cover
 

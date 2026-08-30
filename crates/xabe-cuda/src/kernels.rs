@@ -444,6 +444,52 @@ __device__ __forceinline__ float q6k_dot8(
     return acc;
 }
 
+// Eight consecutive elements of one K-quant super-block, header decoded once.
+//
+// `gemm` stages the weight tile two elements per thread and was reaching them
+// through `q_at`, which re-derives the block header for each - the same waste
+// `q4k_pair` exists to remove from `gemv`, left behind in the tiled kernel
+// because only the decode path had been measured. It is most of prefill.
+//
+// Eight *eight-aligned* elements stay inside one 32-element sub-block and one
+// 16-element Q6_K scale group, so the scales, the shift and the byte pointer
+// are all shared and the inner eight are a nibble extract and a multiply-add.
+// Same addressing as `q6k_dot8` before it was regrouped; `gemm` wants a run of
+// the contraction where `gemv` wants a run of whole bytes.
+__device__ __forceinline__ void q4k_eight(
+    const unsigned char* blk, int j, float* e)
+{
+    float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+    unsigned char sc, mn;
+    q_scale_min(blk + 4, j >> 5, sc, mn);
+    const unsigned char* qs = blk + 16 + ((j >> 6) << 5) + (j & 31);
+    int shift = ((j >> 5) & 1) << 2;
+    float ds = d * (float)sc, dm = dmin * (float)mn;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        e[t] = ds * (float)((qs[t] >> shift) & 0x0F) - dm;
+    }
+}
+
+__device__ __forceinline__ void q6k_eight(
+    const unsigned char* blk, int j, float* e)
+{
+    const unsigned char* qh = blk + 128;
+    const signed char* scales = (const signed char*)(blk + 192);
+    float d = q_f16(blk, 208);
+    int g = j >> 7, r = j & 127;
+    int sl = (r >> 6) & 1, sh = (r >> 5) & 3;
+    const unsigned char* qlp = blk + (g << 6) + (r & 63);
+    const unsigned char* qhp = qh + (g << 5) + (r & 31);
+    float dsc = d * (float)((int)scales[j >> 4]);
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        int lo = (qlp[t] >> (sl << 2)) & 0x0F;
+        int b = (qhp[t] >> (sh << 1)) & 0x03;
+        e[t] = dsc * (float)((lo | (b << 4)) - 32);
+    }
+}
+
 __device__ __forceinline__ float q_at(
     const unsigned char* w, int ty, int bs, int ts, long row, int k, int kk)
 {
@@ -668,7 +714,51 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             }
             as[row * GEMM_WSTRIDE + j] = packed;
         }
-        for (int i = tid; i < GEMM_NT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
+        // The two K-quants every checkpoint here uses stage eight elements a
+        // thread so the header is decoded once for all of them. `GEMM_KC` is a
+        // multiple of eight and `kc` a multiple of `GEMM_KC`, so `kk` is
+        // eight-aligned and the run cannot straddle a sub-block.
+        const bool q_fast = w_quant && q_bs == 256
+            && (w_quant == QT_Q4_K || w_quant == QT_Q6_K);
+        if (q_fast) {
+            for (int i = tid; i < GEMM_NT * (GEMM_KC / 8); i += GEMM_WARPS * 32) {
+                int row = i / (GEMM_KC / 8);
+                int jq  = i % (GEMM_KC / 8);
+                int kk  = kc + 8 * jq;
+                float e[8];
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    e[t] = 0.0f;
+                }
+                if (n0 + row < n) {
+                    if (kk + 7 < k) {
+                        long nb = k / 256;
+                        const unsigned char* blk = wq
+                            + ((size_t)(n0 + row) * nb + (kk >> 8)) * (size_t)q_ts;
+                        if (w_quant == QT_Q4_K) {
+                            q4k_eight(blk, kk & 255, e);
+                        } else {
+                            q6k_eight(blk, kk & 255, e);
+                        }
+                    } else {
+                        // The tail of a contraction that is not a whole tile.
+                        #pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            if (kk + t < k) {
+                                e[t] = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + t);
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    bs[row * GEMM_WSTRIDE + 4 * jq + t] =
+                        gemm_pack(e[2 * t], e[2 * t + 1]);
+                }
+            }
+        }
+        for (int i = q_fast ? GEMM_NT * (GEMM_KC / 2) : tid;
+             i < GEMM_NT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
             int row = i / (GEMM_KC / 2);
             int j   = i % (GEMM_KC / 2);
             int kk  = kc + 2 * j;

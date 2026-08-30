@@ -159,13 +159,40 @@ longer wasting its loads, that costs what it should:
 
 | Same file, same weights | Decode | Prefill | Residency |
 | --- | ---: | ---: | ---: |
-| `--packing packed` | **16.4 ms/tok, 61.0 tok/s** | 302 tok/s | 4.9 GB |
-| `--packing f16` | 28.5 ms/tok, 35.0 tok/s | **469 tok/s** | ~16 GB |
+| `--packing packed` | **16.4 ms/tok, 61.0 tok/s** | **399 tok/s** | 4.9 GB |
+| `--packing f16` | 28.5 ms/tok, 35.0 tok/s | 322 tok/s | ~16 GB |
 
 So packed is 1.74x faster at decode *and* 3.3x smaller, and the trade-off that
-made f16 worth considering is gone. f16 still wins prefill by 1.55x, because
-prefill is a `gemm` with as many rows as there are prompt tokens and reaches the
-tensor cores, which the packed path does not - that one is real and unaddressed.
+made f16 worth considering is gone.
+
+Prefill used to be f16's one remaining win, by 1.55x, and it is not any more -
+see below. The reason it was is worth keeping: prefill is a `gemm` with as many
+rows as there are prompt tokens, and the tiled kernel *stages* its operands to
+f16 before touching the tensor cores. Reading a packed weight means unpacking
+during that staging, and the staging had never been measured.
+
+### Prefill was decoding a block header for every element it staged
+
+`gemv` got the one-header-per-eight-elements treatment when decode was measured.
+`gemm` did not, because prefill was not on anyone's list, so its staging loop
+still reached each weight through `q_at` - which re-derives two f16 scales, a
+six-bit sub-block scale and four divisions per element. Two elements a thread,
+two full header decodes.
+
+Eight elements a thread instead, one header for all of them. Eight *eight-
+aligned* elements stay inside one 32-element sub-block and one Q6_K scale group,
+and `GEMM_KC` is a multiple of eight, so nothing straddles.
+
+| Taigi 13 B, prompt tokens | prefill | |
+| --- | ---: | ---: |
+| packed, per element | 515.9 ms / 32 tok | 62.0 tok/s |
+| packed, one header per pair | 298.9 ms / 32 tok | 107.1 tok/s |
+| packed, one header per eight | **238.7 ms / 32 tok** | **134.0 tok/s** |
+
+**2.16x.** At 128 prompt tokens it passes the f16 path outright - 398.8 tok/s
+against 322.4 - so packed is now ahead of f16 on both halves of a forward pass
+as well as 3.3x smaller. There is no shape left where widening the weights
+helps.
 
 ## A spoken turn: where the 7 s went
 
@@ -177,11 +204,13 @@ of three runs of the same prompt.
 
 | | one card | translator on card 1 |
 | --- | ---: | ---: |
-| first audio | 2272 ms | **1930 ms** |
-| whole turn | 6784 ms | **5620 ms** |
+| first audio | **1798 ms** | 1930 ms |
+| whole turn | **5638 ms** | 5620 ms |
 
-The one-card column is after the Tacotron2 second pass below; the two-card one
-predates it and is that much better again in practice.
+The one-card column is current. The two-card one predates both the Tacotron2
+second pass and the prefill fix, which is why one card now reads better than
+two: splitting the cards is still worth what it was worth, on top of numbers
+that have since moved.
 
 Read that as the cost of the single-card constraint rather than as a speedup
 available everywhere: **everything below applies only across cards.** On one
@@ -638,6 +667,31 @@ The check was kept anyway, and this is why it is recorded here rather than as a
 speedup: the cut in `translate` exists precisely because the model *sometimes*
 closes its tag instead of ending, and on those turns the loop had no way to
 know. It bounds a tail that does not show up in a median.
+
+### Four more attempts at the decode gemv, all measured worse
+
+Decode reads every weight once a token, so its `gemv` is the whole of what a
+clause costs once prefill is fixed. It runs at 372 GB/s. A kernel that reads the
+same buffer and does nothing with it reaches 587, so the gap is real and it is
+1.58x. None of these closed any of it, measured standalone at n=14336, k=4096
+against the shipped kernel's 88.1 us:
+
+- **The activation staged in shared memory**, once per block instead of once per
+  warp - 122.7 us. Two `__syncthreads()` per super-block cost more than the
+  traffic they save; the warps stop covering each other's latency.
+- **Two output columns per warp**, so the activation registers serve twice the
+  weights - 91.6 us. Halves the blocks and the parallelism with them.
+- **The 16-byte block header as one `uint4`** instead of eight byte loads, which
+  every lane issues identically - 108.8 us. The byte loads broadcast out of L1
+  and cost less than the register shuffling to take them apart again.
+- **The activation dropped entirely**, as a diagnostic rather than a candidate -
+  80.0 us. That is the whole of what the activation loads cost: 9%. They are not
+  the limiter, which is why the first two could not have worked.
+
+What is left is the format. Between the header decode and reading 144-byte
+blocks in two pieces rather than as a stream, 372 GB/s against 587 is close to
+what unpacking Q4_K on the fly is worth on this card. The next honest step is a
+cheaper format, not a cheaper kernel.
 
 ### Two micro-optimisations of the K-quant gemv, both measured flat
 
