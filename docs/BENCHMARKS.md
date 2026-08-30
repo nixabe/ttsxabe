@@ -83,6 +83,30 @@ delta, or an "improved from X" narrative. The change story belongs in the commit
 message; durable reasoning belongs in WHY below, and measured rejections in
 WHY NOT.
 
+## First speech, with llama.cpp behind both Llama stages
+
+The table below says llama.cpp is ahead on both stages. This is what that is
+worth to a listener. Same card, same checkpoints, `--llm-url` and
+`--translator-url` pointed at two `llama-server` processes on 127.0.0.1 with
+everything else - ASR, VAD, the synthesisers, the socket - still in this engine.
+
+| one card, three-clause turn | in-process | llama.cpp behind both |
+| --- | ---: | ---: |
+| first audio | 1798 ms | **1400 ms** |
+| whole turn | 5638 ms | **3525 ms** |
+| resident | 22.4 GB | 21.7 GB |
+
+**1.28x to first speech.** Medians of seven runs against three; the turn total is
+the softer of the two numbers because the two chat models sample differently and
+the replies are not the same length, where first audio is one clause either way.
+Per clause, translation went from 1091-1164 ms to 798-859.
+
+It costs a process boundary and two more things to supervise, and it wins. The
+in-process stages stay - they are what the oracle tests compare against, and
+they are what makes the packed-weight work measurable at all - but nothing here
+should claim the pipeline is fastest with them in the reply path, because it is
+not.
+
 ## Against llama.cpp, which is the baseline and is still ahead
 
 This section used to say the measurement to take was decode tokens per second

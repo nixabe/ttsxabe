@@ -34,6 +34,11 @@ pub struct GatewayConfig {
     /// audio from 2659 ms to 2919 - the whole turn no faster and the part a
     /// listener waits through slower. `xabe-engine` sets this by comparing the
     /// translator's device with the synthesiser's.
+    ///
+    /// A stage reached over a URL is taken to be off this card, which is a
+    /// guess: the URL may well be a `llama-server` on 127.0.0.1 holding the
+    /// same GPU. It is the right guess for the case the flag exists for and
+    /// there is nothing in a base URL that would say otherwise.
     pub translate_ahead: usize,
     /// Language given to the ASR.
     pub asr_lang: String,
