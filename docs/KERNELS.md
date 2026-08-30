@@ -173,15 +173,62 @@ The fix is to let a lane own whole bytes and take whichever elements those bytes
 happen to encode, which for `Q4_K` is four adjacent elements and the four 32
 along, and for `Q6_K` two adjacent columns across all four 2-bit fields. It
 costs extra scale-group decoding, because the elements of one byte can straddle
-sub-blocks, and that is much cheaper than the duplicate fetches. Anything else
-added here - a new format, a wider load - should start from the same question:
-how many times does the warp read each packed byte?
+sub-blocks, and that is much cheaper than the duplicate fetches.
 
-**Only a weight, never an activation.** A weight comes from a checkpoint and is
-already in blocks; an activation is produced at f32 by the previous kernel, so
-quantizing one would mean quantizing at runtime, which is a different piece of
-work. `CudaError::QuantizedActivation` refuses it rather than growing a path
-nothing asks for.
+**Then how *wide* each lane's load is, which is a second question and was worth
+more.** Owning whole bytes fetches each byte once; it does not say how many at a
+time. Four bytes a lane reaches 373 GB/s and sixteen reaches 578 on a card whose
+streaming roof for the same buffer is 587 - and the sixteen-byte number was
+measured with the arithmetic deleted, which is what proved the layout had stopped
+being the constraint. `docs/BENCHMARKS.md` has the sequence; the short version is
+that six attempts to beat the four-byte kernel by rearranging it all failed, and
+the one that worked changed nothing about the arrangement.
+
+Sixteen bytes of `Q4_K` is 32 elements, and that is the catch: 32 f32
+activations is 128 bytes of scattered reads, which costs more than the wide load
+wins. So the activation goes to int8 (below), the dot product becomes four
+`__dp4a` against nibble masks that are already four int8 weights in a word, and
+the block's minimum comes out as one more `__dp4a` against a word of ones.
+
+`Q6_K` needs one thing more. Its blocks are 210 bytes, so consecutive blocks in
+a file sit at every alignment in turn and a 16-byte load is legal on none of
+them. `Gpu::upload_quant` re-strides them to 224 - the next multiple of 16 -
+which costs 6.7% of the bytes of a `Q6_K` tensor and is **the only place in this
+engine where what sits in VRAM is not byte-for-byte what sits in the file**. It
+is a stride and not a re-encoding: every block is still the file's own 210 bytes,
+at a wider pitch. `Quant::device_stride` is the one function that knows.
+
+Anything added here - a new format, a different grouping - should start from both
+questions in order: how many times does the warp read each packed byte, and how
+many bytes does one lane ask for at once.
+
+**A weight may be packed; an activation is quantized, which is not the same
+thing.** A weight arrives from the checkpoint already in blocks, and
+`CudaError::QuantizedActivation` still refuses one as the *left* operand of a
+matmul, because nothing produces one there.
+
+What is new is that the activation is quantized at runtime, and only to feed the
+wide load above. `Gpu::quantize_activation` writes int8 codes in groups of 32
+with one f32 scale a group, codes and scales in one allocation. Three things
+about it are deliberate:
+
+- **The scale is `max|a| / 127`,** symmetric, so zero maps to zero and there is
+  no zero point to carry a second term for. An all-zero group gets scale zero
+  and quantizes exactly rather than dividing by it.
+- **It is the engine's one approximation, and it is measured, not assumed.**
+  0.66% of the logit span against the same model at f16, and zero tokens of
+  difference in greedy decoding. `xabe_dsp::quantize_q8` is the CPU twin and the
+  differential test compares at *exact equality* - the thing worth checking is
+  that the two implementations approximate identically, and a tolerance there
+  would hide exactly the group-boundary or rounding-mode disagreement it exists
+  to catch.
+- **The caller takes it, not the matmul.** A transformer layer feeds one normed
+  activation to three projections and another to two, so quantizing per
+  projection is four fifths of a launch and an allocation wasted.
+  `Operand::F32Q` carries an activation with its twin; `gemm_batched` still
+  takes one for itself when handed a plain `Operand::F32`, and checks a
+  caller-supplied twin's shape against `m` and `k`, because a mismatched one
+  would index another tensor's codes in bounds and return numbers.
 
 **A row must start on a block boundary.** `q_at` finds an element's block by
 dividing, so a contraction that is not a whole number of blocks would read into
@@ -338,16 +385,54 @@ ones**: 1.0 for the first 29 pairs, a ramp through six, then 8.0 for the rest.
 A defaulted divisor gives a model fluent for one sentence and drifting after it,
 which no shape check catches and no short test notices.
 
-**`repeat_kv` expands 8 key-value heads to 32 query heads.** It is a gather and
-nothing more, and it is deliberately indifferent to what is inside a head: a
-whole head is `t * head_dim` contiguous floats whether the block is `[t, hd]` or
-the transposed `[hd, t]` the value side wants, so one kernel serves both sides
-of the attention.
+**`repeat_kv` expanded 8 key-value heads to 32 query heads.** It is a gather and
+nothing more, and the chat and translator paths no longer call it: the grouped
+heads are the *batch dimension* of a matmul that was already batched. Eight
+products of four query rows each, reading one copy of each key head four times,
+instead of thirty-two products against a key tensor expanded to match. The query
+rows line up for free, because a head split lays them out `[head][t][d]` and the
+`group * n` rows one key head serves are contiguous — and for a single decode
+step they are contiguous already, which is why the split is skipped there too.
+The kernel stays for the ASR's cross-attention.
 
-The cache is held at the **narrow** width and expanded on the way in, not stored
-expanded. Storing the expansion would quadruple it for no information — the four
-query heads in a group read the same key-value head — which at 8k tokens across
-32 layers is 6 GB against 1.5.
+That is one of five layout kernels the attention no longer runs per layer per
+token. The other four went the same way, by **storing the cache in the layout
+attention reads** rather than the one the projection produces: keys
+`[kv_heads, capacity, head_dim]`, values `[kv_heads, head_dim, capacity]`.
+`cache_append` scatters a step straight into either, at the one moment the data
+is small. What it replaces is a head split for the keys, a transposed split for
+the values, and two `repeat_kv` expansions, every one of them building a tensor
+that was thrown away before the next token.
+
+The value side is why `Batch` has a `w_row`. A head's values are
+`[head_dim, capacity]` and attention contracts over the `tk` positions that
+exist, so a row of the operand is a *capacity* apart, not a `tk`. Without a row
+stride the cache would have to be exactly as long as the context, which is what
+made the old one reallocate and copy itself every step.
+
+The cache is held at the **narrow** width, not expanded. Storing the expansion
+would quadruple it for no information — the four query heads in a group read the
+same key-value head — which at 8k tokens across 32 layers is 6 GB against 1.5.
+It also has **capacity distinct from length**, doubling on growth. Growing it by
+exactly the tokens added meant an allocation, a zeroing and a full copy of the
+whole cache for every layer of every token: quadratic in the context, and 128
+allocations and 16 MB of copying a token at 64 of it.
+
+**Three kernels fold work into a pass something else was making anyway.**
+`rms_norm` takes an optional residual to add and an optional int8 twin to emit;
+`silu_mul` takes the twin too; `softmax_causal` does the scale, the causal mask
+and the softmax in one. None of these is a new algorithm and all of them are
+worth more than they look: at a single decode row the row is 16 KB and the
+kernel is one block, so what costs is the launch and the latency, not the work.
+`rms_norm` also reads four floats a thread rather than one, for the same reason
+the mat-vec does.
+
+The shapes these fusions need are the reason they carry constructor checks: a
+scale group is 32 columns and a warp must own a whole number of them, so
+`rms_norm_q` refuses a width that is not a multiple of 32 and `silu_mul_q` one
+that is not a multiple of the block. The general `rms_norm` keeps a scalar path
+for ragged widths, because narrowing a public kernel's contract to fit an
+optimisation is the wrong trade.
 
 The trap next to it has no kernel of its own: **`rope` on `k` runs over
 `kv_heads`, not `heads`.** The kernel walks the tensor as `heads * head_dim` per

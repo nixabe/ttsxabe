@@ -617,6 +617,40 @@ to f16 and the packed staging was still decoding a block header per element.
 Eight elements a thread and one header closed it: 2.16x, and packed now leads
 f16 on prefill too.
 
+### And then it was still 1.66x behind llama.cpp, which was the actual bar
+
+The 6.4x above is against where this engine started. Measured against
+`llama-bench` on the same card and file, decode was 60.8 tok/s to llama.cpp's
+101.2 - and the paragraph above had no way of showing that, which is why the
+comparison now has a table of its own.
+
+Closing it took two things, in this order, and the second was the larger.
+
+**Sixteen bytes a lane instead of four**, which needs the activation at int8 to
+keep up, because 32 elements of weight against 32 f32 activations is a wider
+scattered read than the wide load saves. 60.8 to 80.9 tok/s. Six earlier attempts
+to beat the four-byte kernel by rearranging it had all failed, and the conclusion
+drawn from them - that the block layout was the cap - was wrong; the measurement
+that settled it was a kernel with the arithmetic deleted, which ran at the
+streaming roof.
+
+**Then everything that was not the matmul**, which by that point was 40% of a
+token: 1154 kernel launches and 1126 allocations, a KV cache that reallocated and
+copied itself every layer of every token, five layout kernels a layer rearranging
+that cache into the shape attention wanted, and a one-float argument allocated
+and zeroed on every rope call. 80.9 to **101.5 tok/s**.
+
+That is 0.3% ahead of llama.cpp on chat decode - a tie dressed as a win, and the
+first of the four llama.cpp numbers this engine has ever led. The translator's
+decode is 55.3 against 61.5, and prefill on both is about 3.5x behind and
+untouched. The int8 activation is the engine's one deliberate approximation:
+0.66% of the logit span, and zero tokens of difference under greedy decoding.
+
+Two things are worth carrying forward from it. The kernel work was found by
+*deleting* the suspected part rather than by trying alternatives to it, and the
+larger half of the win was not kernel work at all - it was bookkeeping that
+profiled as nothing because every individual kernel was fast.
+
 ## What the numbering does not cover
 
 Batching and streaming synthesis are still deliberately absent. They are

@@ -45,10 +45,19 @@ unpacks them inside the kernel, so a quantized model occupies its file's size
 on the card rather than its unpacked size. `docs/KERNELS.md` has the design and
 the two findings that cost time; `docs/BENCHMARKS.md` has what it measures.
 
-The limit that remains is narrower and worth stating in its place. Only the
-**matmul** reads packed blocks. The embedding table is still gathered at f32,
-because a gather is not a matmul and it has its own kernel; and quantizing at
-*runtime* is not here at all, which is why an activation may not be packed.
+That paragraph used to end by saying quantizing at *runtime* was not here at
+all. **It is now**, in one place and for one reason: the packed mat-vec reads
+sixteen bytes of weight a lane, that is 32 elements, and 32 f32 activations cost
+more to fetch than the wide load saves. So an activation is quantized to int8 in
+groups of 32 on its way into that kernel - `Gpu::quantize_activation`, with a
+CPU twin in `xabe-dsp` and a differential test at exact equality. It is the
+engine's one deliberate approximation, worth 0.66% of the logit span and zero
+tokens of difference in greedy decoding; `docs/BENCHMARKS.md` has both numbers.
+
+The limits that remain are narrower. Only the **matmul** reads packed blocks -
+the embedding table is still gathered at f32, because a gather is not a matmul
+and it has its own kernel. And a *weight* still may not arrive packed as the
+left operand of a matmul; that refusal stands.
 
 ## Current standing
 
@@ -60,11 +69,14 @@ is the file to read before starting work rather than this paragraph.
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
 medians. The ASR is **0.55x** against `whisper-server` — a stated milestone that
-is not met, recorded as a miss. And both Llama stages are **behind llama.cpp on
-this hardware**: 0.60x and 0.58x on decode, and about 0.29x on prefill. The
-large speedups recorded for them are against where this engine started, not
-against llama.cpp, which has never been beaten here. Those numbers and every
-other comparison belong in `docs/BENCHMARKS.md` and nowhere else.
+is not met, recorded as a miss. And the Llama stages are now split: the chat
+model's **decode** is marginally ahead of llama.cpp (101.5 against 101.2 tok/s,
+a 0.3% margin that is a tie dressed as a win), the translator's is 0.90x, and
+**prefill on both is about 0.29x** and has not been worked on. An earlier version
+of this paragraph said llama.cpp had never been beaten here; that is no longer
+true of exactly one of the four numbers, and it is still true of the other three.
+Those numbers and every other comparison belong in `docs/BENCHMARKS.md` and
+nowhere else.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.

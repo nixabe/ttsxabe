@@ -117,6 +117,12 @@ and says which variable to set.
 | `XABE_CHAT_DEVICE` | the card to load the 8 B chat model onto | none; that test skips |
 | `XABE_QUANT_FILE` | which file in `XABE_QUANT_DIR` the packed test reads | `breeze-Q4_K_M.gguf` |
 | `XABE_TACO_DEVICE` | the card to load Tacotron2 + WaveGlow onto | none; those tests skip |
+| `XABE_CHAT_MODEL` | the chat GGUF the `llama_server` oracle runs | none; that test skips |
+
+`XABE_QUANT_DIR` is read as given, so an absolute path is the safe form: cargo
+runs a test binary from the workspace root but a relative `models` is easy to
+get wrong from a subdirectory, and the failure is a `SKIP:` rather than an
+error.
 
 `XABE_CHAT_DEVICE` has no default either, and for a different reason: this box
 has three cards and two of them are running somebody's pipeline. `run.sh` says
@@ -148,6 +154,24 @@ a block layout produces a *permuted* tensor rather than an error - a model that
 loads, runs, and speaks fluent nonsense. So it is checked twice, at different
 distances from the bytes, and neither check subsumes the other.
 
+A third check sits between them and covers what the other two cannot. The wide
+mat-vec is a different addressing scheme from the element-for-element path, and
+the int8 activation makes exact comparison impossible - so
+`the_wide_kquant_matvec_agrees_with_the_f32_product` runs both formats at a `k`
+that takes the fast path and bounds the disagreement at 1% of the output span,
+which is what quantizing the activation costs and nothing more. The bound is
+loose on purpose and it is not what catches an addressing mistake: a lane
+reading the wrong sixteen bytes does not land within a percent of the right
+answer. It caught one during development - an element offset of `n * 64` where
+the layout wanted `n * 128` - by being wrong by 74%.
+
+The quantiser itself is compared to `xabe_dsp::quantize_q8` at **exact
+equality**, on both codes and scales, including an all-zero group and one whose
+maximum is a power of two so ties are reachable. It is the one approximation in
+the engine, and the thing worth checking is that the two implementations
+approximate identically; a tolerance there would hide the group-boundary or
+rounding-mode disagreement the test exists to find.
+
 **Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
 `xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
 at exact equality. It extracts weights *element for element* through a one-hot
@@ -165,24 +189,48 @@ the packed operand gets to every projection rather than most of them. It needs
 comparison is the unpacked 16 GB.
 
 The two paths are close rather than identical, and the asymmetry has a reason:
-on the tiled kernel both stage the same f16 bits, while on the scalar kernel
-the packed path keeps the exact dequantized f32 and the f16 path has already
-rounded it. Decode runs on the scalar kernel, so that is where any difference
-shows.
+on the tiled kernel both stage the same f16 bits, while on the mat-vec the
+packed path quantizes the *activation* to int8 to feed its wide loads. Decode
+runs on the mat-vec, so that is where the difference shows, and it is now the
+larger of the two effects by two orders of magnitude.
 
-Measured, and the two crates landed on opposite sides of exactly that:
+Measured, and the two crates land on opposite sides of exactly that:
 
 | | prompt | worst logit difference | logit span |
 | --- | --- | --- | --- |
 | `xabe-translate` 13 B `Q4_K_M` | 30 tokens | **0.000000** | 28.655 |
-| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.004566 | 25.323 |
+| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.167409 | 25.323 |
 
 The translator's prompt is past `GEMV_MAX_M`, so every projection takes the
-tiled kernel and the two paths are bit-identical - and its translation is
-character-identical as well. The chat prompt is not, so its projections run on
-the exact-f32 scalar kernel where the packed operand is genuinely the more
-precise of the two. Neither number is a tolerance being met; they are the two
-kernels behaving as the design says they do.
+tiled kernel, no activation is quantized, and the two paths are bit-identical -
+its translation is character-identical as well. The chat prompt is not, so its
+projections run on the mat-vec, and 0.167 against a span of 25.3 is **0.66%**,
+which is what int8 activations cost. It was 0.004566 before that change.
+
+That number is a bound on the arithmetic, not on the output. What it costs in
+*tokens* is measured separately and is zero: greedy decoding against the
+`llama-server` capture picks the same token at every position it picked before,
+and the disagreement list below is byte-identical across the change.
+
+### The chat model disagrees with llama-server in five places, and did before
+
+`xabe-chat`'s `tests/llama_server.rs` compares greedy replies against a capture
+from `llama-server` running the same GGUF. On the current capture it **fails**,
+at five positions across seven prompts, with llama-server's margin between 0.60
+and 2.86 logits - too wide to be rounding.
+
+This is not caused by anything in the packed or int8 work. It was confirmed by
+capturing the oracle, running the test, stashing every change, running it again
+on the unmodified tree, and comparing: the same five positions, the same
+margins, to the last digit. It reproduces identically after the wide mat-vec,
+the int8 activation, the head-major cache and every fusion.
+
+So it is a real, pre-existing divergence and it is unexplained. It is recorded
+here rather than fixed because finding it needs per-layer taps against an oracle
+this model does not have - it exists as a GGUF and nothing else, which
+`tools/oracle/capture_chat_server.py` says at the top. What the test *is* good
+for meanwhile is exactly what it was used for here: as a fixed point that any
+change to attention, caching or precision must reproduce byte for byte.
 
 The synthetic quantization corpus under `.golden/gguf/quants` is different: it
 is kilobytes, and it covers all ten block formats where the real file covers

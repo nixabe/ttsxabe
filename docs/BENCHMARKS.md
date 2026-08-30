@@ -2,6 +2,12 @@
 
 ## Current standing
 
+The one-line version: the synthesiser is 1.24x faster than PyTorch, the chat
+model's decode is now marginally ahead of llama.cpp (101.5 against 101.2 tok/s),
+the translator's decode is 1.11x behind it, the ASR is 0.55x against
+`whisper-server`, and prefill on both Llama stages is about 3.5x behind. Each
+of those has its own section; this paragraph is not the evidence for any of them.
+
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
 Twenty timed synthesis calls after five warm-up, medians, alternated in pairs.
@@ -107,43 +113,150 @@ they are what makes the packed-weight work measurable at all - but nothing here
 should claim the pipeline is fastest with them in the reply path, because it is
 not.
 
-## Against llama.cpp, which is the baseline and is still ahead
+## Against llama.cpp: the chat model's decode is now ahead
 
-This section used to say the measurement to take was decode tokens per second
-against `llama-server`. It had never been taken. It has now, with `llama-bench`
-on the same card and the same two files, `-ngl 99`, and it is not a comfortable
-number.
+`llama-bench` on the same card and the same two files, `-ngl 99`, against
+`xabe-llm-bench` at the same shapes. The chat model's decode has passed it; the
+translator's has not, and prefill is untouched.
 
 | Checkpoint | | llama.cpp | this engine | |
 | --- | --- | ---: | ---: | ---: |
-| Breeze2 8 B Q4_K_M | prefill, 128 tok | **1950 tok/s** | 551 tok/s | 3.5x behind |
-| | decode, 64 tok | **101.2 tok/s** | 60.8 tok/s | 1.66x behind |
+| Breeze2 8 B Q4_K_M | prefill, 128 tok | **1950 tok/s** | 553 tok/s | 3.5x behind |
+| | decode, 64 tok | 101.2 tok/s | **101.5 tok/s** | ahead |
 | Taigi 13 B Q4_K_M | prefill, 128 tok | **1327 tok/s** | 399 tok/s | 3.3x behind |
-| | decode, 64 tok | **61.5 tok/s** | 35.8 tok/s | 1.72x behind |
+| | decode, 64 tok | **61.5 tok/s** | 55.3 tok/s | 1.11x behind |
 
-**Behind on all four.** The 6.4x below is real and is against where this engine
-started, not against llama.cpp; nothing here has ever beaten it, and the earlier
-absence of this table is the reason that was easy to miss.
+Decode was 60.8 and 35.8 when this table was first written, so the two stages
+are 1.67x and 1.55x faster than that. **The margin on the chat model is 0.3%,
+which is a tie dressed as a win** - it is reproducible across runs to within
+0.1 tok/s, and it is not a comfortable lead.
 
-Decode is bandwidth. llama.cpp moves about 480 GB/s of Q4_K against this
-engine's 300 in-model and 372 for the matmul alone, on a card whose streaming
-roof for the same buffer measures 587. So roughly a fifth of the gap is
-everything that is not the matmul, and the rest is the matmul.
+Decode is bandwidth, and the weights are now read at close to the roof: the chat
+model's `gemv` moves 5.0 GB per token in 8.7 ms, which is 567 GB/s against a
+streaming ceiling of 587 measured on this card. That is 97%, and it is why the
+last two thirds of this work were spent on everything that is *not* the matmul.
 
-Their mat-vec differs structurally rather than in one trick, and the source says
-why: `mmvq.cu` notes that on Turing a thread running too few k-iterations
-"cannot keep enough loads in flight to reach the bandwidth roof", and it splits
-one output row across a whole thread block, reducing through shared memory, with
-`rows_per_cuda_block` tuned per quantisation type. This engine gives one warp
-one output column. Six attempts to close the gap without adopting that shape are
-in WHY NOT below, all measured worse.
+The earlier note here said llama.cpp's advantage was structural - `mmvq.cu`
+splitting one output row across a thread block, because on Turing a thread with
+too few k-iterations "cannot keep enough loads in flight to reach the bandwidth
+roof". Half of that reading was right and half was wrong. The diagnosis was
+right: loads in flight was the constraint. The prescription was not - a
+block-per-row shape was implemented and measured worse (WHY NOT below), and what
+actually closed the gap was widening each thread's load from 4 bytes to 16, which
+needs the *activation* narrow enough to keep up. See "Sixteen bytes a lane"
+below.
 
-Prefill is arithmetic, and 3.5x is the larger gap of the two. It is not the
+Prefill is arithmetic, and 3.5x is now the larger gap by far. It is not the
 unpacking: the f16 path, which does no unpacking at all, runs at 322 tok/s
 against llama.cpp's 1950. The tiled `gemm` reaches 15-17 TFLOP/s on the shapes
 `bench-gemm` covers and about 6 on a 128-row prefill, where the whole `m`
 dimension is one tile and the staging has nothing to amortise against. That is a
 tiling problem and it has not been worked on.
+
+## Sixteen bytes a lane, and the token that was 40% not-matmul
+
+Two separate problems, found in that order, and the second was the larger.
+
+### The mat-vec was capped by load width, not by block layout
+
+The packed mat-vec had a lane owning four whole bytes of a Q4_K block. Six
+attempts to beat that are recorded in WHY NOT, all worse, and the conclusion
+drawn from them - that the block layout was the cap - was wrong.
+
+The measurement that settled it was a kernel that read the same 144-byte blocks
+with the same header gaps, sixteen bytes a lane, and did *no arithmetic at all*:
+**57.2 us, 577.8 GB/s**, against a streaming ceiling of 586.5 for the same
+buffer. The layout was never the problem. Four bytes a lane was.
+
+Sixteen bytes of Q4_K is 32 elements, and 32 f32 activations is 128 bytes of
+scattered reads that cost more than the wide load wins - measured at 128.6 us,
+worse than the 88.7 it replaced, with `ptxas` reporting 64 registers and no
+spills, so it was the reads and not the pressure. Staging the activations in
+shared memory instead was 143.3 us, killed by 16-way bank conflicts.
+
+What works is quantizing the activation to int8. Then 32 of them are two 16-byte
+loads, and the dot product is four `__dp4a` against nibble masks that are
+already four int8 weights in a word:
+
+| n | k | before | wide + int8 | |
+| --- | --- | ---: | ---: | ---: |
+| 14336 | 4096 | 88.7 us / 373 GB/s | **58.9 us / 561 GB/s** | 1.50x |
+| 4096 | 4096 | - | 488 GB/s | 1.52x |
+| 4096 | 14336 | - | 541 GB/s | 1.60x |
+
+Neither half works alone: `dp4a` on four-byte loads was worth 4%, and wide loads
+without it went backwards.
+
+Q6_K needed one more thing. Its blocks are 210 bytes, so consecutive blocks in a
+file sit at every alignment in turn and a 16-byte load is not legal on any of
+them. They are re-strided to 224 on upload - 6.7% more VRAM on Q6_K tensors, and
+the only place in this engine where what sits in the card is not byte-for-byte
+what sits in the file.
+
+In the model: chat decode 60.8 -> 76.4 tok/s with Q4_K alone, 80.9 with Q6_K too.
+
+### The rest of the token was 40% of it
+
+At 80.9 tok/s a token was 12.37 ms, of which `nsys` put 8.8 in the mat-vec. The
+other 3.6 ms was 1.7 ms of small kernels and 1.9 ms the GPU spent idle, waiting
+for a CPU issuing **1154 launches and 1126 allocations a token**. Nothing in
+that number is arithmetic.
+
+What was actually wrong, in the order it was found and fixed:
+
+| | change | decode |
+| --- | --- | ---: |
+| | starting point | 80.9 tok/s |
+| 1 | one int8 twin per activation, not per projection | 82.3 |
+| 2 | KV cache appended in place, capacity doubled | 84.9 |
+| 3 | head-major cache, grouped heads as the batch | **95.2** |
+| 4 | normalise and quantise in one kernel | 96.4 |
+| 5 | residual add folded into the normalisation; scale, mask and softmax into one pass | 97.5 |
+| 6 | the gate's twin taken by the gating; `up` sharing the twin `gate` already had | 98.9 |
+| 7 | `float4` in the normalisation | 100.1 |
+| 8 | the rope's dummy argument allocated once, not per call | **101.5** |
+
+(3) is the structural one. The cache was stored the way the projection produced
+it and rearranged into attention's layout every step: a head split for the
+queries, one for the keys, a transposed one for the values, and two `repeat_kv`
+expansions that materialised four identical copies of every cached head - six
+kernels and six allocations a layer, all of them producing a tensor thrown away
+before the next token. Storing the cache head-major makes every one of them
+disappear, and the grouped heads become the batch dimension of a matmul that was
+already batched: eight products of four query rows each, instead of thirty-two
+products against a key tensor expanded to match.
+
+(2) is worth naming separately because it was quadratic. The cache grew by
+exactly the tokens being added, so every layer of every token allocated a new
+buffer, zeroed it, and copied the whole cache into it - 128 allocations and
+16 MB of copying a token at 64 of context, and worse from there.
+
+(8) is the smallest change here and worth 1.4 tok/s: `rope` took an optional
+argument as a flag plus a buffer the kernel never reads, and allocated and
+zeroed that one float on every call.
+
+Per decoded token, chat: 1154 launches and 1126 allocations became 866 and
+roughly 480, and the GPU-idle gap went from 1.9 ms to 0.15.
+
+### What it cost in accuracy
+
+The int8 activation is the one deliberate approximation. Against the same model
+with f16 weights, worst logit difference **0.167 against a span of 25.3**, or
+0.66%. Greedy decoding against the `llama-server` capture picks the same token
+at every position it picked before this work - the disagreement list is
+byte-identical, before and after, including the five positions where this engine
+already disagreed with llama-server. Those five predate all of it; see
+`docs/TESTING.md`.
+
+### The translator is 1.55x faster and still behind
+
+Same changes, same order, 35.8 -> 55.3 tok/s against llama.cpp's 61.5. It is
+further from the roof than the chat model - 500 GB/s in the mat-vec against 567 -
+and the reason is its attention rather than its projections: 13 B Llama-2 is
+multi-head, so there are 80 small attention mat-vecs a token against the chat
+model's 64, over a KV cache four times the size and held at f32 where llama.cpp
+holds it at f16. Halving that cache is the next thing to try and it has not been
+tried.
 
 ## The two Llama stages: 6.4x, and the ceiling that is left
 
@@ -691,6 +804,38 @@ means real overflow risk for no measured gain. Not attempted.
 
 Durable reasoning. Things learned that outlive the change that taught them.
 
+## Isolate the constraint by removing everything else, not by trying alternatives
+
+Six variants of the packed mat-vec were measured and all were worse, and the
+conclusion drawn was that the block layout was the cap. It was not. The
+measurement that settled it was not another variant: it was a kernel that read
+the same bytes in the same pattern with **the arithmetic deleted**, which ran at
+the streaming roof and proved the layout was never in the way.
+
+The general lesson: **a run of failed alternatives tells you about those
+alternatives and nothing else.** To find what a kernel is bound by, build the
+one that does only the suspected part and see how fast it goes. That is one
+experiment against six, and unlike them it produces a number with a known
+meaning.
+
+## A token is not a matmul, and after a point it is mostly not
+
+At the roof, the chat model's mat-vecs are 8.7 ms of a 12.4 ms token. The other
+3.6 ms was small kernels and a CPU that could not issue 1154 launches and 1126
+allocations fast enough to keep the card fed - and closing it was worth more
+than everything the kernel work had bought.
+
+Most of it was not optimisation at all but bookkeeping that should never have
+been there: a KV cache that reallocated and copied itself every layer of every
+token, rearranged into attention's layout every step and thrown away; a one-float
+argument allocated and zeroed on every call. Nothing profiles as "wrong" - each
+kernel is individually fast - and the whole is 40% overhead.
+
+The general lesson: **profile the token, not the kernel.** A kernel summary
+sorted by time will show the matmul at the top for as long as you look at it,
+and will never show you the gap between the kernels or the work that did not
+need doing.
+
 ## The vocabulary is POJ, and getting that wrong is inaudible to the author
 
 `facebook/mms-tts-nan` has `c` and U+0358 in its 48 symbols, which makes it POJ,
@@ -754,17 +899,25 @@ Two more, added when llama.cpp was measured and turned out to be 1.66x ahead:
 
 - **An int8-quantised activation with `__dp4a`**, which is where llama.cpp's
   mat-vec gets its integer throughput - 101.6 us against the float path's 106.0
-  in the same harness, 4%, for 3.7e-3 relative error. Worth knowing before
-  someone spends a week on it: `dp4a` is not the thing that makes their kernel
-  fast, and on this shape the arithmetic was never the limit.
+  in the same harness, 4%, for 3.7e-3 relative error. **This entry drew the
+  wrong conclusion from that number and the conclusion has been overturned.** It
+  said `dp4a` was not what makes their kernel fast and that the arithmetic was
+  never the limit. The second half is true and the first is not: `dp4a` is
+  worth 4% on four-byte loads and 1.5x on sixteen-byte ones, because what it
+  buys is not throughput but a *narrow enough activation to keep up with a wide
+  weight load*. Neither half works alone. See "Sixteen bytes a lane" above,
+  which is the shipped kernel.
 - **Four super-blocks of loads issued before any is consumed**, aimed straight
   at the memory-level parallelism their source names - 394.8 us, 4.5x *slower*.
   Four headers and eight `float4` in flight is far past what 64 registers hold,
-  and it spills to local memory.
+  and it spills to local memory. This one stands: what the shipped kernel does
+  instead is widen each load rather than issue more of them.
 
-What is left is the shape of the kernel, not the arithmetic in it. Closing the
-gap means one output row per thread block with a shared-memory reduction, which
-is a rewrite of the dispatch rather than an edit to the inner loop.
+This entry used to end by saying what was left was the shape of the kernel, and
+that closing the gap meant one output row per thread block with a shared-memory
+reduction. That shape was implemented and measured - it is the block-per-column
+variant above, 99-105 us against 88.7 - and the gap was closed by something
+else entirely.
 
 ### Two micro-optimisations of the K-quant gemv, both measured flat
 
@@ -794,6 +947,21 @@ spills, which is full occupancy on sm_75, and the variant that removed the
 arithmetic while keeping the loads ran at 431 GB/s against the shipped kernel's
 86. Two flat results are evidence about the two things tried and not about
 everything else.
+
+### A normalisation block sized to divide the row exactly
+
+The fused normalise-and-quantise kernel runs one block a row and reads four
+floats a thread. At the chat model's 4096 that is 1024 threads and exactly one
+iteration; at the translator's 5120 it is two, the second a quarter full.
+
+Sizing the block to divide the row instead - 256 threads and five full
+iterations - made the translator *slower*, 55.5 to 55.1 tok/s. An earlier
+version of the same kernel at 256 threads with scalar loads lost to the unfused
+pair outright.
+
+The general lesson: **at one block a row, the block is all the parallelism there
+is, and starving it costs more than any amount of ragged tail.** The waste is
+visible and the latency is not, which is what makes this the tempting direction.
 
 ### `torch.backends.cudnn.benchmark = True` makes the baseline 13x slower
 

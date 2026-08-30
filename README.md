@@ -51,8 +51,17 @@ What widened the scope afterwards was not speed but the seams. Making that one
 stage fast left a working system of **7 processes, 2 Python environments, 2
 languages and 6 ports**, held together by a shell script — and the interesting
 problems that remain are in the orchestration as much as the arithmetic. So the
-engine is absorbing the rest of it. The chat LLM stays in llama.cpp
-permanently; rewriting that would buy nothing.
+engine is absorbing the rest of it.
+
+This paragraph used to end by saying the chat LLM stayed in llama.cpp
+permanently because rewriting it would buy nothing. Both halves are retracted.
+It is written here, and on decode it is now marginally *faster* than llama.cpp
+on this card — 101.5 tokens per second against 101.2, which is a tie rather than
+a lead, and it took a wide packed mat-vec, an int8 activation and the removal of
+40% of a token that was never arithmetic to get there. Prefill is still about
+3.5x behind and the translator's decode is 1.11x behind.
+`docs/BENCHMARKS.md` has all four numbers and does not round any of them
+kindly.
 
 ## Target hardware and model
 
