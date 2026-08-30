@@ -1167,6 +1167,22 @@ __global__ void add_inplace(float* a, const float* b, int n)
     if (i < n) a[i] += b[i];
 }
 
+// `a[r * cols + j] += b[r * stride + off + j]`.
+//
+// The strided twin of `add_inplace`, for adding one column block of a wide
+// matrix to a narrow one. WaveGlow's conditioning is a single `[steps, 2 * ch *
+// layers]` product - one matmul rather than one per layer, which measured
+// 1.30x on the shape - and a layer's share of it is a column range of every
+// row rather than a contiguous run.
+__global__ void add_strided(
+    float* a, const float* b, int cols, int stride, int off, int rows)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols * rows) return;
+    int r = i / cols, j = i - r * cols;
+    a[i] += b[(size_t)r * stride + off + j];
+}
+
 __global__ void sub_inplace(float* a, const float* b, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

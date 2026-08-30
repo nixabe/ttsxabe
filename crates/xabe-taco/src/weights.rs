@@ -474,8 +474,15 @@ impl Taco2 {
 pub(crate) struct Wn {
     pub(crate) start: Conv,
     pub(crate) end: Conv,
-    /// One conditioning projection per layer, `[2 * ch, cond]` each.
-    pub(crate) cond: Vec<Conv>,
+    /// The conditioning projection for every layer at once, `[2 * ch * layers,
+    /// cond]` - which is how the checkpoint stores it.
+    ///
+    /// Kept whole rather than split per layer because the conditioning does not
+    /// depend on the audio being transformed, so all `layers` of it are one
+    /// matmul. On this checkpoint's shape that measured 2.94 ms against 2.26 -
+    /// 11.8 TFLOP/s against 15.3 - and a layer's share is then a column range
+    /// of every row, which [`Gpu::add_strided`] adds without materialising.
+    pub(crate) cond: Conv,
     pub(crate) in_layers: Vec<Conv>,
     /// The residual half, absent on the last layer, which feeds only the skip.
     pub(crate) res: Vec<Option<Conv>>,
@@ -515,7 +522,17 @@ impl Glow {
             let mut in_layers = Vec::with_capacity(c.wn_layers);
             let mut res = Vec::with_capacity(c.wn_layers);
             let mut skip = Vec::with_capacity(c.wn_layers);
-            let mut cond = Vec::with_capacity(c.wn_layers);
+            // One projection for all the layers: see `Wn::cond`.
+            let cond = bind_wn_rows(
+                f,
+                gpu,
+                &format!("WN.{k}.cond_layer"),
+                2 * ch * c.wn_layers,
+                cond_in,
+                1,
+                0,
+                1,
+            )?;
             for i in 0..c.wn_layers {
                 in_layers.push(bind_wn(
                     f,
@@ -524,16 +541,6 @@ impl Glow {
                     2 * ch,
                     ch,
                     c.wn_kernel,
-                )?);
-                cond.push(bind_wn_rows(
-                    f,
-                    gpu,
-                    &format!("WN.{k}.cond_layer"),
-                    2 * ch * c.wn_layers,
-                    cond_in,
-                    1,
-                    i,
-                    c.wn_layers,
                 )?);
                 // The last layer feeds only the skip path, so it has no
                 // residual half. Getting this backwards runs, and mixes the

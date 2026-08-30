@@ -82,6 +82,13 @@ fn coupling(
     let mut skip = gpu.zeros(steps * ch)?;
     clock.stop(gpu, "    wn start", at)?;
 
+    // Every layer's conditioning at once. It depends only on the mel, not on
+    // the audio the loop below is transforming, so there is nothing to wait
+    // for and one wide matmul beats `layers` narrow ones - see `Wn::cond`.
+    let at = clock.start();
+    let cond_all = matmul(gpu, cond_t, &wn.cond, steps, wn.cond.in_ch, wn.cond.out_ch)?;
+    clock.stop(gpu, "    wn cond", at)?;
+
     for i in 0..c.wn_layers {
         // Dilation doubles per layer and the padding follows it, so the length
         // is unchanged. `im2col` gathers the window as `channel * k + tap`,
@@ -95,10 +102,15 @@ fn coupling(
         clock.stop(gpu, "    wn dilated", at)?;
 
         let at = clock.start();
-        let cnd = &wn.cond[i];
-        let c_i = matmul(gpu, cond_t, cnd, steps, cnd.in_ch, cnd.out_ch)?;
-        gpu.add_inplace(&mut act, &c_i, steps * 2 * ch)?;
-        clock.stop(gpu, "    wn cond", at)?;
+        gpu.add_strided(
+            &mut act,
+            &cond_all,
+            2 * ch,
+            wn.cond.out_ch,
+            i * 2 * ch,
+            steps,
+        )?;
+        clock.stop(gpu, "    wn cond add", at)?;
 
         let at = clock.start();
         let gated = gpu.gated_activation_rows(&act, ch, steps)?;

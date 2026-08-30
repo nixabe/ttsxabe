@@ -249,7 +249,12 @@ pub(crate) fn synthesize(
             1,
         )?;
         let loc_t = gpu.transpose(&loc, c.location_filters, t)?;
-        let query = gpu.linear(
+        // `gemm` and not `linear` for the single-row projections. Both keep
+        // f32 - one row dispatches to `gemv`, which is a warp per output column
+        // and a shuffle reduction - where `linear` gives one *thread* per output
+        // element. The gate is the extreme case: `n` of one is one thread
+        // walking 1536 weights while the rest of the card idles.
+        let query = gpu.gemm(
             &att.h,
             &w.query.w,
             None,
@@ -303,7 +308,7 @@ pub(crate) fn synthesize(
         gpu.copy_into(&mut both, &dec.h, 0, c.decoder_rnn_dim)?;
         gpu.copy_into(&mut both, &context, c.decoder_rnn_dim, e)?;
 
-        let next = gpu.linear(
+        let next = gpu.gemm(
             &both,
             &w.projection.w,
             w.projection.bias.as_ref(),
@@ -311,7 +316,7 @@ pub(crate) fn synthesize(
             dhac,
             mel,
         )?;
-        let gate = gpu.linear(&both, &w.gate.w, w.gate.bias.as_ref(), 1, dhac, 1)?;
+        let gate = gpu.gemm(&both, &w.gate.w, w.gate.bias.as_ref(), 1, dhac, 1)?;
 
         gpu.copy_into(&mut out, &next, frames * mel, mel)?;
         frames += 1;

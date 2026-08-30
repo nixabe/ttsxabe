@@ -463,6 +463,23 @@ fn the_elementwise_kernels_match() {
     g.sub_inplace(&mut d, &db, n).unwrap();
     assert_close("sub_inplace", &want, &g.download(&d).unwrap());
 
+    // `add_strided` takes a column block of a wide matrix. The offset is
+    // deliberately not zero and the stride not a multiple of the width, so a
+    // kernel that quietly treated it as contiguous would disagree here.
+    let (rows, cols, stride, off) = (37usize, 11usize, 40usize, 17usize);
+    let narrow = seq(rows * cols, 35);
+    let wide = seq(rows * stride, 36);
+    let want: Vec<f32> = (0..rows * cols)
+        .map(|i| {
+            let (r, j) = (i / cols, i % cols);
+            narrow[i] + wide[r * stride + off + j]
+        })
+        .collect();
+    let mut d = g.upload(&narrow).unwrap();
+    let dw = g.upload(&wide).unwrap();
+    g.add_strided(&mut d, &dw, cols, stride, off, rows).unwrap();
+    assert_close("add_strided", &want, &g.download(&d).unwrap());
+
     let want: Vec<f32> = a.iter().map(|x| x / 3.0).collect();
     let mut d = g.upload(&a).unwrap();
     g.scale_inplace(&mut d, n, 1.0 / 3.0).unwrap();

@@ -177,8 +177,11 @@ of three runs of the same prompt.
 
 | | one card | translator on card 1 |
 | --- | ---: | ---: |
-| first audio | 2738 ms | **1930 ms** |
-| whole turn | 7206 ms | **5620 ms** |
+| first audio | 2272 ms | **1930 ms** |
+| whole turn | 6784 ms | **5620 ms** |
+
+The one-card column is after the Tacotron2 second pass below; the two-card one
+predates it and is that much better again in practice.
 
 Read that as the cost of the single-card constraint rather than as a speedup
 available everywhere: **everything below applies only across cards.** On one
@@ -307,13 +310,62 @@ between runs on the same text and a mean would mostly be measuring that.
 | `gua2 si7 tai5-uan5-lang5` | 1.60 s | 407.9 ms | 133.0 ms | 3.07x |
 | a two-clause line | 5.57 s | 1399.4 ms | 467.4 ms | 2.99x |
 
-**3.90x realtime to 12.04x realtime** on the middle line. Through a warm server,
-against the engine already running beside it:
+**3.90x realtime to 12.04x realtime** on the middle line.
+
+### A second pass: 1.28x more, from one thread per output element
+
+`nsys` rather than the built-in breakdown, because the breakdown synchronises
+per stage and the decoder has seven stages inside a loop that runs once per mel
+frame - it charges its own syncs to whatever it is timing. The kernel summary
+does not:
+
+| kernel | share of GPU time | calls |
+| --- | ---: | ---: |
+| `gemm` | 37.5% | 1980 |
+| `linear` | **25.6%** | 5190 |
+| `gemv` | 14.9% | 7645 |
+
+A quarter of the time in `linear`, which is the plain one-thread-per-output
+kernel, at 46 us a call. Tacotron2's decoder called it directly for the
+projections it runs every frame, and for `m` of one that is as bad as it sounds:
+the gate is `n` of one, so **one thread** walked 1536 weights while the other 71
+SMs idled, and the query got 128 threads. `Gpu::gemm` dispatches a single row to
+`gemv` - a warp per output column and a shuffle reduction - and keeps f32 either
+way, so the three single-row projections moved to it.
+
+| Text | Audio | Before | After | Realtime |
+| --- | ---: | ---: | ---: | ---: |
+| `Tâi-lâm ū chiok chē hó-chia̍h--ê,` | 2.40 s | 203.1 ms | **158.5 ms** | 15.16x |
+| `chhin-chhiūⁿ:Khah-sú môa-lî,...` | 4.62 s | 374.2 ms | **296.9 ms** | 15.56x |
+| `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó,...` | 7.98 s | 643.7 ms | **506.8 ms** | 15.74x |
+
+**1.28x, and 12.0x realtime to 15.5x.** It costs what a different summation
+order costs: same sample count, cosine 0.9999973, error 52.2 dB below the
+signal.
+
+The conditioning is also one matmul per flow now instead of one per layer -
+WaveGlow's `cond_layer` does not depend on the audio being transformed, and the
+checkpoint already stores it as a single `[2 * ch * layers, cond]` matrix that
+was being sliced apart at load. In isolation that shape is 2.94 ms against 2.26,
+11.8 TFLOP/s against 15.3; end to end it is worth 2.6%, measured 158.5 ms
+against 162.8 with everything else equal. Bit-identical output, so it stays, but
+it is not where the 1.28x came from.
+
+Through a warm server, against the engine already running beside it:
 
 | Engine | Round trip | Audio | Realtime |
 | --- | ---: | ---: | ---: |
 | mms (VITS) | 36.7 ms | 1.38 s @ 16 kHz | 37.4x |
 | tacotron2 | 132.6 ms | 1.59 s @ 22.05 kHz | 12.0x |
+
+Those two rows predate the second pass. Through the socket after it, on the
+single-card layout, synthesis of a clause is 271-318 ms where it had been
+338-447, and the turn it sits in moved with it:
+
+| one card, three clauses | before | after |
+| --- | ---: | ---: |
+| first audio | 2738 ms | **2272 ms** |
+| whole turn | 7206 ms | **6784 ms** |
 
 Still 3.6x behind the synthesiser this repository started with, which is what an
 autoregressive decoder and an 87.9 M-parameter flow vocoder cost against a

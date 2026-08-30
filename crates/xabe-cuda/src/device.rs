@@ -281,6 +281,7 @@ const NAMES: &[&str] = &[
     "add_inplace",
     "sub_inplace",
     "mul_inplace",
+    "add_strided",
     "scale_inplace",
     "copy_range",
     "copy_into",
@@ -1120,6 +1121,28 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(a).arg(b).arg(&len);
         launched("add_inplace", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// `a[r * cols + j] += b[r * stride + off + j]`.
+    ///
+    /// The strided twin of [`Gpu::add_inplace`]. WaveGlow's conditioning is one
+    /// `[steps, 2 * ch * layers]` product rather than one matmul per layer,
+    /// which measured 1.30x on the shape, and a layer's share of it is a column
+    /// range of every row instead of a contiguous run.
+    pub fn add_strided(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        cols: usize,
+        stride: usize,
+        off: usize,
+        rows: usize,
+    ) -> Result<(), CudaError> {
+        let (c, s, o, r) = (cols as i32, stride as i32, off as i32, rows as i32);
+        let f = self.func("add_strided");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(b).arg(&c).arg(&s).arg(&o).arg(&r);
+        launched("add_strided", unsafe { lb.launch(Self::flat(cols * rows)) })
     }
 
     /// Element-wise `a *= b`.
