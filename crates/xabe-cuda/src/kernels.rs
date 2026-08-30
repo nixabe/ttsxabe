@@ -490,6 +490,139 @@ __device__ __forceinline__ void q6k_eight(
     }
 }
 
+// Quantises an activation row to int8 in groups of 32, with one f32 scale a
+// group.
+//
+// This is the first thing in this engine that quantizes at *runtime*, and it
+// exists for one reason: the packed mat-vec cannot use wide loads while the
+// activation is f32. Measured on this card, a lane loading sixteen bytes of
+// Q4_K quants reaches 578 GB/s against 440 for four bytes - but sixteen bytes
+// is 32 elements, and 32 f32 activations is 128 bytes of scattered reads that
+// cost more than the wide load wins. At int8 they are 32 bytes and two loads,
+// and the dot product becomes four `dp4a` instead of 32 conversions and 64
+// fused multiply-adds.
+//
+// Scale is max|a| / 127 over the group, so zero maps to zero and the sign is
+// symmetric. A group that is entirely zero gets scale zero and quantises to
+// zero, which is exact.
+extern "C" __global__ void quantize_q8(
+    const float* __restrict__ a, signed char* __restrict__ qa,
+    int asc_off, int k, int rows, long sa, int m)
+{
+    float* asc = (float*)(qa + asc_off);
+    const int groups = k >> 5;
+    const int g = blockIdx.x * blockDim.y + threadIdx.y;
+    if (g >= rows * groups) {
+        return;
+    }
+    const int r = g / groups, j = g - r * groups;
+    const int z = r / m, row = r - z * m;
+    const float* src = a + (size_t)z * sa + (size_t)row * k + (j << 5);
+    const int lane = threadIdx.x;
+    const float v = src[lane];
+    float mx = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    }
+    const float d = mx * (1.0f / 127.0f);
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    qa[(size_t)r * k + (j << 5) + lane] = (signed char)__float2int_rn(v * inv);
+    if (lane == 0) {
+        asc[(size_t)r * groups + j] = d;
+    }
+}
+
+// Sixteen bytes of one Q4_K super-block's quants against an int8 activation.
+//
+// Eight lanes cover a block's 128 quant bytes, so a warp spans four consecutive
+// super-blocks and a lane produces 32 elements: the sixteen low nibbles and the
+// sixteen high ones, 32 apart in the contraction. `slot` picks the 16-byte run,
+// and the two runs of elements land in adjacent 32-element sub-blocks, so two
+// scale pairs cover them - the same shape `q4k_pair` uses, four times as wide.
+//
+// The nibble masks are the point: `v & 0x0F0F0F0F` is already four int8 weights
+// in one word, which is exactly what `dp4a` wants, and no element is ever
+// converted to float. The block's minimum comes out as `dmin * mn * sum(a)`,
+// and `sum(a)` is another `dp4a` against a word of ones.
+__device__ __forceinline__ float q4k_wide(
+    const unsigned char* blk, const signed char* xa, const float* asc,
+    int slot, int jlo, int q0, int j0)
+{
+    uint4 q = *(const uint4*)(blk + 16 + (slot << 4));
+    float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+    unsigned char s0, m0, s1, m1;
+    q_scale_min(blk + 4, q0, s0, m0);
+    q_scale_min(blk + 4, q0 + 1, s1, m1);
+    uint4 xl = *(const uint4*)(xa + j0);
+    uint4 xh = *(const uint4*)(xa + j0 + 32);
+    const unsigned* qw = (const unsigned*)&q;
+    const unsigned* xlw = (const unsigned*)&xl;
+    const unsigned* xhw = (const unsigned*)&xh;
+    int dot0 = 0, sum0 = 0, dot1 = 0, sum1 = 0;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        unsigned v = qw[w];
+        dot0 = __dp4a((int)(v & 0x0F0F0F0Fu), (int)xlw[w], dot0);
+        sum0 = __dp4a(0x01010101, (int)xlw[w], sum0);
+        dot1 = __dp4a((int)((v >> 4) & 0x0F0F0F0Fu), (int)xhw[w], dot1);
+        sum1 = __dp4a(0x01010101, (int)xhw[w], sum1);
+    }
+    float a0 = asc[j0 >> 5], a1 = asc[(j0 + 32) >> 5];
+    return a0 * (d * (float)s0 * (float)dot0 - dmin * (float)m0 * (float)sum0)
+         + a1 * (d * (float)s1 * (float)dot1 - dmin * (float)m1 * (float)sum1);
+}
+
+// Sixteen bytes of one Q6_K super-block's low quants and sixteen of its high
+// bits, against an int8 activation.
+//
+// The same shape as `q4k_wide` and it needs the same thing to work: a 16-byte
+// load has to be 16-byte aligned, and a Q6_K block is 210 bytes, so consecutive
+// blocks in a file are aligned to 2 and nothing more. `Gpu::upload_quant` pads
+// the stride to 224 for exactly this reason - it is the only place in the
+// engine where what sits in VRAM is not byte-for-byte what sits in the file,
+// and it is a stride change rather than a format change.
+//
+// Eight lanes cover a block. A lane owns sixteen `ql` bytes and the sixteen
+// `qh` bytes that share their `l`, which between them carry 32 elements: the
+// low nibbles at `j0` and the high ones 64 further along. Two of the block's
+// sixteen signed scales cover them.
+//
+// The -32 bias is not applied per element. `sum(x)` comes out of a second
+// `dp4a` against a word of ones and the bias is one multiply at the end, which
+// is what keeps the inner loop to eight instructions.
+__device__ __forceinline__ float q6k_wide(
+    const unsigned char* blk, const signed char* xa, const float* asc,
+    int qlo, int qho, int sc_lo, int shift, int j0)
+{
+    uint4 v = *(const uint4*)(blk + qlo);
+    uint4 u = *(const uint4*)(blk + qho);
+    float d = q_f16(blk, 208);
+    const signed char* sc = (const signed char*)(blk + 192);
+    float slo = (float)sc[sc_lo], shi = (float)sc[sc_lo + 4];
+    uint4 xl = *(const uint4*)(xa + j0);
+    uint4 xh = *(const uint4*)(xa + j0 + 64);
+    const unsigned* vw = (const unsigned*)&v;
+    const unsigned* uw = (const unsigned*)&u;
+    const unsigned* xlw = (const unsigned*)&xl;
+    const unsigned* xhw = (const unsigned*)&xh;
+    int dot0 = 0, sum0 = 0, dot1 = 0, sum1 = 0;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        unsigned lo = (vw[w] & 0x0F0F0F0Fu)
+                    | (((uw[w] >> shift) & 0x03030303u) << 4);
+        unsigned hi = ((vw[w] >> 4) & 0x0F0F0F0Fu)
+                    | (((uw[w] >> (shift + 4)) & 0x03030303u) << 4);
+        dot0 = __dp4a((int)lo, (int)xlw[w], dot0);
+        sum0 = __dp4a(0x01010101, (int)xlw[w], sum0);
+        dot1 = __dp4a((int)hi, (int)xhw[w], dot1);
+        sum1 = __dp4a(0x01010101, (int)xhw[w], sum1);
+    }
+    float a0 = asc[j0 >> 5], a1 = asc[(j0 + 64) >> 5];
+    return a0 * d * slo * (float)(dot0 - 32 * sum0)
+         + a1 * d * shi * (float)(dot1 - 32 * sum1);
+}
+
 __device__ __forceinline__ float q_at(
     const unsigned char* w, int ty, int bs, int ts, long row, int k, int kk)
 {
@@ -513,7 +646,22 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     int a_half, int w_half,
     // Zero when `w` is F32 or F16. Otherwise the ggml type id, and `w` points
     // at packed blocks: `q_bs` elements to a block, `q_ts` bytes to a block.
-    int w_quant, int q_bs, int q_ts)
+    int w_quant, int q_bs, int q_ts,
+    // Elements between consecutive rows of `w`, when that is not `k`.
+    //
+    // The value cache is the reason this exists: it is one buffer of
+    // `[kv_heads, head_dim, capacity]` and attention contracts over `tk`
+    // positions of it, so a row of the operand is `capacity` apart and not
+    // `tk`. F32 only - a packed weight is a checkpoint tensor and those are
+    // always tight.
+    int w_rs,
+    // The activation again, int8 in groups of 32, or null. `quantize_q8` writes
+    // it densely as `[batch, m, k]`, so it has its own addressing rather than
+    // `sa`, and it writes the per-group scales into the same allocation at
+    // `asc_off` bytes - one allocation rather than two, because at 225 of these
+    // a token the allocation is a cost worth counting. Only the two K-quant
+    // paths read either.
+    const signed char* __restrict__ qa, int asc_off)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -534,6 +682,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     const float* af = (const float*)a + (size_t)blockIdx.z * sa + (size_t)row * k;
     const unsigned* ahr =
         (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1) + (size_t)row * (k >> 1);
+    const float* asc = qa ? (const float*)(qa + asc_off) : (const float*)0;
     float acc = 0.0f;
     if (w_quant) {
         // Blocks tile along the contraction, so a row is `k / q_bs` of them.
@@ -544,7 +693,22 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         // The two K-quants the checkpoints actually use get a path that decodes
         // a header once per eight elements instead of once per element. One
         // super-block per warp, eight contiguous elements per lane.
-        if (!a_half && q_bs == 256 && w_quant == QT_Q4_K) {
+        if (qa && q_bs == 256 && w_quant == QT_Q4_K) {
+            // Four super-blocks a warp, sixteen quant bytes a lane. See
+            // `q4k_wide` for why this needs the int8 activation to pay.
+            const int nb = k >> 8;
+            const int sub = lane >> 3, slot = lane & 7;
+            const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
+            const int q0 = jlo >> 5;
+            const size_t r = (size_t)blockIdx.z * m + row;
+            const signed char* xa = qa + r * k;
+            const float* xs = asc + r * (k >> 5);
+            const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
+            for (int b = 0; b < nb; b += 4) {
+                acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                xa, xs, slot, jlo, q0, ((b + sub) << 8) + jlo);
+            }
+        } else if (!a_half && q_bs == 256 && w_quant == QT_Q4_K) {
             const int nb = k >> 8;
             const int hi = lane >> 3, kk = (lane & 7) << 2;
             const float* av = af + (hi << 6) + kk;
@@ -561,6 +725,26 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
                         wq + ((size_t)col * nb + b) * (size_t)q_ts,
                         av + (b << 8), hi, kk);
                 }
+            }
+        } else if (qa && q_bs == 256 && w_quant == QT_Q6_K) {
+            const int nb = k >> 8;
+            const int sub = lane >> 3, slot = lane & 7;
+            const int nn = slot >> 2, gg = (slot >> 1) & 1, hh = slot & 1;
+            const int qlo = (nn << 6) + (gg << 5) + (hh << 4);
+            const int qho = 128 + (nn << 5) + (hh << 4);
+            const int sc_lo = (nn << 3) + (gg << 1) + hh;
+            // Not `qlo`: a lane's sixteen `ql` bytes sit at `nn * 64` inside the
+            // block and the elements they carry sit at `nn * 128`, because the
+            // high nibbles are 64 elements further along.
+            const int jlo = (nn << 7) + (gg << 5) + (hh << 4);
+            const size_t r = (size_t)blockIdx.z * m + row;
+            const signed char* xa = qa + r * k;
+            const float* xs = asc + r * (k >> 5);
+            const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
+            for (int b = 0; b < nb; b += 4) {
+                acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                xa, xs, qlo, qho, sc_lo, gg << 1,
+                                ((b + sub) << 8) + jlo);
             }
         } else if (!a_half && q_bs == 256 && w_quant == QT_Q6_K) {
             const int nb = k >> 8;
@@ -602,7 +786,8 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             acc += alo * lo + ahi * hi;
         }
     } else {
-        const float* wv = (const float*)w + (size_t)blockIdx.z * sw + (size_t)col * k;
+        const float* wv =
+            (const float*)w + (size_t)blockIdx.z * sw + (size_t)col * (w_rs ? w_rs : k);
         for (int i = lane; i < k; i += 32) {
             float av = a_half ? 0.0f : af[i];
             if (a_half) {
@@ -633,7 +818,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     int a_half, int w_half,
     // Zero when `w` is F32 or F16. Otherwise the ggml type id, and `w` points
     // at packed blocks: `q_bs` elements to a block, `q_ts` bytes to a block.
-    int w_quant, int q_bs, int q_ts)
+    int w_quant, int q_bs, int q_ts,
+    // Elements between consecutive rows of `w`, when that is not `k`. See the
+    // note in `gemv`; f32 only.
+    int w_rs)
 {
     __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
     __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
@@ -788,7 +976,7 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             } else {
                 float lo = 0.0f, hi = 0.0f;
                 if (n0 + row < n) {
-                    const float* src = wf + (size_t)(n0 + row) * k + kk;
+                    const float* src = wf + (size_t)(n0 + row) * (w_rs ? w_rs : k) + kk;
                     if (whole) {
                         float2 v = *reinterpret_cast<const float2*>(src);
                         lo = v.x;
@@ -1122,6 +1310,86 @@ __global__ void softmax_rows(float* __restrict__ x, int cols)
     for (int i = threadIdx.x; i < cols; i += blockDim.x) xr[i] *= inv;
 }
 
+// Softmax over each row, with the scale and the causal mask folded in.
+//
+// Three kernels and three passes over the score matrix became one. The mask
+// costs a comparison rather than a pass, and at a single decode step it costs
+// nothing at all - the one query is the last position, so no column is masked -
+// which is the case the unfused version paid a full launch and a full pass for.
+//
+// Warp shuffles rather than a shared-memory tree, for the reason `rms_norm`
+// gives: at one row of scores this block is all the parallelism there is.
+extern "C" __global__ void softmax_causal(
+    float* __restrict__ x, int cols, int tq, int offset, float scale)
+{
+    __shared__ float red[32];
+    const int row = blockIdx.x;
+    const int lim = (row % tq) + offset;
+    float* xr = x + (size_t)row * cols;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int warps = nt >> 5;
+    // NVRTC compiles without the host math headers, so this is -INFINITY's bit
+    // pattern.
+    const float ninf = __int_as_float(0xff800000);
+
+    float m = ninf;
+    for (int i = tid; i < cols; i += nt) {
+        m = fmaxf(m, (i > lim) ? ninf : xr[i] * scale);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    }
+    if (lane == 0) {
+        red[warp] = m;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < warps) ? red[lane] : ninf;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+        }
+        if (lane == 0) {
+            red[0] = v;
+        }
+    }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+
+    float partial = 0.0f;
+    for (int i = tid; i < cols; i += nt) {
+        float e = (i > lim) ? 0.0f : __expf(xr[i] * scale - m);
+        xr[i] = e;
+        partial += e;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        partial += __shfl_xor_sync(0xffffffff, partial, o);
+    }
+    if (lane == 0) {
+        red[warp] = partial;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < warps) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+            red[0] = v;
+        }
+    }
+    __syncthreads();
+    const float inv = 1.0f / red[0];
+    for (int i = tid; i < cols; i += nt) {
+        xr[i] *= inv;
+    }
+}
+
 // --------------------------------------------------------------- activations
 
 __global__ void act_relu(float* x, int n)
@@ -1450,51 +1718,202 @@ __global__ void expand_prior(
 // Not layer normalisation: no mean subtraction and no bias. Substituting one
 // for the other passes every shape check and shifts every activation by the
 // row's mean, which on a residual stream is not small.
+// Root-mean-square normalisation, optionally emitting the int8 twin as well.
+//
+// One block a row, because the reduction is over the whole row. That is only a
+// block's worth of parallelism at a single decode step, so the two things that
+// cost are latency and synchronisation: the reduction is warp shuffles with one
+// `__syncthreads` between the warp results and their combination, rather than a
+// shared-memory tree with a barrier at every halving.
+//
+// With `qa`, it also writes the codes and scales `quantize_q8` would have -
+// which is the same arithmetic over data this kernel already holds, against a
+// second launch that re-reads the row it just wrote. The scale is per 32
+// columns, and a warp covers exactly 32 consecutive columns per iteration, so
+// the group reduction is a shuffle and needs no memory at all. That mapping is
+// why `dim` must be a multiple of the block: a ragged last iteration would
+// leave lanes inactive inside a full-mask shuffle.
 extern "C" __global__ void rms_norm(
-    const float* __restrict__ x,
+    float* __restrict__ x,
+    const float* __restrict__ add,
     const float* __restrict__ weight,
     float* __restrict__ out,
+    signed char* __restrict__ qa,
+    int asc_off,
     int dim, float eps)
 {
-    extern __shared__ float partial[];
+    __shared__ float red[32];
     const int row = blockIdx.x;
-    const float* xr = x + (size_t)row * dim;
-    float* orow = out + (size_t)row * dim;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int warps = nt >> 5;
+    const size_t base = (size_t)row * dim;
+    const int n4 = dim >> 2;
+
+    // Four floats a thread, not one. A whole hidden row is 16 KB and one block
+    // is all the parallelism a single decode step has, so what decides this
+    // kernel is how many loads a thread keeps in flight - the same finding the
+    // packed mat-vec turned on, and the same fix.
+    float4* xr = (float4*)(x + base);
+    const float4* ar = add ? (const float4*)(add + base) : (const float4*)0;
+    const float4* wr = (const float4*)weight;
+    float4* orow = (float4*)(out + base);
+
+    // Four floats a thread needs a row that is a whole number of them. Every
+    // model shape here is; the scalar path below is for the general contract,
+    // and for it alone - the quantized path is a multiple of 1024 by
+    // construction and never takes it.
+    const bool wide = (dim & 3) == 0;
 
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        acc += xr[i] * xr[i];
-    }
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            partial[threadIdx.x] += partial[threadIdx.x + s];
+    if (!wide) {
+        const float* xs = x + base;
+        for (int i = tid; i < dim; i += nt) {
+            float v = xs[i];
+            if (add) {
+                v += add[base + i];
+                x[base + i] = v;
+            }
+            acc += v * v;
         }
-        __syncthreads();
     }
-    const float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        orow[i] = xr[i] * scale * weight[i];
+    for (int i = tid; wide && i < n4; i += nt) {
+        float4 v = xr[i];
+        // The residual, when there is one. Folded in here rather than left to
+        // `add_inplace` because the sum is what this kernel reads anyway, and
+        // `x` is updated in place because the residual stream is what the
+        // *next* block adds to.
+        if (add) {
+            float4 r = ar[i];
+            v.x += r.x;
+            v.y += r.y;
+            v.z += r.z;
+            v.w += r.w;
+            xr[i] = v;
+        }
+        acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+    if (lane == 0) {
+        red[warp] = acc;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float s = (lane < warps) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            s += __shfl_xor_sync(0xffffffff, s, o);
+        }
+        if (lane == 0) {
+            red[0] = s;
+        }
+    }
+    __syncthreads();
+    const float scale = rsqrtf(red[0] / (float)dim + eps);
+
+    // A thread owns four columns, so a scale group of 32 is eight threads and
+    // the group reduction is three shuffles inside a warp. The loop runs to a
+    // multiple of the block rather than to `n4` so that every lane reaches every
+    // shuffle - a thread past the end contributes zero rather than not arriving.
+    signed char* qrow = qa + base;
+    float* asc = qa ? (float*)(qa + asc_off) + (size_t)row * (dim >> 5) : (float*)0;
+    if (!wide) {
+        const float* xs = x + base;
+        float* os = out + base;
+        for (int i = tid; i < dim; i += nt) {
+            os[i] = xs[i] * scale * weight[i];
+        }
+        return;
+    }
+    const int ceil4 = ((n4 + nt - 1) / nt) * nt;
+    for (int i = tid; i < ceil4; i += nt) {
+        float4 y = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (i < n4) {
+            float4 v = xr[i], w = wr[i];
+            y.x = v.x * scale * w.x;
+            y.y = v.y * scale * w.y;
+            y.z = v.z * scale * w.z;
+            y.w = v.w * scale * w.w;
+            orow[i] = y;
+        }
+        if (!qa) {
+            continue;
+        }
+        float mx = fmaxf(fmaxf(fabsf(y.x), fabsf(y.y)), fmaxf(fabsf(y.z), fabsf(y.w)));
+        #pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        }
+        const float d = mx * (1.0f / 127.0f);
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        if (i < n4) {
+            char4 c;
+            c.x = (signed char)__float2int_rn(y.x * inv);
+            c.y = (signed char)__float2int_rn(y.y * inv);
+            c.z = (signed char)__float2int_rn(y.z * inv);
+            c.w = (signed char)__float2int_rn(y.w * inv);
+            *(char4*)(qrow + (i << 2)) = c;
+            if ((tid & 7) == 0) {
+                asc[i >> 3] = d;
+            }
+        }
     }
 }
 
+
+
 // a = silu(a) * b, the SwiGLU gate.
+// `a = silu(a) * b`, optionally emitting the int8 twin as well.
+//
+// The twin is here for the same reason it is in `rms_norm`: the result goes
+// straight into a packed projection, and quantizing it in a kernel of its own
+// means a launch and a second read of the row this one just wrote. A block is a
+// multiple of 32 threads over a flat index, so a warp owns exactly one
+// 32-element scale group and the group reduction is a shuffle.
+//
+// `n` must be a multiple of the block for the twin, or the last block's tail
+// lanes would sit inside a full-mask shuffle without being in the group.
 extern "C" __global__ void silu_mul(
     float* __restrict__ a,
     const float* __restrict__ b,
+    signed char* __restrict__ qa,
+    int asc_off,
     int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
+    if (i >= n && !qa) {
         return;
     }
-    float v = a[i];
-    // `expf`, not `__expf`. The fast intrinsic is about 2^-21 accurate and
-    // this one is a few ulp; the difference costs nothing measurable here and
-    // it keeps the differential test against the scalar twin tight enough to
-    // catch a real mistake.
-    a[i] = v * (1.0f / (1.0f + expf(-v))) * b[i];
+    float y = 0.0f;
+    if (i < n) {
+        float v = a[i];
+        // `expf`, not `__expf`. The fast intrinsic is about 2^-21 accurate and
+        // this one is a few ulp; the difference costs nothing measurable here
+        // and it keeps the differential test against the scalar twin tight
+        // enough to catch a real mistake.
+        y = v * (1.0f / (1.0f + expf(-v))) * b[i];
+        a[i] = y;
+    }
+    if (!qa) {
+        return;
+    }
+    float* asc = (float*)(qa + asc_off);
+    float mx = fabsf(y);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    }
+    const float d = mx * (1.0f / 127.0f);
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    if (i < n) {
+        qa[i] = (signed char)__float2int_rn(y * inv);
+        if ((threadIdx.x & 31) == 0) {
+            asc[i >> 5] = d;
+        }
+    }
 }
 
 // Rotary position embedding, in place over [t, heads * head_dim].
@@ -1687,6 +2106,52 @@ extern "C" __global__ void causal_mask(
 // every `group` batches - would be faster and is a kernel change with a
 // differential test of its own; this is the same arithmetic with one extra
 // read of the cache, and the cache is small next to the projections.
+// Writes one step's keys into a head-major cache.
+//
+// `src` is the projection's output, `[n, kv_heads * head_dim]`; `dst` is
+// `[kv_heads, capacity, head_dim]`. The scatter is the whole point: written
+// this way, attention reads a head's keys as `[tk, head_dim]` at a fixed offset
+// and needs no transpose, no head split and no expansion of the grouped heads.
+//
+// The cache used to be stored the way it arrives and rearranged every step -
+// four kernels and four allocations a layer, all of them producing a tensor
+// that was thrown away before the next token. This is that work done once, at
+// the only moment the data is small.
+extern "C" __global__ void cache_append(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int n, int kv_heads, int head_dim, int cap, int past)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int d = kv_heads * head_dim;
+    if (i >= (size_t)n * d) {
+        return;
+    }
+    const int ti = (int)(i / d);
+    const int h = (int)((i % d) / head_dim);
+    const int j = (int)(i % head_dim);
+    dst[((size_t)h * cap + past + ti) * head_dim + j] = src[i];
+}
+
+// The same for values, which attention contracts over rather than along.
+//
+// `dst` is `[kv_heads, head_dim, capacity]`, so a head's values are already the
+// transpose the second matmul wants. That its rows are `capacity` apart rather
+// than `tk` is what `w_rs` in `gemv` and `gemm` is for.
+extern "C" __global__ void cache_append_t(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int n, int kv_heads, int head_dim, int cap, int past)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int d = kv_heads * head_dim;
+    if (i >= (size_t)n * d) {
+        return;
+    }
+    const int ti = (int)(i / d);
+    const int h = (int)((i % d) / head_dim);
+    const int j = (int)(i % head_dim);
+    dst[((size_t)h * head_dim + j) * cap + past + ti] = src[i];
+}
+
 extern "C" __global__ void repeat_kv(
     const float* __restrict__ src,
     float* __restrict__ dst,

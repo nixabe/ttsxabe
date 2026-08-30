@@ -685,6 +685,7 @@ fn a_batched_product_is_the_same_as_running_each_one_alone() {
                     a: m * k,
                     w: n * k,
                     out: m * n,
+                    w_row: 0,
                 },
                 m,
                 k,

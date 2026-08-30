@@ -31,6 +31,61 @@ pub enum CudaError {
         block: usize,
     },
 
+    /// A packed tensor whose byte count is not a whole number of blocks.
+    ///
+    /// Checked at upload because Q6_K is restrided on the way to the device -
+    /// see [`crate::Quant::device_stride`]. A ragged tail would be restrided
+    /// into the next block's slot and decode to plausible numbers rather than
+    /// failing, so the length is the thing to refuse.
+    #[error("{len} bytes is not a whole number of {ty}-byte blocks")]
+    RaggedBlockBytes {
+        /// The length handed over.
+        len: usize,
+        /// Bytes per block in the format handed over.
+        ty: usize,
+    },
+
+    /// An [`crate::Operand::F32Q`] whose int8 twin was taken at another shape.
+    ///
+    /// The twin is addressed as a dense `[rows, k]` of its own, so one taken at
+    /// a different shape is read in bounds and produces numbers. There is no
+    /// downstream check that would catch it - which is the whole reason this
+    /// one exists at the boundary.
+    #[error("the int8 twin is {rows}x{k}, and this matmul is {want_rows}x{want_k}")]
+    MismatchedQ8 {
+        /// Rows the twin was taken over.
+        rows: usize,
+        /// Contraction the twin was taken along.
+        k: usize,
+        /// Rows this matmul has.
+        want_rows: usize,
+        /// Contraction this matmul has.
+        want_k: usize,
+    },
+
+    /// A cache append that would run past the buffer's capacity.
+    ///
+    /// The cache is one allocation holding every head, so a `past` beyond its
+    /// capacity writes into the next head's positions rather than off the end:
+    /// in bounds, and wrong for every step after it.
+    #[error("appending at {at} to a cache with room for {cap}")]
+    CacheOverrun {
+        /// Where the write would end.
+        at: usize,
+        /// Positions the buffer has room for.
+        cap: usize,
+    },
+
+    /// A row stride asked for on an operand that has no rows to stride.
+    ///
+    /// The packed and f16 paths derive addressing from the block or word
+    /// layout, so a stride handed to them would be ignored without a word.
+    #[error("a row stride of {stride} on a weight that is not f32")]
+    StridedNonF32Weight {
+        /// The stride asked for.
+        stride: usize,
+    },
+
     /// A quantized left operand, which no kernel accepts.
     ///
     /// Weights come from a checkpoint and can be stored packed; activations are

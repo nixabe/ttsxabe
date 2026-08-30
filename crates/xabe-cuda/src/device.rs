@@ -39,6 +39,13 @@ pub struct Gpu {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     funcs: HashMap<&'static str, CudaFunction>,
+    /// One zeroed float, for launch arguments that must point at something.
+    ///
+    /// Every kernel argument has to be a real pointer, so an optional input is
+    /// passed as a flag plus a buffer the kernel is told never to read. Made
+    /// once: allocating and zeroing it per call was 64 allocations and 64
+    /// memsets a decoded token, for a float nothing ever looks at.
+    dummy: CudaSlice<f32>,
 }
 
 impl std::fmt::Debug for Gpu {
@@ -163,6 +170,24 @@ impl Quant {
         }
     }
 
+    /// Bytes between blocks once the tensor is on the device.
+    ///
+    /// The same as [`Quant::type_size`] for every format but Q6_K, which is
+    /// padded from 210 to 224. A 16-byte load has to be 16-byte aligned and 210
+    /// is not a multiple of 16, so consecutive blocks in the file land at every
+    /// alignment in turn and the wide mat-vec cannot read them. 224 is the next
+    /// multiple of 16, costing 6.7% of the bytes of a Q6_K tensor.
+    ///
+    /// This is the one place the engine's copy of a checkpoint is not
+    /// byte-for-byte the file's. It is a stride, not a re-encoding: every block
+    /// is still the file's own 210 bytes, at a wider pitch.
+    pub const fn device_stride(self) -> usize {
+        match self {
+            Self::Q6K => 224,
+            _ => self.type_size(),
+        }
+    }
+
     /// Bytes a tensor of `elements` occupies in this format.
     ///
     /// `elements` must be a whole number of blocks; the callers that size an
@@ -204,12 +229,70 @@ pub enum Operand<'a> {
         /// Which layout to read them with.
         ty: Quant,
     },
+    /// Full precision, with the int8 twin the packed mat-vec wants already
+    /// taken.
+    ///
+    /// Identical to [`Operand::F32`] in what it means and in what every path
+    /// but one does with it. The difference is bookkeeping: a transformer layer
+    /// feeds one normed activation to three projections and another to two, and
+    /// quantizing it once per *projection* is four fifths of a kernel launch
+    /// and an allocation wasted. The caller that knows an activation is about
+    /// to be used more than once takes [`Gpu::quantize_activation`] itself and
+    /// hands the result to each.
+    ///
+    /// A mismatched `q8` is a caller error the kernel cannot see - it would
+    /// read another tensor's codes and produce plausible numbers - so
+    /// [`Gpu::gemm_batched`] checks its shape against `m` and `k` and refuses.
+    F32Q {
+        /// The activation, unchanged.
+        data: &'a CudaSlice<f32>,
+        /// Its int8 twin.
+        q8: &'a Q8,
+    },
 }
 
-impl Operand<'_> {
+/// An activation quantized to int8, ready for the packed mat-vec.
+///
+/// Codes and per-group scales share one allocation: the codes first, then the
+/// scales at [`Q8::scale_offset`] bytes. Two allocations would be clearer and
+/// there are enough of these a token that clearer is not what this needs.
+#[derive(Debug)]
+pub struct Q8 {
+    /// `rows * k` codes, then `rows * k / 32` scales as f32.
+    buf: CudaSlice<i8>,
+    /// Rows quantized, counting every row of every batch element.
+    rows: usize,
+    /// The contraction length these codes were taken along.
+    k: usize,
+}
+
+impl Q8 {
+    /// Bytes from the start of the buffer to the first scale.
+    ///
+    /// A multiple of four, because `k` is a multiple of 1024 - which is what
+    /// makes reading the scales as f32 from the same allocation sound.
+    pub const fn scale_offset(&self) -> usize {
+        self.rows * self.k
+    }
+
+    /// The shape these codes were taken at.
+    pub const fn shape(&self) -> (usize, usize) {
+        (self.rows, self.k)
+    }
+}
+
+impl<'a> Operand<'a> {
     /// Whether this side is packed, as the kernel's flag.
     fn half(self) -> i32 {
         i32::from(matches!(self, Operand::F16(_)))
+    }
+
+    /// The int8 twin a caller took ahead of time, if any.
+    fn q8(self) -> Option<&'a Q8> {
+        match self {
+            Operand::F32Q { q8, .. } => Some(q8),
+            _ => None,
+        }
     }
 
     /// The block format, if this side is quantized.
@@ -240,6 +323,15 @@ pub struct Batch {
     pub w: usize,
     /// Elements between consecutive outputs.
     pub out: usize,
+    /// Elements between consecutive *rows* of the right operand, or 0 for `k`.
+    ///
+    /// Only the value cache needs it, and it needs it because the cache is one
+    /// buffer with room for more positions than are in it: a head's values are
+    /// `[head_dim, capacity]` and the contraction is over the `tk` of them that
+    /// exist. Zero rather than `Option` because zero is not a stride any real
+    /// operand has, and because every other caller would have to spell out
+    /// `None`.
+    pub w_row: usize,
 }
 
 impl Batch {
@@ -253,9 +345,23 @@ impl Batch {
             a: 0,
             w: 0,
             out,
+            w_row: 0,
         }
     }
 }
+
+/// Threads a fused normalise-and-quantise block runs.
+///
+/// A multiple of 32, so a warp owns four whole 32-column scale groups, and the
+/// largest the hardware allows, because at one block a row this block is all
+/// the parallelism a decode step has.
+///
+/// Both smaller choices were measured and are worse. At 256 with scalar loads
+/// it lost to the unfused pair outright; at 256 with `float4`, chosen so that
+/// 5120 divides exactly instead of leaving a quarter-full last iteration, the
+/// 13 B translator went from 55.5 to 55.1 tok/s. Starving the block costs more
+/// than the ragged iteration it avoids.
+const RMS_THREADS: u32 = 1024;
 
 const NAMES: &[&str] = &[
     "conv1d",
@@ -265,6 +371,10 @@ const NAMES: &[&str] = &[
     "linear",
     "gemm",
     "gemv",
+    "quantize_q8",
+    "cache_append",
+    "cache_append_t",
+    "softmax_causal",
     "layer_norm",
     "softmax_rows",
     "act_relu",
@@ -356,10 +466,17 @@ impl Gpu {
         }
 
         tracing::info!(ordinal, kernels = funcs.len(), "opened CUDA device");
+        let dummy = stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
         Ok(Self {
             stream,
             module,
             funcs,
+            dummy,
         })
     }
 
@@ -489,6 +606,115 @@ impl Gpu {
         })
     }
 
+    /// Allocates an int8 buffer without zeroing.
+    ///
+    /// # Safety
+    ///
+    /// As [`Gpu::uninit`]. Only used for the activation `quantize_q8` writes,
+    /// which writes every element of it.
+    unsafe fn uninit_i8(&self, n: usize) -> Result<CudaSlice<i8>, CudaError> {
+        // SAFETY: the caller has promised every element is written first.
+        unsafe { self.stream.alloc::<i8>(n) }.map_err(|source| CudaError::Driver {
+            what: "allocating",
+            source,
+        })
+    }
+
+    /// Quantises an activation to int8 in groups of 32, one scale a group.
+    ///
+    /// `rows` counts every row of every batch element, laid out `[batch, m, k]`
+    /// with `sa` between batch elements in the input and nothing between them
+    /// in the output - the output is dense, because nothing but the mat-vec
+    /// reads it.
+    ///
+    /// Mirrors [`xabe_dsp::quantize_q8`], which is the reference the
+    /// differential test compares against.
+    fn quantize_into(
+        &self,
+        a: &CudaSlice<f32>,
+        k: usize,
+        rows: usize,
+        sa: i64,
+        m: usize,
+    ) -> Result<Q8, CudaError> {
+        let groups = k / 32;
+        // SAFETY: one lane per element and one group per warp covers every code
+        // and every scale of both regions; the grid is rounded up and the
+        // excess returns before writing.
+        let mut buf = unsafe { self.uninit_i8(rows * k + rows * groups * 4) }?;
+        let off = (rows * k) as i32;
+        let (ki, ri, mi) = (k as i32, rows as i32, m as i32);
+        let f = self.func("quantize_q8");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a)
+            .arg(&mut buf)
+            .arg(&off)
+            .arg(&ki)
+            .arg(&ri)
+            .arg(&sa)
+            .arg(&mi);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((rows * groups).div_ceil(8) as u32, 1, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the grid covers every group of every row exactly once, and
+        // the buffer is sized to it.
+        launched("quantize_q8", unsafe { lb.launch(cfg) })?;
+        Ok(Q8 { buf, rows, k })
+    }
+
+    /// Takes the int8 twin of an activation that several matmuls will read.
+    ///
+    /// The point of doing it here rather than inside [`Gpu::gemm_batched`] is
+    /// that a transformer layer reuses one normed activation across three
+    /// projections and another across two. Quantizing per projection is correct
+    /// and wasteful; this is the same work done once. Hand the result back as
+    /// [`Operand::F32Q`].
+    ///
+    /// Rejects a shape the packed mat-vec would not use anyway, rather than
+    /// silently producing codes nothing reads.
+    pub fn quantize_activation(
+        &self,
+        a: &CudaSlice<f32>,
+        rows: usize,
+        k: usize,
+    ) -> Result<Q8, CudaError> {
+        if !k.is_multiple_of(1024) {
+            return Err(CudaError::RaggedBlock { k, block: 1024 });
+        }
+        self.quantize_into(a, k, rows, (rows * k) as i64, rows)
+    }
+
+    /// Quantises an activation and copies both halves back.
+    ///
+    /// For the differential test against [`xabe_dsp::quantize_q8`]. The engine
+    /// never needs the codes on the host - the mat-vec consumes them where they
+    /// are - so this exists only to make the CUDA half comparable.
+    pub fn quantize_q8_for_test(
+        &self,
+        a: &CudaSlice<f32>,
+        k: usize,
+        rows: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>), CudaError> {
+        let q = self.quantize_into(a, k, rows, (rows * k) as i64, rows)?;
+        let raw = self
+            .stream
+            .clone_dtoh(&q.buf)
+            .map_err(|source| CudaError::Driver {
+                what: "downloading",
+                source,
+            })?;
+        let (codes, tail) = raw.split_at(q.scale_offset());
+        let scales = tail
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]))
+            .collect();
+        Ok((codes.to_vec(), scales))
+    }
+
     /// Copies already-packed f16 bits to the device.
     ///
     /// For weights a checkpoint stores narrow, where rounding has already
@@ -516,6 +742,33 @@ impl Gpu {
                 what: "uploading quantized weights",
                 source,
             })
+    }
+
+    /// Copies packed blocks to the device at [`Quant::device_stride`].
+    ///
+    /// The path every model loader takes. For all but Q6_K it is
+    /// [`Gpu::upload_u8`] with a length check; for Q6_K it restrides the blocks
+    /// on the way, which is why the check is a rejection and not a
+    /// `debug_assert`: a `bytes` that is not a whole number of blocks would be
+    /// restrided into garbage that still decodes to plausible numbers.
+    pub fn upload_quant(&self, q: Quant, bytes: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
+        let ts = q.type_size();
+        if !bytes.len().is_multiple_of(ts) {
+            return Err(CudaError::RaggedBlockBytes {
+                len: bytes.len(),
+                ty: ts,
+            });
+        }
+        let stride = q.device_stride();
+        if stride == ts {
+            return self.upload_u8(bytes);
+        }
+        let blocks = bytes.len() / ts;
+        let mut wide = vec![0u8; blocks * stride];
+        for (b, src) in bytes.chunks_exact(ts).enumerate() {
+            wide[b * stride..b * stride + ts].copy_from_slice(src);
+        }
+        self.upload_u8(&wide)
     }
 
     /// Copies a slice to the device as f16, rounding once.
@@ -871,11 +1124,21 @@ impl Gpu {
         // loop in kernels.rs, and `every_output_element_is_written_exactly_once`
         // in the tests, which is the check this relies on.
         let mut out = unsafe { self.uninit(batch.count * m * n) }?;
+        // A row stride is meaningful only where a row is read as a row. The
+        // packed and f16 paths derive it from the block or word layout, so a
+        // caller asking for one there is asking for something that would be
+        // silently ignored.
+        if batch.w_row != 0 && !matches!(w, Operand::F32(_)) {
+            return Err(CudaError::StridedNonF32Weight {
+                stride: batch.w_row,
+            });
+        }
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let w_rs = batch.w_row as i32;
         let (sa, sw, so) = (batch.a as i64, batch.w as i64, batch.out as i64);
         let (a_half, w_half) = (a.half(), w.half());
         let (w_quant, q_bs, q_ts) = match w.quant() {
-            Some(q) => (q.id(), q.block_size() as i32, q.type_size() as i32),
+            Some(q) => (q.id(), q.block_size() as i32, q.device_stride() as i32),
             None => (0, 0, 0),
         };
         let null: u64 = 0;
@@ -886,17 +1149,54 @@ impl Gpu {
         // the derivation in kernels.rs, which is also why those three numbers
         // must move together with GEMM_MT, GEMM_NT and GEMM_WARPS.
         let small = m <= GEMV_MAX_M;
+
+        // The wide packed mat-vec reads the activation as int8, because a lane
+        // that loads sixteen bytes of quants covers 32 elements and 32 f32
+        // activations cost more to fetch than the wide load saves. Quantising
+        // is a kernel of its own rather than a change to any call site: the
+        // buffer lives exactly as long as this launch.
+        //
+        // Restricted to what the fast path actually handles - four super-blocks
+        // to a warp, so `k` must be a multiple of 1024 - and to an f32
+        // activation, which every caller of a quantized matmul passes.
+        let wide = small
+            && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
+            && matches!(w.quant(), Some(Quant::Q4K | Quant::Q6K))
+            && k.is_multiple_of(1024);
+        // A caller's own twin has to have been taken at this shape. Nothing in
+        // the kernel could notice otherwise: it would index another tensor's
+        // codes, in bounds, and return numbers.
+        if let Some(q8) = a.q8()
+            && q8.shape() != (batch.count * m, k)
+        {
+            let (rows, kk) = q8.shape();
+            return Err(CudaError::MismatchedQ8 {
+                rows,
+                k: kk,
+                want_rows: batch.count * m,
+                want_k: k,
+            });
+        }
+        let taken = match (wide, a) {
+            (true, Operand::F32(v)) => Some(self.quantize_into(v, k, batch.count * m, sa, m)?),
+            _ => None,
+        };
+        let q8 = match (wide, a.q8()) {
+            (true, Some(q)) => Some(q),
+            _ => taken.as_ref(),
+        };
+
         let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
         match a {
-            Operand::F32(v) => lb.arg(v),
+            Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
             Operand::F16(v) => lb.arg(v),
             // Refused above, but the arm has to exist. Passing the pointer
             // keeps this a rejected input rather than an unreachable panic.
             Operand::Q { data, .. } => lb.arg(data),
         };
         match w {
-            Operand::F32(v) => lb.arg(v),
+            Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
             Operand::F16(v) => lb.arg(v),
             Operand::Q { data, .. } => lb.arg(data),
         };
@@ -915,7 +1215,15 @@ impl Gpu {
             .arg(&w_half)
             .arg(&w_quant)
             .arg(&q_bs)
-            .arg(&q_ts);
+            .arg(&q_ts)
+            .arg(&w_rs);
+        let asc_off = q8.map_or(0, |q| q.scale_offset() as i32);
+        if small {
+            match q8 {
+                Some(q) => lb.arg(&q.buf).arg(&asc_off),
+                None => lb.arg(&null).arg(&asc_off),
+            };
+        }
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: if small {
@@ -937,6 +1245,59 @@ impl Gpu {
             lb.launch(cfg)
         })?;
         Ok(out)
+    }
+
+    /// Writes one step's keys or values into a head-major cache.
+    ///
+    /// `src` is `[n, kv_heads * head_dim]` as the projection produced it. With
+    /// `transposed`, the destination is `[kv_heads, head_dim, cap]` - the shape
+    /// the context matmul contracts over; without, it is
+    /// `[kv_heads, cap, head_dim]`, the shape the score matmul reads.
+    ///
+    /// Refuses a write that would run off the end, because the destination is
+    /// one long buffer and a `past` past its capacity would land in the next
+    /// head's keys: in bounds, and wrong for every step after it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_append(
+        &self,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        n: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cap: usize,
+        past: usize,
+        transposed: bool,
+    ) -> Result<(), CudaError> {
+        if past + n > cap {
+            return Err(CudaError::CacheOverrun { at: past + n, cap });
+        }
+        let total = n * kv_heads * head_dim;
+        let name = if transposed {
+            "cache_append_t"
+        } else {
+            "cache_append"
+        };
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        let (ni, kh, hd, ca, pa) = (
+            n as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            cap as i32,
+            past as i32,
+        );
+        lb.arg(src)
+            .arg(dst)
+            .arg(&ni)
+            .arg(&kh)
+            .arg(&hd)
+            .arg(&ca)
+            .arg(&pa);
+        // SAFETY: one thread per source element, bounds checked in the kernel,
+        // and the destination range is checked above.
+        launched(name, unsafe { lb.launch(Self::flat(total)) })?;
+        Ok(())
     }
 
     /// Layer normalisation over each row. Mirrors `xabe_dsp::layer_norm`.
@@ -975,6 +1336,33 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(&c);
         launched("softmax_rows", unsafe { lb.launch(Self::per_row(rows)) })
+    }
+
+    /// Softmax over each row, scaling and causal-masking on the way.
+    ///
+    /// `tq` rows to a query block and `offset` the position the first of them
+    /// sits at, which is `tk - tq` for the usual append-only attention. Replaces
+    /// a scale, a mask and a softmax with one pass - see the kernel.
+    pub fn softmax_causal(
+        &self,
+        x: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        tq: usize,
+        offset: usize,
+        scale: f32,
+    ) -> Result<(), CudaError> {
+        let (c, q, o) = (cols as i32, tq as i32, offset as i32);
+        let f = self.func("softmax_causal");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&c).arg(&q).arg(&o).arg(&scale);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            // A multiple of 32, so the shuffle reductions have full warps.
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launched("softmax_causal", unsafe { lb.launch(cfg) })
     }
 
     /// Applies a pointwise activation in place.
@@ -1500,9 +1888,9 @@ impl Gpu {
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
         let out_t = (t + pad_left).saturating_sub(k) / stride + 1;
         let mut out = self.zeros(out_ch * out_t)?;
-        let dummy = self.zeros(1)?;
+        let dummy = &self.dummy;
         let has = i32::from(bias.is_some());
-        let b = bias.unwrap_or(&dummy);
+        let b = bias.unwrap_or(dummy);
         let (p, q, r, s, u, v, y) = (
             in_ch as i32,
             t as i32,
@@ -1639,22 +2027,93 @@ impl Gpu {
         weight: &CudaSlice<f32>,
         eps: f32,
     ) -> Result<CudaSlice<f32>, CudaError> {
+        Ok(self
+            .rms_norm_inner(x, None, rows, dim, weight, eps, false)?
+            .0)
+    }
+
+    /// The same, also emitting the int8 twin the packed mat-vec wants.
+    ///
+    /// The activation a normalisation produces is, in every transformer here,
+    /// immediately projected two or three times by a packed weight. Taking the
+    /// twin here rather than in a kernel of its own saves a launch, an
+    /// allocation and a re-read of the row that was just written.
+    ///
+    /// Refuses the shapes the fused mapping does not cover rather than falling
+    /// back silently: a caller that asked for a twin and got none would work,
+    /// slowly, and nothing would say why.
+    pub fn rms_norm_q(
+        &self,
+        x: &mut CudaSlice<f32>,
+        add: Option<&CudaSlice<f32>>,
+        rows: usize,
+        dim: usize,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+    ) -> Result<(CudaSlice<f32>, Q8), CudaError> {
+        // Whole 32-column scale groups, which is also what makes a group a
+        // whole number of threads. The last iteration may be ragged; the kernel
+        // predicates it, and the boundary falls on a group either way.
+        if !dim.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock { k: dim, block: 32 });
+        }
+        let (out, q8) = self.rms_norm_inner(x, add, rows, dim, weight, eps, true)?;
+        Ok((out, q8.expect("asked for the twin")))
+    }
+
+    /// Both of the above. `quantize` decides whether the twin is written.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_inner(
+        &self,
+        x: &CudaSlice<f32>,
+        add: Option<&CudaSlice<f32>>,
+        rows: usize,
+        dim: usize,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+        quantize: bool,
+    ) -> Result<(CudaSlice<f32>, Option<Q8>), CudaError> {
         // SAFETY: the kernel writes every element of every row it owns, and
         // the grid is one block per row.
         let mut out = unsafe { self.uninit(rows * dim) }?;
+        // SAFETY: the same loop writes every code, and its last lane every
+        // scale, over the same range.
+        let mut q8 = match quantize {
+            true => Some(Q8 {
+                buf: unsafe { self.uninit_i8(rows * dim + rows * (dim / 32) * 4) }?,
+                rows,
+                k: dim,
+            }),
+            false => None,
+        };
         let d = dim as i32;
+        let off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
+        let null: u64 = 0;
         let f = self.func("rms_norm");
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(x).arg(weight).arg(&mut out).arg(&d).arg(&eps);
-        // A power of two, because the reduction halves the block each step.
-        let threads = (dim as u32).next_power_of_two().clamp(32, 1024);
+        lb.arg(x);
+        match add {
+            Some(a) => lb.arg(a),
+            None => lb.arg(&null),
+        };
+        lb.arg(weight).arg(&mut out);
+        match &mut q8 {
+            Some(q) => lb.arg(&mut q.buf),
+            None => lb.arg(&null),
+        };
+        lb.arg(&off).arg(&d).arg(&eps);
+        // A multiple of 32, so that one warp covers one scale group.
+        let threads = match quantize {
+            true => RMS_THREADS,
+            false => (dim as u32).next_power_of_two().clamp(32, 1024),
+        };
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (threads, 1, 1),
-            shared_mem_bytes: threads * 4,
+            shared_mem_bytes: 0,
         };
         launched("rms_norm", unsafe { lb.launch(cfg) })?;
-        Ok(out)
+        Ok((out, q8))
     }
 
     /// `a = silu(a) * b`. Mirrors `xabe_dsp::silu_mul`.
@@ -1664,11 +2123,62 @@ impl Gpu {
         b: &CudaSlice<f32>,
         n: usize,
     ) -> Result<(), CudaError> {
-        let len = n as i32;
+        self.silu_mul_inner(a, b, n, false).map(|_| ())
+    }
+
+    /// The same, also emitting the int8 twin the packed mat-vec wants.
+    ///
+    /// The gated result is projected straight back down by a packed weight, so
+    /// this is the same saving [`Gpu::rms_norm_q`] makes at the other end of
+    /// the block.
+    pub fn silu_mul_q(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<Q8, CudaError> {
+        if !n.is_multiple_of(BLOCK as usize) {
+            return Err(CudaError::RaggedBlock {
+                k: n,
+                block: BLOCK as usize,
+            });
+        }
+        Ok(self
+            .silu_mul_inner(a, b, n, true)?
+            .expect("asked for the twin"))
+    }
+
+    /// Both of the above.
+    fn silu_mul_inner(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        n: usize,
+        quantize: bool,
+    ) -> Result<Option<Q8>, CudaError> {
+        // SAFETY: one thread per element writes every code, and its group's
+        // first lane every scale.
+        let mut q8 = match quantize {
+            true => Some(Q8 {
+                buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
+                rows: 1,
+                k: n,
+            }),
+            false => None,
+        };
+        let off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
+        let null: u64 = 0;
+        let ni = n as i32;
         let f = self.func("silu_mul");
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(a).arg(b).arg(&len);
-        launched("silu_mul", unsafe { lb.launch(Self::flat(n)) })
+        lb.arg(a).arg(b);
+        match &mut q8 {
+            Some(q) => lb.arg(&mut q.buf),
+            None => lb.arg(&null),
+        };
+        lb.arg(&off).arg(&ni);
+        launched("silu_mul", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(q8)
     }
 
     /// Rotary position embedding, in place. Mirrors `xabe_dsp::rope`.
@@ -1709,9 +2219,9 @@ impl Gpu {
         // A flag, not a null pointer: every launch argument has to point at
         // something real, so the no-scaling case passes a one-element dummy
         // the kernel is told never to read.
-        let dummy = self.zeros(1)?;
+        let dummy = &self.dummy;
         let has = i32::from(freq_div.is_some());
-        let div = freq_div.unwrap_or(&dummy);
+        let div = freq_div.unwrap_or(dummy);
         lb.arg(x)
             .arg(div)
             .arg(&has)

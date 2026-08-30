@@ -171,7 +171,7 @@ fn every_block_format_unpacks_element_for_element() {
     for &(q, gt) in FORMATS {
         let raw = blocks(q, n * k / q.block_size(), 7);
         let want = xabe_gguf::dequantize_blocks(gt, &raw, n * k).expect("the CPU decoder");
-        let dw = g.upload_u8(&raw).unwrap();
+        let dw = g.upload_quant(q, &raw).unwrap();
 
         for j0 in (0..k).step_by(16) {
             let rows = 16.min(k - j0);
@@ -230,7 +230,7 @@ fn quantized_gemv_matches_the_cpu_dequantizer() {
         let want = xabe_dsp::linear(&a, m, k, &w, Some(&bias), n);
 
         let da = g.upload(&a).unwrap();
-        let dw = g.upload_u8(&raw).unwrap();
+        let dw = g.upload_quant(q, &raw).unwrap();
         let db = g.upload(&bias).unwrap();
         let out = g
             .gemm_batched(
@@ -305,7 +305,7 @@ fn quantized_gemm_matches_the_cpu_dequantizer() {
         let want = xabe_dsp::linear(&ah, m, k, &wh, None, n);
 
         let da = g.upload(&a).unwrap();
-        let dw = g.upload_u8(&raw).unwrap();
+        let dw = g.upload_quant(q, &raw).unwrap();
         let out = g
             .gemm_batched(
                 Operand::F32(&da),
@@ -358,7 +358,7 @@ fn the_packed_path_refuses_what_it_cannot_address() {
     // find the block, so this would read into the previous row's last block:
     // in bounds, and wrong.
     let raw = blocks(Quant::Q4K, 4, 31);
-    let dw = g.upload_u8(&raw).unwrap();
+    let dw = g.upload_quant(Quant::Q4K, &raw).unwrap();
     let da = g.upload(&seq(300, 32)).unwrap();
     let err = g
         .gemm_batched(
@@ -403,4 +403,98 @@ fn the_packed_path_refuses_what_it_cannot_address() {
         matches!(err, xabe_cuda::CudaError::QuantizedActivation),
         "wrong error: {err}",
     );
+}
+
+/// The runtime quantiser, against its CPU twin, code for code.
+///
+/// Exact equality on both halves rather than a tolerance. This is the one
+/// approximation the engine introduces deliberately, and the thing worth
+/// checking is that the two implementations approximate *identically* - a
+/// tolerance here would hide exactly the disagreement that matters, which is a
+/// group boundary in the wrong place or a rounding mode that differs at .5.
+#[test]
+fn the_runtime_quantiser_matches_its_cpu_twin() {
+    let Some(g) = gpu() else { return };
+
+    // Awkward on purpose: 3 rows so the row/group division is exercised, and a
+    // k that is several groups but not a power-of-two count of them.
+    let (rows, k) = (3usize, 320usize);
+    let mut x = seq(rows * k, 91);
+    // One group entirely zero, which must give scale zero and codes zero
+    // rather than a division by zero.
+    x[64..96].fill(0.0);
+    // One group whose maximum is a power of two, so the scale is exact and
+    // ties are reachable.
+    for (j, v) in x[96..128].iter_mut().enumerate() {
+        *v = (j as f32 - 16.0) / 16.0;
+    }
+
+    let (want_c, want_s) = xabe_dsp::quantize_q8(&x);
+    let dx = g.upload(&x).unwrap();
+    let (got_c, got_s) = g.quantize_q8_for_test(&dx, k, rows).unwrap();
+
+    assert_eq!(got_c, want_c, "codes");
+    assert_eq!(got_s, want_s, "scales");
+    assert_eq!(want_s[2], 0.0, "the zero group did not get a zero scale");
+}
+
+/// The wide K-quant mat-vecs, against the same product taken at f32.
+///
+/// Two things at once, and only one of them is a tolerance. The addressing is
+/// checked by the *shape* of the disagreement: a lane that reads the wrong
+/// sixteen bytes does not land within a few parts in a thousand of the right
+/// answer, it lands somewhere else entirely. So the bound below is what int8
+/// activation costs and nothing more - measured at 3.7e-3 relative on this
+/// card, allowed 1e-2 here.
+///
+/// `k` is a multiple of 1024 because that is the fast path's condition: four
+/// super-blocks to a warp. At 512 the kernel takes the older per-byte path,
+/// which `every_block_format_unpacks_element_for_element` already covers.
+#[test]
+fn the_wide_kquant_matvec_agrees_with_the_f32_product() {
+    let Some(g) = gpu() else { return };
+
+    let (k, n) = (1024usize, 24usize);
+    for &(q, gt) in &[(Quant::Q4K, GgmlType::Q4K), (Quant::Q6K, GgmlType::Q6K)] {
+        let raw = blocks(q, n * k / 256, 5);
+        let wf = xabe_gguf::dequantize_blocks(gt, &raw, n * k).expect("the CPU decoder");
+
+        let dq = g.upload_quant(q, &raw).unwrap();
+        let df = g.upload(&wf).unwrap();
+
+        for rows in [1usize, 5] {
+            let x = seq(rows * k, 17);
+            let dx = g.upload(&x).unwrap();
+            let want = g
+                .gemm_batched(
+                    Operand::F32(&dx),
+                    Operand::F32(&df),
+                    None,
+                    Batch::single(rows * n),
+                    rows,
+                    k,
+                    n,
+                )
+                .unwrap();
+            let got = g
+                .gemm_batched(
+                    Operand::F32(&dx),
+                    Operand::Q { data: &dq, ty: q },
+                    None,
+                    Batch::single(rows * n),
+                    rows,
+                    k,
+                    n,
+                )
+                .unwrap();
+            let (want, got) = (g.download(&want).unwrap(), g.download(&got).unwrap());
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-2 * scale,
+                    "{q:?} rows={rows} element {i}: {a} against {b}",
+                );
+            }
+        }
+    }
 }
