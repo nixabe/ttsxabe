@@ -175,10 +175,15 @@ what a listener waits through rather than what a stage costs in isolation.
 Three clauses, Tacotron2, Breeze2 8 B chat, Taigi 13 B translator; medians
 of three runs of the same prompt.
 
-| | one card, sequential | translator on card 1, pipelined |
+| | one card | translator on card 1 |
 | --- | ---: | ---: |
-| first audio | 2659 ms | **1930 ms** |
-| whole turn | 6951 ms | **5620 ms** |
+| first audio | 2738 ms | **1930 ms** |
+| whole turn | 7206 ms | **5620 ms** |
+
+Read that as the cost of the single-card constraint rather than as a speedup
+available everywhere: **everything below applies only across cards.** On one
+card the numbers are what they always were, and deliberately so - see the second
+change.
 
 Two changes, and the order matters because the first one is a flag.
 
@@ -193,6 +198,15 @@ by then the chat model has finished and there was nothing to contend with.
 models on now-different cards, so clause N+1 is translated while clause N is
 still becoming a waveform. Synthesis stays a single ordered consumer, because
 audio has to reach the browser in playback order.
+
+**Overlapping them on one card is worse than not.** Measured before the overlap
+was made conditional: synthesis went from about 400 ms a clause to 950-1200,
+first audio from 2659 ms to 2919, and the whole turn no faster. Two GPU jobs on
+one set of SMs do not run in half the time; they run in the same total time and
+delay whichever finishes first, which here is the clause the listener is waiting
+for. `xabe-engine` therefore compares the translator's resolved device with the
+synthesiser's and only overlaps when they differ - `translate_ahead` in the
+startup line says which it chose.
 
 ### The split, and why the synthesiser is not the thing to optimise
 

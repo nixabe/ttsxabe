@@ -25,6 +25,16 @@ pub struct GatewayConfig {
     pub min_chunk: usize,
     /// Minimum characters before the *first* chunk is synthesised.
     pub first_chunk: usize,
+    /// How many clauses may be translated ahead of the one being synthesised.
+    ///
+    /// One overlaps the two stages; zero runs them one after the other. It is
+    /// worth one only when they are on **different cards**. Sharing a card,
+    /// the overlap is two jobs competing for the same SMs: measured on a
+    /// three-clause turn, synthesis went from 440 ms to about 950 and first
+    /// audio from 2659 ms to 2919 - the whole turn no faster and the part a
+    /// listener waits through slower. `xabe-engine` sets this by comparing the
+    /// translator's device with the synthesiser's.
+    pub translate_ahead: usize,
     /// Language given to the ASR.
     pub asr_lang: String,
     /// TTS engines by name, as base URLs or the local marker.
@@ -57,6 +67,9 @@ impl Default for GatewayConfig {
             // Four for the first, deliberately lower: getting the voice started
             // is worth more than getting the first clause exactly right.
             first_chunk: 4,
+            // Sequential unless the caller knows the two stages do not share a
+            // card. The default deployment is one card, where overlapping loses.
+            translate_ahead: 0,
             // Never `en`. Breeze-ASR-26 transcribes Taigi speech *into*
             // Mandarin Han, and asking it for English gets a translation.
             asr_lang: "zh".into(),

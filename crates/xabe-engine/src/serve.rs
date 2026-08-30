@@ -66,6 +66,25 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         min_chunk: args.min_chunk,
         first_chunk: args.first_chunk,
         asr_lang: args.asr_lang.clone(),
+        // Overlapping translation with synthesis only pays when they are not
+        // competing for one card's SMs. Sharing a card it costs first audio,
+        // so the comparison is made here, where the devices are resolved,
+        // rather than guessed at in the serving layer. The `or_else` is the
+        // same fallback a registered engine uses: with no local `--tts-model`
+        // there is no stage to take the card from and `--tts-device` says it.
+        // Anything not local to this process is not competing for its card.
+        translate_ahead: usize::from(
+            match (
+                stages.translator.device(),
+                stages
+                    .tts
+                    .device()
+                    .or_else(|| args.tts_device.as_deref().and_then(Device::parse)),
+            ) {
+                (Some(translator), Some(tts)) => translator != tts,
+                _ => true,
+            },
+        ),
         ..GatewayConfig::default()
     };
 
@@ -189,6 +208,25 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
             });
         }
         tts_scripts.insert(name.to_string(), script.to_string());
+    }
+
+    // Refused here rather than discovered as a silent turn. A local engine that
+    // reads romanisation gets it from the translator and from nowhere else, so
+    // without one it is handed Han and says nothing. Remote engines are left
+    // alone: what an upstream accepts is its own business.
+    if translator.is_none() {
+        for (name, backend) in &tts {
+            if !matches!(backend, TtsBackend::Local(_)) {
+                continue;
+            }
+            let script = tts_scripts.get(name).unwrap_or(&args.translator_target);
+            if !script.eq_ignore_ascii_case("HAN") {
+                return Err(EngineError::ScriptNeedsTranslator {
+                    engine: name.clone(),
+                    script: script.clone(),
+                });
+            }
+        }
     }
 
     Ok(AppState(Arc::new(Inner {

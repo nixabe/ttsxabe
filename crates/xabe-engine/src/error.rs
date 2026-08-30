@@ -42,6 +42,28 @@ pub enum EngineError {
         known: String,
     },
 
+    /// A local synthesiser reads romanisation and nothing produces any.
+    ///
+    /// The same silent turn [`EngineError::UnknownEngine`] exists to prevent,
+    /// reached from the other side. Tacotron2 and mms read Tai-lo or POJ, and
+    /// their alphabets contain no Han at all - `text_to_sequence` drops what it
+    /// cannot map without a word, so a Han reply synthesises as near-silence
+    /// rather than as an error. The translator is what turns the reply into
+    /// romanisation, so with it off these engines have nothing to say.
+    ///
+    /// Hit most easily with `--direct-taigi`, which answers in Taigi *Han* and
+    /// takes the translator out of the pipeline in the same move.
+    #[error(
+        "engine `{engine}` reads `{script}` and there is no translator to \
+         produce it; give --translator-model, or use an engine that reads HAN"
+    )]
+    ScriptNeedsTranslator {
+        /// The engine that would have been silent.
+        engine: String,
+        /// The script it was asked to read.
+        script: String,
+    },
+
     /// The serving layer failed.
     #[error(transparent)]
     Serve(#[from] xabe_serve::ServeError),

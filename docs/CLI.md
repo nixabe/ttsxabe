@@ -194,6 +194,18 @@ On one card, put the translator there anyway and expect the first clause to
 cost what the table's left column says. On two, this is the split that matters;
 a third card has nothing left to move onto it that is worth the VRAM.
 
+Nothing else needs setting: the engine compares the translator's device with the
+synthesiser's and overlaps the two stages only when they differ, because sharing
+a card the overlap costs first audio rather than buying it. The `serving` line
+prints `translate_ahead=1` or `0` so it is visible which was chosen.
+
+**A synthesiser that reads romanisation needs the translator.** Tacotron2 and
+mms read Tai-lo or POJ and their alphabets contain no Han, so a Han reply
+synthesises as near-silence rather than as an error. `--direct-taigi` answers in
+Taigi *Han* and removes the translator in the same move, so it pairs only with
+an engine on `--tts-script <name>=HAN` - CosyVoice. The combination is refused at
+startup rather than discovered as a quiet turn.
+
 CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms and
 Tacotron2 read romanisation and get POJ from `--translator-target`. Tacotron2
 was trained on Tâi-lô with the tone as a trailing digit rather than on POJ with

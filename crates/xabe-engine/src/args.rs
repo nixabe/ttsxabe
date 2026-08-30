@@ -84,7 +84,12 @@ pub struct Args {
     /// Have the chat model answer in Taigi Han itself, skipping the translator.
     ///
     /// Measured 3.8 s -> 1.6 s on a voice turn, and it frees the translator's
-    /// VRAM. This is what the shipped pipeline runs.
+    /// VRAM.
+    ///
+    /// Only with a synthesiser that reads **Han**. The reply is Taigi Han and
+    /// this takes the translator out of the pipeline in the same move, so an
+    /// engine on POJ or Tai-lo is left with nothing to romanise its input and
+    /// says nothing at all. Refused at startup rather than discovered later.
     #[arg(long, env = "XABE_DIRECT_TAIGI")]
     pub direct_taigi: bool,
 

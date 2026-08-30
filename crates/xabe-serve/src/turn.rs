@@ -33,8 +33,10 @@ use axum::extract::ws::{Message, WebSocket};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 /// How many synthesised chunks may be buffered before the worker waits.
@@ -348,6 +350,7 @@ async fn reply(
         // engine the frame asked for, so mms and CosyVoice can be served by
         // one translator and still each get what they read.
         state.script_for(engine.as_deref()).to_string(),
+        state.config.translate_ahead,
         jobs_rx,
         audio_tx,
     ));
@@ -450,13 +453,6 @@ async fn reply(
     .await
 }
 
-/// How many chunks may be translated ahead of the one being synthesised.
-///
-/// One is the whole benefit: it keeps the translator busy across the gap while
-/// a waveform is produced. More would only buy latency on a queue that is
-/// already bounded by how fast the chat model writes.
-const TRANSLATE_AHEAD: usize = 1;
-
 /// A chunk that has been translated and is waiting to be spoken.
 struct Ready {
     /// What the synthesiser reads.
@@ -467,29 +463,50 @@ struct Ready {
     chars: usize,
     /// How long the translation took.
     translate_ms: u64,
+    /// Held until this chunk has been *spoken*, not merely received.
+    ///
+    /// The channel alone cannot express `ahead` of zero: its smallest capacity
+    /// is one, and one buffered item is already one chunk of overlap. The
+    /// permit is released at the end of the loop below, so `ahead + 1` permits
+    /// means one chunk in the synthesiser and `ahead` translated in front of
+    /// it.
+    _permit: OwnedSemaphorePermit,
 }
 
-/// Drains the chunk queue, translating one chunk ahead of the one being spoken.
+/// Drains the chunk queue, translating up to `ahead` chunks before the one
+/// being spoken.
 ///
-/// Two stages, not one: translation and synthesis are different models and, in
-/// the layout `docs/CLI.md` recommends, different cards, so chunk N+1 can be
-/// translated while chunk N is still becoming a waveform. Measured on a
-/// three-clause turn, translation is four times the cost of synthesis, so the
-/// overlap hides the synthesis of every chunk after the first.
+/// Two stages rather than one, because translation and synthesis are different
+/// models: given different cards, chunk N+1 can be translated while chunk N is
+/// still becoming a waveform, and translation is four times the cost of
+/// synthesis so the overlap hides all of the latter after the first chunk.
 ///
-/// Synthesis stays a single ordered consumer. Audio has to reach the browser in
-/// the order it will be played, and a second synthesiser would finish a short
-/// later clause before a long earlier one.
+/// `ahead` of zero runs them one after the other, which is what sharing a card
+/// wants - see [`crate::config::GatewayConfig::translate_ahead`], which is the
+/// measurement for why.
+///
+/// Synthesis stays a single ordered consumer either way. Audio has to reach the
+/// browser in the order it will be played, and a second synthesiser would
+/// finish a short later clause before a long earlier one.
 async fn synthesis_worker(
     backend: TtsBackend,
     translator: Option<TranslatorBackend>,
     target: String,
+    ahead: usize,
     mut jobs: mpsc::Receiver<String>,
     audio: mpsc::Sender<TtsChunk>,
 ) -> Result<(), ServeError> {
-    let (ready_tx, mut ready) = mpsc::channel::<Ready>(TRANSLATE_AHEAD);
+    let (ready_tx, mut ready) = mpsc::channel::<Ready>(ahead + 1);
+    let in_flight = Arc::new(Semaphore::new(ahead + 1));
+    let permits = in_flight.clone();
     let translating = tokio::spawn(async move {
         while let Some(chunk) = jobs.recv().await {
+            // Taken before the work, not before the send, so that with `ahead`
+            // at zero nothing is translated until the previous clause has
+            // finished being spoken.
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
             // Timed per chunk because the two stages are bound by different
             // things and only measurement says which one a listener is waiting
             // on. Reported once per chunk at info, by the stage below.
@@ -516,6 +533,7 @@ async fn synthesis_worker(
                 taigi,
                 chars,
                 translate_ms: queued.elapsed().as_millis() as u64,
+                _permit: permit,
             };
             if ready_tx.send(ready).await.is_err() {
                 break;
@@ -542,6 +560,9 @@ async fn speak_in_order(
         taigi,
         chars,
         translate_ms,
+        // Dropped at the end of this iteration, which is what lets the stage
+        // above start the next translation.
+        _permit,
     }) = ready.recv().await
     {
         let translated = Instant::now();

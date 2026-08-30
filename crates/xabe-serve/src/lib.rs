@@ -53,7 +53,16 @@ pub async fn serve(addr: &str, state: AppState) -> Result<(), ServeError> {
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| addr.to_string());
-    tracing::info!(addr = %local, converses = state.can_converse(), "serving");
+    tracing::info!(
+        addr = %local,
+        converses = state.can_converse(),
+        // Zero means translation and synthesis share a card and run one after
+        // the other; one means they do not and overlap. Worth seeing at
+        // startup, because it is derived from the device flags rather than set
+        // by one, and it is the difference between two very different turns.
+        translate_ahead = state.config.translate_ahead,
+        "serving"
+    );
 
     axum::serve(listener, server::router(state))
         .with_graceful_shutdown(async {
