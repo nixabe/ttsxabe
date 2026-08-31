@@ -6,7 +6,7 @@
 
 use crate::clock::{Clock, Timings};
 use crate::model::Rng;
-use crate::text::{Tokenizer, poj_to_tlpa};
+use crate::text::{Tokenizer, poj_to_tlpa, with_gate_cue};
 use crate::weights::{Glow, Taco2};
 use crate::{Config, TacoError, model, vocoder};
 use std::path::Path;
@@ -154,7 +154,14 @@ impl Taco {
     }
 
     fn run(&self, text: &str, mut clock: Clock) -> Result<(Vec<f32>, Timings, usize), TacoError> {
-        let converted = poj_to_tlpa(text);
+        // The cue goes on *after* the conversion, because the conversion is
+        // what folds a full-width mark into one the cue recognises - the other
+        // order appends a stop to a line that already ended in one and speaks
+        // `?.`. And it goes on here rather than in `encoder`, which is pinned
+        // against a captured oracle and must transform text exactly as the
+        // reference does. See `text::with_gate_cue`.
+        let tlpa = poj_to_tlpa(text);
+        let converted = with_gate_cue(&tlpa);
         let Some(ids) = self.tokens(&converted) else {
             if !clock.enabled() {
                 tracing::warn!(text = %text, "nothing in this clause is in the alphabet");

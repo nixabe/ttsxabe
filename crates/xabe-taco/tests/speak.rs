@@ -155,3 +155,61 @@ fn a_seed_reproduces_a_run() {
         "same seed, different samples"
     );
 }
+
+// ----------------------------------------------------- the runaway decoder
+
+/// Full-width punctuation reaches the alphabet instead of vanishing.
+///
+/// The chat model punctuates Han full-width and the translator carries it into
+/// POJ, so this is what nearly every line arriving here ends in. None of these
+/// marks is among the checkpoint's 71 symbols, and before they were folded the
+/// tokeniser dropped them without a word - taking the decoder's only
+/// end-of-utterance cue with them.
+#[test]
+fn full_width_punctuation_is_folded_rather_than_dropped() {
+    use xabe_taco::poj_to_tlpa;
+
+    assert_eq!(poj_to_tlpa("lí hó。"), "li2 ho2.");
+    assert_eq!(poj_to_tlpa("lí hó，sī"), "li2 ho2,si7");
+    assert_eq!(poj_to_tlpa("lí hó！"), "li2 ho2!");
+    assert_eq!(poj_to_tlpa("lí hó？"), "li2 ho2?");
+    assert_eq!(poj_to_tlpa("lí hó、sī"), "li2 ho2,si7");
+    // ASCII is already right and must not be touched twice.
+    assert_eq!(poj_to_tlpa("li2 ho2."), "li2 ho2.");
+}
+
+/// A line with no punctuation gets some, and one that has some is left alone.
+///
+/// Without this the gate can fail to fire at all and the decoder runs to
+/// `max_decoder_steps` - 34.8 seconds of held tone on this checkpoint, which
+/// is the "stuck voice". Any of the six marks satisfies it, measured, so a
+/// clause ending in a comma is not repunctuated into a sentence it is not.
+#[test]
+fn a_line_with_no_punctuation_is_given_a_stop() {
+    use xabe_taco::{poj_to_tlpa, with_gate_cue};
+
+    assert_eq!(with_gate_cue("li2 ho2"), "li2 ho2.");
+    assert_eq!(with_gate_cue("tsiah8-pa2--bo5"), "tsiah8-pa2--bo5.");
+    // Trailing whitespace is not punctuation and must not hide the absence.
+    assert_eq!(with_gate_cue("li2 ho2  "), "li2 ho2.");
+
+    for already in [
+        "li2 ho2.", "li2 ho2,", "li2 ho2?", "li2 ho2!", "li2 ho2;", "li2 ho2:",
+    ] {
+        assert_eq!(
+            with_gate_cue(already),
+            already,
+            "{already} was repunctuated"
+        );
+    }
+
+    // The pipeline converts first for exactly this reason: a full-width mark
+    // is already ASCII by the time the cue looks, so it is not stopped twice.
+    assert_eq!(with_gate_cue(&poj_to_tlpa("lí hó。")), "li2 ho2.");
+    assert_eq!(with_gate_cue(&poj_to_tlpa("lí hó")), "li2 ho2.");
+
+    // Nothing speakable: left alone, so the caller still reaches the
+    // empty-sequence path and its warning rather than synthesising one stop.
+    assert_eq!(with_gate_cue(""), "");
+    assert_eq!(with_gate_cue("   "), "   ");
+}

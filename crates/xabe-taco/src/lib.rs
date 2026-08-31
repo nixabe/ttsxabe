@@ -43,4 +43,4 @@ pub use config::Config;
 pub use error::TacoError;
 pub use model::Rng;
 pub use pipeline::{FILES, Taco};
-pub use text::{Tokenizer, poj_to_tlpa};
+pub use text::{Tokenizer, poj_to_tlpa, with_gate_cue};
