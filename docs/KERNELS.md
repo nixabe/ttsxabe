@@ -321,6 +321,46 @@ The sweep, all at KC=32 unless stated, TFLOP/s for (q/k/v/o, mlp up, mlp down):
 | 8 | 256 | 64 | 32 | 20.1 | 18.5 | 18.8 |
 | 8 | 64 | 64 | 64 | 19.5 | 14.6 | 18.7 |
 
+Re-swept after the staging rework, on the same encoder shapes and on a 128-row
+prefill of both Llama stages, 128x128x32 still wins everything - the closest
+were 128x128x64 (chat prefill 1306 against 1352) and 64x128x64 (1307). The
+derivation above holds and the sweep did not need to move.
+
+One warning about re-running it: the launch geometry lives in `device.rs` and
+the tile in this file, and for one afternoon they disagreed. `n.div_ceil(128)`
+was written next to a tile that had become 16x64, so the grid covered a
+fraction of the output and every small tile "measured" three times faster by
+not computing most of the answer. `kernels::define` now reads `GEMM_MT`,
+`GEMM_NT` and `GEMM_WARPS` out of the CUDA source at compile time, so the two
+cannot disagree again. The ASR oracle caught it; `xabe-llm-bench` checks no
+numbers and did not.
+
+### Splitting the contraction
+
+At prefill the whole `m` dimension is one tile: 128 prompt tokens at
+`GEMM_MT = 128` is one row of blocks, so a 1024-wide projection is eight blocks
+on 72 SMs. The tile cannot fix that. Shrinking `GEMM_MT` does make more blocks,
+but each weight is then dequantized once per block instead of once, which is
+what the sweep above is measuring when it rejects small tiles.
+
+`ksplit_for` splits `k` instead. Each slice takes a whole number of `GEMM_KC`
+trips, so no slice boundary falls inside a staged tile and the staging loop is
+untouched; `gemm_reduce` sums the slices afterwards. Every weight is still read
+exactly once, by whichever slice owns its part of the contraction - the split
+buys blocks without buying redundancy.
+
+The reduction sums in index order rather than by `atomicAdd`. An atomic
+reduction is faster and would pass every tolerance-based test in the workspace,
+while making the matmul return slightly different numbers from one run to the
+next - and every differential threshold in this workspace would then depend on
+how the blocks happened to be scheduled.
+`a_split_contraction_is_bit_identical_from_run_to_run` asserts it.
+
+`SM_TARGET = 144` is two blocks an SM on 72 SMs, which is what the register and
+shared footprints allow. Raising it measured worse (288 gives chat prefill 1224
+against 1350), because the extra slices are short and a slice reads the whole
+tile footprint however little of `k` it covers.
+
 ### WHY NOT
 
 - **Do not time a GPU kernel by downloading its result.** The first version of
@@ -331,7 +371,21 @@ The sweep, all at KC=32 unless stated, TFLOP/s for (q/k/v/o, mlp up, mlp down):
   all seven configurations "measured" 2.9 to 3.5 TFLOP/s. `synchronize`.
 - **KC=64 is slower than KC=32**, at every tile shape tried. More contraction
   per staging trip is fewer barriers and also a larger shared footprint; the
-  second wins here.
+  second wins here. Still true after the staging rework: 1306 against 1352.
+- **Do not hide the staging behind the mma by prefetching.** Both standard
+  forms were built and both lost. Register prefetch took the kernel from 117
+  registers to 158 and residency from two blocks an SM to one: 687 tok/s
+  against 940. Shared double buffering needs 40960 bytes a block against the
+  SM's 64 KB, so also one block: 1178 against 1355, and the encoder shapes fell
+  from 19.4 to 11.8 TFLOP/s. sm_75 has no `cp.async`, so a global-to-shared
+  copy has to occupy registers or a second buffer, and the second resident
+  block was already providing the overlap that either scheme pays for.
+  `docs/BENCHMARKS.md` has the numbers for every variant tried.
+- **Do not widen `GEMM_NPW` to improve the shared-load to mma ratio.** The mma
+  loop issues 18 shared loads per 16 mma, which looks like the binding
+  constraint and is not: four warps at 128x128 gives NPW=4 and measures 819
+  against 940, and eight warps at 128x256 gives 828. The accumulator array
+  grows with NPW and comes out of the same register budget as everything else.
 
 ### Reachability at sm_75
 

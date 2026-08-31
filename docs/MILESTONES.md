@@ -643,7 +643,9 @@ and zeroed on every rope call. 80.9 to **101.5 tok/s**.
 That is 0.3% ahead of llama.cpp on chat decode - a tie dressed as a win, and the
 first of the four llama.cpp numbers this engine has ever led. The translator's
 decode is 55.3 against 61.5, and prefill on both is about 3.5x behind and
-untouched. The int8 activation is the engine's one deliberate approximation:
+untouched. (Prefill was worked on afterwards and is 1.7x behind; see
+"Prefill: what four changes bought, and what two did not" in
+`docs/BENCHMARKS.md`.) The int8 activation is the engine's one deliberate approximation:
 0.66% of the logit span, and zero tokens of difference under greedy decoding.
 
 Two things are worth carrying forward from it. The kernel work was found by

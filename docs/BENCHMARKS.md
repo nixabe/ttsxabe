@@ -3,10 +3,11 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, both Llama
-stages' decode is level with llama.cpp (101.4 against 101.2 tok/s on the chat
-model, 61.1 against 61.5 on the translator), the ASR is 0.55x against
-`whisper-server`, and prefill on both Llama stages is about 3.5x behind. Each
-of those has its own section; this paragraph is not the evidence for any of them.
+stages' decode is level with llama.cpp (101.1 against 101.1 tok/s on the chat
+model, 61.0 against 61.4 on the translator), the ASR is 0.55x against
+`whisper-server`, and prefill on both Llama stages is about 1.6x behind - it was
+3.5x. Each of those has its own section; this paragraph is not the evidence for
+any of them.
 
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
@@ -119,12 +120,24 @@ not.
 `xabe-llm-bench` at the same shapes. The chat model's decode has passed it; the
 translator's has not, and prefill is untouched.
 
+`llama-bench -r 5`, medians of the tool's own repeats:
+
 | Checkpoint | | llama.cpp | this engine | |
 | --- | --- | ---: | ---: | ---: |
-| Breeze2 8 B Q4_K_M | prefill, 128 tok | **1950 tok/s** | 553 tok/s | 3.5x behind |
-| | decode, 64 tok | 101.2 tok/s | **101.4 tok/s** | ahead |
-| Taigi 13 B Q4_K_M | prefill, 128 tok | **1327 tok/s** | 401 tok/s | 3.3x behind |
-| | decode, 64 tok | **61.5 tok/s** | 61.1 tok/s | level |
+| Breeze2 8 B Q4_K_M | prefill, 128 tok | **2416 tok/s** | 1414 tok/s | 1.71x behind |
+| | decode, 64 tok | 101.1 tok/s | 101.1 tok/s | level |
+| Taigi 13 B Q4_K_M | prefill, 128 tok | **1400 tok/s** | 841 tok/s | 1.66x behind |
+| | decode, 64 tok | **61.4 tok/s** | 61.0 tok/s | level |
+
+The llama.cpp prefill figures are noisy - +/- 156 and +/- 79 tok/s across five
+repeats - and an earlier single run of the chat model recorded 1950, which is
+the number the rest of this file was written against. 2416 is the five-repeat
+figure and is the one to compare to.
+
+Both prefills were measured against `forward`, which projected all 128 rows
+through the output head, until that was changed to project the one row that
+predicts a token - which is what `llama-bench`'s pp128 does. The engine column
+is now the same measurement as the llama.cpp column.
 
 Decode was 60.8 and 35.8 when this table was first written, so the two stages
 are 1.67x and 1.71x faster than that. **Both decode margins are inside 1%,
@@ -154,12 +167,94 @@ actually closed the gap was widening each thread's load from 4 bytes to 16, whic
 needs the *activation* narrow enough to keep up. See "Sixteen bytes a lane"
 below.
 
-Prefill is arithmetic, and 3.5x is now the larger gap by far. It is not the
-unpacking: the f16 path, which does no unpacking at all, runs at 322 tok/s
-against llama.cpp's 1950. The tiled `gemm` reaches 15-17 TFLOP/s on the shapes
-`bench-gemm` covers and about 6 on a 128-row prefill, where the whole `m`
-dimension is one tile and the staging has nothing to amortise against. That is a
-tiling problem and it has not been worked on.
+Prefill is arithmetic, and it is still the larger gap. It is not the unpacking:
+the f16 path, which does no unpacking at all, ran at 322 tok/s when this was
+written. The reading that the 128-row prefill was "a tiling problem" was half
+right - see "Prefill: what four changes bought and what two did not" below,
+which is what closed most of it. What remains is the staging, and the two
+standard ways of hiding it both measured worse on this card.
+
+## Prefill: what four changes bought, and what two did not
+
+Prefill went from 553 to 1414 tok/s on the chat model and 400 to 841 on the
+translator. The route was one diagnostic repeated at each step: delete the
+staging from the tiled `gemm` - wrong results, timing only - and time the mma
+loop on its own. At the start that said 547 against 3344; at the end, 1414
+against 3103. Everything below is the distance between those two numbers.
+
+| | chat prefill | translator |
+| --- | ---: | ---: |
+| start | 553 | 400 |
+| split the contraction across blocks | 926 | 578 |
+| round the activation to f16 once | 982 | 632 |
+| read K-quant nibbles by the word | 1198 | 733 |
+| stage in quads, unpack sixteen a call | 1355 | 832 |
+| project only the row that predicts | 1414 | 841 |
+| *the same kernel with no staging at all* | *3103* | - |
+
+**The tile was not the problem, and a broken measurement said it was.** The
+first thing tried was a tile sweep, and it reported 1441 tok/s at 32x64 against
+551 at 128x128. That was wrong: the launch geometry was written `div_ceil(128)`
+in `device.rs` beside a tile that is a `#define` in `kernels.rs`, so every
+non-128 tile launched a grid that covered a fraction of the output and the
+kernel "ran" faster by not computing most of it. The ASR oracle caught it; the
+LLM benchmark checks no numbers and would not have. `kernels::define` now reads
+the tile out of the CUDA source at compile time so there is one copy. Swept
+again with a correct grid, 128x128x32 is the best tile on every shape measured,
+which is what the arithmetic-intensity derivation in `docs/KERNELS.md` said
+before the sweep started.
+
+**What was actually wrong was that one tile of `m` is the whole prefill.** A
+128-token prompt at `GEMM_MT = 128` is one row of blocks, so a 1024-wide
+projection was eight blocks on 72 SMs. Shrinking the tile to make more blocks
+makes each weight dequantized once per block instead of once, which is why the
+corrected sweep hates it. Splitting `k` instead adds blocks without that
+redundancy. That was the largest single change, 1.67x.
+
+**The rest was instruction count in the staging loop**, in three parts: the
+activation was staged from f32 and re-read once per column tile though the
+kernel rounds it to f16 anyway; the K-quant nibbles were read one byte at a
+time, one global load per element produced; and the activation quads and the
+K-quant runs were both narrower than the alignment allowed. None of these is
+clever. All three were sitting in the hottest loop in the engine.
+
+### The two that did not work, and why
+
+Both are the textbook answer to "the staging and the mma never overlap, because
+a `__syncthreads()` separates them in each direction". Both lose on this card,
+and they lose for the same reason.
+
+- **Register prefetch.** Fetch trip i+1 into registers before the mma loop, so
+  the global loads issue underneath the tensor instructions. Registers went 117
+  to 158, which drops residency from two blocks an SM to one, and prefill went
+  940 to 687. Pinning `__launch_bounds__(..., 2)` capped it at 128 registers
+  and spilled 12 bytes, which gave 935 - a wash. Prefetching only the weights
+  was worse still (171 registers, 699).
+- **Shared double buffering.** Stage trip i+1 into a second pair of buffers
+  while the mma reads the first, one barrier a trip instead of two. No register
+  cost, but 40960 bytes of shared memory a block against the SM's 64 KB, so
+  again one resident block: 1178 against 1355, and the encoder shapes fell from
+  19.4 to 11.8 TFLOP/s. Shrinking the tile until two blocks fit does not
+  recover it - 128x64 double-buffered is 1128.
+
+The common cause is that sm_75 has no `cp.async`: a global-to-shared copy
+occupies registers or a second buffer, and this kernel has no room for either.
+The second resident block was already providing the overlap, and both schemes
+pay for a better overlap by removing it.
+
+### Two things that are not worth trying again
+
+The **dequantization arithmetic** is 3 ms of a 90 ms prefill. Replacing the
+scale and nibble arithmetic with a bit-twiddle that keeps the same loads gives
+1472 against 1422. Measure it before optimising it: an earlier version of this
+same test replaced `q4k_run` with a byte-at-a-time loop and reported the
+dequant as *negative* cost, because it had swapped an efficient path for an
+inefficient one rather than removing anything.
+
+**Widening each warp's n-slice** to cut the ratio of shared loads to mma
+instructions - 18 loads per 16 mma - measured worse at every tile tried
+(`GEMM_WARPS = 4` at 128x128: 819; 128x256 at eight warps: 828). The
+accumulator array grows with it and the registers come from the same budget.
 
 ## Sixteen bytes a lane, and the token that was 40% not-matmul
 
