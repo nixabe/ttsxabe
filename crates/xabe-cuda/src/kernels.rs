@@ -125,6 +125,39 @@ __device__ __forceinline__ void gemm_unpack(unsigned p, float& lo, float& hi) {
         : "=f"(lo), "=f"(hi) : "r"(p));
 }
 
+// The two shared loads that feed `mma`, as one instruction each.
+//
+// `ldmatrix` exists to do exactly this: every lane hands it the address of one
+// *row* of an 8x8 half tile, and it returns the tile already distributed in
+// the register layout `mma` wants. The scalar loads it replaces were one
+// 32-bit `ld.shared` per lane per fragment - 72 of them per lane per staged
+// trip against 64 `mma`, in a loop measured at 41 ms of a 95 ms prefill with
+// the staging deleted around it.
+//
+// The address a lane supplies is its row's base plus the k step, and both are
+// 16-byte aligned: `GEMM_WSTRIDE` is a multiple of four words so a row starts
+// aligned, and a k step is four words into it. `ldmatrix` requires that.
+//
+// Only the first 8 lanes' addresses matter for `.x1` and the first 16 for
+// `.x2`; the rest are ignored, and are given an in-range address anyway rather
+// than an out-of-bounds one that happens not to be read.
+__device__ __forceinline__ void gemm_ld_a(
+    const unsigned* row, unsigned& a0, unsigned& a1)
+{
+    unsigned p = (unsigned)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                 : "=r"(a0), "=r"(a1) : "r"(p));
+}
+
+__device__ __forceinline__ unsigned gemm_ld_b(const unsigned* row)
+{
+    unsigned p = (unsigned)__cvta_generic_to_shared(row);
+    unsigned b;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+                 : "=r"(b) : "r"(p));
+    return b;
+}
+
 __device__ __forceinline__ void gemm_mma_step(
     float& d0, float& d1, float& d2, float& d3,
     unsigned a0, unsigned a1, unsigned b0)
@@ -1124,15 +1157,20 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             // across every n tile, so one shared load feeds several
             // instructions. That reuse is what keeps this off the shared-load
             // limit once the global one has been raised.
+            // `ldmatrix` wants a row index per lane, where the scalar load
+            // wanted an element index: lanes 0-7 name the eight rows of one
+            // 8x8 tile, lanes 8-15 the next.
+            const int lrow = lane & 15;
             unsigned b0[GEMM_NPW];
             #pragma unroll
             for (int nt = 0; nt < GEMM_NPW; ++nt) {
-                b0[nt] = bs[((warp * GEMM_NPW + nt) * 8 + g) * GEMM_WSTRIDE + 4 * ks + tg];
+                b0[nt] = gemm_ld_b(
+                    &bs[((warp * GEMM_NPW + nt) * 8 + (lane & 7)) * GEMM_WSTRIDE + 4 * ks]);
             }
             #pragma unroll
             for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
-                unsigned a0 = as[(16 * ms + g)     * GEMM_WSTRIDE + 4 * ks + tg];
-                unsigned a1 = as[(16 * ms + g + 8) * GEMM_WSTRIDE + 4 * ks + tg];
+                unsigned a0, a1;
+                gemm_ld_a(&as[(16 * ms + lrow) * GEMM_WSTRIDE + 4 * ks], a0, a1);
                 #pragma unroll
                 for (int nt = 0; nt < GEMM_NPW; ++nt) {
                     gemm_mma_step(acc[ms][nt][0], acc[ms][nt][1],
