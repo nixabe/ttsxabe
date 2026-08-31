@@ -104,6 +104,14 @@ The entrypoint is the `xabe-engine` binary itself and `command:` is the
 argument list, so `docker run ... --help` prints the real flag surface rather
 than a shell's.
 
+**The system prompt is one of these variables**, which is the point of it
+having an inline form: `XABE_SYSTEM_PROMPT` carries the whole prompt, and
+`XABE_PROMPT_FILE` points at one under the mounted tree for anything long
+enough that a variable is the wrong shape. They are alternatives; both is
+refused. `.env` has both lines commented, and [CLI.md](CLI.md) has the rules -
+the important one being that a given prompt replaces the built-in whole and
+must be written in whatever script the configured synthesiser reads.
+
 ## The two shapes
 
 `.env` sets `COMPOSE_PROFILES=mono`, so the bare command is the monolith and

@@ -56,6 +56,56 @@ pub fn serve(args: &Args, stages: &Stages, addr: &str) -> Result<(), EngineError
 }
 
 /// Assembles what this process can reach from what its flags said.
+/// The system prompt this run will use, resolved before anything is loaded.
+///
+/// Three sources and they do not merge. An explicit prompt **replaces** the
+/// built-in one whole rather than being prepended to it: a system prompt is a
+/// single instruction to one model, and two of them stacked is the shape that
+/// produces a model following neither. So `--system-prompt` and
+/// `--prompt-file` are alternatives and giving both is refused by name, on the
+/// same reasoning as `--tts-model` with `--tts-url`.
+///
+/// With neither, the built-in depends on who is expected to produce Taigi.
+/// With `--direct-taigi` the chat model does it and the translator is out of
+/// the reply path entirely; otherwise the model writes Mandarin and the
+/// translator converts it. That choice is the *only* thing an explicit prompt
+/// takes over - `--direct-taigi` still decides the pipeline.
+///
+/// An empty prompt is refused rather than accepted. Trimming to nothing leaves
+/// [`xabe_serve::GatewayConfig::build_prompt`] opening a completion with a
+/// blank line and the model with no instruction at all, which reads as a model
+/// behaving badly rather than as a file that was never filled in. An empty
+/// `--prompt-file` used to do exactly that silently.
+pub fn system_prompt(args: &Args) -> Result<String, EngineError> {
+    let given = match (&args.system_prompt, &args.prompt_file) {
+        (Some(_), Some(_)) => return Err(EngineError::BothPrompts),
+        (Some(text), None) => Some(("--system-prompt", text.clone())),
+        (None, Some(path)) => Some((
+            "--prompt-file",
+            std::fs::read_to_string(path).map_err(|source| EngineError::Io {
+                what: "reading the prompt file",
+                path: path.display().to_string(),
+                source,
+            })?,
+        )),
+        (None, None) => None,
+    };
+
+    let Some((flag, text)) = given else {
+        return Ok(if args.direct_taigi {
+            xabe_serve::direct_taigi_prompt(&args.person, &args.bot)
+        } else {
+            xabe_serve::mandarin_prompt(&args.person, &args.bot)
+        });
+    };
+
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(EngineError::EmptyPrompt { flag });
+    }
+    Ok(text)
+}
+
 fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     let mut config = GatewayConfig {
         person: args.person.clone(),
@@ -88,25 +138,24 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         ..GatewayConfig::default()
     };
 
-    // Which prompt depends on who is expected to produce Taigi. With
-    // --direct-taigi the chat model does it and the translator is out of the
-    // reply path entirely; otherwise the model writes Mandarin and the
-    // translator converts it.
-    config.system_prompt = if args.direct_taigi {
-        xabe_serve::direct_taigi_prompt(&args.person, &args.bot)
-    } else {
-        xabe_serve::mandarin_prompt(&args.person, &args.bot)
-    };
-    if let Some(path) = &args.prompt_file {
-        config.system_prompt = std::fs::read_to_string(path)
-            .map_err(|source| EngineError::Io {
-                what: "reading the prompt file",
-                path: path.display().to_string(),
-                source,
-            })?
-            .trim()
-            .to_string();
-    }
+    config.system_prompt = system_prompt(args)?;
+    // Which prompt a served process ended up with is not visible from a
+    // command line that may have come from six environment variables, and it
+    // is the setting most likely to be wrong in a way that reads as the model
+    // misbehaving. So it is announced, like the stages are.
+    tracing::info!(
+        source = if args.system_prompt.is_some() {
+            "--system-prompt"
+        } else if args.prompt_file.is_some() {
+            "--prompt-file"
+        } else if args.direct_taigi {
+            "built-in, taigi"
+        } else {
+            "built-in, mandarin"
+        },
+        chars = config.system_prompt.chars().count(),
+        "system prompt",
+    );
 
     let asr = match &stages.asr {
         Stage::Remote { url } => Some(AsrBackend::Remote(Upstream::new(url)?)),

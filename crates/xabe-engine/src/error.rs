@@ -69,6 +69,31 @@ pub enum EngineError {
         script: String,
     },
 
+    /// Both ways of giving a system prompt at once.
+    ///
+    /// They are alternatives rather than layers, and the reason is what a
+    /// system prompt is: one instruction to one model. Concatenating an inline
+    /// prompt with a file would produce a pair of instructions that may
+    /// contradict, and a model following neither is the hardest failure here
+    /// to attribute - it looks like a bad model rather than like two prompts.
+    /// So the run is refused while both flags are still in hand.
+    #[error("--system-prompt and --prompt-file are alternatives; give one, not both")]
+    BothPrompts,
+
+    /// A system prompt that is given but empty.
+    ///
+    /// An empty file or an empty string trims to nothing, and the completion
+    /// then opens with a blank line and no instruction at all. The model
+    /// answers something, so nothing fails - it just answers as though it had
+    /// never been told who it is, which reads as a model behaving badly rather
+    /// than as a prompt that was never written. `--prompt-file` did this
+    /// silently before the flag had a twin.
+    #[error("{flag} is empty; a system prompt that says nothing is not a prompt")]
+    EmptyPrompt {
+        /// Which of the two flags was given.
+        flag: &'static str,
+    },
+
     /// The serving layer failed.
     #[error(transparent)]
     Serve(#[from] xabe_serve::ServeError),

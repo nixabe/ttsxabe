@@ -113,7 +113,8 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--history-turns` | `XABE_HISTORY_TURNS` | 6 | turns kept in the prompt |
 | `--min-chunk` | `XABE_MIN_CHUNK` | 6 | characters before a later chunk is spoken |
 | `--first-chunk` | `XABE_FIRST_CHUNK` | 4 | characters before the *first* chunk is spoken |
-| `--prompt-file` | `XABE_PROMPT_FILE` | — | replaces the built-in system prompt |
+| `--system-prompt` | `XABE_SYSTEM_PROMPT` | — | replaces the built-in system prompt, inline |
+| `--prompt-file` | `XABE_PROMPT_FILE` | — | the same, read from a file |
 | `--config` | `XABE_TTS_CONFIG` | next to the model | TTS `config.json` |
 | `--seed` | `XABE_SEED` | 0 | duration and prior sampling |
 | `--noise-scale` | | 0.667 | prior temperature |
@@ -173,6 +174,57 @@ xabe-engine --serve 127.0.0.1:8000 \
             --tts-engine tacotron2=models/tts/tacotron2-nan \
             --tts-script cosyvoice=HAN \
             --tts-script tacotron2=POJ
+```
+
+### The system prompt
+
+Two built-ins, and which one a run gets follows who is expected to produce
+Taigi rather than any flag of its own. With `--direct-taigi` the chat model
+writes Taigi Han itself and the built-in asks for exactly that; without it the
+model writes Mandarin and the translator converts, so the built-in asks for
+Mandarin. Both are short, both name `--person` and `--bot`, and both say the
+reply will be read aloud - at most two sentences, no Markdown, no parentheses.
+
+`--system-prompt` gives one inline and `--prompt-file` reads one from a file.
+They are the same setting with a level of indirection, they are **alternatives
+rather than layers**, and giving both is refused:
+
+```sh
+xabe-engine --serve 0.0.0.0:8000 --llm-model models/breeze2-8b-Q4_K_M.gguf \
+            --system-prompt "你是小哇，用台語漢字講話，逐句 8-12 字。"
+
+XABE_PROMPT_FILE=prompts/xiaowa.txt xabe-engine --serve 0.0.0.0:8000 ...
+```
+
+A given prompt **replaces** the built-in whole rather than being prepended to
+it. That is the decision worth knowing: a system prompt is one instruction to
+one model, and two of them stacked is the shape that produces a model
+following neither - which reads as a bad model rather than as two prompts.
+
+Three consequences follow, and each is a thing to get wrong once:
+
+- **It is taken literally.** No `{person}`/`{bot}` substitution. The built-ins
+  interpolate those because they are the engine's own text; a prompt from
+  outside is not the engine's to rewrite, and one containing a brace would
+  otherwise change meaning depending on where it was written. Write the names
+  in directly.
+- **`--direct-taigi` still places the translator.** Giving a prompt takes over
+  the text and nothing else, so the two flags are not the same switch. A
+  prompt handed in here has to write in whatever script the configured
+  synthesiser reads - `mms` reads POJ, CosyVoice reads Han - and the engine
+  cannot check that for you the way it checks the built-in pairing.
+- **An empty prompt is refused**, from either source. Trimming to nothing
+  leaves the completion opening on a blank line with no instruction at all;
+  the model still answers, just as though it had never been told who it is.
+  An empty `--prompt-file` used to do that silently.
+
+Which prompt a process ended up with is logged at startup beside the stages,
+because a served process may have been configured from six environment
+variables and this is the setting most likely to be wrong in a way that looks
+like the model misbehaving:
+
+```
+INFO system prompt source="--system-prompt" chars=23
 ```
 
 ## Which card each stage goes on
@@ -290,6 +342,8 @@ same; someone told to wait for phase 3 would wait forever.
 | `--tts-device` with no `--tts-model` and no `--tts-engine` | nothing local to place |
 | stages but no `--serve`, `--in` or `--text` | a serve command with `--serve` forgotten |
 | `--in` and `--text` together | alternatives; give one |
+| `--system-prompt` and `--prompt-file` together | alternatives; give one |
+| either of those two, empty | a prompt that says nothing is not a prompt |
 | `--serve` with `--in` or `--text` | a server is not a one-shot run |
 | `--text` with no TTS stage | names `--tts-model` and `--tts-url` |
 | `--text` with no `--out` | nowhere to put the WAV |

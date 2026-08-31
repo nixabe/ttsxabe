@@ -247,7 +247,28 @@ pub struct Args {
     #[arg(long, env = "XABE_FIRST_CHUNK", default_value_t = 4)]
     pub first_chunk: usize,
 
+    /// The system prompt, given inline, instead of the built-in one.
+    ///
+    /// Taken literally: no `{person}` or `{bot}` substitution, exactly as
+    /// `--prompt-file` has always been. The built-ins interpolate those two
+    /// because they are the engine's own text; a prompt that came from outside
+    /// is not the engine's to rewrite, and a prompt containing a brace would
+    /// otherwise change meaning depending on where it was written.
+    ///
+    /// `--direct-taigi` still decides whether the translator is in the reply
+    /// path when this is given. It only stops choosing the *prompt*, which is
+    /// now this one either way - so a prompt handed in here has to write in
+    /// whatever script the configured synthesiser reads.
+    #[arg(long, env = "XABE_SYSTEM_PROMPT", value_name = "TEXT")]
+    pub system_prompt: Option<String>,
+
     /// Read the system prompt from a file instead of using the built-in one.
+    ///
+    /// The same thing as `--system-prompt` with a level of indirection, and
+    /// the two are alternatives rather than layers - see
+    /// [`crate::serve::system_prompt`]. Worth having both: a prompt long
+    /// enough to be worth writing is awkward in an environment variable, and
+    /// one short enough to type is awkward in a file.
     #[arg(long, env = "XABE_PROMPT_FILE", value_name = "PATH")]
     pub prompt_file: Option<PathBuf>,
 

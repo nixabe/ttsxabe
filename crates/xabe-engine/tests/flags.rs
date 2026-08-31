@@ -379,3 +379,197 @@ fn every_stage_flag_has_an_environment_twin() {
         assert!(help.contains(var), "{var} is not in --help");
     }
 }
+
+// ------------------------------------------------------------- system prompt
+
+/// Resolves the system prompt from a command line, as `serve` would.
+fn prompt(argv: &[&str]) -> Result<String, xabe_engine::EngineError> {
+    xabe_engine::serve::system_prompt(&parse(argv).expect("flags parse"))
+}
+
+#[test]
+fn an_inline_prompt_replaces_the_built_in_one_whole() {
+    let built_in = prompt(&["--llm-url", "http://h:1", "--serve", "h:1"]).expect("built-in");
+    let given = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--system-prompt",
+        "你是小哇，用台語講話。",
+    ])
+    .expect("inline");
+
+    assert_eq!(given, "你是小哇，用台語講話。");
+    // Replaced, not prepended: a system prompt is one instruction, and two
+    // stacked is the shape that produces a model following neither.
+    assert!(
+        !given.contains(&built_in),
+        "the built-in prompt survived alongside the given one",
+    );
+}
+
+#[test]
+fn the_two_ways_of_giving_a_prompt_are_alternatives() {
+    let e = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--system-prompt",
+        "x",
+        "--prompt-file",
+        "/nonexistent",
+    ])
+    .expect_err("both should be refused");
+
+    assert!(
+        matches!(e, xabe_engine::EngineError::BothPrompts),
+        "wanted BothPrompts, got {e}",
+    );
+    // Refused on the flags alone: the path is never opened, so the error is
+    // about the combination rather than about a file that happens to be
+    // missing too.
+    assert!(!format!("{e}").contains("nonexistent"));
+}
+
+#[test]
+fn a_prompt_that_says_nothing_is_refused_rather_than_used() {
+    for empty in ["", "   ", "\n\t  \n"] {
+        let e = prompt(&[
+            "--llm-url",
+            "http://h:1",
+            "--serve",
+            "h:1",
+            "--system-prompt",
+            empty,
+        ])
+        .expect_err("an empty prompt should be refused");
+        assert!(
+            matches!(e, xabe_engine::EngineError::EmptyPrompt { flag } if flag == "--system-prompt"),
+            "wanted EmptyPrompt, got {e}",
+        );
+    }
+}
+
+#[test]
+fn a_given_prompt_is_trimmed_but_not_otherwise_rewritten() {
+    // Braces stay braces. The built-ins interpolate `person` and `bot`
+    // because they are the engine's own text; a prompt from outside is not
+    // the engine's to rewrite, and one containing a brace would otherwise
+    // change meaning depending on where it was written.
+    let given = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--person",
+        "阿公",
+        "--system-prompt",
+        "  {person} 佮 {bot} 咧講話。  ",
+    ])
+    .expect("inline");
+
+    assert_eq!(given, "{person} 佮 {bot} 咧講話。");
+}
+
+#[test]
+fn which_built_in_is_chosen_follows_who_produces_taigi() {
+    let mandarin = prompt(&["--llm-url", "http://h:1", "--serve", "h:1"]).expect("mandarin");
+    let taigi = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--direct-taigi",
+    ])
+    .expect("direct taigi");
+
+    assert_ne!(mandarin, taigi, "--direct-taigi did not change the prompt");
+    assert!(
+        taigi.contains("台語"),
+        "the direct prompt should ask for Taigi"
+    );
+}
+
+#[test]
+fn direct_taigi_still_places_the_translator_when_the_prompt_is_given() {
+    // `--direct-taigi` decides the pipeline; giving a prompt only takes over
+    // which text is used, so the two are not the same switch.
+    let given = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--direct-taigi",
+        "--system-prompt",
+        "講台語。",
+    ])
+    .expect("inline");
+
+    assert_eq!(given, "講台語。");
+    let args = parse(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--direct-taigi",
+    ])
+    .expect("flags parse");
+    assert!(args.direct_taigi, "the flag still means what it meant");
+}
+
+#[test]
+fn a_prompt_file_is_read_and_trimmed() {
+    let dir = std::env::temp_dir().join("xabe-prompt-test");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("prompt.txt");
+    std::fs::write(&path, "\n  你是小哇。  \n\n").expect("write");
+
+    let given = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--prompt-file",
+        path.to_str().expect("utf-8 path"),
+    ])
+    .expect("file");
+    assert_eq!(given, "你是小哇。");
+
+    // The same emptiness rule, from the other source. This used to be
+    // accepted and produce a completion opening on a blank line.
+    std::fs::write(&path, "   \n ").expect("write");
+    let e = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--prompt-file",
+        path.to_str().expect("utf-8 path"),
+    ])
+    .expect_err("an empty file should be refused");
+    assert!(
+        matches!(e, xabe_engine::EngineError::EmptyPrompt { flag } if flag == "--prompt-file"),
+        "wanted EmptyPrompt, got {e}",
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_prompt_file_that_is_not_there_names_the_path() {
+    let e = prompt(&[
+        "--llm-url",
+        "http://h:1",
+        "--serve",
+        "h:1",
+        "--prompt-file",
+        "/nonexistent/prompt.txt",
+    ])
+    .expect_err("a missing file should be refused");
+    assert!(
+        format!("{e}").contains("/nonexistent/prompt.txt"),
+        "the error should name the path, got {e}",
+    );
+}
