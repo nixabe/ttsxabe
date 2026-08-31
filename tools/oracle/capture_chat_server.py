@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Capture `llama-server`'s replies for the chat model, as JSON.
 
+**Point it at the f16 GGUF, not the quantized one.** That is not a detail; it
+is the difference between the capture being a reference and being a second
+opinion of the same precision. Measured on this machine, against the same
+Breeze2 checkpoint:
+
+    this engine on Q4_K vs llama-server on f16    1 of 125 decisions, 7 of 8 replies
+    this engine on Q4_K vs llama-server on Q4_K  10 of 105 decisions, 3 of 7 replies
+
+llama.cpp multiplies a quantized weight against an int8 activation, so its
+quantized run differs from its own f16 run by more than this engine's quantized
+run differs from either. Capturing from the quantized build records that error
+as the target and then reports a faithful engine as wrong - which is exactly
+what happened, and is written up in `docs/TESTING.md`.
+
     python tools/oracle/capture_chat_server.py --url http://127.0.0.1:8082 \
         --out .golden/chat/llama_server.json
 

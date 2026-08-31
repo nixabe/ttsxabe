@@ -212,6 +212,126 @@ That number is a bound on the arithmetic, not on the output. What it costs in
 `llama-server` capture picks the same token at every position it picked before,
 and the disagreement list below is byte-identical across the change.
 
+### The chat model's disagreement was the reference, not the engine
+
+This section recorded ten disagreements of 105 teacher-forced decisions against
+llama-server, with margins up to 2.86 nats, as a real and unexplained defect.
+It is explained. **The capture was taken from llama-server running the
+*quantized* checkpoint**, and llama.cpp's quantized matmul multiplies the packed
+weight against an int8 activation - a coarser arithmetic than this engine's
+tiled path uses. The capture recorded that error as the target.
+
+Re-captured from the same llama-server running the **f16** build of the same
+model, and compared against this engine reading the *quantized* one:
+
+| reference | decisions | replies |
+| --- | ---: | ---: |
+| llama-server on f16 | **1 of 125**, margin 0.056 | **7 of 8** identical |
+| llama-server on Q4_K | 10 of 105, margin 2.86 | 3 of 7 identical |
+
+The forked replies under the second row are, word for word, the replies
+llama-server produces from the f16 build. This engine reading a 4-bit
+checkpoint reproduces the full-precision model; llama.cpp reading the same 4-bit
+checkpoint does not.
+
+`.golden/chat/llama_server.json` is therefore captured from the f16 build, and
+`tools/oracle/capture_chat_server.py` says so at the top with the numbers.
+
+Three arithmetic interventions were made before the reference was suspected, and
+each moved the disagreement list by exactly zero: an integer tiled matmul
+multiplying the packed blocks the way llama.cpp does, an activation pre-rounded
+to the int8 grid, and both attention matmuls in exact f32. All three produced
+byte-identical lists. `docs/BENCHMARKS.md` has them under WHY NOT. **A run of
+interventions that change nothing is evidence about the target, not about the
+thing being changed** - and that is the lesson, because it took three of them.
+
+### What the int8 activation costs, in decisions
+
+The engine has two multiplies for a packed weight and they are not equally
+faithful. `tests/stepwise.rs` runs the same 125 decisions a token at a time, so
+every projection lands on the mat-vec, which quantizes the activation to int8 to
+feed its wide loads:
+
+| weights | activation | agreement with the f16 reference |
+| --- | --- | ---: |
+| `Q4_K` | f16, tiled | 124 of 125 |
+| f16 | f32, mat-vec | 124 of 125 |
+| `Q4_K` | **int8, mat-vec** | **114 of 125** |
+
+Quantizing the weights costs almost nothing. Quantizing the activation costs
+about a tenth of greedy decisions, several at margins the reference won by nine
+to twelve nats. That is what decode buys its 1.67x with, it is the same trade
+llama.cpp makes, and the number is here so that it is not assumed to be small.
+
+`tests/consistency.rs` bounds the rest: the batched prefill against the same
+tokens one at a time - both this engine, no oracle - fork on 5 of 179 argmaxes.
+A greedy comparison of an 8 B model is measuring chaos alongside correctness.
+
+### The packed matmul is tested at two distances
+
+`Operand::Q` lets a quantized weight stay packed in VRAM, and being wrong about
+a block layout produces a *permuted* tensor rather than an error - a model that
+loads, runs, and speaks fluent nonsense. So it is checked twice, at different
+distances from the bytes, and neither check subsumes the other.
+
+A third check sits between them and covers what the other two cannot. The wide
+mat-vec is a different addressing scheme from the element-for-element path, and
+the int8 activation makes exact comparison impossible - so
+`the_wide_kquant_matvec_agrees_with_the_f32_product` runs both formats at a `k`
+that takes the fast path and bounds the disagreement at 1% of the output span,
+which is what quantizing the activation costs and nothing more. The bound is
+loose on purpose and it is not what catches an addressing mistake: a lane
+reading the wrong sixteen bytes does not land within a percent of the right
+answer. It caught one during development - an element offset of `n * 64` where
+the layout wanted `n * 128` - by being wrong by 74%.
+
+The quantiser itself is compared to `xabe_dsp::quantize_q8` at **exact
+equality**, on both codes and scales, including an all-zero group and one whose
+maximum is a power of two so ties are reachable. It is the one approximation in
+the engine, and the thing worth checking is that the two implementations
+approximate identically; a tolerance there would hide the group-boundary or
+rounding-mode disagreement the test exists to find.
+
+**Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
+`xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
+at exact equality. It extracts weights *element for element* through a one-hot
+activation on the exact f32 path, so the comparison is equality rather than a
+tolerance and a permutation inside a block cannot hide behind a dot product. It
+also runs the whole product on both kernels, and pins the two size tables that
+`xabe-cuda` duplicates because it may not depend on `xabe-gguf`.
+
+**Further out**, `xabe-chat`'s `tests/packed.rs` loads the same quantized file
+twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
+only check on the *wiring*: that the ggml type maps to the right layout, that
+the rope permutation reaches the packed bytes as well as the f16 ones, and that
+the packed operand gets to every projection rather than most of them. It needs
+`XABE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
+comparison is the unpacked 16 GB.
+
+The two paths are close rather than identical, and the asymmetry has a reason:
+on the tiled kernel both stage the same f16 bits, while on the mat-vec the
+packed path quantizes the *activation* to int8 to feed its wide loads. Decode
+runs on the mat-vec, so that is where the difference shows, and it is now the
+larger of the two effects by two orders of magnitude.
+
+Measured, and the two crates land on opposite sides of exactly that:
+
+| | prompt | worst logit difference | logit span |
+| --- | --- | --- | --- |
+| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | **0.000000** | 28.655 |
+| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.167409 | 25.323 |
+
+The translator's prompt is past `GEMV_MAX_M`, so every projection takes the
+tiled kernel, no activation is quantized, and the two paths are bit-identical -
+its translation is character-identical as well. The chat prompt is not, so its
+projections run on the mat-vec, and 0.167 against a span of 25.3 is **0.66%**,
+which is what int8 activations cost. It was 0.004566 before that change.
+
+That number is a bound on the arithmetic, not on the output. What it costs in
+*tokens* is measured separately and is zero: greedy decoding against the
+`llama-server` capture picks the same token at every position it picked before,
+and the disagreement list below is byte-identical across the change.
+
 ### Where that disagreement lives, and where it does not
 
 The five above are the ones with a wide margin; the full count is **10 of 105
@@ -259,25 +379,18 @@ no oracle - and they fork on **5 of 179 argmaxes**. A greedy comparison between
 two implementations of an 8 B model at f16 is measuring chaos as much as
 correctness, and the disagreement counts above should be read with that in mind.
 
-### The chat model disagrees with llama-server in five places, and did before
+### The order the sections run in, which is not the order they were written
 
-`xabe-chat`'s `tests/llama_server.rs` compares greedy replies against a capture
-from `llama-server` running the same GGUF. On the current capture it **fails**,
-at five positions across seven prompts, with llama-server's margin between 0.60
-and 2.86 logits - too wide to be rounding.
+`tests/llama_server.rs` is one test with numbered sections, and the teacher-forced
+decisions used to be section 1 and to assert immediately. That meant a
+*diagnostic* - one that drives every position through the tiled matmul in a
+single pass, which is not how the model is ever used - failed the test before
+section 2 could report whether the engine still says the same sentences.
 
-This is not caused by anything in the packed or int8 work. It was confirmed by
-capturing the oracle, running the test, stashing every change, running it again
-on the unmodified tree, and comparing: the same five positions, the same
-margins, to the last digit. It reproduces identically after the wide mat-vec,
-the int8 activation, the head-major cache and every fusion.
-
-So it is a real, pre-existing divergence and it is unexplained. It is recorded
-here rather than fixed because finding it needs per-layer taps against an oracle
-this model does not have - it exists as a GGUF and nothing else, which
-`tools/oracle/capture_chat_server.py` says at the top. What the test *is* good
-for meanwhile is exactly what it was used for here: as a fixed point that any
-change to attention, caching or precision must reproduce byte for byte.
+The assertion is now held to the end. The replies, the streaming, the
+cancellation and the sampler checks all report first, and the teacher-forced
+verdict is raised after them. Nothing about the check changed; what changed is
+that a reader sees the product result before the diagnostic that hid it.
 
 The synthetic quantization corpus under `.golden/gguf/quants` is different: it
 is kilobytes, and it covers all ten block formats where the real file covers

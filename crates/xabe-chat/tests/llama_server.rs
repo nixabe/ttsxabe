@@ -189,18 +189,22 @@ fn the_engine_reproduces_llama_server_and_streams_it_correctly() {
         if disagreed.is_empty() { 0.0 } else { tightest }
     );
 
-    let solid: Vec<_> = disagreed.iter().filter(|(.., m)| *m >= TIE).collect();
-    assert!(
-        solid.is_empty(),
-        "disagreements where llama-server was not close: {solid:?}"
-    );
+    // Held back to the end of the test rather than raised here.
+    //
+    // This section is a *diagnostic* and the one below it is the product: what
+    // the pipeline actually does is prefill a prompt once and then decode, and
+    // teacher forcing deliberately does neither - it drives every position
+    // through the tiled matmul in a single pass to keep measuring past the
+    // first fork. Asserting here meant a known, localised, precision-bound
+    // diagnostic hid whether the engine still says the same sentences, which is
+    // the thing anyone reading this test wants to know first.
+    let solid: Vec<_> = disagreed
+        .iter()
+        .filter(|(.., m)| *m >= TIE)
+        .cloned()
+        .collect();
     assert!(decisions >= 100, "only {decisions} decisions in the corpus");
-    // A handful of coin-flips is expected; a majority means something else.
-    assert!(
-        disagreed.len() * 20 <= decisions,
-        "{} of {decisions} decisions differ, which is too many to be ties",
-        disagreed.len()
-    );
+    let too_many = disagreed.len() * 20 > decisions;
 
     // 2. Free-running replies, which is what the product does. Held to a
     //    weaker bar for the reason in the module docs: one near-tie forks the
@@ -300,4 +304,23 @@ fn the_engine_reproduces_llama_server_and_streams_it_correctly() {
             Err(xabe_chat::ChatError::BadSampler { .. })
         ));
     }
+
+    // 6. And finally the teacher-forced decisions held back from section 1, so
+    //    that everything above has already reported when this fails.
+    //
+    //    It does fail, at ten of 105, and `docs/TESTING.md` carries what is and
+    //    is not known about that: it is confined to the batched matmul path -
+    //    the same comparison a position at a time disagrees at one of 105 - and
+    //    three separate arithmetic interventions moved it by exactly zero. The
+    //    assertion stays because the defect is real and unexplained.
+    // A handful of coin-flips is expected; a majority means something else.
+    assert!(
+        !too_many,
+        "{} of {decisions} decisions differ, which is too many to be ties",
+        disagreed.len()
+    );
+    assert!(
+        solid.is_empty(),
+        "disagreements where llama-server was not close: {solid:?}"
+    );
 }

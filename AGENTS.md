@@ -76,11 +76,16 @@ a lead), while **prefill on both is about 0.29x** and has not been worked on.
 Those numbers and every other comparison belong in `docs/BENCHMARKS.md` and
 nowhere else.
 
-The chat model also **disagrees with llama-server at 10 of 105 teacher-forced
-decisions**, which is a real and open defect rather than a rounding difference.
-It is localised: the same comparison one token at a time disagrees at 1 of 105,
-so it is the tiled matmul path and not the engine. `docs/TESTING.md` has what
-has been ruled out and what has not.
+One correctness note that is easy to get backwards. The chat model was recorded
+as disagreeing with llama-server at 10 of 105 teacher-forced decisions. **The
+capture was the problem, not the engine**: it had been taken from llama-server
+running the *quantized* checkpoint, whose matmul multiplies packed weights
+against an int8 activation and is coarser than this engine's. Against the same
+server running the f16 build, this engine reading the *quantized* file agrees at
+1 of 125 decisions and 7 of 8 replies. Capture the chat oracle from the f16
+GGUF; `tools/oracle/capture_chat_server.py` says so and `docs/TESTING.md` has
+the numbers and the three arithmetic changes that were made before the reference
+was suspected.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.

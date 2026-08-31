@@ -246,15 +246,28 @@ zeroed that one float on every call.
 Per decoded token, chat: 1154 launches and 1126 allocations became 866 and
 roughly 480, and the GPU-idle gap went from 1.9 ms to 0.15.
 
-### What it cost in accuracy
+### What it cost in accuracy, which is more than it first looked
 
 The int8 activation is the one deliberate approximation. Against the same model
 with f16 weights, worst logit difference **0.167 against a span of 25.3**, or
-0.66%. Greedy decoding against the `llama-server` capture picks the same token
-at every position it picked before this work - the disagreement list is
-byte-identical, before and after, including the five positions where this engine
-already disagreed with llama-server. Those five predate all of it; see
-`docs/TESTING.md`.
+0.66%.
+
+That number understated it, and the sentence that used to follow it - that
+greedy decoding picks the same token at every position - was measured against a
+capture that turned out to be the wrong reference. Against llama-server running
+the **f16** build, on the same quantized checkpoint:
+
+| weights | activation | agreement |
+| --- | --- | ---: |
+| `Q4_K` | f16, tiled | 124 of 125 |
+| f16 | f32, mat-vec | 124 of 125 |
+| `Q4_K` | **int8, mat-vec** | **114 of 125** |
+
+**Quantizing the weights costs almost nothing and quantizing the activation
+costs about a tenth of greedy decisions**, several at margins the reference won
+by nine to twelve nats. It is the same trade llama.cpp makes for the same
+reason, and it is what this section's 1.67x is bought with. `docs/TESTING.md`
+has the rest.
 
 ### The translator is 1.55x faster and still behind
 
