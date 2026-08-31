@@ -100,10 +100,14 @@ frontend, a byte-level BPE, a tensor-core matmul, encoder and decoder matching
 a captured oracle layer by layer, and greedy decoding reproducing 🤗
 `WhisperForConditionalGeneration`'s transcripts token for token. Measured
 against `whisper-server` on the same card with the same model and no VAD on
-either side, it is **0.55x** — 264 ms against 144 on a 2.7-second clip, with
-identical transcripts. That was a stated milestone and it is not met;
-`docs/BENCHMARKS.md` computes what closing the gap would take rather than
-restating the target.
+either side, it was **0.55x** — 264 ms against 144 on a 2.7-second clip, with
+identical transcripts. Fusing the encoder's attention has since taken the
+engine side to 223 ms, so the ratio is now about **0.65x** — but that half was
+measured on a machine with no `whisper-server` on it, so it is two sittings
+rather than one alternated run and `docs/BENCHMARKS.md` flags it as the
+weakest number in the document. Either way it is a stated milestone that is not
+met; that file costs what closing the gap would take rather than restating the
+target.
 
 **CosyVoice3 runs in the engine.** Three networks from scratch — a Qwen2 0.5 B
 speech language model, a 22-layer diffusion transformer with its Euler solver,

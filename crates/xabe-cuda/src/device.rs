@@ -451,6 +451,7 @@ const NAMES: &[&str] = &[
     "gemm_i8_q6k",
     "gemm_reduce",
     "flash_attn",
+    "flash_attn_64",
     "gemv",
     "quantize_q8",
     "cache_append",
@@ -2779,6 +2780,17 @@ impl Gpu {
     /// `__expf` like `softmax_causal`, probabilities rounded to f16 on their
     /// way into the value product - where the chain rounded them too.
     #[allow(clippy::too_many_arguments)]
+    /// Whether [`Self::flash_attn`] covers this attention shape.
+    ///
+    /// A predicate rather than a caught error, because choosing the path is
+    /// not an exceptional case: a model whose head width the kernel is not
+    /// instantiated at runs the unfused chain and is correct, and asking with
+    /// an error would mean allocating an output buffer to throw away.
+    pub fn supports_flash(&self, head_dim: usize, heads: usize, kv_heads: usize) -> bool {
+        matches!(head_dim, 64 | 128) && heads.is_multiple_of(kv_heads.max(1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_attn(
         &self,
         q: &CudaSlice<f32>,
@@ -2791,8 +2803,24 @@ impl Gpu {
         head_dim: usize,
         cap: usize,
         scale: f32,
+        causal: bool,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        if head_dim != 128 || !heads.is_multiple_of(kv_heads.max(1)) {
+        // Only the widths the kernel is instantiated at. A width it is not
+        // instantiated at would index across heads *in bounds* and return
+        // plausible context, so it is refused by name and the caller falls
+        // back to the unfused chain.
+        let name = match head_dim {
+            128 => "flash_attn",
+            64 => "flash_attn_64",
+            _ => {
+                return Err(CudaError::UnsupportedAttention {
+                    head_dim,
+                    heads,
+                    kv_heads,
+                });
+            }
+        };
+        if !heads.is_multiple_of(kv_heads.max(1)) {
             return Err(CudaError::UnsupportedAttention {
                 head_dim,
                 heads,
@@ -2809,7 +2837,8 @@ impl Gpu {
             kv_heads as i32,
             cap as i32,
         );
-        let f = self.func("flash_attn");
+        let causal_i = i32::from(causal);
+        let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
         lb.arg(q)
             .arg(k)
@@ -2820,13 +2849,14 @@ impl Gpu {
             .arg(&hi)
             .arg(&kvi)
             .arg(&ci)
-            .arg(&scale);
+            .arg(&scale)
+            .arg(&causal_i);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: ((tq as u32).div_ceil(32), heads as u32, 1),
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };
-        launched("flash_attn", unsafe { lb.launch(cfg) })?;
+        launched(name, unsafe { lb.launch(cfg) })?;
         Ok(out)
     }
 

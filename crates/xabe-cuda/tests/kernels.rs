@@ -1601,13 +1601,17 @@ fn an_offset_past_the_end_of_the_source_is_refused() {
 /// so what remains inside the tolerance is rounding order, and what a wrong
 /// index would produce - another head's or another position's context - is a
 /// full-scale disagreement, not a rounding one.
-#[test]
-fn fused_attention_matches_the_unfused_arithmetic() {
+///
+/// Driven at both head widths the kernel is instantiated at and in both
+/// masking modes by the two tests below. The width is what the fragment
+/// layout depends on - a warp owns `hd / 32` output column fragments - so a
+/// width that is only ever exercised through the model would have its
+/// indexing checked by nothing.
+fn fused_attention_case(heads: usize, kv_heads: usize, hd: usize, causal: bool) {
     let Some(g) = gpu() else { return };
 
-    // Odd on purpose: a query count that is not a whole tile, a cache with
-    // more capacity than positions, and grouped-query heads.
-    let (heads, kv_heads, hd) = (4usize, 2usize, 128usize);
+    // Odd on purpose: a query count that is not a whole tile, and a cache with
+    // more capacity than positions.
     let (tq, past, cap) = (70usize, 33usize, 160usize);
     let tk = past + tq;
     let scale = (hd as f32).powf(-0.5);
@@ -1635,51 +1639,133 @@ fn fused_attention_matches_the_unfused_arithmetic() {
     let dk = g.upload(&kc).expect("upload k");
     let dv = g.upload(&vc).expect("upload v");
     let out = g
-        .flash_attn(&dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale)
+        .flash_attn(&dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale, causal)
         .expect("flash_attn");
     let got = g.download(&out).expect("download");
 
-    let h16 = |x: f32| f32::from(half::f16::from_f32(x));
+    // Operands are rounded to f16 because the kernel rounds them; the
+    // *accumulation* is f64 because the kernel's blocked order and a scalar
+    // loop's sequential one are both approximations of it, and a reference
+    // has no business being the less accurate of the two. This is not
+    // pedantry: on this data some softmax rows are degenerate - one position
+    // takes essentially all the mass - which makes the value product a
+    // difference of terms up to 45x its own result. At that conditioning a
+    // sequential f32 reference disagrees with the kernel by 2%, and every
+    // digit of it is the reference's summation order rather than the
+    // kernel's indexing.
+    let h16 = |x: f32| f64::from(f32::from(half::f16::from_f32(x)));
+    // The probabilities, which the reference now carries at f64, get the same
+    // one f16 step the kernel gives them on their way into the value product.
+    let h16p = |x: f64| f64::from(f32::from(half::f16::from_f32(x as f32)));
     let dq_row = heads * hd;
-    let mut worst = 0.0f32;
+    let mut worst = 0.0f64;
     for h in 0..heads {
         let kh = h / (heads / kv_heads);
         for r in 0..tq {
-            let qpos = past + r;
-            let mut s = vec![f32::NEG_INFINITY; tk];
-            for p in 0..=qpos.min(tk - 1) {
-                let mut acc = 0.0f32;
+            // Causal: this row sees up to its own position. Otherwise it
+            // sees every key, which is the encoder's case. `past + tq == tk`
+            // here, so a causal row's own position is always in range.
+            let last = if causal { past + r } else { tk - 1 };
+            let mut s = vec![f64::NEG_INFINITY; tk];
+            for (p, sp) in s.iter_mut().enumerate().take(last + 1) {
+                let mut acc = 0.0f64;
                 for d in 0..hd {
-                    acc += h16(q[r * dq_row + h * hd + d])
-                        * h16(kvals[(kh * tk + p) * hd + d]);
+                    acc += h16(q[r * dq_row + h * hd + d]) * h16(kvals[(kh * tk + p) * hd + d]);
                 }
-                s[p] = acc * scale;
+                *sp = acc * f64::from(scale);
             }
-            let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let e: Vec<f32> = s
+            let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = s
                 .iter()
-                .map(|&x| if x == f32::NEG_INFINITY { 0.0 } else { (x - m).exp() })
+                .map(|&x| if x.is_finite() { (x - m).exp() } else { 0.0 })
                 .collect();
-            let l: f32 = e.iter().sum();
+            let l: f64 = e.iter().sum();
             for d in 0..hd {
-                let mut acc = 0.0f32;
+                let mut acc = 0.0f64;
+                // The spread of the values this row averages. The output is a
+                // convex combination of them, so a rounding-sized wobble in
+                // the scores moves it by a fraction of this - never by a
+                // fraction of the output's own magnitude, which is what a
+                // purely relative tolerance would assume and which goes to
+                // zero exactly where the averaging cancels.
+                let mut spread = 0.0f64;
                 for (p, &ep) in e.iter().enumerate() {
-                    acc += h16(ep) * h16(vvals[(kh * tk + p) * hd + d]);
+                    acc += h16p(ep) * h16(vvals[(kh * tk + p) * hd + d]);
                 }
                 let want = acc / l;
-                let have = got[r * dq_row + h * hd + d];
-                let tol = 2e-4 + 1e-2 * want.abs();
+                for (p, &ep) in e.iter().enumerate() {
+                    spread += (ep / l) * (h16(vvals[(kh * tk + p) * hd + d]) - want).abs();
+                }
+                let have = f64::from(got[r * dq_row + h * hd + d]);
+                let tol = 2e-4 + 1e-2 * want.abs() + 1e-2 * spread;
                 let err = (want - have).abs();
-                worst = worst.max(err);
+                worst = worst.max(err / tol);
                 assert!(
                     err <= tol,
                     "head {h} row {r} dim {d}: {have} wanted {want} \
-                     (err {err}, tol {tol})",
+                     (err {err}, tol {tol}, spread {spread})",
                 );
             }
         }
     }
-    // A permuted position or head would land far outside this; the assert is
-    // here so a loosened tolerance cannot rot silently.
-    assert!(worst < 5e-3, "worst error {worst} is not rounding-sized");
+    // A permuted position or head substitutes one of the averaged values for
+    // another, which is a whole `spread` and so many multiples of the
+    // tolerance. Reporting the worst as a fraction of its own tolerance is
+    // what keeps that margin visible: if this ever creeps towards 1 the
+    // kernel has drifted, whether or not any single point has crossed.
+    assert!(
+        worst < 0.5,
+        "worst error is {worst} of its tolerance, not comfortably inside it",
+    );
+}
+
+/// Both Llama stages' shape: 128-wide heads, grouped, causal.
+#[test]
+fn fused_attention_matches_the_unfused_arithmetic() {
+    fused_attention_case(4, 2, 128, true);
+}
+
+/// The Whisper encoder's shape: 64-wide heads, ungrouped, and attending over
+/// the whole window rather than a triangle.
+///
+/// Non-causal is the mode that can go wrong quietly. The causal loop bound
+/// stops at the last tile a row can see, so a masking mistake there truncates
+/// the row and shows up; with the mask open the kernel reads every tile
+/// either way, and a wrong per-row limit would only shift *which* keys are
+/// summed - still a full softmax, still plausible context.
+#[test]
+fn fused_attention_attends_the_whole_window_when_it_is_not_causal() {
+    fused_attention_case(4, 4, 64, false);
+}
+
+/// A 64-wide head that is grouped, and a 128-wide one that is not.
+///
+/// The width and the grouping are independent, and the two tests above happen
+/// to pair each width with one grouping. This crosses them so that neither
+/// instantiation's `head / (heads / kv_heads)` is only ever exercised at a
+/// ratio of one.
+#[test]
+fn fused_attention_crosses_head_width_with_grouping() {
+    fused_attention_case(4, 2, 64, false);
+    fused_attention_case(4, 4, 128, true);
+}
+
+/// A head width the kernel is not instantiated at is refused, not indexed.
+#[test]
+fn an_uninstantiated_head_width_is_refused() {
+    let Some(g) = gpu() else { return };
+    assert!(
+        !g.supports_flash(96, 4, 4),
+        "96-wide heads are not instantiated and supports_flash said they were",
+    );
+    let q = g.zeros(4 * 4 * 96).expect("alloc");
+    assert!(
+        g.flash_attn(&q, &q, &q, 4, 0, 4, 4, 96, 4, 1.0, false)
+            .is_err(),
+        "a 96-wide head was attended rather than refused",
+    );
+    assert!(
+        !g.supports_flash(128, 4, 3),
+        "heads are not a multiple of kv_heads and supports_flash said they were",
+    );
 }

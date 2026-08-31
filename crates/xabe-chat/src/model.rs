@@ -695,6 +695,7 @@ impl ChatModel {
                     hd,
                     cap,
                     (hd as f32).powf(-0.5),
+                    true,
                 )?;
                 let out = self.project(Operand::F32(&ctx), &l.o, n)?;
                 residual = Some(out);

@@ -137,12 +137,13 @@ pub enum CudaError {
     /// An attention shape the fused kernel's tiles cannot cover.
     ///
     /// Prevents silently attending with a kernel whose fragment layout
-    /// assumes a 128-wide head: any other width would index another head's
-    /// values, in bounds, and return plausible context. The caller falls back
-    /// to the unfused chain instead.
+    /// assumes a head width it was not instantiated at: any other width would
+    /// index another head's values, in bounds, and return plausible context.
+    /// 128 covers both Llama stages and 64 covers every Whisper size; the
+    /// caller falls back to the unfused chain for anything else.
     #[error(
-        "fused attention wants head_dim 128 and heads a multiple of kv_heads, \
-         got head_dim {head_dim}, {heads} heads over {kv_heads}"
+        "fused attention wants head_dim 64 or 128 and heads a multiple of \
+         kv_heads, got head_dim {head_dim}, {heads} heads over {kv_heads}"
     )]
     UnsupportedAttention {
         /// The head width asked for.

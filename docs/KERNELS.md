@@ -42,7 +42,7 @@ exists.
 | tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `xabe_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k` | `xabe-cuda` quant |
 | split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
 | KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
-| fused causal attention | both Llama stages, prefill | (scalar softmax-attention, in the test) | `flash_attn` | `xabe-cuda` kernels |
+| fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -563,12 +563,13 @@ over `ksplit * m * n` floats that nothing ever read. Both tiled kernels have
 this property and the test `every_output_element_is_written_exactly_once` is
 what it rests on.
 
-## Fused causal attention, `flash_attn`
+## Fused attention, `flash_attn`
 
-Scores, mask, softmax and the value product for a whole prompt, in one kernel,
-with nothing materialised. Both Llama stages take it for any multi-token pass;
-a single decode step keeps the unfused chain, whose score row is one `gemv`
-and has nothing to fuse.
+Scores, mask, softmax and the value product for a whole prompt - or a whole
+encoder window - in one kernel, with nothing materialised. Both Llama stages
+take it for any multi-token pass and the Whisper encoder takes it for every
+layer; a single decode step keeps the unfused chain, whose score row is one
+`gemv` and has nothing to fuse.
 
 ### What it replaces, and why that was worth a kernel
 
@@ -588,10 +589,19 @@ them.
 One block owns 32 query rows of one head and walks the keys 32 at a time.
 Scores by `m16n8k8` into f32, probabilities rounded to f16 on their way into
 the value product, one more `m16n8k8` against the values, the output
-accumulator in registers throughout. The loop's upper bound is the last key
-its rows may see, so the upper triangle is never computed at all - the fusion
-gets the triangle skip that would have been a special case in the tiled gemm
-for free.
+accumulator in registers throughout. When the pass is causal the loop's upper
+bound is the last key its rows may see, so the upper triangle is never
+computed at all - the fusion gets the triangle skip that would have been a
+special case in the tiled gemm for free.
+
+**Causality is a flag, not a shape.** The encoder attends over its whole
+1500-position window, and all that costs is a per-row limit of the key count
+instead of the row's own position. It is worth saying which direction is the
+dangerous one: the causal loop bound stops at the last tile a row can see, so
+a masking mistake there truncates the row and shows up, while with the mask
+open the kernel reads every tile either way and a wrong per-row limit would
+only shift *which* keys are summed - still a full softmax, still plausible
+context. The differential test drives both modes for that reason.
 
 The layouts are the caches' own. K is `[kv_head][pos][hd]`, which is the
 `[n][k]` shape the score product's B fragment wants; V is `[kv_head][hd][cap]`,
@@ -601,19 +611,56 @@ out of the projection buffer and the merged context written straight back in
 disappear from the prompt path rather than getting faster. A grouped-query
 model maps `head / (heads / kv_heads)` and reads the one cached copy.
 
-`hd` is fixed at 128 - both Llama stages' - and the wrapper refuses anything
-else by construction rather than by tolerance: another width would index
-another head's values, in bounds, and return plausible context.
+`hd` is a template parameter and the kernel is instantiated at the two widths
+this engine has: 128 for both Llama stages, 64 for every Whisper size - Whisper
+holds the head width fixed and varies the count, so large-v2's 1280 over 20
+heads and tiny's 384 over 6 are the same 64. The width is the only thing the
+fragment layout depends on: a warp owns `hd / 32` of the output's n8 column
+fragments, four at 128 and two at 64, and the shared-memory strides follow.
+Every other tile shape - 32 query rows, 32 keys a trip, eight warps as two
+query groups by four column groups - is width-independent and is not repeated
+per instantiation. A width the kernel is *not* instantiated at is refused by
+construction rather than by tolerance: it would index another head's values, in
+bounds, and return plausible context. `Gpu::supports_flash` is the predicate
+callers use to pick a path, so choosing the unfused chain does not mean
+allocating an output buffer and throwing it away.
 
 ### The arithmetic is the chain's, deliberately
 
 Operands round to f16 where the tiled `gemm` rounded them, scores accumulate
-in f32, `__expf` because that is what `softmax_causal` uses, probabilities
-round to f16 exactly where the chain rounded them - on their way into the
-value product - and the normaliser sums unrounded f32. The differential test
-compares against a scalar reference with the same roundings, on a *peaked*
-softmax: near-uniform scores would let a permuted position hide inside the
-tolerance, and a permuted position is precisely what the test exists to catch.
+in f32, `__expf` because that is what `softmax_causal` and `softmax_rows` both
+use, probabilities round to f16 exactly where the chain rounded them - on their
+way into the value product - and the normaliser sums unrounded f32.
+
+**One place it is deliberately not the chain's arithmetic**, and it is worth
+naming rather than discovering later. `softmax_rows` scales the probabilities
+by `1/l` before rounding them to f16; an online softmax cannot, because `l` is
+not known until the last tile, so it rounds `exp(s - m)` instead and divides
+the f32 accumulator at the end. Both are one f16 step on a positive number, so
+the relative error is the same size - and on a 1500-key encoder row the online
+form is the better conditioned of the two, because `exp(s - m)` sits near 1
+where `p / l` sits near 1/1500. The captured ASR oracle, layer by layer over
+32 encoder layers, is what says that is harmless here.
+
+The differential test compares against a scalar reference with the same
+roundings, on a *peaked* softmax: near-uniform scores would let a permuted
+position hide inside the tolerance, and a permuted position is precisely what
+the test exists to catch.
+
+**The reference accumulates at f64, and that is not pedantry.** On peaked data
+some softmax rows are degenerate - one position takes essentially all the mass
+- which makes the value product a difference of terms up to 45x its own
+result. At that conditioning the kernel's blocked summation order and a
+sequential f32 reference's disagree by 2%, every digit of it the reference's
+summation order rather than the kernel's indexing; a reference has no business
+being the less accurate of the two. The tolerance is sized by the *spread* of
+the values the row averages rather than by the output's own magnitude, because
+a convex combination's sensitivity to a rounding-sized score wobble is a
+fraction of that spread and does not go to zero where the averaging cancels.
+A permuted position substitutes one averaged value for another - a whole
+spread, and many multiples of the tolerance - so the margin is still the thing
+the test measures. It is reported as the worst error's fraction of its own
+tolerance, so drift shows up before any single point crosses.
 
 ## The three kernels the translator added
 

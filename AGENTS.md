@@ -79,9 +79,14 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.55x** against `whisper-server` — a stated milestone that
-is not met, recorded as a miss. And the Llama stages are **level with or ahead
-of llama.cpp on every measured row**: the chat model ahead on prefill at both
+medians. The ASR is **about 0.65x** against `whisper-server` — a stated
+milestone that is not met, recorded as a miss, and the one comparison in the
+repository whose two halves were not measured in the same sitting: the engine
+side moved from 264 ms to 223 (flash attention in the encoder, alternated
+against the previous build) on a machine with no `whisper-server` installed, so
+the ratio is owed a re-run and `docs/BENCHMARKS.md` says so where it appears.
+And the Llama stages are **level with or ahead of llama.cpp on every measured
+row**: the chat model ahead on prefill at both
 prompt lengths (2447 against 2259 at 128 tokens, 2928 against 2513 at 512) and
 on decode (100.9 against 95.3), the translator ahead on decode (61.4 against
 60.0), level on 512-token prefill (1636 against 1647), and at 0.94x on

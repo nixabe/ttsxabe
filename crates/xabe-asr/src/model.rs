@@ -458,9 +458,15 @@ impl AsrModel {
 
         let mut tapped = Vec::with_capacity(taps);
         let hd = d / heads;
+        // The encoder's window is 1500 positions, so one layer's scores are
+        // 20 x 1500 x 1500 floats - 180 MB written by the score product, read
+        // and written again by the softmax, and read once more by the context
+        // product. Across 32 layers that is 23 GB of traffic carrying no
+        // arithmetic. `flash_attn` never writes a score anywhere; see
+        // docs/BENCHMARKS.md for what it was worth here.
+        let fused = self.gpu.supports_flash(hd, heads, heads);
         for (i, l) in self.enc_layers.iter().enumerate() {
             let x = self.norm(&h, &l.attn_ln, t)?;
-            let q = self.queries(Operand::F32(&x), &l.attn, t, heads)?;
             let k = self.gpu.split_heads(
                 &self.project(Operand::F32(&x), &l.attn.k, t)?,
                 t,
@@ -473,15 +479,30 @@ impl AsrModel {
                 heads,
                 hd,
             )?;
-            let ctx = self.attend(
-                Operand::F32(&q),
-                Operand::F32(&k),
-                Operand::F32(&v),
-                t,
-                t,
-                heads,
-                false,
-            )?;
+            let ctx = if fused {
+                // The scale stays on the query rather than moving to the
+                // scores, for the reason [`Self::queries`] gives - so the
+                // kernel is handed 1.0 and the rounding is the chain's. The
+                // fused path also skips the query's head split and the
+                // context's merge: it reads the projection buffer's layout
+                // and writes it back.
+                let mut q = self.project(Operand::F32(&x), &l.attn.q, t)?;
+                self.gpu
+                    .scale_inplace(&mut q, t * d, (hd as f32).powf(-0.5))?;
+                self.gpu
+                    .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)?
+            } else {
+                let q = self.queries(Operand::F32(&x), &l.attn, t, heads)?;
+                self.attend(
+                    Operand::F32(&q),
+                    Operand::F32(&k),
+                    Operand::F32(&v),
+                    t,
+                    t,
+                    heads,
+                    false,
+                )?
+            };
             let out = self.project(Operand::F32(&ctx), &l.attn.out, t)?;
             self.gpu.add_inplace(&mut h, &out, t * d)?;
 

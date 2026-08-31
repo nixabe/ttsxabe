@@ -1802,14 +1802,15 @@ GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K)
 
 // ------------------------------------------------------------ flash attention
 //
-// Causal attention for a whole prompt in one kernel: scores, mask, softmax and
-// the value product, with nothing materialised. The unfused chain writes the
-// score matrix, reads it back to softmax it, writes the probabilities, and
-// reads them again for the value product - `heads * tq * tk` floats three
-// times over, plus a head split and a merge. At 512 tokens on the 13 B that
-// chain measured about 27 ms a prefill; the score tensor exists only so the
-// softmax can find its row maximum, and the running-maximum trick removes
-// that need.
+// Attention for a whole prompt - or a whole encoder window - in one kernel:
+// scores, mask, softmax and the value product, with nothing materialised. The
+// unfused chain writes the score matrix, reads it back to softmax it, writes
+// the probabilities, and reads them again for the value product -
+// `heads * tq * tk` floats three times over, plus a head split and a merge. At
+// 512 tokens on the 13 B that chain measured about 27 ms a prefill, and the
+// Whisper encoder's 20 x 1500 x 1500 scores are 180 MB a layer; the score
+// tensor exists only so the softmax can find its row maximum, and the
+// running-maximum trick removes that need.
 //
 // One block owns 32 query rows of one head and walks the keys 32 at a time,
 // keeping the output accumulator in registers. Per tile: scores by `m16n8k8`
@@ -1817,38 +1818,64 @@ GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K)
 // rescaled by `exp(m_old - m_new)`, probabilities rounded to f16 - exactly
 // where the unfused chain rounded them, on their way into the value product -
 // and one more `m16n8k8` against the values. `__expf`, because that is what
-// `softmax_causal` uses; this kernel replaces it and must not be a precision
-// change. The loop stops at the last tile a row can see, so the upper
-// triangle is never computed at all.
+// `softmax_causal` and `softmax_rows` both use; this kernel replaces them and
+// must not be a precision change.
+//
+// **The one place it is not the chain's arithmetic** is where the normaliser
+// divides. `softmax_rows` scales the probabilities by `1/l` before rounding
+// them to f16; an online softmax cannot, because `l` is not known until the
+// last tile, so it rounds `exp(s - m)` instead and divides the f32 accumulator
+// at the end. Both roundings are one f16 step on a positive number, so the
+// relative error is the same size - and on a 1500-key encoder row the online
+// form is the better conditioned of the two, because `exp(s - m)` sits near 1
+// where `p / l` sits near 1/1500. It is still a change, so it is stated here
+// and measured against the captured oracle rather than assumed harmless.
+//
+// **Causality is a flag, not a shape.** A decoder prompt masks the upper
+// triangle and the loop bound doubles as a free skip of it; the Whisper
+// encoder attends over the whole window and passes `causal = 0`, which turns
+// the per-row limit into the key count and nothing else.
 //
 // Layouts are the caches' own: K is `[kv_head][pos][hd]`, V is
 // `[kv_head][hd][cap]`, and the queries are read straight out of the
 // projection buffer at `[tq, heads * hd]` - no `split_heads` - with the
-// merged context written the same way, so no `merge_heads` either. `hd` is
-// 128 and the wrapper refuses anything else: the tile shapes below assume it.
+// merged context written the same way, so no `merge_heads` either.
 // Grouped-query models map `head / (heads / kv_heads)`.
+//
+// **`HD` is a template parameter, and the two widths that exist are
+// instantiated by name below.** The fragment layout is what depends on it: a
+// warp owns `HD / 32` of the output's n8 column fragments, so 128 gives four
+// and 64 gives two, and the shared-memory strides follow. Every other tile
+// shape - 32 query rows, 32 keys a trip, eight warps as two query groups by
+// four column groups - is independent of the head width and is not repeated
+// per instantiation. A width that is not instantiated is refused by name in
+// the wrapper rather than indexing across heads in bounds.
 
 #define FA_QT 32                       // query rows a block
 #define FA_KT 32                       // key positions a trip
-#define FA_HD 128
 #define FA_WARPS 8
-#define FA_QSTR 68                     // words a Qs row: 64 + 4, bank-spread
-#define FA_KSTR 68                     // words a Ks row (Ks is [pos][d])
 #define FA_VSTR 20                     // words a Vs row (Vs is [d][pos])
 #define FA_PSTR 20                     // words a Ps row
 #define FA_SSTR 36                     // floats an Ss row
 
-extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
+template <int HD>
+__device__ __forceinline__ void flash_attn_impl(
     const float* __restrict__ q,
     const float* __restrict__ kc,
     const float* __restrict__ vc,
     float* __restrict__ out,
-    int tq, int past, int heads, int kv_heads, int cap, float scale)
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
-    __shared__ __align__(16) unsigned qs[FA_QT * FA_QSTR];
-    __shared__ __align__(16) unsigned kvs[FA_HD * FA_VSTR > FA_KT * FA_KSTR
-                                              ? FA_HD * FA_VSTR
-                                              : FA_KT * FA_KSTR];
+    // Words a Qs/Ks row: HD/2 packed pairs, plus four to spread the banks.
+    constexpr int QSTR = HD / 2 + 4;
+    constexpr int KSTR = HD / 2 + 4;
+    // n8 output column fragments a warp owns: four column groups cover HD.
+    constexpr int NT = HD / 32;
+    constexpr int KVS = (HD * FA_VSTR > FA_KT * KSTR) ? HD * FA_VSTR
+                                                      : FA_KT * KSTR;
+
+    __shared__ __align__(16) unsigned qs[FA_QT * QSTR];
+    __shared__ __align__(16) unsigned kvs[KVS];
     __shared__ __align__(16) unsigned ps[FA_QT * FA_PSTR];
     __shared__ __align__(16) float ss[FA_QT * FA_SSTR];
     __shared__ float sm_m[FA_QT], sm_l[FA_QT], sm_fac[FA_QT];
@@ -1861,23 +1888,23 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     const int qt0 = blockIdx.x * FA_QT;
     const int h = blockIdx.y;
     const int kh = h / (heads / kv_heads);
-    const int dq = heads * FA_HD;
+    const int dq = heads * HD;
 
-    const float* kb = kc + (size_t)kh * cap * FA_HD;
-    const float* vb = vc + (size_t)kh * FA_HD * cap;
+    const float* kb = kc + (size_t)kh * cap * HD;
+    const float* vb = vc + (size_t)kh * HD * cap;
 
     // Queries once, rounded to f16 - the same rounding the tiled gemm applied
     // to its operands. A row past `tq` stages zeros and is never stored.
-    for (int i = tid; i < FA_QT * (FA_HD / 2); i += FA_WARPS * 32) {
-        const int r = i / (FA_HD / 2), j = i % (FA_HD / 2);
+    for (int i = tid; i < FA_QT * (HD / 2); i += FA_WARPS * 32) {
+        const int r = i / (HD / 2), j = i % (HD / 2);
         unsigned w = 0u;
         if (qt0 + r < tq) {
             const float2 v =
                 *reinterpret_cast<const float2*>(q + (size_t)(qt0 + r) * dq
-                                                 + (size_t)h * FA_HD + 2 * j);
+                                                 + (size_t)h * HD + 2 * j);
             w = gemm_pack(v.x, v.y);
         }
-        qs[r * FA_QSTR + j] = w;
+        qs[r * QSTR + j] = w;
     }
     if (tid < FA_QT) {
         sm_m[tid] = -1.0f / 0.0f;
@@ -1885,12 +1912,12 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     }
 
     // The output accumulator: warp `w` owns query group `w >> 2` (16 rows)
-    // and value columns `(w & 3) * 32 .. + 31`, as four n8 fragments.
+    // and value columns `(w & 3) * NT * 8 .. + NT * 8 - 1`, as NT n8 fragments.
     const int mg = warp >> 2;
-    const int ng0 = (warp & 3) * 4;
-    float acc[4][4];
+    const int ng0 = (warp & 3) * NT;
+    float acc[NT][4];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < NT; ++i) {
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             acc[i][j] = 0.0f;
@@ -1898,20 +1925,23 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     }
     __syncthreads();
 
-    // The last key a row of this block may see is `past + qt0 + FA_QT - 1`.
-    const int kend = min(past + tq, past + qt0 + FA_QT);
+    // Causal: the last key a row of this block may see is
+    // `past + qt0 + FA_QT - 1`, so the loop stops there and never touches the
+    // upper triangle. Non-causal: every row sees every key.
+    const int ktot = past + tq;
+    const int kend = causal ? min(ktot, past + qt0 + FA_QT) : ktot;
     for (int kv0 = 0; kv0 < kend; kv0 += FA_KT) {
         // Keys, `[pos][d]`, rounded like the queries. Positions past `kend`
         // stage zeros; the mask discards whatever the mma made of them.
-        for (int i = tid; i < FA_KT * (FA_HD / 2); i += FA_WARPS * 32) {
-            const int r = i / (FA_HD / 2), j = i % (FA_HD / 2);
+        for (int i = tid; i < FA_KT * (HD / 2); i += FA_WARPS * 32) {
+            const int r = i / (HD / 2), j = i % (HD / 2);
             unsigned w = 0u;
             if (kv0 + r < kend) {
                 const float2 v = *reinterpret_cast<const float2*>(
-                    kb + (size_t)(kv0 + r) * FA_HD + 2 * j);
+                    kb + (size_t)(kv0 + r) * HD + 2 * j);
                 w = gemm_pack(v.x, v.y);
             }
-            kvs[r * FA_KSTR + j] = w;
+            kvs[r * KSTR + j] = w;
         }
         __syncthreads();
 
@@ -1921,12 +1951,12 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
             const int smg = warp >> 2, sng = warp & 3;
             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
             #pragma unroll
-            for (int ks = 0; ks < FA_HD / 8; ++ks) {
+            for (int ks = 0; ks < HD / 8; ++ks) {
                 unsigned a0, a1;
-                gemm_ld_a(&qs[(smg * 16 + (lane & 15)) * FA_QSTR + 4 * ks],
+                gemm_ld_a(&qs[(smg * 16 + (lane & 15)) * QSTR + 4 * ks],
                           a0, a1);
                 const unsigned b0 =
-                    gemm_ld_b(&kvs[(sng * 8 + (lane & 7)) * FA_KSTR + 4 * ks]);
+                    gemm_ld_b(&kvs[(sng * 8 + (lane & 7)) * KSTR + 4 * ks]);
                 gemm_mma_step(d0, d1, d2, d3, a0, a1, b0);
             }
             const int c0 = sng * 8 + 2 * tg;
@@ -1939,14 +1969,15 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
 
         // The running maximum. Eight lanes to a row, four columns each; the
         // leader folds the tile's maximum into the row's and leaves the
-        // rescale factor for everyone.
+        // rescale factor for everyone. `lim` is the last key this row may
+        // attend to - its own position when causal, the last key otherwise.
         {
             const int r = tid >> 3, c0 = (tid & 7) * 4;
-            const int qpos = past + qt0 + r;
+            const int lim = causal ? (past + qt0 + r) : (ktot - 1);
             float mx = -1.0f / 0.0f;
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
-                if (kv0 + c0 + c <= qpos) {
+                if (kv0 + c0 + c <= lim) {
                     mx = fmaxf(mx, ss[r * FA_SSTR + c0 + c]);
                 }
             }
@@ -1966,13 +1997,13 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
         // where the unfused chain rounded them too - and the running sum.
         {
             const int r = tid >> 3, c0 = (tid & 7) * 4;
-            const int qpos = past + qt0 + r;
+            const int lim = causal ? (past + qt0 + r) : (ktot - 1);
             const float m = sm_m[r];
             float p[4], sum = 0.0f;
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 const float s = ss[r * FA_SSTR + c0 + c];
-                p[c] = (kv0 + c0 + c <= qpos) ? __expf(s - m) : 0.0f;
+                p[c] = (kv0 + c0 + c <= lim) ? __expf(s - m) : 0.0f;
                 sum += p[c];
             }
             ps[r * FA_PSTR + (c0 >> 1)] = gemm_pack(p[0], p[1]);
@@ -1988,7 +2019,7 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
 
         // Values, `[d][pos]` - the cache's own transposed layout, which is
         // already the `[n][k]` shape the B fragment wants.
-        for (int i = tid; i < FA_HD * (FA_KT / 2); i += FA_WARPS * 32) {
+        for (int i = tid; i < HD * (FA_KT / 2); i += FA_WARPS * 32) {
             const int r = i / (FA_KT / 2), j = i % (FA_KT / 2);
             unsigned w = 0u;
             if (kv0 + 2 * j + 1 < kend) {
@@ -2007,7 +2038,7 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
         const float f0 = sm_fac[mg * 16 + g];
         const float f1 = sm_fac[mg * 16 + g + 8];
         #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < NT; ++nt) {
             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
             #pragma unroll
             for (int ks = 0; ks < FA_KT / 8; ++ks) {
@@ -2032,8 +2063,8 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     const float inv0 = sm_l[r0] > 0.0f ? 1.0f / sm_l[r0] : 0.0f;
     const float inv1 = sm_l[r1] > 0.0f ? 1.0f / sm_l[r1] : 0.0f;
     #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-        const int col = (size_t)h * FA_HD + (ng0 + nt) * 8 + 2 * tg;
+    for (int nt = 0; nt < NT; ++nt) {
+        const int col = (size_t)h * HD + (ng0 + nt) * 8 + 2 * tg;
         if (qt0 + r0 < tq) {
             float* o = out + (size_t)(qt0 + r0) * dq + col;
             o[0] = acc[nt][0] * inv0;
@@ -2045,6 +2076,31 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
             o[1] = acc[nt][3] * inv1;
         }
     }
+}
+
+// The two head widths that exist in this engine: 128 for both Llama stages,
+// 64 for every Whisper size (large-v2's 1280 over 20 heads, and the smaller
+// ones' too - Whisper holds the head width fixed and varies the count).
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+{
+    flash_attn_impl<128>(q, kc, vc, out, tq, past, heads, kv_heads, cap, scale,
+                         causal);
+}
+
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+{
+    flash_attn_impl<64>(q, kc, vc, out, tq, past, heads, kv_heads, cap, scale,
+                        causal);
 }
 
 // ---------------------------------------------------------------- convolution

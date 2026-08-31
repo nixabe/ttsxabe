@@ -3,7 +3,9 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.55x against `whisper-server`, and both Llama stages are now **level with or
+roughly 0.65x against `whisper-server` - a milestone still missed, and the one
+figure here whose two halves were not measured in one sitting - and both Llama
+stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
 three of its rows (1.08x and 1.17x prefill, 1.06x decode), the translator
 ahead on decode, level on 512-token prefill, and at 0.94x of a 128-token
@@ -48,26 +50,35 @@ the same job. Both produced identical transcripts on every clip.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
 | --- | --- | --- | --- |
-| 2.67 s | 264 ms | 144 ms | 0.55x |
-| 3.90 s | 296 ms | 177 ms | 0.60x |
+| 2.67 s | 223 ms | 144 ms | 0.65x |
+| 3.90 s | not re-run | 177 ms | — |
 
 **This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
-for an ASR faster than `whisper-server`; it is 1.8x slower, and the section
-below computes what closing that would take rather than promising a factor.
+for an ASR faster than `whisper-server`; it is still about 1.5x slower.
 
-Where the 264 ms goes, measured with `xabe-asr-bench --stages`:
+**Both cells in that ratio were not taken in one sitting, and it is therefore
+the weakest number in this document.** The engine column was re-measured on a
+machine with no `whisper-server` installed, so the 0.65x is arithmetic against
+a `whisper-server` figure from the sitting that produced the 264 ms this
+supersedes - exactly the cross-sitting pairing the llama.cpp section refuses to
+trust. It is written down because the milestone is stated in those terms and a
+blank would read as progress; it should be re-alternated, on both clips,
+before it is quoted anywhere. What *was* properly paired is the engine against
+itself: the two builds alternated in threes on the 2.67 s clip, 261 ms before
+the fused attention below and 223 after.
+
+Where the 223 ms goes, measured with `xabe-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
-| encoder | 173 | 66% |
-| decode loop, 6 tokens | 57 | 22% |
-| cross-attention KV | 21 | 8% |
-| mel frontend (CPU) | 17 | 6% |
+| encoder | 125 | 56% |
+| decode loop, 6 tokens | 65 | 29% |
+| cross-attention KV | 19 | 9% |
+| mel frontend (CPU) | 17 | 7% |
 
-The encoder is 2.26 TFLOP for a 30-second window, so 173 ms is 13.1 TFLOP/s -
-55% of what this workspace's own matmul reaches standalone, and 13% of the
-card's 99 TFLOP/s f16 tensor-core peak. Note that the window is fixed: a 2.67 s
-clip and a 29 s one cost the same encoder.
+The encoder is 2.26 TFLOP for a 30-second window, so 125 ms is 18.1 TFLOP/s -
+18% of the card's 99 TFLOP/s f16 tensor-core peak. Note that the window is
+fixed: a 2.67 s clip and a 29 s one cost the same encoder.
 
 ### Translator
 
@@ -779,8 +790,8 @@ with it.
 `bench-gemm` shows the same thing from the other side: its f32 encoder shapes
 ran at 19.3 TFLOP/s with the widening and 20.8 without.
 
-The ASR is still 0.55x against `whisper-server` and that stays a recorded miss.
-The lesson is narrower and worth more: **an end-to-end number that does not
+The ASR was still 0.55x against `whisper-server` after this work, and a miss
+is what it stayed. The lesson is narrower and worth more: **an end-to-end number that does not
 move is not evidence that nothing changed.** Two changes of opposite sign
 inside one A/B look exactly like no change at all, and the only way this
 surfaced was profiling the ASR and finding a kernel at 10.4% of its GPU time
@@ -1359,23 +1370,47 @@ computed rather than guessed because
 
 ### The ASR's headroom, and what it would cost
 
-Two things account for the encoder's 173 ms, and both are known quantities.
+This section used to name two levers. **The first has been spent, and it
+returned slightly more than it was costed at**: the 34 ms the encoder was
+predicted to be spending moving an attention score matrix it never needed to
+materialise came back as 38 ms, because `flash_attn` also took the query's head
+split and the context's merge with it. The encoder is 125 ms and the
+transcription 223.
 
-**34 ms of it carries no arithmetic at all.** The attention score matrix is
-20 heads x 1500 x 1500 floats - 180 MB - and it is written by the score
-product, read and written again by the softmax, and read by the context
-product. That is 23 GB of traffic across 32 layers, at 672 GB/s. Flash
-attention removes it entirely by never materialising the matrix.
+Three things account for what is left, in the order they are worth taking.
 
-**The matmul runs at 23.8 of 99 TFLOP/s.** The projections and feed-forwards
-are 1.89 TFLOP, which is 79 ms at that rate. `ldmatrix` and a double-buffered
-global-to-shared pipeline are the standard route to 40-50% of peak on this
-architecture; at 40% the same work is 47 ms.
+**The matmul runs at 22-25 of 99 TFLOP/s.** `bench-gemm` on this card, at the
+encoder's own shapes: 22.5 TFLOP/s for a 1500x1280x1280 projection, 21.9 for
+the feed-forward up, 24.8 for the down. The projections and feed-forwards are
+1.89 TFLOP, which is about 85 ms of the encoder's 125 at that rate. `ldmatrix`
+and a double-buffered global-to-shared pipeline are the standard route to
+40-50% of peak on this architecture; at 40% the same work is 47 ms. This is
+the largest single lever left in the engine and it is **not** an ASR-only
+change: the same `gemm` runs the Whisper encoder and both Llama stages'
+prefill, which is upside and risk in the same sentence - the llama.cpp
+comparison is settled at level-or-ahead and a regression there would cost more
+than the ASR gains.
 
-Both together put the encoder near 100 ms and the whole transcription near
-190 ms - still above `whisper-server`'s 144. A third lever would be needed, and
-what it is has not been established, which is exactly why this section does not
-name one.
+**The fused attention itself runs at 11.9 TFLOP/s**, which is 31 ms of the
+encoder. That is half what the tiled `gemm` reaches, and the reason is tile
+shape rather than arithmetic: at `hd` 64 a warp owns two output column
+fragments where at 128 it owns four, so each of the four block-wide barriers
+per key tile is amortised over half as many `m16n8k8` issues. The block does
+about 117 us of tensor-core work and about 200-500 us of K/V staging per
+layer and takes 967. A 64-key trip, or 64 query rows a block, would halve the
+barrier count; neither has been tried, so no factor is promised here.
+
+**The decode loop is 65 ms for six tokens.** Ten milliseconds a token for a
+1.5 B decoder is about a third of what this card's bandwidth allows: the
+weights a step actually reads are 734 M parameters at f16, the cross-attention
+K and V caches are 491 MB because they are held at f32, and the tied output
+head is 133 MB - about 2.1 GB, or 3.1 ms at 672 GB/s. Holding the cross
+caches at f16 is the cheap half of that and worth about 2 ms of the six-token
+loop; the rest is `gemv` efficiency.
+
+None of these has been costed to the point of promising that they close the
+gap to 144 ms, and this section still does not name a factor it has not
+measured.
 
 ## CosyVoice3 in-engine: a preliminary figure, and why it is only that
 
