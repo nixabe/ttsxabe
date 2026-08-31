@@ -71,7 +71,7 @@ const TAIL_IDLE_MIN: f64 = 0.3;
 /// resident blocks:
 ///
 /// * **Under a wave**, splitting turns idle SMs into concurrent slices and the
-///   old rule stands: fill the machine, keep a slice at least [`KSLICE_MIN`].
+///   old rule stands: fill the machine, keep a slice at least `KSLICE_MIN`.
 /// * **Over a wave**, more blocks do not buy concurrency - they buy a shorter
 ///   *tail*. A launch of 1.11 waves runs its last 16 blocks on an otherwise
 ///   idle machine for a whole block's k-loop, and splitting s ways cuts that
@@ -80,7 +80,7 @@ const TAIL_IDLE_MIN: f64 = 0.3;
 ///   160 blocks, 44% idle, measured 15-25% faster split four ways - and worth
 ///   avoiding when the waves are already full: the same model's 13824-wide
 ///   projections, three exact waves, measured 80% *slower* split in two. The
-///   slice floor is higher here too; see [`KSLICE_TAIL`].
+///   slice floor is higher here too; see `KSLICE_TAIL`.
 pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
     let blocks =
         n.div_ceil(kernels::GEMM_NT as usize) * m.div_ceil(kernels::GEMM_MT as usize) * batch;
@@ -733,7 +733,7 @@ impl Gpu {
     /// in the output - the output is dense, because nothing but the mat-vec
     /// reads it.
     ///
-    /// Mirrors [`xabe_dsp::quantize_q8`], which is the reference the
+    /// Mirrors `xabe_dsp::quantize_q8`, which is the reference the
     /// differential test compares against.
     fn quantize_into(
         &self,
@@ -794,7 +794,7 @@ impl Gpu {
 
     /// Quantises an activation and copies both halves back.
     ///
-    /// For the differential test against [`xabe_dsp::quantize_q8`]. The engine
+    /// For the differential test against `xabe_dsp::quantize_q8`. The engine
     /// never needs the codes on the host - the mat-vec consumes them where they
     /// are - so this exists only to make the CUDA half comparable.
     pub fn quantize_q8_for_test(
@@ -860,7 +860,7 @@ impl Gpu {
     ///
     /// The path every model loader takes. For all but Q6_K it is
     /// [`Gpu::upload_u8`] with a length check; for Q6_K it re-strides *and*
-    /// re-packs the blocks on the way - see [`Gpu::q6k_device_block`] - which
+    /// re-packs the blocks on the way - see `Gpu::q6k_device_block` - which
     /// is why the check is a rejection and not a `debug_assert`: a `bytes`
     /// that is not a whole number of blocks would be rebuilt into garbage that
     /// still decodes to plausible numbers.
@@ -907,8 +907,7 @@ impl Gpu {
     /// nowhere at all.
     fn q6k_device_block(src: &[u8], dst: &mut [u8]) {
         let lo4 = |e: usize| (src[(e >> 7) * 64 + (e & 63)] >> (4 * ((e >> 6) & 1))) & 0x0F;
-        let hi2 =
-            |e: usize| (src[128 + (e >> 7) * 32 + (e & 31)] >> (2 * ((e >> 5) & 3))) & 0x03;
+        let hi2 = |e: usize| (src[128 + (e >> 7) * 32 + (e & 31)] >> (2 * ((e >> 5) & 3))) & 0x03;
         for p in 0..4 {
             for b in 0..32 {
                 let e = 64 * p + b;
@@ -918,10 +917,8 @@ impl Gpu {
                 for s in 0..2 {
                     for v in 0..4 {
                         let e0 = 64 * p + 32 * s + 16 * h + v;
-                        dst[128 + 16 * p + 8 * h + 4 * s + v] = hi2(e0)
-                            | (hi2(e0 + 4) << 2)
-                            | (hi2(e0 + 8) << 4)
-                            | (hi2(e0 + 12) << 6);
+                        dst[128 + 16 * p + 8 * h + 4 * s + v] =
+                            hi2(e0) | (hi2(e0 + 4) << 2) | (hi2(e0 + 8) << 4) | (hi2(e0 + 12) << 6);
                     }
                 }
             }
@@ -1407,7 +1404,6 @@ impl Gpu {
             None
         };
         let ks = ksplit as i32;
-
 
         // Round an f32 activation once rather than on every trip.
         //

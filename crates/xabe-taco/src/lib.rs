@@ -10,7 +10,7 @@
 //!
 //! Every other model here is a geometry crate that refuses to do arithmetic
 //! plus a crate that runs it. This follows `xabe-cosy` instead and keeps both
-//! inside one crate with the boundary drawn between modules: [`config`] and
+//! inside one crate with the boundary drawn between modules: `config` and
 //! `weights` know the shapes and never touch an activation, `model` and
 //! `vocoder` do the arithmetic and never parse a file.
 //!

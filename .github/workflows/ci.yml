@@ -87,14 +87,6 @@ jobs:
       # This compiles `xabe-cuda` on a runner with no CUDA toolkit, which works
       # because cudarc is built with `fallback-dynamic-loading`: it resolves
       # libcuda and libnvrtc at run time, so nothing links against them here.
-      # Debug, not `--release`. The tests that actually execute here are pure
-      # logic; the numerical ones skip for want of a device. Paying for a
-      # thin-LTO single-codegen-unit build to run them would double the wall
-      # clock and prove nothing extra.
-      #
-      # This compiles `xabe-cuda` on a runner with no CUDA toolkit, which works
-      # because cudarc is built with `fallback-dynamic-loading`: it resolves
-      # libcuda and libnvrtc at run time, so nothing links against them here.
       - name: Tests
         # `shell: bash` rather than the default, because it sets `pipefail`.
         # Without it the pipeline into `tee` reports *tee's* status and a

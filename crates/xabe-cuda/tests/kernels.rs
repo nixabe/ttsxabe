@@ -1556,8 +1556,10 @@ fn cache_append_reads_its_own_block_of_a_batched_projection() {
     for transposed in [false, true] {
         let src = g.upload(&all).expect("upload");
         let mut fused = g.zeros(cap * kv_heads * hd).expect("cache");
-        g.cache_append(&src, off, &mut fused, n, kv_heads, hd, cap, past, transposed)
-            .expect("append at an offset");
+        g.cache_append(
+            &src, off, &mut fused, n, kv_heads, hd, cap, past, transposed,
+        )
+        .expect("append at an offset");
 
         let lone = g.upload(&all[off..off + span]).expect("upload");
         let mut apart = g.zeros(cap * kv_heads * hd).expect("cache");
@@ -1639,7 +1641,9 @@ fn fused_attention_case(heads: usize, kv_heads: usize, hd: usize, causal: bool) 
     let dk = g.upload(&kc).expect("upload k");
     let dv = g.upload(&vc).expect("upload v");
     let out = g
-        .flash_attn(&dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale, causal)
+        .flash_attn(
+            &dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale, causal,
+        )
         .expect("flash_attn");
     let got = g.download(&out).expect("download");
 

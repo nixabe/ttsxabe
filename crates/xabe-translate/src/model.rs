@@ -732,73 +732,73 @@ impl Translator {
                 let out = self.project(Operand::F32(&ctx), &l.o, n)?;
                 residual = Some(out);
             } else {
-            let qh = match n {
-                1 => None,
-                _ => Some(self.gpu.split_heads(q, n, heads, hd)?),
-            };
+                let qh = match n {
+                    1 => None,
+                    _ => Some(self.gpu.split_heads(q, n, heads, hd)?),
+                };
 
-            let mut scores = self.gpu.gemm_batched(
-                Operand::F32(qh.as_ref().unwrap_or(q)),
-                Operand::F32(&cache.k[i]),
-                None,
-                Batch {
-                    count: heads,
-                    a: n * hd,
-                    w: cap * hd,
-                    out: n * tk,
-                    w_row: 0,
-                },
-                n,
-                hd,
-                tk,
-            )?;
-            // Llama scales the *scores*, not the query - the opposite of
-            // Whisper, and the same algebra. The scale, the mask and the
-            // softmax are one pass; see `Gpu::softmax_causal`.
-            self.gpu.softmax_causal(
-                &mut scores,
-                heads * n,
-                tk,
-                n,
-                tk - n,
-                (hd as f32).powf(-0.5),
-            )?;
+                let mut scores = self.gpu.gemm_batched(
+                    Operand::F32(qh.as_ref().unwrap_or(q)),
+                    Operand::F32(&cache.k[i]),
+                    None,
+                    Batch {
+                        count: heads,
+                        a: n * hd,
+                        w: cap * hd,
+                        out: n * tk,
+                        w_row: 0,
+                    },
+                    n,
+                    hd,
+                    tk,
+                )?;
+                // Llama scales the *scores*, not the query - the opposite of
+                // Whisper, and the same algebra. The scale, the mask and the
+                // softmax are one pass; see `Gpu::softmax_causal`.
+                self.gpu.softmax_causal(
+                    &mut scores,
+                    heads * n,
+                    tk,
+                    n,
+                    tk - n,
+                    (hd as f32).powf(-0.5),
+                )?;
 
-            let ctx = self.gpu.gemm_batched(
-                Operand::F32(&scores),
-                Operand::F32(&cache.v[i]),
-                None,
-                // `w_row` is `cap`, not `tk`: the values sit in a buffer with
-                // room for more positions than are in it.
-                Batch {
-                    count: heads,
-                    a: n * tk,
-                    w: hd * cap,
-                    out: n * hd,
-                    w_row: cap,
-                },
-                n,
-                tk,
-                hd,
-            )?;
-            // The merge takes the context's int8 twin in the same pass when
-            // the output projection is packed and will read it - the same
-            // reasoning that gives the normalisation and the gating theirs. A
-            // single step has nothing to merge, and its twin is taken by
-            // `project` as before.
-            let packed_o = matches!(l.o.w, GWeight::Packed { .. });
-            let (ctx, cq) = match n {
-                1 => (ctx, None),
-                _ if packed_o && (heads * hd).is_multiple_of(256) => {
-                    let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
-                    (c, Some(q))
-                }
-                _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
-            };
-            // Not added here: the next normalisation reads `h + out` and
-            // nothing between now and then does.
-            let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
-            residual = Some(out);
+                let ctx = self.gpu.gemm_batched(
+                    Operand::F32(&scores),
+                    Operand::F32(&cache.v[i]),
+                    None,
+                    // `w_row` is `cap`, not `tk`: the values sit in a buffer with
+                    // room for more positions than are in it.
+                    Batch {
+                        count: heads,
+                        a: n * tk,
+                        w: hd * cap,
+                        out: n * hd,
+                        w_row: cap,
+                    },
+                    n,
+                    tk,
+                    hd,
+                )?;
+                // The merge takes the context's int8 twin in the same pass when
+                // the output projection is packed and will read it - the same
+                // reasoning that gives the normalisation and the gating theirs. A
+                // single step has nothing to merge, and its twin is taken by
+                // `project` as before.
+                let packed_o = matches!(l.o.w, GWeight::Packed { .. });
+                let (ctx, cq) = match n {
+                    1 => (ctx, None),
+                    _ if packed_o && (heads * hd).is_multiple_of(256) => {
+                        let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
+                        (c, Some(q))
+                    }
+                    _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
+                };
+                // Not added here: the next normalisation reads `h + out` and
+                // nothing between now and then does.
+                let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
+                residual = Some(out);
             }
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;

@@ -5,7 +5,7 @@
 //! frame. Everything else in this crate is feed-forward.
 //!
 //! What it refuses to do: the matmuls. `weight_ih @ x` and `weight_hh @ h` are
-//! [`crate::linear`] and are computed by the caller, because the input side of
+//! [`crate::linear()`] and are computed by the caller, because the input side of
 //! a whole sequence is one projection while the hidden side is one per step,
 //! and fusing them here would force the encoder to do the slow thing.
 

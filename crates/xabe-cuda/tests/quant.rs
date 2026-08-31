@@ -690,9 +690,7 @@ fn the_merged_context_twin_matches_a_separate_quantise() {
     let dx = g.upload(&x).unwrap();
 
     let merged = g.merge_heads(&dx, t, heads, hd).unwrap();
-    let (want_c, want_s) = g
-        .quantize_q8_for_test(&merged, heads * hd, t)
-        .unwrap();
+    let (want_c, want_s) = g.quantize_q8_for_test(&merged, heads * hd, t).unwrap();
 
     let (fused, q8) = g.merge_heads_q(&dx, t, heads, hd).unwrap();
     let (got_c, got_s) = g.q8_parts_for_test(&q8).unwrap();

@@ -700,76 +700,76 @@ impl ChatModel {
                 let out = self.project(Operand::F32(&ctx), &l.o, n)?;
                 residual = Some(out);
             } else {
-            let qh = if n == 1 {
-                None
-            } else {
-                Some(self.gpu.split_heads(q, n, heads, hd)?)
-            };
-            let mut scores = self.gpu.gemm_batched(
-                Operand::F32(qh.as_ref().unwrap_or(q)),
-                Operand::F32(&cache.k[i]),
-                None,
-                Batch {
-                    count: kv_heads,
-                    a: group * n * hd,
-                    w: cap * hd,
-                    out: group * n * tk,
-                    w_row: 0,
-                },
-                group * n,
-                hd,
-                tk,
-            )?;
-            // Llama scales the *scores*, not the query - the opposite of
-            // Whisper, and the same algebra. Copy each where it belongs.
-            self.gpu.softmax_causal(
-                &mut scores,
-                heads * n,
-                tk,
-                n,
-                tk - n,
-                (hd as f32).powf(-0.5),
-            )?;
+                let qh = if n == 1 {
+                    None
+                } else {
+                    Some(self.gpu.split_heads(q, n, heads, hd)?)
+                };
+                let mut scores = self.gpu.gemm_batched(
+                    Operand::F32(qh.as_ref().unwrap_or(q)),
+                    Operand::F32(&cache.k[i]),
+                    None,
+                    Batch {
+                        count: kv_heads,
+                        a: group * n * hd,
+                        w: cap * hd,
+                        out: group * n * tk,
+                        w_row: 0,
+                    },
+                    group * n,
+                    hd,
+                    tk,
+                )?;
+                // Llama scales the *scores*, not the query - the opposite of
+                // Whisper, and the same algebra. Copy each where it belongs.
+                self.gpu.softmax_causal(
+                    &mut scores,
+                    heads * n,
+                    tk,
+                    n,
+                    tk - n,
+                    (hd as f32).powf(-0.5),
+                )?;
 
-            // `w_row` is `cap`, not `tk`: the values sit in a buffer with room
-            // for more positions than are in it, so a row of the operand is a
-            // capacity apart. Contracting over `tk` of it is what makes the
-            // untouched tail of the cache irrelevant rather than wrong.
-            let ctx = self.gpu.gemm_batched(
-                Operand::F32(&scores),
-                Operand::F32(&cache.v[i]),
-                None,
-                Batch {
-                    count: kv_heads,
-                    a: group * n * tk,
-                    w: hd * cap,
-                    out: group * n * hd,
-                    w_row: cap,
-                },
-                group * n,
-                tk,
-                hd,
-            )?;
-            // `[kv_head][group * n][hd]` is `[head][t][hd]`, which for a single
-            // step is already `[heads * hd]` - the shape the output projection
-            // wants. Only a multi-row pass has anything to merge.
-            // The merge takes the context's int8 twin in the same pass when
-            // the output projection is packed and will read it - the same
-            // reasoning that gives the normalisation and the gating theirs.
-            let packed_o = matches!(l.o.w, GWeight::Packed { .. });
-            let (ctx, cq) = match n {
-                1 => (ctx, None),
-                _ if packed_o && (heads * hd).is_multiple_of(256) => {
-                    let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
-                    (c, Some(q))
-                }
-                _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
-            };
-            // Not added here. The next normalisation reads `h + out` and
-            // nothing between now and then does, so the sum is left for it to
-            // take in the pass it was going to make anyway.
-            let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
-            residual = Some(out);
+                // `w_row` is `cap`, not `tk`: the values sit in a buffer with room
+                // for more positions than are in it, so a row of the operand is a
+                // capacity apart. Contracting over `tk` of it is what makes the
+                // untouched tail of the cache irrelevant rather than wrong.
+                let ctx = self.gpu.gemm_batched(
+                    Operand::F32(&scores),
+                    Operand::F32(&cache.v[i]),
+                    None,
+                    Batch {
+                        count: kv_heads,
+                        a: group * n * tk,
+                        w: hd * cap,
+                        out: group * n * hd,
+                        w_row: cap,
+                    },
+                    group * n,
+                    tk,
+                    hd,
+                )?;
+                // `[kv_head][group * n][hd]` is `[head][t][hd]`, which for a single
+                // step is already `[heads * hd]` - the shape the output projection
+                // wants. Only a multi-row pass has anything to merge.
+                // The merge takes the context's int8 twin in the same pass when
+                // the output projection is packed and will read it - the same
+                // reasoning that gives the normalisation and the gating theirs.
+                let packed_o = matches!(l.o.w, GWeight::Packed { .. });
+                let (ctx, cq) = match n {
+                    1 => (ctx, None),
+                    _ if packed_o && (heads * hd).is_multiple_of(256) => {
+                        let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
+                        (c, Some(q))
+                    }
+                    _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
+                };
+                // Not added here. The next normalisation reads `h + out` and
+                // nothing between now and then does, so the sum is left for it to
+                // take in the pass it was going to make anyway.
+                let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
+                residual = Some(out);
             }
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
