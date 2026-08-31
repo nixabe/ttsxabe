@@ -709,6 +709,28 @@ impl Translator {
             // it from zero and a single step reads it as the row it is.
             let q = &proj[qg];
 
+            // A prompt takes the fused attention: scores, mask, softmax and
+            // the value product in one kernel, reading the query buffer and
+            // the caches in place - no head split, no score matrix, no merge.
+            // A single step keeps the chain below: its score row is one gemv
+            // and there is nothing to fuse. So does any geometry the fused
+            // kernel's tiles do not cover, which this checkpoint's never is.
+            if n > 1 && hd == 128 {
+                let ctx = self.gpu.flash_attn(
+                    q,
+                    &cache.k[i],
+                    &cache.v[i],
+                    n,
+                    past,
+                    heads,
+                    heads,
+                    hd,
+                    cap,
+                    (hd as f32).powf(-0.5),
+                )?;
+                let out = self.project(Operand::F32(&ctx), &l.o, n)?;
+                residual = Some(out);
+            } else {
             let qh = match n {
                 1 => None,
                 _ => Some(self.gpu.split_heads(q, n, heads, hd)?),
@@ -776,6 +798,7 @@ impl Translator {
             // nothing between now and then does.
             let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
             residual = Some(out);
+            }
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
             let xo = Self::operand(&x, xq.as_ref());

@@ -1800,6 +1800,253 @@ __device__ __forceinline__ void gemm_i8_body(
 GEMM_I8_ENTRY(gemm_i8_q4k, QT_Q4_K)
 GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K)
 
+// ------------------------------------------------------------ flash attention
+//
+// Causal attention for a whole prompt in one kernel: scores, mask, softmax and
+// the value product, with nothing materialised. The unfused chain writes the
+// score matrix, reads it back to softmax it, writes the probabilities, and
+// reads them again for the value product - `heads * tq * tk` floats three
+// times over, plus a head split and a merge. At 512 tokens on the 13 B that
+// chain measured about 27 ms a prefill; the score tensor exists only so the
+// softmax can find its row maximum, and the running-maximum trick removes
+// that need.
+//
+// One block owns 32 query rows of one head and walks the keys 32 at a time,
+// keeping the output accumulator in registers. Per tile: scores by `m16n8k8`
+// into f32, the row maximum folded into a running one, the accumulator
+// rescaled by `exp(m_old - m_new)`, probabilities rounded to f16 - exactly
+// where the unfused chain rounded them, on their way into the value product -
+// and one more `m16n8k8` against the values. `__expf`, because that is what
+// `softmax_causal` uses; this kernel replaces it and must not be a precision
+// change. The loop stops at the last tile a row can see, so the upper
+// triangle is never computed at all.
+//
+// Layouts are the caches' own: K is `[kv_head][pos][hd]`, V is
+// `[kv_head][hd][cap]`, and the queries are read straight out of the
+// projection buffer at `[tq, heads * hd]` - no `split_heads` - with the
+// merged context written the same way, so no `merge_heads` either. `hd` is
+// 128 and the wrapper refuses anything else: the tile shapes below assume it.
+// Grouped-query models map `head / (heads / kv_heads)`.
+
+#define FA_QT 32                       // query rows a block
+#define FA_KT 32                       // key positions a trip
+#define FA_HD 128
+#define FA_WARPS 8
+#define FA_QSTR 68                     // words a Qs row: 64 + 4, bank-spread
+#define FA_KSTR 68                     // words a Ks row (Ks is [pos][d])
+#define FA_VSTR 20                     // words a Vs row (Vs is [d][pos])
+#define FA_PSTR 20                     // words a Ps row
+#define FA_SSTR 36                     // floats an Ss row
+
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale)
+{
+    __shared__ __align__(16) unsigned qs[FA_QT * FA_QSTR];
+    __shared__ __align__(16) unsigned kvs[FA_HD * FA_VSTR > FA_KT * FA_KSTR
+                                              ? FA_HD * FA_VSTR
+                                              : FA_KT * FA_KSTR];
+    __shared__ __align__(16) unsigned ps[FA_QT * FA_PSTR];
+    __shared__ __align__(16) float ss[FA_QT * FA_SSTR];
+    __shared__ float sm_m[FA_QT], sm_l[FA_QT], sm_fac[FA_QT];
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int g = lane >> 2, tg = lane & 3;
+
+    const int qt0 = blockIdx.x * FA_QT;
+    const int h = blockIdx.y;
+    const int kh = h / (heads / kv_heads);
+    const int dq = heads * FA_HD;
+
+    const float* kb = kc + (size_t)kh * cap * FA_HD;
+    const float* vb = vc + (size_t)kh * FA_HD * cap;
+
+    // Queries once, rounded to f16 - the same rounding the tiled gemm applied
+    // to its operands. A row past `tq` stages zeros and is never stored.
+    for (int i = tid; i < FA_QT * (FA_HD / 2); i += FA_WARPS * 32) {
+        const int r = i / (FA_HD / 2), j = i % (FA_HD / 2);
+        unsigned w = 0u;
+        if (qt0 + r < tq) {
+            const float2 v =
+                *reinterpret_cast<const float2*>(q + (size_t)(qt0 + r) * dq
+                                                 + (size_t)h * FA_HD + 2 * j);
+            w = gemm_pack(v.x, v.y);
+        }
+        qs[r * FA_QSTR + j] = w;
+    }
+    if (tid < FA_QT) {
+        sm_m[tid] = -1.0f / 0.0f;
+        sm_l[tid] = 0.0f;
+    }
+
+    // The output accumulator: warp `w` owns query group `w >> 2` (16 rows)
+    // and value columns `(w & 3) * 32 .. + 31`, as four n8 fragments.
+    const int mg = warp >> 2;
+    const int ng0 = (warp & 3) * 4;
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // The last key a row of this block may see is `past + qt0 + FA_QT - 1`.
+    const int kend = min(past + tq, past + qt0 + FA_QT);
+    for (int kv0 = 0; kv0 < kend; kv0 += FA_KT) {
+        // Keys, `[pos][d]`, rounded like the queries. Positions past `kend`
+        // stage zeros; the mask discards whatever the mma made of them.
+        for (int i = tid; i < FA_KT * (FA_HD / 2); i += FA_WARPS * 32) {
+            const int r = i / (FA_HD / 2), j = i % (FA_HD / 2);
+            unsigned w = 0u;
+            if (kv0 + r < kend) {
+                const float2 v = *reinterpret_cast<const float2*>(
+                    kb + (size_t)(kv0 + r) * FA_HD + 2 * j);
+                w = gemm_pack(v.x, v.y);
+            }
+            kvs[r * FA_KSTR + j] = w;
+        }
+        __syncthreads();
+
+        // S = Q K^T for this tile. Warps 0-3 cover query group 0, warps 4-7
+        // group 1; each owns one n8 fragment of the 32 positions.
+        {
+            const int smg = warp >> 2, sng = warp & 3;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            #pragma unroll
+            for (int ks = 0; ks < FA_HD / 8; ++ks) {
+                unsigned a0, a1;
+                gemm_ld_a(&qs[(smg * 16 + (lane & 15)) * FA_QSTR + 4 * ks],
+                          a0, a1);
+                const unsigned b0 =
+                    gemm_ld_b(&kvs[(sng * 8 + (lane & 7)) * FA_KSTR + 4 * ks]);
+                gemm_mma_step(d0, d1, d2, d3, a0, a1, b0);
+            }
+            const int c0 = sng * 8 + 2 * tg;
+            ss[(smg * 16 + g) * FA_SSTR + c0] = d0 * scale;
+            ss[(smg * 16 + g) * FA_SSTR + c0 + 1] = d1 * scale;
+            ss[(smg * 16 + g + 8) * FA_SSTR + c0] = d2 * scale;
+            ss[(smg * 16 + g + 8) * FA_SSTR + c0 + 1] = d3 * scale;
+        }
+        __syncthreads();
+
+        // The running maximum. Eight lanes to a row, four columns each; the
+        // leader folds the tile's maximum into the row's and leaves the
+        // rescale factor for everyone.
+        {
+            const int r = tid >> 3, c0 = (tid & 7) * 4;
+            const int qpos = past + qt0 + r;
+            float mx = -1.0f / 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (kv0 + c0 + c <= qpos) {
+                    mx = fmaxf(mx, ss[r * FA_SSTR + c0 + c]);
+                }
+            }
+            #pragma unroll
+            for (int o = 4; o > 0; o >>= 1) {
+                mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
+            }
+            if ((tid & 7) == 0) {
+                const float m_new = fmaxf(sm_m[r], mx);
+                sm_fac[r] = __expf(sm_m[r] - m_new);
+                sm_m[r] = m_new;
+            }
+        }
+        __syncthreads();
+
+        // Probabilities, rounded to f16 on their way into the value product -
+        // where the unfused chain rounded them too - and the running sum.
+        {
+            const int r = tid >> 3, c0 = (tid & 7) * 4;
+            const int qpos = past + qt0 + r;
+            const float m = sm_m[r];
+            float p[4], sum = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float s = ss[r * FA_SSTR + c0 + c];
+                p[c] = (kv0 + c0 + c <= qpos) ? __expf(s - m) : 0.0f;
+                sum += p[c];
+            }
+            ps[r * FA_PSTR + (c0 >> 1)] = gemm_pack(p[0], p[1]);
+            ps[r * FA_PSTR + (c0 >> 1) + 1] = gemm_pack(p[2], p[3]);
+            #pragma unroll
+            for (int o = 4; o > 0; o >>= 1) {
+                sum += __shfl_down_sync(0xffffffff, sum, o);
+            }
+            if ((tid & 7) == 0) {
+                sm_l[r] = sm_l[r] * sm_fac[r] + sum;
+            }
+        }
+
+        // Values, `[d][pos]` - the cache's own transposed layout, which is
+        // already the `[n][k]` shape the B fragment wants.
+        for (int i = tid; i < FA_HD * (FA_KT / 2); i += FA_WARPS * 32) {
+            const int r = i / (FA_KT / 2), j = i % (FA_KT / 2);
+            unsigned w = 0u;
+            if (kv0 + 2 * j + 1 < kend) {
+                const float2 v = *reinterpret_cast<const float2*>(
+                    vb + (size_t)r * cap + kv0 + 2 * j);
+                w = gemm_pack(v.x, v.y);
+            } else if (kv0 + 2 * j < kend) {
+                w = gemm_pack(vb[(size_t)r * cap + kv0 + 2 * j], 0.0f);
+            }
+            kvs[r * FA_VSTR + j] = w;
+        }
+        __syncthreads();
+
+        // O = O * fac + P V. The rescale factor is per row, and a lane's
+        // fragment rows are `g` and `g + 8` of its group.
+        const float f0 = sm_fac[mg * 16 + g];
+        const float f1 = sm_fac[mg * 16 + g + 8];
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            #pragma unroll
+            for (int ks = 0; ks < FA_KT / 8; ++ks) {
+                unsigned a0, a1;
+                gemm_ld_a(&ps[(mg * 16 + (lane & 15)) * FA_PSTR + 4 * ks],
+                          a0, a1);
+                const unsigned b0 = gemm_ld_b(
+                    &kvs[((ng0 + nt) * 8 + (lane & 7)) * FA_VSTR + 4 * ks]);
+                gemm_mma_step(d0, d1, d2, d3, a0, a1, b0);
+            }
+            acc[nt][0] = acc[nt][0] * f0 + d0;
+            acc[nt][1] = acc[nt][1] * f0 + d1;
+            acc[nt][2] = acc[nt][2] * f1 + d2;
+            acc[nt][3] = acc[nt][3] * f1 + d3;
+        }
+        __syncthreads();
+    }
+
+    // O / l, written merged: `[tq, heads * hd]`, `split_heads` and
+    // `merge_heads` both gone.
+    const int r0 = mg * 16 + g, r1 = r0 + 8;
+    const float inv0 = sm_l[r0] > 0.0f ? 1.0f / sm_l[r0] : 0.0f;
+    const float inv1 = sm_l[r1] > 0.0f ? 1.0f / sm_l[r1] : 0.0f;
+    #pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+        const int col = (size_t)h * FA_HD + (ng0 + nt) * 8 + 2 * tg;
+        if (qt0 + r0 < tq) {
+            float* o = out + (size_t)(qt0 + r0) * dq + col;
+            o[0] = acc[nt][0] * inv0;
+            o[1] = acc[nt][1] * inv0;
+        }
+        if (qt0 + r1 < tq) {
+            float* o = out + (size_t)(qt0 + r1) * dq + col;
+            o[0] = acc[nt][2] * inv1;
+            o[1] = acc[nt][3] * inv1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- convolution
 
 // Cross-correlation over time. `w` is [out_ch, in_ch, k].

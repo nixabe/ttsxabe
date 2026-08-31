@@ -134,6 +134,25 @@ pub enum CudaError {
         name: String,
     },
 
+    /// An attention shape the fused kernel's tiles cannot cover.
+    ///
+    /// Prevents silently attending with a kernel whose fragment layout
+    /// assumes a 128-wide head: any other width would index another head's
+    /// values, in bounds, and return plausible context. The caller falls back
+    /// to the unfused chain instead.
+    #[error(
+        "fused attention wants head_dim 128 and heads a multiple of kv_heads, \
+         got head_dim {head_dim}, {heads} heads over {kv_heads}"
+    )]
+    UnsupportedAttention {
+        /// The head width asked for.
+        head_dim: usize,
+        /// Query heads.
+        heads: usize,
+        /// Key/value heads.
+        kv_heads: usize,
+    },
+
     /// A driver call failed.
     #[error("{what}: {source}")]
     Driver {

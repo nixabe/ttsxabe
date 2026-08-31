@@ -1591,3 +1591,95 @@ fn an_offset_past_the_end_of_the_source_is_refused() {
         "cache_append read past the end and did not say so",
     );
 }
+
+/// The fused attention against a scalar reference of the same arithmetic.
+///
+/// The reference applies the roundings where the kernel does: operands to f16
+/// going into both products, scores accumulated in f32, probabilities rounded
+/// to f16 on their way into the value product, the normaliser summed at f32.
+/// The kernel's running-maximum rescaling is algebraically the same softmax,
+/// so what remains inside the tolerance is rounding order, and what a wrong
+/// index would produce - another head's or another position's context - is a
+/// full-scale disagreement, not a rounding one.
+#[test]
+fn fused_attention_matches_the_unfused_arithmetic() {
+    let Some(g) = gpu() else { return };
+
+    // Odd on purpose: a query count that is not a whole tile, a cache with
+    // more capacity than positions, and grouped-query heads.
+    let (heads, kv_heads, hd) = (4usize, 2usize, 128usize);
+    let (tq, past, cap) = (70usize, 33usize, 160usize);
+    let tk = past + tq;
+    let scale = (hd as f32).powf(-0.5);
+
+    // The queries are scaled up so the softmax is *peaked*: near-uniform
+    // scores would let a permuted position hide inside the tolerance, and
+    // permutations are exactly what this test exists to catch.
+    let q: Vec<f32> = seq(tq * heads * hd, 71).iter().map(|v| v * 100.0).collect();
+    let kvals = seq(kv_heads * tk * hd, 72);
+    let vvals = seq(kv_heads * tk * hd, 73);
+    // The caches' own layouts: K `[kv_head][pos][hd]`, V `[kv_head][hd][cap]`,
+    // with the unused capacity zeroed as the real cache's is.
+    let mut kc = vec![0.0f32; kv_heads * cap * hd];
+    let mut vc = vec![0.0f32; kv_heads * hd * cap];
+    for h in 0..kv_heads {
+        for p in 0..tk {
+            for d in 0..hd {
+                kc[(h * cap + p) * hd + d] = kvals[(h * tk + p) * hd + d];
+                vc[(h * hd + d) * cap + p] = vvals[(h * tk + p) * hd + d];
+            }
+        }
+    }
+
+    let dq = g.upload(&q).expect("upload q");
+    let dk = g.upload(&kc).expect("upload k");
+    let dv = g.upload(&vc).expect("upload v");
+    let out = g
+        .flash_attn(&dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale)
+        .expect("flash_attn");
+    let got = g.download(&out).expect("download");
+
+    let h16 = |x: f32| f32::from(half::f16::from_f32(x));
+    let dq_row = heads * hd;
+    let mut worst = 0.0f32;
+    for h in 0..heads {
+        let kh = h / (heads / kv_heads);
+        for r in 0..tq {
+            let qpos = past + r;
+            let mut s = vec![f32::NEG_INFINITY; tk];
+            for p in 0..=qpos.min(tk - 1) {
+                let mut acc = 0.0f32;
+                for d in 0..hd {
+                    acc += h16(q[r * dq_row + h * hd + d])
+                        * h16(kvals[(kh * tk + p) * hd + d]);
+                }
+                s[p] = acc * scale;
+            }
+            let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = s
+                .iter()
+                .map(|&x| if x == f32::NEG_INFINITY { 0.0 } else { (x - m).exp() })
+                .collect();
+            let l: f32 = e.iter().sum();
+            for d in 0..hd {
+                let mut acc = 0.0f32;
+                for (p, &ep) in e.iter().enumerate() {
+                    acc += h16(ep) * h16(vvals[(kh * tk + p) * hd + d]);
+                }
+                let want = acc / l;
+                let have = got[r * dq_row + h * hd + d];
+                let tol = 2e-4 + 1e-2 * want.abs();
+                let err = (want - have).abs();
+                worst = worst.max(err);
+                assert!(
+                    err <= tol,
+                    "head {h} row {r} dim {d}: {have} wanted {want} \
+                     (err {err}, tol {tol})",
+                );
+            }
+        }
+    }
+    // A permuted position or head would land far outside this; the assert is
+    // here so a loosened tolerance cannot rot silently.
+    assert!(worst < 5e-3, "worst error {worst} is not rounding-sized");
+}

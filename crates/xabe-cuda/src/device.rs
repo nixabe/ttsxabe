@@ -450,6 +450,7 @@ const NAMES: &[&str] = &[
     "gemm_i8_q4k",
     "gemm_i8_q6k",
     "gemm_reduce",
+    "flash_attn",
     "gemv",
     "quantize_q8",
     "cache_append",
@@ -2759,6 +2760,74 @@ impl Gpu {
         head_dim: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
         Ok(self.merge_heads_inner(x, t, heads, head_dim, false)?.0)
+    }
+
+    /// Causal attention over a whole prompt, fused: scores, mask, softmax and
+    /// the value product in one kernel, nothing materialised.
+    ///
+    /// `q` is the projection buffer itself, `[tq, heads * 128]` with the
+    /// query first - no head split - and the merged context comes back in the
+    /// same shape, so neither `split_heads` nor `merge_heads` runs. `k` and
+    /// `v` are the caches in their own layouts, `[kv_head][pos][128]` and
+    /// `[kv_head][128][cap]`, holding `past + tq` valid positions. A
+    /// grouped-query model passes `kv_heads < heads`.
+    ///
+    /// The head dimension is fixed at 128 - both Llama stages' - because the
+    /// kernel's tile shapes assume it; anything else is refused, and the
+    /// caller keeps the unfused chain for it. The arithmetic is the chain's
+    /// exactly: scores accumulate in f32 from f16-rounded operands,
+    /// `__expf` like `softmax_causal`, probabilities rounded to f16 on their
+    /// way into the value product - where the chain rounded them too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        tq: usize,
+        past: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cap: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if head_dim != 128 || !heads.is_multiple_of(kv_heads.max(1)) {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim,
+                heads,
+                kv_heads,
+            });
+        }
+        // SAFETY: every (row, column) of the output is written by exactly one
+        // lane of the store loop below; rows past `tq` are predicated off.
+        let mut out = unsafe { self.uninit(tq * heads * head_dim) }?;
+        let (tqi, pi, hi, kvi, ci) = (
+            tq as i32,
+            past as i32,
+            heads as i32,
+            kv_heads as i32,
+            cap as i32,
+        );
+        let f = self.func("flash_attn");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(&mut out)
+            .arg(&tqi)
+            .arg(&pi)
+            .arg(&hi)
+            .arg(&kvi)
+            .arg(&ci)
+            .arg(&scale);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((tq as u32).div_ceil(32), heads as u32, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        launched("flash_attn", unsafe { lb.launch(cfg) })?;
+        Ok(out)
     }
 
     /// The merge and the int8 twin of its output, in one pass.

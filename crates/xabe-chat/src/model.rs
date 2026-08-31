@@ -677,6 +677,28 @@ impl ChatModel {
             // it from zero and a single step reads it as the row it is.
             let q = &proj[qg];
 
+            // A prompt takes the fused attention: scores, mask, softmax and
+            // the value product in one kernel, reading the query buffer and
+            // the caches in place - no head split, no score matrix, no merge,
+            // and the grouped heads read the one cached copy directly. A
+            // single step keeps the chain below: its score row is one gemv
+            // and there is nothing to fuse.
+            if n > 1 && hd == 128 {
+                let ctx = self.gpu.flash_attn(
+                    q,
+                    &cache.k[i],
+                    &cache.v[i],
+                    n,
+                    past,
+                    heads,
+                    kv_heads,
+                    hd,
+                    cap,
+                    (hd as f32).powf(-0.5),
+                )?;
+                let out = self.project(Operand::F32(&ctx), &l.o, n)?;
+                residual = Some(out);
+            } else {
             let qh = if n == 1 {
                 None
             } else {
@@ -747,6 +769,7 @@ impl ChatModel {
             // take in the pass it was going to make anyway.
             let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
             residual = Some(out);
+            }
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
             let xo = Self::operand(&x, xq.as_ref());
