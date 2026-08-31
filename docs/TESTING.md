@@ -212,6 +212,43 @@ That number is a bound on the arithmetic, not on the output. What it costs in
 `llama-server` capture picks the same token at every position it picked before,
 and the disagreement list below is byte-identical across the change.
 
+### Where that disagreement lives, and where it does not
+
+The five above are the ones with a wide margin; the full count is **10 of 105
+teacher-forced decisions**. They are not a wiring bug and they are not spread
+across the engine. Four measurements place them:
+
+| | disagreements |
+| --- | ---: |
+| ours vs llama.cpp, f16 checkpoint, batched | 1 of 125, margin 0.056 |
+| ours vs llama.cpp, Q4_K, one token at a time | 1 of 105, margin 0.19 |
+| ours vs llama.cpp, Q4_K, batched | 10 of 105, margin 2.86 |
+| llama.cpp CPU vs its own CUDA, Q4_K | none, to the printed precision |
+
+The first says our arithmetic tracks llama.cpp's to a coin flip when both do
+the same thing. The last says the reference is deterministic. The middle two
+say the difference is **which of our kernels multiplied**, and nothing else:
+`tests/stepwise.rs` runs the identical comparison one position at a time so
+every projection lands on the mat-vec instead of the tiled matmul, and nine of
+the ten disagreements go away.
+
+What is left in the tiled path is not the packed weight. Replacing that matmul
+outright - an integer kernel multiplying the checkpoint's blocks against an int8
+activation, which is llama.cpp's own arithmetic - moved none of the ten, and
+measured *less* accurate than the f16 staging it replaced (`docs/BENCHMARKS.md`
+has the numbers and the kernel is gone). Feeding the f16 kernel an activation
+pre-rounded to the int8 grid moved none of them either.
+
+The remaining difference between the two paths is the **attention** matmuls:
+the mat-vec runs them in exact f32 and the tiled one stages them to f16. That
+is where to look next, and it has not been looked at.
+
+`tests/consistency.rs` bounds how much of this is anyone's fault. It runs the
+batched prefill against the same tokens fed one at a time - both this engine,
+no oracle - and they fork on **5 of 179 argmaxes**. A greedy comparison between
+two implementations of an 8 B model at f16 is measuring chaos as much as
+correctness, and the disagreement counts above should be read with that in mind.
+
 ### The chat model disagrees with llama-server in five places, and did before
 
 `xabe-chat`'s `tests/llama_server.rs` compares greedy replies against a capture

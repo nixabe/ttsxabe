@@ -2,9 +2,9 @@
 
 ## Current standing
 
-The one-line version: the synthesiser is 1.24x faster than PyTorch, the chat
-model's decode is now marginally ahead of llama.cpp (101.5 against 101.2 tok/s),
-the translator's decode is 1.11x behind it, the ASR is 0.55x against
+The one-line version: the synthesiser is 1.24x faster than PyTorch, both Llama
+stages' decode is level with llama.cpp (101.4 against 101.2 tok/s on the chat
+model, 61.1 against 61.5 on the translator), the ASR is 0.55x against
 `whisper-server`, and prefill on both Llama stages is about 3.5x behind. Each
 of those has its own section; this paragraph is not the evidence for any of them.
 
@@ -122,14 +122,22 @@ translator's has not, and prefill is untouched.
 | Checkpoint | | llama.cpp | this engine | |
 | --- | --- | ---: | ---: | ---: |
 | Breeze2 8 B Q4_K_M | prefill, 128 tok | **1950 tok/s** | 553 tok/s | 3.5x behind |
-| | decode, 64 tok | 101.2 tok/s | **101.5 tok/s** | ahead |
-| Taigi 13 B Q4_K_M | prefill, 128 tok | **1327 tok/s** | 399 tok/s | 3.3x behind |
-| | decode, 64 tok | **61.5 tok/s** | 55.3 tok/s | 1.11x behind |
+| | decode, 64 tok | 101.2 tok/s | **101.4 tok/s** | ahead |
+| Taigi 13 B Q4_K_M | prefill, 128 tok | **1327 tok/s** | 401 tok/s | 3.3x behind |
+| | decode, 64 tok | **61.5 tok/s** | 61.1 tok/s | level |
 
 Decode was 60.8 and 35.8 when this table was first written, so the two stages
-are 1.67x and 1.55x faster than that. **The margin on the chat model is 0.3%,
-which is a tie dressed as a win** - it is reproducible across runs to within
-0.1 tok/s, and it is not a comfortable lead.
+are 1.67x and 1.71x faster than that. **Both decode margins are inside 1%,
+which is a tie rather than a lead** - each is reproducible across runs to
+within 0.2 tok/s, and neither is comfortable.
+
+The translator's last 10% was not a kernel. A warp of the wide mat-vec covers
+four super-blocks a trip, and the path was gated on `k` being a multiple of
+1024 - four of them. 13 B Llama-2 contracts its down projection over 13824,
+which is 54 super-blocks, so **22% of every layer's weights fell silently onto
+the four-byte path**. Letting the lanes past the end of a row sit out is exact,
+because their contribution is a separate term of the warp reduction, and it is
+worth 55.4 to 61.2 tok/s.
 
 Decode is bandwidth, and the weights are now read at close to the roof: the chat
 model's `gemv` moves 5.0 GB per token in 8.7 ms, which is 567 GB/s against a
@@ -947,6 +955,55 @@ spills, which is full occupancy on sm_75, and the variant that removed the
 arithmetic while keeping the loads ran at 431 GB/s against the shipped kernel's
 86. Two flat results are evidence about the two things tried and not about
 everything else.
+
+### An integer tiled matmul, built and measured 12x *less* accurate
+
+llama.cpp multiplies a packed weight as integers against an int8 activation and
+never forms the dequantized value. This engine's tiled matmul dequantizes to
+f16 first. That difference was the leading theory for why the chat model
+disagrees with llama-server, and for why its prefill is 3.5x behind - int8
+tensor cores run at twice the f16 rate on this card, and
+`m8n8k16.s32.s8.s8.s32` is one of only two mma shapes that assemble on sm_75.
+
+So it was built: a 64x64 tile over a 32-element k-tile, which is exactly one
+`Q4_K` sub-block, with the block minimum applied as a rank-1 correction from
+the activation's row sums rather than per element.
+
+It went from 193 to 556 tok/s over three fixes, and the profile lessons are
+worth more than the kernel:
+
+- Staging the weight with 64 of the 256 threads, each decoding 32 quants in
+  sequence, was 193 tok/s. Eight quants a thread across all of them was 361 -
+  the header comes out four times a column instead of once, and that is the
+  cheaper end of the trade.
+- Recomputing the activation's row sums from global memory on every trip
+  through the contraction was the rest of it. They come out of `dp4a` against a
+  word of ones on the registers the staging already holds: 361 to 556.
+- Hoisting the rescale's shared loads out of the inner loop and folding the
+  minimum into one `fmaf` bought accuracy rather than speed.
+
+At 556 tok/s it matched the f16 kernel on the chat model and lost 10% on the
+translator. And then the accuracy measurement, once it was labelled correctly:
+
+| | integer | f16-staged |
+| --- | ---: | ---: |
+| Q4_K, 140x1024x512 | 0.0752% | **0.0064%** |
+| Q6_K | 0.4811% | **0.0307%** |
+
+**The integer kernel is twelve to fifteen times less accurate**, and the reason
+is the operand nobody was looking at: an int8 activation carries 8 bits where
+f16 carries 11, and a weight that reaches the multiply exactly does not make
+that back. Teacher-forced agreement with llama-server was unchanged at 10 of
+105 either way. Removed.
+
+Two things survive it. The first is a correction: an earlier version of this
+section reasoned that llama.cpp's exact-integer weights must be *more* accurate
+than f16 staging. They are not - llama.cpp's prefill is the coarser of the two,
+and this engine tracks the reference better by not copying it. The second is
+that a measurement read off an un-labelled number is worth nothing: the
+comparison above was run three times with the new kernel switched off by an
+environment variable, and reported the f16 path's accuracy as the integer
+path's each time.
 
 ### A normalisation block sized to divide the row exactly
 

@@ -69,14 +69,18 @@ is the file to read before starting work rather than this paragraph.
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
 medians. The ASR is **0.55x** against `whisper-server` — a stated milestone that
-is not met, recorded as a miss. And the Llama stages are now split: the chat
-model's **decode** is marginally ahead of llama.cpp (101.5 against 101.2 tok/s,
-a 0.3% margin that is a tie dressed as a win), the translator's is 0.90x, and
-**prefill on both is about 0.29x** and has not been worked on. An earlier version
-of this paragraph said llama.cpp had never been beaten here; that is no longer
-true of exactly one of the four numbers, and it is still true of the other three.
+is not met, recorded as a miss. And the Llama stages are now split: **decode on
+both is level with llama.cpp** (101.4 against 101.2 tok/s on the chat model,
+61.1 against 61.5 on the translator — margins inside 1%, which is a tie and not
+a lead), while **prefill on both is about 0.29x** and has not been worked on.
 Those numbers and every other comparison belong in `docs/BENCHMARKS.md` and
 nowhere else.
+
+The chat model also **disagrees with llama-server at 10 of 105 teacher-forced
+decisions**, which is a real and open defect rather than a rounding difference.
+It is localised: the same comparison one token at a time disagrees at 1 of 105,
+so it is the tiled matmul path and not the engine. `docs/TESTING.md` has what
+has been ruled out and what has not.
 
 Do not write comments, commit messages, or documentation asserting a speedup
 that has not been measured on this hardware.
