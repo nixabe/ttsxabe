@@ -256,6 +256,17 @@ instructions - 18 loads per 16 mma - measured worse at every tile tried
 (`GEMM_WARPS = 4` at 128x128: 819; 128x256 at eight warps: 828). The
 accumulator array grows with it and the registers come from the same budget.
 
+### None of it reached the ASR
+
+The same `gemm` runs the Whisper encoder, and on the three `bench-gemm` encoder
+shapes it went from 16.8/15.2/16.2 to 19.4/17.7/18.4 TFLOP/s. End to end the
+ASR did not move: 293.4 ms before the work and 294.3 ms after, on the same
+2.67 s clip, which is inside the run-to-run spread. The encoder matmul is not
+what the ASR is waiting on, so the 0.55x against `whisper-server` is untouched
+and stays a recorded miss. Measured rather than assumed, because a 15% gain on
+the kernel that "is" the encoder is exactly the kind of thing that gets written
+up as an end-to-end number without anyone checking.
+
 ## Sixteen bytes a lane, and the token that was 40% not-matmul
 
 Two separate problems, found in that order, and the second was the larger.
