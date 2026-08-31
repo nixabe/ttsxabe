@@ -598,3 +598,75 @@ fn the_tiled_matmul_reports_its_own_staging_error() {
     // is what it would catch.
     assert!(worst < 0.05 * scale, "staging error {worst} of {scale}");
 }
+
+/// Several matrices against one activation, as one product.
+///
+/// The attention projections are issued this way: `Batch::a == 0` says every
+/// matrix of the batch multiplies the *same* left operand, which is what turns
+/// three launches of forty blocks into one launch of a hundred and twenty. Two
+/// things could go wrong silently and this pins both - the weight stride, which
+/// would read the neighbouring matrix, and the activation's own row stride,
+/// which the packed paths derive from a row count rather than from `Batch::a`
+/// and which has to stop advancing when the operand is shared.
+///
+/// Bit-for-bit, not a tolerance: the batched product and the separate ones do
+/// the same arithmetic in the same order on the same bytes. Anything else is a
+/// mistake rather than a rounding difference.
+#[test]
+fn a_batch_over_one_activation_matches_the_same_products_apart() {
+    let Some(g) = gpu() else { return };
+    let (k, n, count) = (512usize, 128usize, 3usize);
+
+    // Both dispatches: `m` under GEMV_MAX_M takes the mat-vec, past it the
+    // tiled integer kernel, and the shared activation has to hold on both.
+    for &m in &[1usize, xabe_cuda::GEMV_MAX_M, 140] {
+        for &(q, _) in FORMATS {
+            let raw = blocks(q, count * n * k / q.block_size(), 31);
+            let a = seq(m * k, 32);
+            let da = g.upload(&a).unwrap();
+            let dw = g.upload_quant(q, &raw).unwrap();
+
+            let together = g
+                .gemm_batched(
+                    Operand::F32(&da),
+                    Operand::Q { data: &dw, ty: q },
+                    None,
+                    Batch {
+                        count,
+                        a: 0,
+                        w: n * k,
+                        out: m * n,
+                        w_row: 0,
+                    },
+                    m,
+                    k,
+                    n,
+                )
+                .expect("the batched product");
+            let got = g.download(&together).unwrap();
+
+            let per = q.block_size();
+            for c in 0..count {
+                let bytes = raw.len() / count;
+                let one = g.upload_quant(q, &raw[c * bytes..(c + 1) * bytes]).unwrap();
+                let apart = g
+                    .gemm_batched(
+                        Operand::F32(&da),
+                        Operand::Q { data: &one, ty: q },
+                        None,
+                        Batch::single(m * n),
+                        m,
+                        k,
+                        n,
+                    )
+                    .expect("one product");
+                assert_eq!(
+                    g.download(&apart).unwrap(),
+                    got[c * m * n..(c + 1) * m * n],
+                    "{q:?} m={m} block={per}: element {c} of the batch differs \
+                     from the same matrix on its own",
+                );
+            }
+        }
+    }
+}

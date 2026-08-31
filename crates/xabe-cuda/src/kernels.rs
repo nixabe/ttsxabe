@@ -830,7 +830,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     // `asc_off` bytes - one allocation rather than two, because at 225 of these
     // a token the allocation is a cost worth counting. Only the two K-quant
     // paths read either.
-    const signed char* __restrict__ qa, int asc_off)
+    const signed char* __restrict__ qa, int asc_off, int a_rows)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -869,7 +869,10 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const int sub = lane >> 3, slot = lane & 7;
             const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
             const int q0 = jlo >> 5;
-            const size_t r = (size_t)blockIdx.z * m + row;
+            // `a_rows` and not `m`: the codes are dense `[batch, a_rows, k]`,
+            // and a batch that shares one activation - the attention
+            // projections do - quantizes it once and passes zero here.
+            const size_t r = (size_t)blockIdx.z * (size_t)a_rows + row;
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
             const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
@@ -913,7 +916,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const int qho = 128 + (pp << 4) + (hh << 3);
             const int sc_lo = (pp << 2) + hh;
             const int jlo = (pp << 6) + (hh << 4);
-            const size_t r = (size_t)blockIdx.z * m + row;
+            const size_t r = (size_t)blockIdx.z * (size_t)a_rows + row;
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
             const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
@@ -2681,7 +2684,7 @@ extern "C" __global__ void silu_mul(
 // the hardest possible thing to debug. `first` is the absolute position of row
 // zero, so a decode step past a KV cache rotates by where the token really is.
 extern "C" __global__ void rope(
-    float* __restrict__ x,
+    float* __restrict__ x, long off,
     const float* __restrict__ freq_div, int has_div,
     int t, int heads, int head_dim, float theta, int first)
 {
@@ -2715,7 +2718,11 @@ extern "C" __global__ void rope(
     float sn, cs;
     sincosf(angle, &sn, &cs);
 
-    const size_t base = ((size_t)p * heads + h) * head_dim + j;
+    // `off` is where this tensor starts. The attention projections are issued
+    // as one batched product, so `q` and `k` are two contiguous blocks of one
+    // allocation rather than two allocations, and rotating `k` means starting
+    // at its block instead of copying it out first.
+    const size_t base = (size_t)off + ((size_t)p * heads + h) * head_dim + j;
     const float a = x[base];
     const float b = x[base + half];
     x[base]        = a * cs - b * sn;
@@ -2875,7 +2882,7 @@ extern "C" __global__ void causal_mask(
 // that was thrown away before the next token. This is that work done once, at
 // the only moment the data is small.
 extern "C" __global__ void cache_append(
-    const float* __restrict__ src, float* __restrict__ dst,
+    const float* __restrict__ src, long src_off, float* __restrict__ dst,
     int n, int kv_heads, int head_dim, int cap, int past)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2886,7 +2893,7 @@ extern "C" __global__ void cache_append(
     const int ti = (int)(i / d);
     const int h = (int)((i % d) / head_dim);
     const int j = (int)(i % head_dim);
-    dst[((size_t)h * cap + past + ti) * head_dim + j] = src[i];
+    dst[((size_t)h * cap + past + ti) * head_dim + j] = src[(size_t)src_off + i];
 }
 
 // The same for values, which attention contracts over rather than along.
@@ -2895,7 +2902,7 @@ extern "C" __global__ void cache_append(
 // transpose the second matmul wants. That its rows are `capacity` apart rather
 // than `tk` is what `w_rs` in `gemv` and `gemm` is for.
 extern "C" __global__ void cache_append_t(
-    const float* __restrict__ src, float* __restrict__ dst,
+    const float* __restrict__ src, long src_off, float* __restrict__ dst,
     int n, int kv_heads, int head_dim, int cap, int past)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2906,7 +2913,7 @@ extern "C" __global__ void cache_append_t(
     const int ti = (int)(i / d);
     const int h = (int)((i % d) / head_dim);
     const int j = (int)(i % head_dim);
-    dst[((size_t)h * head_dim + j) * cap + past + ti] = src[i];
+    dst[((size_t)h * head_dim + j) * cap + past + ti] = src[(size_t)src_off + i];
 }
 
 extern "C" __global__ void repeat_kv(

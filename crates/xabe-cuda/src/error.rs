@@ -63,6 +63,22 @@ pub enum CudaError {
         want_k: usize,
     },
 
+    /// A read that starts inside a buffer and runs off the end of it.
+    ///
+    /// The attention projections are issued as one batched product, so `rope`
+    /// and `cache_append` are handed a whole allocation plus the offset of the
+    /// one block they own. An offset computed from the wrong grouping lands in
+    /// the middle of a real tensor: the read is in bounds for most of its
+    /// length, the numbers are plausible, and only the last rows are garbage.
+    /// So the end of the read is checked rather than the start.
+    #[error("reading to {at} in a buffer of {len}")]
+    SliceOverrun {
+        /// Where the read would end.
+        at: usize,
+        /// Elements the buffer holds.
+        len: usize,
+    },
+
     /// A cache append that would run past the buffer's capacity.
     ///
     /// The cache is one allocation holding every head, so a `past` beyond its

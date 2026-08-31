@@ -1262,25 +1262,38 @@ impl Gpu {
             && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
             && matches!(w.quant(), Some(Quant::Q4K | Quant::Q6K))
             && k.is_multiple_of(256);
+        // A zero left-operand stride means every product of the batch reads the
+        // same activation - the attention projections are three matrices
+        // against one normalised input - so it is quantized once and the
+        // kernel is told to stop advancing between products.
+        let shared_a = batch.count > 1 && batch.a == 0;
+        let q_rows = if shared_a { m } else { batch.count * m };
+        // What both packed paths add per batch element when they index the
+        // codes, which are dense `[batch, a_rows, k]`.
+        let a_rows = if shared_a { 0i32 } else { m as i32 };
+
         // A caller's own twin has to have been taken at this shape. Nothing in
         // the kernel could notice otherwise: it would index another tensor's
         // codes, in bounds, and return numbers.
         if let Some(q8) = a.q8()
-            && q8.shape() != (batch.count * m, k)
+            && q8.shape() != (q_rows, k)
         {
             let (rows, kk) = q8.shape();
             return Err(CudaError::MismatchedQ8 {
                 rows,
                 k: kk,
-                want_rows: batch.count * m,
+                want_rows: q_rows,
                 want_k: k,
             });
         }
         // The mat-vec's fast path and the tiled integer kernel read the same
         // codes in the same layout, so they share one quantisation.
+        //
+        // Quantizing `count * m` rows for a shared activation would be the
+        // same numbers two or three times over; `q_rows` above says so.
         let int8 = wide || use_i8;
         let taken = match (int8, a) {
-            (true, Operand::F32(v)) => Some(self.quantize_into(v, k, batch.count * m, sa, m)?),
+            (true, Operand::F32(v)) => Some(self.quantize_into(v, k, q_rows, sa, m)?),
             _ => None,
         };
         let q8 = match (int8, a.q8()) {
@@ -1364,9 +1377,6 @@ impl Gpu {
         };
         let a_half = if widened.is_some() { 1 } else { a_half };
 
-        // The codes are dense `[batch, m, k]`: each batch element of the
-        // twin starts `m` rows after the last.
-        let a_rows = m as i32;
         if use_i8 {
             let q = q8.expect("`use_i8` implies the activation was quantized");
             let off = q.scale_offset() as i32;
@@ -1461,8 +1471,8 @@ impl Gpu {
         let asc_off = q8.map_or(0, |q| q.scale_offset() as i32);
         if small {
             match q8 {
-                Some(q) => lb.arg(&q.buf).arg(&asc_off),
-                None => lb.arg(&null).arg(&asc_off),
+                Some(q) => lb.arg(&q.buf).arg(&asc_off).arg(&a_rows),
+                None => lb.arg(&null).arg(&asc_off).arg(&a_rows),
             };
         }
 
@@ -1539,6 +1549,7 @@ impl Gpu {
     pub fn cache_append(
         &self,
         src: &CudaSlice<f32>,
+        src_off: usize,
         dst: &mut CudaSlice<f32>,
         n: usize,
         kv_heads: usize,
@@ -1551,6 +1562,14 @@ impl Gpu {
             return Err(CudaError::CacheOverrun { at: past + n, cap });
         }
         let total = n * kv_heads * head_dim;
+        // The source may be one product of a batched projection rather than a
+        // whole allocation, so the read runs from `src_off` and has to fit.
+        if src_off + total > src.len() {
+            return Err(CudaError::SliceOverrun {
+                at: src_off + total,
+                len: src.len(),
+            });
+        }
         let name = if transposed {
             "cache_append_t"
         } else {
@@ -1565,15 +1584,18 @@ impl Gpu {
             cap as i32,
             past as i32,
         );
+        let so = src_off as i64;
         lb.arg(src)
+            .arg(&so)
             .arg(dst)
             .arg(&ni)
             .arg(&kh)
             .arg(&hd)
             .arg(&ca)
             .arg(&pa);
-        // SAFETY: one thread per source element, bounds checked in the kernel,
-        // and the destination range is checked above.
+        // SAFETY: one thread per source element, bounds checked in the kernel
+        // against `n * kv_heads * head_dim` from `src_off`, the destination
+        // range is checked above, and the caller's `src_off` is checked here.
         launched(name, unsafe { lb.launch(Self::flat(total)) })?;
         Ok(())
     }
@@ -2472,13 +2494,14 @@ impl Gpu {
     pub fn rope(
         &self,
         x: &mut CudaSlice<f32>,
+        off: usize,
         t: usize,
         heads: usize,
         head_dim: usize,
         theta: f32,
         first: usize,
     ) -> Result<(), CudaError> {
-        self.rope_scaled(x, None, t, heads, head_dim, theta, first)
+        self.rope_scaled(x, off, None, t, heads, head_dim, theta, first)
     }
 
     /// RoPE with an optional per-pair frequency divisor.
@@ -2491,6 +2514,7 @@ impl Gpu {
     pub fn rope_scaled(
         &self,
         x: &mut CudaSlice<f32>,
+        off: usize,
         freq_div: Option<&CudaSlice<f32>>,
         t: usize,
         heads: usize,
@@ -2499,6 +2523,15 @@ impl Gpu {
         first: usize,
     ) -> Result<(), CudaError> {
         let n = t * heads * head_dim / 2;
+        // `off` exists because the attention projections are issued as one
+        // batched product: `q` and `k` are contiguous blocks of one output,
+        // and rotating `k` in place is cheaper than copying it out to rotate.
+        if off + t * heads * head_dim > x.len() {
+            return Err(CudaError::SliceOverrun {
+                at: off + t * heads * head_dim,
+                len: x.len(),
+            });
+        }
         let (a, b_, c, d) = (t as i32, heads as i32, head_dim as i32, first as i32);
         let f = self.func("rope");
         let mut lb = self.stream.launch_builder(f);
@@ -2508,7 +2541,9 @@ impl Gpu {
         let dummy = &self.dummy;
         let has = i32::from(freq_div.is_some());
         let div = freq_div.unwrap_or(dummy);
+        let o = off as i64;
         lb.arg(x)
+            .arg(&o)
             .arg(div)
             .arg(&has)
             .arg(&a)

@@ -1117,7 +1117,7 @@ fn rope_matches_at_every_offset() {
         xabe_dsp::rope(&mut want, t, heads, hd, 10_000.0, first);
 
         let mut dev = g.upload(&x).expect("upload");
-        g.rope(&mut dev, t, heads, hd, 10_000.0, first)
+        g.rope(&mut dev, 0, t, heads, hd, 10_000.0, first)
             .expect("rope");
         // The tolerance has to grow with the position, and the reason is not
         // sloppiness on either side. Both compute `angle = pos * inv_freq` in
@@ -1169,7 +1169,7 @@ fn scaled_rope_matches_the_twin_with_llama3_factors() {
 
         let mut dev = g.upload(&x).expect("upload");
         let d = g.upload(&div).expect("upload div");
-        g.rope_scaled(&mut dev, Some(&d), t, heads, hd, 500_000.0, first)
+        g.rope_scaled(&mut dev, 0, Some(&d), t, heads, hd, 500_000.0, first)
             .expect("rope_scaled");
         let got = g.download(&dev).expect("download");
 
@@ -1190,9 +1190,9 @@ fn scaled_rope_with_no_divisor_is_the_unscaled_one() {
     let x = seq(t * heads * hd, 12);
 
     let mut a = g.upload(&x).expect("upload");
-    g.rope(&mut a, t, heads, hd, 10_000.0, 7).expect("rope");
+    g.rope(&mut a, 0, t, heads, hd, 10_000.0, 7).expect("rope");
     let mut b = g.upload(&x).expect("upload");
-    g.rope_scaled(&mut b, None, t, heads, hd, 10_000.0, 7)
+    g.rope_scaled(&mut b, 0, None, t, heads, hd, 10_000.0, 7)
         .expect("rope_scaled");
 
     assert_eq!(
@@ -1493,4 +1493,101 @@ fn a_split_contraction_is_bit_identical_from_run_to_run() {
             .expect("download");
         assert_eq!(first, again, "round {round} differs from the first");
     }
+}
+
+/// One block of a batched projection, rotated where it sits.
+///
+/// The attention projections are issued as one product, so `q` and `k` are two
+/// contiguous blocks of one allocation and `rope` is handed the whole thing
+/// plus an offset. What this guards is that the offset moves the *read* and
+/// nothing else: the rotation of a block at offset `o` must be bit-identical to
+/// the rotation of the same numbers at offset zero, and the bytes on either
+/// side of it must not move at all.
+#[test]
+fn rope_at_an_offset_rotates_that_block_and_only_that_block() {
+    let Some(g) = gpu() else { return };
+    let (t, heads, hd) = (5usize, 3usize, 64usize);
+    let span = t * heads * hd;
+    // A whole buffer of three blocks, rotating the middle one.
+    let all = seq(3 * span, 77);
+    let off = span;
+
+    let mut dev = g.upload(&all).expect("upload");
+    g.rope(&mut dev, off, t, heads, hd, 10_000.0, 11)
+        .expect("rope at an offset");
+    let got = g.download(&dev).expect("download");
+
+    // The block itself against the scalar twin, at the tolerance the other
+    // rope tests use - both sides compute the angle in f32 and `sincosf`
+    // disagrees in the last bits.
+    let mut want = all[off..off + span].to_vec();
+    xabe_dsp::rope(&mut want, t, heads, hd, 10_000.0, 11);
+    assert_close_to("rope at an offset", &want, &got[off..off + span], 1e-5);
+
+    // Everything outside the block, exactly: an offset that moved the write
+    // would show here and nowhere else.
+    assert_eq!(&got[..off], &all[..off], "wrote before the block");
+    assert_eq!(
+        &got[off + span..],
+        &all[off + span..],
+        "wrote after the block",
+    );
+
+    // And the same numbers alone, to show the offset is not doing arithmetic.
+    let mut alone = g.upload(&all[off..off + span]).expect("upload");
+    g.rope(&mut alone, 0, t, heads, hd, 10_000.0, 11)
+        .expect("rope");
+    assert_eq!(
+        g.download(&alone).expect("download"),
+        got[off..off + span],
+        "a block rotated in place differs from the same block rotated alone",
+    );
+}
+
+/// The same for the cache, which reads a block rather than writing one.
+#[test]
+fn cache_append_reads_its_own_block_of_a_batched_projection() {
+    let Some(g) = gpu() else { return };
+    let (n, kv_heads, hd, cap, past) = (4usize, 2usize, 8usize, 16usize, 3usize);
+    let span = n * kv_heads * hd;
+    let all = seq(3 * span, 41);
+    let off = 2 * span;
+
+    for transposed in [false, true] {
+        let src = g.upload(&all).expect("upload");
+        let mut fused = g.zeros(cap * kv_heads * hd).expect("cache");
+        g.cache_append(&src, off, &mut fused, n, kv_heads, hd, cap, past, transposed)
+            .expect("append at an offset");
+
+        let lone = g.upload(&all[off..off + span]).expect("upload");
+        let mut apart = g.zeros(cap * kv_heads * hd).expect("cache");
+        g.cache_append(&lone, 0, &mut apart, n, kv_heads, hd, cap, past, transposed)
+            .expect("append");
+
+        assert_eq!(
+            g.download(&fused).expect("fused"),
+            g.download(&apart).expect("apart"),
+            "transposed={transposed}: the offset changed more than the source",
+        );
+    }
+}
+
+/// A read that starts inside the buffer and ends past it is refused.
+#[test]
+fn an_offset_past_the_end_of_the_source_is_refused() {
+    let Some(g) = gpu() else { return };
+    let (t, heads, hd) = (2usize, 2usize, 8usize);
+    let span = t * heads * hd;
+    let mut x = g.zeros(span).expect("alloc");
+    assert!(
+        g.rope(&mut x, 1, t, heads, hd, 10_000.0, 0).is_err(),
+        "rope read one element past the end and did not say so",
+    );
+    let src = g.zeros(span).expect("alloc");
+    let mut dst = g.zeros(8 * heads * hd).expect("alloc");
+    assert!(
+        g.cache_append(&src, 1, &mut dst, t, heads, hd, 8, 0, false)
+            .is_err(),
+        "cache_append read past the end and did not say so",
+    );
 }

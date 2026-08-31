@@ -314,9 +314,9 @@ impl SpeechLlm {
             // would read 896 floats out of a 128-wide row. The buffer is the
             // right length in total, so nothing checks it and nothing crashes.
             self.gpu
-                .rope(&mut q, n, heads, hd, LlmConfig::ROPE_THETA, past)?;
+                .rope(&mut q, 0, n, heads, hd, LlmConfig::ROPE_THETA, past)?;
             self.gpu
-                .rope(&mut k, n, kv_heads, hd, LlmConfig::ROPE_THETA, past)?;
+                .rope(&mut k, 0, n, kv_heads, hd, LlmConfig::ROPE_THETA, past)?;
 
             if first {
                 cache.k.push(k);

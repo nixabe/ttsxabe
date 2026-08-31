@@ -202,11 +202,41 @@ impl GLinear {
 }
 
 /// One transformer block, on the device.
+/// The attention projections, grouped into as few products as the checkpoint
+/// allows.
+///
+/// Batching needs identical `(in_dim, out_dim, block format)`. This model is
+/// multi-head, so all three projections are the same width and the only thing
+/// that can separate them is the format - and Q4_K_M stores `attn_v` as Q6_K
+/// in half the layers, so half fuse all three and half fuse q with k and run v
+/// alone. `xabe-chat` has the same type for the same reason and reaches a
+/// different grouping, because a grouped-query model gives `attn_q` a
+/// different width from `attn_k`.
+///
+/// The point is block count. One 128-token prompt is one row of tiles, so a
+/// 5120-wide projection is 40 blocks on a machine that runs 144 at once, and
+/// the answer used to be splitting the contraction - which buys blocks at the
+/// cost of a partial buffer and a reduction pass. Three projections issued as
+/// one product buy the same blocks with neither.
+struct GAttn {
+    /// One entry per product, in q, k, v order.
+    groups: Vec<GGroup>,
+    /// Where each of q, k, v lands: which group, and which element of it.
+    ///
+    /// `q` is always `(0, 0)`, which is what lets the query keep reading the
+    /// output buffer from its start with no offset of its own.
+    at: [(usize, usize); 3],
+}
+
+/// One batched product: `count` matrices of identical shape in one allocation.
+struct GGroup {
+    w: GLinear,
+    count: usize,
+}
+
 struct GLayer {
     attn_norm: CudaSlice<f32>,
-    q: GLinear,
-    k: GLinear,
-    v: GLinear,
+    attn: GAttn,
     o: GLinear,
     ffn_norm: CudaSlice<f32>,
     gate: GLinear,
@@ -324,13 +354,79 @@ impl Translator {
             })
         };
 
+        // q, k and v as one product where their shapes and formats allow it.
+        // See [`GAttn`].
+        let fused = |bs: &[&Bound]| -> Result<GGroup, TranslateError> {
+            let head = bs[0];
+            let packed = if packing == Packing::Packed {
+                src.packed(head, &cfg)?.map(|(_, ty)| ty)
+            } else {
+                None
+            };
+            let w = match packed {
+                Some(ty) => {
+                    let mut all = Vec::new();
+                    for b in bs {
+                        let (bytes, bt) = src.packed(b, &cfg)?.expect("a packed sibling");
+                        debug_assert_eq!(bt, ty, "a group with two formats");
+                        all.extend_from_slice(&bytes);
+                    }
+                    GWeight::Packed {
+                        data: gpu.upload_quant(ty, &all)?,
+                        ty,
+                    }
+                }
+                None => {
+                    let mut all = Vec::new();
+                    for b in bs {
+                        all.extend_from_slice(&src.f16(b, &cfg)?);
+                    }
+                    GWeight::F16(gpu.upload_u16(&all)?)
+                }
+            };
+            Ok(GGroup {
+                w: GLinear {
+                    w,
+                    in_dim: head.shape[1],
+                    out_dim: head.shape[0],
+                },
+                count: bs.len(),
+            })
+        };
+        let attn = |a: &xabe_llama::Attention| -> Result<GAttn, TranslateError> {
+            let bs = [&a.q, &a.k, &a.v];
+            let key = |b: &Bound| {
+                (
+                    b.shape.clone(),
+                    (packing == Packing::Packed).then_some(b.packed).flatten(),
+                )
+            };
+            let mut runs: Vec<Vec<usize>> = Vec::new();
+            let mut at = [(0usize, 0usize); 3];
+            for i in 0..3 {
+                let joins = runs
+                    .last()
+                    .and_then(|r| r.last())
+                    .is_some_and(|&j| key(bs[i]) == key(bs[j]));
+                match joins {
+                    true => runs.last_mut().expect("a run to join").push(i),
+                    false => runs.push(vec![i]),
+                }
+                at[i] = (runs.len() - 1, runs[runs.len() - 1].len() - 1);
+            }
+            let mut groups = Vec::with_capacity(runs.len());
+            for r in &runs {
+                let bs: Vec<&Bound> = r.iter().map(|&i| bs[i]).collect();
+                groups.push(fused(&bs)?);
+            }
+            Ok(GAttn { groups, at })
+        };
+
         let mut layers = Vec::with_capacity(w.layers.len());
         for l in &w.layers {
             layers.push(GLayer {
                 attn_norm: wide(&l.attn_norm)?,
-                q: lin(&l.attn.q)?,
-                k: lin(&l.attn.k)?,
-                v: lin(&l.attn.v)?,
+                attn: attn(&l.attn)?,
                 o: lin(&l.attn.o)?,
                 ffn_norm: wide(&l.ffn_norm)?,
                 gate: lin(&l.mlp.gate)?,
@@ -517,17 +613,61 @@ impl Translator {
             // that produced the activation.
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.attn_norm)?;
             let xo = Self::operand(&x, xq.as_ref());
-            let mut q = self.project(xo, &l.q, n)?;
-            let mut k = self.project(xo, &l.k, n)?;
-            let v = self.project(xo, &l.v, n)?;
+            // One product per group rather than one per projection. Each
+            // element of a batched product writes a contiguous block of the
+            // same output, so q, k and v are located by an offset into one of
+            // these buffers and nothing is copied to separate them.
+            let mut proj = Vec::with_capacity(l.attn.groups.len());
+            for g in &l.attn.groups {
+                proj.push(self.gpu.gemm_batched(
+                    xo,
+                    g.w.operand(),
+                    None,
+                    Batch {
+                        count: g.count,
+                        // Zero: every matrix of the group multiplies the same
+                        // normalised activation, which is what lets it be
+                        // quantized once instead of once a projection.
+                        a: 0,
+                        w: g.w.in_dim * g.w.out_dim,
+                        out: n * g.w.out_dim,
+                        w_row: 0,
+                    },
+                    n,
+                    g.w.in_dim,
+                    g.w.out_dim,
+                )?);
+            }
+            let block = |j: usize| -> (usize, usize) {
+                let (gi, ei) = l.attn.at[j];
+                (gi, ei * n * l.attn.groups[gi].w.out_dim)
+            };
+            let (qg, q_off) = block(0);
+            let (kg, k_off) = block(1);
+            let (vg, v_off) = block(2);
+            debug_assert_eq!((qg, q_off), (0, 0), "the query leads its group");
 
             // Rotated before caching, because the position is absolute: a key
             // stored unrotated would be rotated again by the wrong offset on
             // every later step.
-            self.gpu
-                .rope(&mut q, n, heads, hd, self.cfg.rope_theta, past)?;
-            self.gpu
-                .rope(&mut k, n, heads, hd, self.cfg.rope_theta, past)?;
+            self.gpu.rope(
+                &mut proj[qg],
+                q_off,
+                n,
+                heads,
+                hd,
+                self.cfg.rope_theta,
+                past,
+            )?;
+            self.gpu.rope(
+                &mut proj[kg],
+                k_off,
+                n,
+                heads,
+                hd,
+                self.cfg.rope_theta,
+                past,
+            )?;
 
             // Scattered straight into the layout attention reads.
             if first {
@@ -535,21 +675,43 @@ impl Translator {
                 cache.v.push(self.gpu.zeros(cache.cap * h_dim)?);
             }
             let cap = cache.cap;
-            self.gpu
-                .cache_append(&k, &mut cache.k[i], n, heads, hd, cap, past, false)?;
-            self.gpu
-                .cache_append(&v, &mut cache.v[i], n, heads, hd, cap, past, true)?;
+            self.gpu.cache_append(
+                &proj[kg],
+                k_off,
+                &mut cache.k[i],
+                n,
+                heads,
+                hd,
+                cap,
+                past,
+                false,
+            )?;
+            self.gpu.cache_append(
+                &proj[vg],
+                v_off,
+                &mut cache.v[i],
+                n,
+                heads,
+                hd,
+                cap,
+                past,
+                true,
+            )?;
             let tk = past + n;
 
             // A single step's queries are already `[head][1][d]`; only a
             // multi-row pass has anything to split.
+            // The query is at the start of its buffer, so `split_heads` reads
+            // it from zero and a single step reads it as the row it is.
+            let q = &proj[qg];
+
             let qh = match n {
                 1 => None,
-                _ => Some(self.gpu.split_heads(&q, n, heads, hd)?),
+                _ => Some(self.gpu.split_heads(q, n, heads, hd)?),
             };
 
             let mut scores = self.gpu.gemm_batched(
-                Operand::F32(qh.as_ref().unwrap_or(&q)),
+                Operand::F32(qh.as_ref().unwrap_or(q)),
                 Operand::F32(&cache.k[i]),
                 None,
                 Batch {
