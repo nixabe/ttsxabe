@@ -124,9 +124,9 @@ translator's has not, and prefill is untouched.
 
 | Checkpoint | | llama.cpp | this engine | |
 | --- | --- | ---: | ---: | ---: |
-| Breeze2 8 B Q4_K_M | prefill, 128 tok | **2416 tok/s** | 1414 tok/s | 1.71x behind |
+| Breeze2 8 B Q4_K_M | prefill, 128 tok | **2416 tok/s** | 1836 tok/s | 1.32x behind |
 | | decode, 64 tok | 101.1 tok/s | 101.1 tok/s | level |
-| Taigi 13 B Q4_K_M | prefill, 128 tok | **1400 tok/s** | 841 tok/s | 1.66x behind |
+| Taigi 13 B Q4_K_M | prefill, 128 tok | **1400 tok/s** | 1025 tok/s | 1.37x behind |
 | | decode, 64 tok | **61.4 tok/s** | 61.0 tok/s | level |
 
 The llama.cpp prefill figures are noisy - +/- 156 and +/- 79 tok/s across five
@@ -190,7 +190,9 @@ against 3103. Everything below is the distance between those two numbers.
 | read K-quant nibbles by the word | 1198 | 733 |
 | stage in quads, unpack sixteen a call | 1355 | 832 |
 | project only the row that predicts | 1414 | 841 |
-| *the same kernel with no staging at all* | *3103* | - |
+| `ldmatrix` instead of scalar shared loads | 1469 | 889 |
+| one load for a Q4_K header instead of eight | 1836 | 1025 |
+| *the same kernel with no staging at all* | *3341* | - |
 
 **The tile was not the problem, and a broken measurement said it was.** The
 first thing tried was a tile sweep, and it reported 1441 tok/s at 32x64 against
@@ -218,6 +220,29 @@ time, one global load per element produced; and the activation quads and the
 K-quant runs were both narrower than the alignment allowed. None of these is
 clever. All three were sitting in the hottest loop in the engine.
 
+### Where the last two came from, and where the time is now
+
+Both came out of the same diagnostic run twice: delete one half of the staging
+and time what is left. That said the *weights* were 40 ms of an 88 ms prefill
+and the activations 13, and an earlier test had already put the
+dequantisation arithmetic at 3 ms. So 37 ms was neither arithmetic nor the
+activation - it was how the weight header was read.
+
+A Q4_K block opens with `d`, `dmin` and twelve packed scale bytes: exactly
+sixteen, and 16-byte aligned. Reading them cost eight separate byte loads a
+run, scattered 144 bytes apart across a warp. One `uint4` is the whole header,
+and that alone was 1469 to 1836 tok/s.
+
+`ldmatrix` is the other. The mma loop issued 72 `ld.shared` a lane per staged
+trip against 64 `mma` - each lane fetching its own 32 bits of a tile the
+hardware will fetch whole - and `ldmatrix` takes that to 40.
+
+Split again at the end, a 69 ms prefill is now roughly 38 ms of mma loop, 21
+of weight staging and 9 of activation staging. The mma loop is the largest
+piece and is about 72% of what this card can issue: 1.8 TFLOP of prefill
+against 512 f32-accumulate FLOP a cycle on 72 SMs at 1.77 GHz is a 27.6 ms
+floor, and the loop with all staging deleted measures 38.
+
 ### The two that did not work, and why
 
 Both are the textbook answer to "the staging and the mma never overlap, because
@@ -241,6 +266,28 @@ The common cause is that sm_75 has no `cp.async`: a global-to-shared copy
 occupies registers or a second buffer, and this kernel has no room for either.
 The second resident block was already providing the overlap, and both schemes
 pay for a better overlap by removing it.
+
+**Register prefetch was tried again** after the staging got cheaper, on the
+weight side alone, and it is a *wash* rather than a loss: 1854 against 1855.
+Worth recording twice over. The first attempt indexed the register file by a
+loop variable the compiler could not prove constant, which put it in local
+memory - a 32-byte stack frame and 1521 tok/s, slower than no prefetch at all.
+Unrolled over a compile-time trip count it holds 124 registers, no stack
+frame, and buys nothing: the two resident blocks were already covering that
+latency. It is not in the tree.
+
+**`ldmatrix.x4`** takes the mma loop's shared loads from 40 to 18 and measures
+worse - 1469 against 1477 on the chat model, 882 against 897 on the
+translator, 122 registers against 117. Four results have to stay live across
+the `nt` loop.
+
+**Keeping the weight tile in registers instead of shared** is the idea this
+stopped short of. The B tile has *no cross-warp reuse* - warp `w` reads rows
+`16w..16w+15` and nothing else touches them - so its shared round trip is pure
+overhead. What makes it not worth doing is that `bs` is a statically sized
+`__shared__` array and the format is a runtime value, so the 10 KB cannot be
+given back and only the instructions can: about 5% of the loop, against a
+rewrite of the fragment addressing.
 
 ### Two things that are not worth trying again
 
