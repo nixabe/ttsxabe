@@ -120,7 +120,16 @@ pub struct AsrModel {
 /// 32 layers of a 1500x1280 projection per token, which is most of the cost of
 /// the decoder. Self-attention's grow by one row a step.
 pub struct Cache {
-    /// Per layer, `[len, d_model]`, capacity `max_target_positions`.
+    /// Per layer, `[heads, cap, head_dim]` and `[heads, head_dim, cap]`.
+    ///
+    /// Head-major and transposed on the value side, which is the layout
+    /// attention reads. The first version of this stored what the projection
+    /// produced - `[len, d_model]` - and rearranged it into this shape every
+    /// step, with a fresh allocation, a zeroing and a full copy of the whole
+    /// cache to grow it. That is four allocations and six launches a layer,
+    /// 128 and 192 a token across the stack, all producing tensors thrown away
+    /// before the next one. The chat model was found to have the same fault
+    /// and fixed the same way; docs/BENCHMARKS.md has both.
     self_k: Vec<CudaSlice<f32>>,
     self_v: Vec<CudaSlice<f32>>,
     /// Per layer, `[heads, 1500, head_dim]` and `[heads, head_dim, 1500]`,
@@ -129,6 +138,13 @@ pub struct Cache {
     cross_v: Vec<CudaSlice<u16>>,
     /// How many tokens the self-attention halves hold.
     len: usize,
+    /// How many they have room for, which is not the same number.
+    ///
+    /// Allocated once at `max_target_positions` rather than doubled as the
+    /// chat model's is: 448 positions of 1280 floats is 2.3 MB a layer and
+    /// 73 MB across the stack, which is small enough that growing it would be
+    /// machinery bought with nothing.
+    cap: usize,
 }
 
 impl Cache {
@@ -307,9 +323,16 @@ impl AsrModel {
     /// Attention, given queries already projected and split, and keys and
     /// values already split.
     ///
-    /// `q` is `[heads, tq, head_dim]`, `k` is `[heads, tk, head_dim]` and `v`
-    /// is `[heads, head_dim, tk]` - the transpose, because the context product
-    /// reads the values down their time axis. Returns `[tq, d_model]`.
+    /// `q` is `[heads, tq, head_dim]`, `k` is `[heads, cap, head_dim]` and `v`
+    /// is `[heads, head_dim, cap]` - the transpose, because the context
+    /// product reads the values down their time axis. Returns `[tq, d_model]`.
+    ///
+    /// `cap` is how many positions the key and value operands are *laid out*
+    /// for, which for the self-attention cache is more than the `tk` in them.
+    /// It is a stride, not a bound: the products contract over `tk`, so the
+    /// untouched tail of the cache is skipped rather than zero-weighted. Pass
+    /// `tk` where the operand is exactly as long as it is used, which is both
+    /// attentions in the encoder and cross-attention in the decoder.
     // Shapes are arguments, not types - the same convention as the `xabe-dsp`
     // and `xabe-cuda` kernels this composes.
     #[allow(clippy::too_many_arguments)]
@@ -320,6 +343,7 @@ impl AsrModel {
         v: Operand<'_>,
         tq: usize,
         tk: usize,
+        cap: usize,
         heads: usize,
         causal: bool,
     ) -> Result<CudaSlice<f32>, AsrError> {
@@ -331,7 +355,7 @@ impl AsrModel {
             Batch {
                 count: heads,
                 a: tq * hd,
-                w: tk * hd,
+                w: cap * hd,
                 out: tq * tk,
                 w_row: 0,
             },
@@ -340,11 +364,16 @@ impl AsrModel {
             tk,
         )?;
         if causal {
-            // With `tk - tq` keys already cached, query `i` really sits at
-            // position `i + (tk - tq)`.
-            self.gpu.causal_mask(&mut scores, heads, tq, tk, tk - tq)?;
+            // Mask and softmax in one pass. With `tk - tq` keys already
+            // cached, query `i` really sits at position `i + (tk - tq)`, which
+            // is what the offset says. The scale is 1: Whisper scales the
+            // query before the product and not the scores after it, for the
+            // reason [`Self::queries`] gives.
+            self.gpu
+                .softmax_causal(&mut scores, heads * tq, tk, tq, tk - tq, 1.0)?;
+        } else {
+            self.gpu.softmax_rows(&mut scores, heads * tq, tk)?;
         }
-        self.gpu.softmax_rows(&mut scores, heads * tq, tk)?;
         let ctx = self.gpu.gemm_batched(
             // The probabilities are *not* converted. They are read exactly
             // once - the context product has a single column tile at
@@ -357,15 +386,24 @@ impl AsrModel {
             Batch {
                 count: heads,
                 a: tq * tk,
-                w: hd * tk,
+                w: hd * cap,
                 out: tq * hd,
-                w_row: 0,
+                // Zero where the values are exactly as long as they are used,
+                // which is the layout the packed cross-attention halves are in
+                // and the only one the f16 path takes.
+                w_row: if cap == tk { 0 } else { cap },
             },
             tq,
             tk,
             hd,
         )?;
-        Ok(self.gpu.merge_heads(&ctx, tq, heads, hd)?)
+        // `[head][tq][hd]` is `[tq][heads * hd]` when `tq` is 1, which is
+        // every step of a greedy decode after the prefix. There is nothing to
+        // merge and the launch is skipped.
+        match tq {
+            1 => Ok(ctx),
+            _ => Ok(self.gpu.merge_heads(&ctx, tq, heads, hd)?),
+        }
     }
 
     /// Queries, projected, scaled and split.
@@ -387,7 +425,11 @@ impl AsrModel {
         let mut q = self.project(x, &a.q, t)?;
         self.gpu
             .scale_inplace(&mut q, t * self.cfg.d_model, (hd as f32).powf(-0.5))?;
-        Ok(self.gpu.split_heads(&q, t, heads, hd)?)
+        // One row is already `[head][1][hd]`, so the split has nothing to do.
+        match t {
+            1 => Ok(q),
+            _ => Ok(self.gpu.split_heads(&q, t, heads, hd)?),
+        }
     }
 
     /// A feed-forward block, applied in place on the residual stream.
@@ -499,6 +541,7 @@ impl AsrModel {
                     Operand::F32(&v),
                     t,
                     t,
+                    t,
                     heads,
                     false,
                 )?
@@ -544,12 +587,22 @@ impl AsrModel {
             cross_k.push(self.gpu.to_f16(&k, t * d)?);
             cross_v.push(self.gpu.to_f16(&v, t * d)?);
         }
+        // The self-attention halves are allocated here rather than on the
+        // first step, so a decode never allocates at all.
+        let cap = self.cfg.max_target_positions;
+        let mut self_k = Vec::with_capacity(self.dec_layers.len());
+        let mut self_v = Vec::with_capacity(self.dec_layers.len());
+        for _ in &self.dec_layers {
+            self_k.push(self.gpu.zeros(cap * d)?);
+            self_v.push(self.gpu.zeros(cap * d)?);
+        }
         Ok(Cache {
-            self_k: Vec::new(),
-            self_v: Vec::new(),
+            self_k,
+            self_v,
             cross_k,
             cross_v,
             len: 0,
+            cap,
         })
     }
 
@@ -590,7 +643,6 @@ impl AsrModel {
         let pos = self.gpu.copy_range(&self.dec_pos, past * d, n * d)?;
         self.gpu.add_inplace(&mut h, &pos, n * d)?;
 
-        let first = cache.self_k.is_empty();
         let mut tapped = Vec::with_capacity(taps);
         for (i, l) in self.dec_layers.iter().enumerate() {
             let x = self.norm(&h, &l.attn_ln, n)?;
@@ -598,33 +650,45 @@ impl AsrModel {
             let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
             let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
 
-            // The cache holds `[t, d_model]` and is split per step. Keeping it
-            // already split would save the permutation and cost an append that
-            // scatters across `heads` separate runs; at a few hundred tokens
-            // of 1280 the permutation is the cheaper of the two by far.
-            if first {
-                cache.self_k.push(k_new);
-                cache.self_v.push(v_new);
-            } else {
-                let (ck, cv) = (&mut cache.self_k[i], &mut cache.self_v[i]);
-                let mut grown_k = self.gpu.zeros((past + n) * d)?;
-                let mut grown_v = self.gpu.zeros((past + n) * d)?;
-                self.gpu.copy_into(&mut grown_k, ck, 0, past * d)?;
-                self.gpu.copy_into(&mut grown_v, cv, 0, past * d)?;
-                self.gpu.copy_into(&mut grown_k, &k_new, past * d, n * d)?;
-                self.gpu.copy_into(&mut grown_v, &v_new, past * d, n * d)?;
-                *ck = grown_k;
-                *cv = grown_v;
-            }
+            // Scattered straight into the layout attention reads, in a buffer
+            // that already has room for the whole utterance. This used to
+            // allocate a larger pair, copy the whole cache into it and then
+            // permute both into head order every step; the comment that stood
+            // here argued the permutation was cheaper than a scattered append,
+            // and it was measuring the wrong thing - the append and the
+            // permutation are the same kernel, so keeping the cache in the
+            // read layout costs nothing and saves all of it.
+            let cap = cache.cap;
+            self.gpu.cache_append(
+                &k_new,
+                0,
+                &mut cache.self_k[i],
+                n,
+                heads,
+                hd,
+                cap,
+                past,
+                false,
+            )?;
+            self.gpu.cache_append(
+                &v_new,
+                0,
+                &mut cache.self_v[i],
+                n,
+                heads,
+                hd,
+                cap,
+                past,
+                true,
+            )?;
             let tk = past + n;
-            let k = self.gpu.split_heads(&cache.self_k[i], tk, heads, hd)?;
-            let v = self.gpu.split_heads_t(&cache.self_v[i], tk, heads, hd)?;
             let ctx = self.attend(
                 Operand::F32(&q),
-                Operand::F32(&k),
-                Operand::F32(&v),
+                Operand::F32(&cache.self_k[i]),
+                Operand::F32(&cache.self_v[i]),
                 n,
                 tk,
+                cap,
                 heads,
                 true,
             )?;
@@ -641,6 +705,7 @@ impl AsrModel {
                 Operand::F16(&cache.cross_k[i]),
                 Operand::F16(&cache.cross_v[i]),
                 n,
+                enc_t,
                 enc_t,
                 heads,
                 false,
