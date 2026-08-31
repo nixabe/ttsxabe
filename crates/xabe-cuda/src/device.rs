@@ -1258,11 +1258,28 @@ impl Gpu {
         // emitted so far and half of those are odd. The half pointer is
         // `sa >> 1` for the same reason, so an odd stride would land every
         // batch after the first half an element out.
+        //
+        // Only against a *packed* weight, and that restriction is measured
+        // rather than principled-sounding. A block-quantized weight is a
+        // quarter the bytes of the activation it multiplies, so the activation
+        // is most of what the staging reads and halving it is most of the
+        // saving. Against an f16 or f32 weight the weight dominates, the
+        // conversion is a launch and a pass for a few percent of the traffic,
+        // and it measured as a loss: the ASR lost 9.6% of a transcription to
+        // it, and `bench-gemm`'s f32 encoder shapes ran at 19.3 TFLOP/s with
+        // it against 20.8 without.
+        //
+        // And only over what the kernel reads. `v` can be a slice of a larger
+        // allocation, and converting all of it was the other half of that cost.
+        let want = (batch.count - 1) * batch.a + m * k;
         let widened = match a {
             Operand::F32(v) | Operand::F32Q { data: v, .. }
-                if !small && k.is_multiple_of(2) && batch.a.is_multiple_of(2) =>
+                if !small
+                    && w.quant().is_some()
+                    && k.is_multiple_of(2)
+                    && batch.a.is_multiple_of(2) =>
             {
-                Some(self.to_f16(v, v.len())?)
+                Some(self.to_f16(v, want.min(v.len()))?)
             }
             _ => None,
         };

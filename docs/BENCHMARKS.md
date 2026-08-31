@@ -256,16 +256,37 @@ instructions - 18 loads per 16 mma - measured worse at every tile tried
 (`GEMM_WARPS = 4` at 128x128: 819; 128x256 at eight warps: 828). The
 accumulator array grows with it and the registers come from the same budget.
 
-### None of it reached the ASR
+### The ASR, and a regression that hid inside an end-to-end wash
 
-The same `gemm` runs the Whisper encoder, and on the three `bench-gemm` encoder
-shapes it went from 16.8/15.2/16.2 to 19.4/17.7/18.4 TFLOP/s. End to end the
-ASR did not move: 293.4 ms before the work and 294.3 ms after, on the same
-2.67 s clip, which is inside the run-to-run spread. The encoder matmul is not
-what the ASR is waiting on, so the 0.55x against `whisper-server` is untouched
-and stays a recorded miss. Measured rather than assumed, because a 15% gain on
-the kernel that "is" the encoder is exactly the kind of thing that gets written
-up as an end-to-end number without anyone checking.
+The same `gemm` runs the Whisper encoder, so the encoder shapes went from
+16.8/15.2/16.2 to 20.8/18.0/19.7 TFLOP/s. The first end-to-end check said the
+ASR had not moved at all - 293.4 ms before the work, 294.3 after - which was
+read as "the encoder matmul is not what the ASR waits on" and written up as
+such. That reading was wrong, and the way it was wrong is the point: the
+measurement compared *all* of the session's changes at once, and inside it one
+change was giving back what the others won.
+
+The activation-widening pass was the culprit. It rounds an f32 activation to
+f16 once instead of on every staging trip, which is free accuracy-wise and
+worth 1% on the chat model's prefill - and it was costing the ASR 9.6% of a
+transcription, 262 ms against 288. Two reasons: it converted `v.len()` rather
+than the `(count - 1) * sa + m * k` the kernel actually reads, and it ran
+against every weight format. A block-quantized weight is a quarter the bytes of
+the activation it multiplies, so halving the activation is most of the saving;
+an f16 or f32 weight dominates its own staging and the pass buys a few percent
+of the traffic for a launch. Gated on a packed weight and sized to what is
+read, the ASR is 266 ms - 9.4% faster than before any of this work, not level
+with it.
+
+`bench-gemm` shows the same thing from the other side: its f32 encoder shapes
+ran at 19.3 TFLOP/s with the widening and 20.8 without.
+
+The ASR is still 0.55x against `whisper-server` and that stays a recorded miss.
+The lesson is narrower and worth more: **an end-to-end number that does not
+move is not evidence that nothing changed.** Two changes of opposite sign
+inside one A/B look exactly like no change at all, and the only way this
+surfaced was profiling the ASR and finding a kernel at 10.4% of its GPU time
+that had not existed that morning.
 
 ## Sixteen bytes a lane, and the token that was 40% not-matmul
 
