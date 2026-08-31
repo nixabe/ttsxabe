@@ -59,6 +59,12 @@ pub const SOURCE: &str = r#"
 // elements and a run that crossed one would need two scales.
 #define GEMM_QRUN  (((GEMM_KC % 16) == 0) ? 16 : 8)
 
+// Weight-staging items one thread takes per trip. A compile-time count so the
+// per-thread header cache below is indexed by a constant and stays in
+// registers.
+#define GEMM_BITER ((GEMM_NT * (GEMM_KC / GEMM_QRUN) + GEMM_WARPS * 32 - 1) \
+                    / (GEMM_WARPS * 32))
+
 // The block tile is chosen by *global* traffic, not by shared-memory capacity.
 //
 // A block reads the whole contraction for GEMM_MT rows of `a` and GEMM_NT rows
@@ -563,6 +569,32 @@ __device__ __forceinline__ void q_words(const unsigned char* p, unsigned* w)
 // cover one row of a `GEMM_KC = 32` trip. Sixteen halves that and reads the
 // quants as one 16-byte load instead of two 8-byte ones. It cannot go higher
 // while a Q6_K scale group is sixteen elements.
+// The same, for a caller that already holds the header.
+//
+// A Q4_K super-block is 256 elements and a staged trip covers `GEMM_KC` of
+// them, so eight consecutive trips read the same sixteen bytes - and a thread
+// keeps the same weight row throughout, so it can read them once. Before this
+// the weight side fetched 24 bytes for every 16 elements whose payload is 9,
+// and the loads were 13 ms of a 69 ms prefill.
+template <int RUN>
+__device__ __forceinline__ void q4k_run_hdr(
+    uint4 h, const unsigned char* blk, int j, float* e)
+{
+    float d = q_half_lo(h.x), dmin = q_half_hi(h.x);
+    unsigned char sc, mn;
+    q_scale_min_words(h.y, h.z, h.w, j >> 5, sc, mn);
+    const unsigned char* qs = blk + 16 + ((j >> 6) << 5) + (j & 31);
+    int shift = ((j >> 5) & 1) << 2;
+    float ds = d * (float)sc, dm = dmin * (float)mn;
+    unsigned w[RUN / 4];
+    q_words<RUN / 4>(qs, w);
+    #pragma unroll
+    for (int t = 0; t < RUN; ++t) {
+        unsigned byte = (w[t >> 2] >> ((t & 3) << 3)) & 0xFF;
+        e[t] = ds * (float)((byte >> shift) & 0x0F) - dm;
+    }
+}
+
 template <int RUN>
 __device__ __forceinline__ void q4k_run(
     const unsigned char* blk, int j, float* e)
@@ -1030,6 +1062,17 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         }
     }
 
+    // One header per weight row per *super-block*, not per trip. `q_fast` and
+    // the row a thread stages are both fixed for the whole loop, so the only
+    // thing that changes is which 256-element super-block `kk` falls in - once
+    // every eight trips at `GEMM_KC = 32`. See `q4k_run_hdr`.
+    uint4 bhdr[GEMM_BITER];
+    long  bhdr_sb[GEMM_BITER];
+    #pragma unroll
+    for (int u = 0; u < GEMM_BITER; ++u) {
+        bhdr_sb[u] = -1;
+    }
+
     for (int kc = kbeg; kc < kend; kc += GEMM_KC) {
         // Stage both tiles as f16. Out-of-range rows and columns are zeroed
         // rather than clamped: a zero contributes nothing to the dot product,
@@ -1113,8 +1156,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         const bool q_fast = w_quant && q_bs == 256
             && (w_quant == QT_Q4_K || w_quant == QT_Q6_K);
         if (q_fast) {
-            for (int i = tid; i < GEMM_NT * (GEMM_KC / GEMM_QRUN);
-                 i += GEMM_WARPS * 32) {
+            #pragma unroll
+            for (int u = 0; u < GEMM_BITER; ++u) {
+                const int i = tid + u * (GEMM_WARPS * 32);
+                if (i >= GEMM_NT * (GEMM_KC / GEMM_QRUN)) continue;
                 int row = i / (GEMM_KC / GEMM_QRUN);
                 int jq  = i % (GEMM_KC / GEMM_QRUN);
                 int kk  = kc + GEMM_QRUN * jq;
@@ -1129,7 +1174,19 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
                         const unsigned char* blk = wq
                             + ((size_t)(n0 + row) * nb + (kk >> 8)) * (size_t)q_ts;
                         if (w_quant == QT_Q4_K) {
-                            q4k_run<GEMM_QRUN>(blk, kk & 255, e);
+                            const long sb = (long)(n0 + row) * nb + (kk >> 8);
+                            if (sb != bhdr_sb[u]) {
+                                bhdr[u] = (((size_t)blk) & 15) == 0
+                                    ? *reinterpret_cast<const uint4*>(blk)
+                                    : make_uint4(0, 0, 0, 0);
+                                bhdr_sb[u] = ((((size_t)blk) & 15) == 0) ? sb : -1;
+                            }
+                            if (bhdr_sb[u] == sb) {
+                                q4k_run_hdr<GEMM_QRUN>(bhdr[u], blk, kk & 255, e);
+                            } else {
+                                // Unaligned block: no cache, the general path.
+                                q4k_run<GEMM_QRUN>(blk, kk & 255, e);
+                            }
                         } else {
                             q6k_run<GEMM_QRUN>(blk, kk & 255, e);
                         }
