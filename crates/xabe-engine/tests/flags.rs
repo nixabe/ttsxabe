@@ -226,6 +226,78 @@ fn the_full_chain_needs_speech_in_a_reply_and_speech_out() {
     assert!(!full.translator.is_on());
 }
 
+// ----------------------------------------------------------- registered engines
+
+#[test]
+fn a_named_engine_is_a_tts_stage_on_its_own() {
+    // Serving one synthesiser without loading the rest: `--tts-engine` names
+    // the checkpoint and there is no `--tts-model` for it to be an extra to.
+    let s = stages(&[
+        "--tts-engine",
+        "taco=/models/tts/tacotron2-nan",
+        "--serve",
+        "h:1",
+    ])
+    .expect("stages");
+
+    assert!(
+        s.has_tts(),
+        "a registered engine is a synthesiser in this process"
+    );
+    assert!(s.any_on(), "so the run is not stageless");
+    // The unnamed slot stays empty: what `--tts-engine` filled has a name, and
+    // nothing downstream should mistake it for the `--tts-model` one.
+    assert_eq!(s.tts, xabe_engine::Stage::Off);
+}
+
+#[test]
+fn a_device_is_meaningful_for_a_named_engine_with_no_tts_model() {
+    // The card a registered engine lands on is `--tts-device`, and with no
+    // `--tts-model` there is no other flag that says which one.
+    let s = stages(&[
+        "--tts-engine",
+        "taco=/models/tts/tacotron2-nan",
+        "--tts-device",
+        "1",
+        "--serve",
+        "h:1",
+    ])
+    .expect("stages");
+    assert!(s.has_tts());
+
+    // Still validated, though: the stage being off is not a licence to accept
+    // a device string that names nothing.
+    let e = stages(&[
+        "--tts-engine",
+        "taco=/t",
+        "--tts-device",
+        "bogus",
+        "--serve",
+        "h:1",
+    ])
+    .unwrap_err();
+    assert_eq!(
+        e,
+        xabe_engine::StageError::BadDevice(xabe_engine::Kind::Tts, "bogus".into())
+    );
+}
+
+#[test]
+fn a_named_engine_completes_the_full_chain() {
+    let full = stages(&[
+        "--asr-model",
+        "/a",
+        "--tts-engine",
+        "taco=/t",
+        "--llm-url",
+        "http://h:8082",
+        "--serve",
+        "h:1",
+    ])
+    .expect("stages");
+    assert!(full.full_chain(), "speech in, a reply, and speech out");
+}
+
 // ------------------------------------------------------------------ the actions
 
 #[test]
@@ -302,6 +374,7 @@ fn every_stage_flag_has_an_environment_twin() {
         "XABE_TRANSLATOR_URL",
         "XABE_TRANSLATOR_DEVICE",
         "XABE_LLM_URL",
+        "XABE_TTS_ENGINES",
     ] {
         assert!(help.contains(var), "{var} is not in --help");
     }

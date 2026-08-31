@@ -53,6 +53,11 @@ pub enum EngineError {
     ///
     /// Hit most easily with `--direct-taigi`, which answers in Taigi *Han* and
     /// takes the translator out of the pipeline in the same move.
+    ///
+    /// Checked only when the chat model is in this process. The script is read
+    /// on the converse path and nowhere else, so a synthesiser-only worker -
+    /// which is handed text over `/tts` and speaks it as given - is not
+    /// subject to it, and does not have to lie about what it reads to come up.
     #[error(
         "engine `{engine}` reads `{script}` and there is no translator to \
          produce it; give --translator-model, or use an engine that reads HAN"

@@ -100,7 +100,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |
 | `--out` | — | — | one-shot output; `-` writes stdout |
-| `--tts-engine` | `XABE_TTS_ENGINES` | — | extra engines as `name=url` or `name=path`, repeatable |
+| `--tts-engine` | `XABE_TTS_ENGINES` | — | engines as `name=url` or `name=path`, repeatable; on its own it *is* the TTS stage |
 | `--cosy-voice` | `XABE_COSY_VOICE` | `<checkpoint>/voices/taigi-ref.safetensors` | speaker bundle for a local CosyVoice |
 | `--cosy-instruct` | `XABE_COSY_INSTRUCT` | a Taigi instruction | what a local CosyVoice is told; must end on `<|endofprompt|>` |
 | `--taco-sigma` | `XABE_TACO_SIGMA` | `tacotron2.json`'s `0.666` | WaveGlow's noise scale for a local Tacotron2 |
@@ -148,6 +148,22 @@ of here, where the path is still in hand.
 
 `--tts-model` sniffs the same way, so it takes either checkpoint. Which one it
 is, is a property of the directory rather than of a second flag.
+
+It also stands alone. `--tts-model` fills one unnamed slot and `--tts-engine`
+fills named ones, but both are a synthesiser running in this process, so a run
+given only the latter has a TTS stage and `--tts-device` says which card its
+local engines land on. That is how one synthesiser is served without loading
+the rest:
+
+```sh
+# tacotron2 and nothing else
+xabe-engine --serve 127.0.0.1:8100 \
+            --tts-engine  taco=models/tts/tacotron2-nan --tts-device 1 \
+            --tts-default taco
+```
+
+Only `--tts-model` and `--tts-url` fill the slot the one-shot `--text` path
+speaks with, because that path has no engine to select by name.
 
 ```sh
 # all three synthesisers in one process, on card 2
@@ -229,11 +245,15 @@ packed path's remaining headroom was measured:
 ```sh
 xabe-llm-bench --model models/breeze2-8b-Q4_K_M.gguf --kind chat --device 0
 xabe-llm-bench --model models/taigi-translator-13b-Q4_K_M.gguf --kind translate --device 0
-``` A local engine registered
-through `--tts-engine` shares `--tts-device` with `--tts-model`, and CosyVoice
-is CUDA only — there is no scalar path for a 642 M-parameter decode plus a
-22-layer diffusion transformer, and offering one would give a configuration
-that starts and then never answers.
+```
+
+A local engine registered through `--tts-engine` shares `--tts-device` with
+`--tts-model`, and takes it from there when there is no `--tts-model` to share
+it with. CosyVoice is CUDA only — there is no scalar path for a 642
+M-parameter decode plus a 22-layer diffusion transformer, and offering one
+would give a configuration that starts and then never answers. So is
+Tacotron2: WaveGlow is 87.9 M parameters of dilated convolution run at the
+sample rate.
 
 `--<stage>-device` exists per stage because the pipeline deliberately spreads
 stages across cards: putting the ASR and the TTS on one GPU makes the next
@@ -266,7 +286,8 @@ same; someone told to wait for phase 3 would wait forever.
 | `--vad-*` with `--serve` and no ASR | served, a VAD is only ever a gate |
 | `--vad-device 0` | the VAD has no CUDA implementation |
 | `--asr-device cpu` | the ASR has no CPU implementation |
-| no stage at all | names the four flag pairs that would give one |
+| no stage at all | names the flag pairs that would give one |
+| `--tts-device` with no `--tts-model` and no `--tts-engine` | nothing local to place |
 | stages but no `--serve`, `--in` or `--text` | a serve command with `--serve` forgotten |
 | `--in` and `--text` together | alternatives; give one |
 | `--serve` with `--in` or `--text` | a server is not a one-shot run |

@@ -190,6 +190,12 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
                 .unwrap_or(Device::Cpu);
             TtsBackend::Local(spawn_local(args, &dir, device)?)
         };
+        tracing::info!(
+            engine = name,
+            local = matches!(backend, TtsBackend::Local(_)),
+            target,
+            "tts engine",
+        );
         tts.insert(name.to_string(), backend);
     }
     if let Some(name) = &args.tts_default {
@@ -214,7 +220,14 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     // reads romanisation gets it from the translator and from nowhere else, so
     // without one it is handed Han and says nothing. Remote engines are left
     // alone: what an upstream accepts is its own business.
-    if translator.is_none() {
+    //
+    // Only when the reply path is *here*, which is what an LLM means. The
+    // script is read by `script_for`, reached only from the converse path, and
+    // a process with no chat model never walks it: a synthesiser-only worker
+    // is handed text over `/tts` and says what it is given, whoever
+    // romanised it. Checking it anyway is what made a split worker declare
+    // `mms=HAN` - a label that was false, inert, and load-bearing.
+    if translator.is_none() && llm.is_some() {
         for (name, backend) in &tts {
             if !matches!(backend, TtsBackend::Local(_)) {
                 continue;

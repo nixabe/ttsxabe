@@ -54,6 +54,9 @@ pub struct Args {
     ///
     /// The CPU path is the scalar reference and is roughly 45x slower than real
     /// time; it exists to be read and to be correct, not to be used.
+    ///
+    /// Local engines from `--tts-engine` share this card, and take it from
+    /// here when there is no `--tts-model` to share it with.
     #[arg(long, env = "XABE_TTS_DEVICE", value_name = "DEV")]
     pub tts_device: Option<String>,
 
@@ -130,6 +133,9 @@ pub struct Args {
     ///
     /// `--tts-model` and `--tts-url` register one engine; this registers the
     /// others, which is how the page offers mms and cosyvoice side by side.
+    /// It also stands alone: a process given this and no `--tts-model` serves
+    /// exactly the engines named here, which is how one synthesiser is served
+    /// without loading the rest.
     ///
     /// A value that begins `http://` or `https://` is another process. Anything
     /// else is a directory, opened **in this one**, and which model it holds is
@@ -258,26 +264,33 @@ impl Args {
                 model: self.asr_model.clone(),
                 url: self.asr_url.clone(),
                 device: self.asr_device.clone(),
+                extra: false,
             },
             &Requested {
                 model: self.vad_model.clone(),
                 url: self.vad_url.clone(),
                 device: self.vad_device.clone(),
+                extra: false,
             },
             &Requested {
                 model: self.tts_model.clone(),
                 url: self.tts_url.clone(),
                 device: self.tts_device.clone(),
+                // `--tts-engine` is a synthesiser in this process too, so a
+                // run that has only those is not a run with no TTS.
+                extra: !self.tts_engines.is_empty(),
             },
             &Requested {
                 model: self.translator_model.clone(),
                 url: self.translator_url.clone(),
                 device: self.translator_device.clone(),
+                extra: false,
             },
             &Requested {
                 model: self.llm_model.clone(),
                 url: self.llm_url.clone(),
                 device: self.llm_device.clone(),
+                extra: false,
             },
             self.serve.is_some(),
         )

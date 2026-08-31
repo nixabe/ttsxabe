@@ -170,6 +170,12 @@ pub struct Stages {
     pub translator: Stage,
     /// The chat model that writes the reply.
     pub llm: Stage,
+    /// Whether `--tts-engine` registered a synthesiser beyond [`Stages::tts`].
+    ///
+    /// Not a [`Stage`] of its own, because those engines are named and there
+    /// may be several of them; it is here so that a process whose only
+    /// synthesiser arrived that way still counts as having one.
+    pub tts_extra: bool,
 }
 
 /// One stage's two flags, before resolution.
@@ -181,6 +187,16 @@ pub struct Requested {
     pub url: Option<String>,
     /// `--<stage>-device`.
     pub device: Option<String>,
+    /// Whether this stage is also satisfied by an engine registered by name.
+    ///
+    /// Only the TTS ever sets it, and it is not a third alternative to the
+    /// pair above. `--tts-engine name=path` runs a synthesiser *here* exactly
+    /// as `--tts-model` does; what differs is which slot it fills, a named one
+    /// in the engine registry rather than the stage's own. So the stage still
+    /// resolves to [`Stage::Off`] - there is no unnamed synthesiser for
+    /// `--text` to speak with - while the process is no longer stageless and
+    /// `--tts-device` has something to place.
+    pub extra: bool,
 }
 
 /// A combination of flags that cannot mean anything.
@@ -198,7 +214,12 @@ pub enum StageError {
     /// Almost always a delegated stage that was meant to be local: the device
     /// flag is the half that got typed and the model flag is the half that
     /// did not.
-    #[error("--{0}-device applies only to --{0}-model, and this run has --{0}-url")]
+    ///
+    /// The message names no `--{0}-url`, though that is the commonest way in,
+    /// because it is not the only one: `--vad-device 0` with no VAD at all
+    /// lands here too, and telling that run it has a URL it never gave sends
+    /// it looking for the wrong typo.
+    #[error("--{0}-device places a local {0} stage and this run has none; add --{0}-model")]
     DeviceWithoutModel(Kind),
 
     /// A device string that is neither `cpu` nor an ordinal.
@@ -225,8 +246,8 @@ pub enum StageError {
     #[error(
         "no stage configured; give at least one of \
          --asr-model/--asr-url, --vad-model/--vad-url, \
-         --tts-model/--tts-url, --translator-model/--translator-url, \
-         --llm-model/--llm-url"
+         --tts-model/--tts-url/--tts-engine, \
+         --translator-model/--translator-url, --llm-model/--llm-url"
     )]
     Nothing,
 }
@@ -250,6 +271,7 @@ impl Stages {
             tts: one(Kind::Tts, tts)?,
             translator: one(Kind::Translator, translator)?,
             llm: one(Kind::Llm, llm)?,
+            tts_extra: tts.extra,
         };
 
         if !stages.any_on() {
@@ -265,9 +287,18 @@ impl Stages {
     pub fn any_on(&self) -> bool {
         self.asr.is_on()
             || self.vad.is_on()
-            || self.tts.is_on()
+            || self.has_tts()
             || self.translator.is_on()
             || self.llm.is_on()
+    }
+
+    /// Whether this process can synthesise at all, however the flags spelled it.
+    ///
+    /// `--tts-model` and `--tts-engine` are both a synthesiser running here.
+    /// Everything that asks *whether* there is one asks this; only the code
+    /// that has to open the unnamed one reads [`Stages::tts`] directly.
+    pub fn has_tts(&self) -> bool {
+        self.tts.is_on() || self.tts_extra
     }
 
     /// Whether this process can answer a whole voice turn by itself.
@@ -276,7 +307,7 @@ impl Stages {
     /// not in the list: `--direct-taigi` takes it out of the reply path, and
     /// that is the default the measured pipeline runs.
     pub fn full_chain(&self) -> bool {
-        self.asr.is_on() && self.tts.is_on() && self.llm.is_on()
+        self.asr.is_on() && self.has_tts() && self.llm.is_on()
     }
 
     /// Every configured stage, for logging what this process turned out to be.
@@ -304,29 +335,39 @@ fn one(kind: Kind, r: &Requested) -> Result<Stage, StageError> {
             }
             Ok(Stage::Remote { url: url.clone() })
         }
-        (Some(path), None) => {
-            let device = match r.device.as_deref() {
-                None => kind.default_device(),
-                Some(s) => {
-                    Device::parse(s).ok_or_else(|| StageError::BadDevice(kind, s.to_string()))?
-                }
-            };
-            if device != Device::Cpu && !kind.has_cuda() {
-                return Err(StageError::CpuOnly(kind));
-            }
-            if device == Device::Cpu && !kind.has_cpu() {
-                return Err(StageError::GpuOnly(kind));
-            }
-            Ok(Stage::Local {
-                path: path.clone(),
-                device,
-            })
-        }
+        (Some(path), None) => Ok(Stage::Local {
+            path: path.clone(),
+            device: resolve_device(kind, r.device.as_deref())?,
+        }),
         (None, None) => {
-            if r.device.is_some() {
-                return Err(StageError::DeviceWithoutModel(kind));
+            // A device with no model is nearly always half of a pair, typed
+            // while the other half was not - except where a named engine is
+            // the model. `--tts-engine name=path` opens a checkpoint in this
+            // process and `--tts-device` is then the only flag that says which
+            // card it lands on, so the string is validated here and the stage
+            // itself stays off.
+            if let Some(s) = r.device.as_deref() {
+                if !r.extra {
+                    return Err(StageError::DeviceWithoutModel(kind));
+                }
+                resolve_device(kind, Some(s))?;
             }
             Ok(Stage::Off)
         }
     }
+}
+
+/// Parses one stage's device flag and refuses a side it cannot run on.
+fn resolve_device(kind: Kind, given: Option<&str>) -> Result<Device, StageError> {
+    let device = match given {
+        None => kind.default_device(),
+        Some(s) => Device::parse(s).ok_or_else(|| StageError::BadDevice(kind, s.to_string()))?,
+    };
+    if device != Device::Cpu && !kind.has_cuda() {
+        return Err(StageError::CpuOnly(kind));
+    }
+    if device == Device::Cpu && !kind.has_cpu() {
+        return Err(StageError::GpuOnly(kind));
+    }
+    Ok(device)
 }
