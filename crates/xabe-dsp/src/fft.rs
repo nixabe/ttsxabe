@@ -76,16 +76,37 @@ fn fft_into(
     // of the subsequence that starts at j and steps by r. For r = 2 this is
     // the butterfly everyone recognises; the loop is the same identity without
     // assuming which radix arrived.
-    for k in 0..m {
-        for q in 0..r {
-            let (mut re, mut im) = (0.0f32, 0.0f32);
-            for j in 0..r {
-                let y = buf[j * m + k];
-                let w = tw[step * ((j * (q * m + k)) % n)];
-                re += y[0] * w[0] - y[1] * w[1];
-                im += y[0] * w[1] + y[1] * w[0];
+    //
+    // The exponent is reduced by carrying it rather than by `%`, which is a
+    // hardware division on a length that is not a compile-time constant and
+    // was most of this transform's cost - the mel frontend spent 10 ms of 16
+    // in here on a three-second clip. Two facts make the carry exact:
+    //
+    // - `j*q*m mod n` is `((j*q) mod r) * m`, because `m * r == n`. That is
+    //   the base, and it is below `n`.
+    // - `j*k` never reaches `n`: `j <= r-1` and `k <= m-1`, so their product
+    //   is at most `n - r - m + 1`.
+    //
+    // So the running index is below `2n` and one conditional subtraction
+    // reduces it. Accumulating into `dst` rather than into a scalar is what
+    // lets `j` be the inner-most loop, which is what makes the carry possible.
+    for q in 0..r {
+        let out = &mut dst[q * m..(q + 1) * m];
+        // `j == 0` has twiddle 1 for every `k`, so it is a copy - which is
+        // also what leaves the accumulator initialised without a zeroing pass.
+        out.copy_from_slice(&buf[..m]);
+        for j in 1..r {
+            let y = &buf[j * m..(j + 1) * m];
+            let mut idx = (j * q % r) * m;
+            for k in 0..m {
+                let w = tw[step * idx];
+                out[k][0] += y[k][0] * w[0] - y[k][1] * w[1];
+                out[k][1] += y[k][0] * w[1] + y[k][1] * w[0];
+                idx += j;
+                if idx >= n {
+                    idx -= n;
+                }
             }
-            dst[q * m + k] = [re, im];
         }
     }
 }
@@ -137,25 +158,66 @@ impl Fft {
     ///
     /// The full complex transform is run and half of it discarded. A packed
     /// real transform would halve the work, and would also be a second piece
-    /// of index arithmetic to get right for no gain this workspace can
-    /// measure - the mel frontend is a rounding error beside the model it
-    /// feeds.
+    /// of index arithmetic to get right for a gain this workspace has not
+    /// needed yet.
+    ///
+    /// This allocates three buffers per call. A caller running a transform per
+    /// frame of a spectrogram wants [`Fft::forward_real_with`] instead.
     ///
     /// # Panics
     ///
     /// If `x` is not `n` long or `out` is not `2 * (n/2 + 1)` long.
     pub fn forward_real(&self, x: &[f32], out: &mut [f32]) {
+        self.forward_real_with(x, out, &mut self.scratch());
+    }
+
+    /// Working buffers sized for this plan, to be reused across transforms.
+    pub fn scratch(&self) -> Scratch {
+        Scratch {
+            src: vec![[0.0; 2]; self.n],
+            dst: vec![[0.0; 2]; self.n],
+            buf: vec![[0.0; 2]; self.n],
+        }
+    }
+
+    /// [`Fft::forward_real`], reusing buffers the caller owns.
+    ///
+    /// The transform needs three arrays of `n` complex numbers and cannot keep
+    /// them itself without either interior mutability - which would cost
+    /// `Sync`, and this plan is shared - or a `&mut self` that would stop two
+    /// threads transforming different frames against one plan. So the
+    /// scratch is a value the caller holds. A spectrogram is a transform per
+    /// frame and there are three thousand frames in Whisper's window; the
+    /// allocation was the larger half of the frontend's cost.
+    ///
+    /// # Panics
+    ///
+    /// If `x` is not `n` long, `out` is not `2 * (n/2 + 1)` long, or the
+    /// scratch was made by a plan of a different length.
+    pub fn forward_real_with(&self, x: &[f32], out: &mut [f32], s: &mut Scratch) {
         assert_eq!(x.len(), self.n, "forward_real wants n real samples");
         let bins = self.n / 2 + 1;
         assert_eq!(out.len(), 2 * bins, "forward_real writes n/2+1 bins");
-        let src: Vec<[f32; 2]> = x.iter().map(|&v| [v, 0.0]).collect();
-        let mut dst = vec![[0.0f32; 2]; self.n];
-        let mut buf = vec![[0.0f32; 2]; self.n];
-        fft_into(&src, 1, self.n, &self.tw, 1, &mut dst, &mut buf);
-        for (o, c) in out.as_chunks_mut::<2>().0.iter_mut().zip(&dst[..bins]) {
+        assert_eq!(s.src.len(), self.n, "the scratch is for a different length");
+        for (c, &v) in s.src.iter_mut().zip(x) {
+            *c = [v, 0.0];
+        }
+        fft_into(&s.src, 1, self.n, &self.tw, 1, &mut s.dst, &mut s.buf);
+        for (o, c) in out.as_chunks_mut::<2>().0.iter_mut().zip(&s.dst[..bins]) {
             *o = *c;
         }
     }
+}
+
+/// Working buffers for one [`Fft`] plan, made by [`Fft::scratch`].
+///
+/// One per thread, not one per call: it exists so that a spectrogram does not
+/// allocate three arrays per frame. It carries the plan's length and is
+/// refused by a plan of any other.
+pub struct Scratch {
+    src: Vec<[f32; 2]>,
+    dst: Vec<[f32; 2]>,
+    buf: Vec<[f32; 2]>,
 }
 
 /// The direct sum, which is the definition the transform is tested against.

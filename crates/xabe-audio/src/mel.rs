@@ -157,6 +157,12 @@ pub fn mel_power(samples: &[f32], cfg: &MelConfig, filters: &[f32]) -> Vec<f32> 
     let mut frame = vec![0.0f32; cfg.n_fft];
     let mut bins = vec![0.0f32; 2 * n_freq];
     let mut power = vec![0.0f32; n_freq];
+    // One frame's mel row, accumulated contiguously and then written out once.
+    // Accumulating straight into `out` reads and writes `n_mels` floats a
+    // *frames* apart for every one of `n_freq` bins - 16 thousand strided
+    // read-modify-writes a frame, over 940 KB, none of which stays in cache.
+    let mut row = vec![0.0f32; n_mels];
+    let mut scratch = fft.scratch();
 
     for t in 0..frames {
         let start = t * cfg.hop;
@@ -173,15 +179,19 @@ pub fn mel_power(samples: &[f32], cfg: &MelConfig, filters: &[f32]) -> Vec<f32> 
         for (i, s) in frame.iter_mut().enumerate() {
             *s = padded.get(start + i).copied().unwrap_or(0.0) * window[i];
         }
-        fft.forward_real(&frame, &mut bins);
+        fft.forward_real_with(&frame, &mut bins, &mut scratch);
         for (p, c) in power.iter_mut().zip(bins.as_chunks::<2>().0) {
             *p = c[0] * c[0] + c[1] * c[1];
         }
+        row.fill(0.0);
         for (i, &p) in power.iter().enumerate() {
-            let row = &filters[i * n_mels..(i + 1) * n_mels];
-            for (m, &w) in row.iter().enumerate() {
-                out[m * frames + t] += w * p;
+            let filt = &filters[i * n_mels..(i + 1) * n_mels];
+            for (r, &w) in row.iter_mut().zip(filt) {
+                *r += w * p;
             }
+        }
+        for (m, &r) in row.iter().enumerate() {
+            out[m * frames + t] = r;
         }
     }
     out
