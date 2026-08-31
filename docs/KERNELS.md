@@ -586,7 +586,7 @@ them.
 
 ### Shape
 
-One block owns 32 query rows of one head and walks the keys 32 at a time.
+One block owns QT query rows of one head and walks the keys KT at a time.
 Scores by `m16n8k8` into f32, probabilities rounded to f16 on their way into
 the value product, one more `m16n8k8` against the values, the output
 accumulator in registers throughout. When the pass is causal the loop's upper
@@ -610,6 +610,39 @@ out of the projection buffer and the merged context written straight back in
 `[tq, heads * hd]`. So `split_heads`, `merge_heads` and `repeat_kv` all
 disappear from the prompt path rather than getting faster. A grouped-query
 model maps `head / (heads / kv_heads)` and reads the one cached copy.
+
+### The tile, and which knob actually mattered
+
+QT, KT and HD are all template parameters and the warp grid is derived from
+them, so a new shape is an argument rather than an edit. HD is forced by the
+model. **QT is the one that pays, and the reason is traffic rather than
+arithmetic.**
+
+A block stages every key and value it walks past, so the whole of K and V is
+re-staged once per query block. At the encoder's 1500 positions and QT 32 that
+is 47 trips through 0.8 MB - 724 MB a layer, against 117 us of actual
+tensor-core work in the same kernel. KT does not appear in that number at all:
+a wider key tile moves the same bytes in fewer trips. It was tried anyway,
+because the first diagnosis was that the four block-wide barriers a trip costs
+were the constraint, and at `hd` 64 each of them is amortised over half as many
+`m16n8k8` issues as at 128. **KT 64 changed the encoder by nothing**, which is
+what sent the analysis back to the traffic. QT 64 halved the re-staging and
+took the kernel from 967 us a layer to 791.
+
+Two limits worth knowing. Only about a third of the halved traffic came back as
+time, so L2 was already absorbing much of the re-read - the next doubling would
+return less again. And QT 128 is not reachable at all: its tile wants 52 KB
+where sm_75 gives a block 48 KB of *static* shared memory, so it fails in
+`ptxas` at module load with `CUDA_ERROR_INVALID_PTX` and no reason attached. A
+`static_assert` on the computed tile size now says which limit and by how much,
+alongside four more that check the derived warp counts divide exactly - a
+warp grid that does not cover its tile drops work silently rather than failing.
+
+So the encoder takes QT 64 and a Llama prefill keeps 32, whose causal loop
+stops at the block's own diagonal and never walks a long key axis to begin
+with.
+
+### The head width
 
 `hd` is a template parameter and the kernel is instantiated at the two widths
 this engine has: 128 for both Llama stages, 64 for every Whisper size - Whisper

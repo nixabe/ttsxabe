@@ -3,7 +3,7 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-roughly 0.65x against `whisper-server` - a milestone still missed, and the one
+roughly 0.68x against `whisper-server` - a milestone still missed, and the one
 figure here whose two halves were not measured in one sitting - and both Llama
 stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
@@ -44,13 +44,16 @@ and to be correct.
 ### ASR
 
 One Quadro RTX 8000, `Breeze-ASR-26` (large-v2, 1.54 B), greedy, `language=zh`.
-Twenty timed transcriptions after three warm-up, medians, alternated in pairs
-against a `whisper-server` started **without** `--vad` so that both sides do
-the same job. Both produced identical transcripts on every clip.
+Medians after three warm-up, against a `whisper-server` started **without**
+`--vad` so that both sides do the same job. Both produced identical transcripts
+on every clip. The `whisper-server` column is twenty timed transcriptions
+alternated in pairs; the engine column is the median of three rounds of nine,
+which is the protocol the llama.cpp sections settled on and the reason the two
+columns are not a pair - see below.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
 | --- | --- | --- | --- |
-| 2.67 s | 223 ms | 144 ms | 0.65x |
+| 2.67 s | 211 ms | 144 ms | 0.68x |
 | 3.90 s | not re-run | 177 ms | — |
 
 **This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
@@ -58,26 +61,26 @@ for an ASR faster than `whisper-server`; it is still about 1.5x slower.
 
 **Both cells in that ratio were not taken in one sitting, and it is therefore
 the weakest number in this document.** The engine column was re-measured on a
-machine with no `whisper-server` installed, so the 0.65x is arithmetic against
+machine with no `whisper-server` installed, so the 0.68x is arithmetic against
 a `whisper-server` figure from the sitting that produced the 264 ms this
 supersedes - exactly the cross-sitting pairing the llama.cpp section refuses to
 trust. It is written down because the milestone is stated in those terms and a
 blank would read as progress; it should be re-alternated, on both clips,
 before it is quoted anywhere. What *was* properly paired is the engine against
-itself: the two builds alternated in threes on the 2.67 s clip, 261 ms before
-the fused attention below and 223 after.
+itself: the builds alternated in threes on the 2.67 s clip, nine timed runs
+each, 257 ms before the fused attention below and 211 after.
 
-Where the 223 ms goes, measured with `xabe-asr-bench --stages`:
+Where the 211 ms goes, measured with `xabe-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
-| encoder | 125 | 56% |
-| decode loop, 6 tokens | 65 | 29% |
-| cross-attention KV | 19 | 9% |
-| mel frontend (CPU) | 17 | 7% |
+| encoder | 119 | 56% |
+| decode loop, 6 tokens | 60 | 28% |
+| cross-attention KV | 20 | 9% |
+| mel frontend (CPU) | 17 | 8% |
 
-The encoder is 2.26 TFLOP for a 30-second window, so 125 ms is 18.1 TFLOP/s -
-18% of the card's 99 TFLOP/s f16 tensor-core peak. Note that the window is
+The encoder is 2.26 TFLOP for a 30-second window, so 119 ms is 19.0 TFLOP/s -
+19% of the card's 99 TFLOP/s f16 tensor-core peak. Note that the window is
 fixed: a 2.67 s clip and a 29 s one cost the same encoder.
 
 ### Translator
@@ -1374,8 +1377,8 @@ This section used to name two levers. **The first has been spent, and it
 returned slightly more than it was costed at**: the 34 ms the encoder was
 predicted to be spending moving an attention score matrix it never needed to
 materialise came back as 38 ms, because `flash_attn` also took the query's head
-split and the context's merge with it. The encoder is 125 ms and the
-transcription 223.
+split and the context's merge with it. Tuning that kernel's tile returned 6 ms
+more. The encoder is 119 ms and the transcription 211.
 
 Three things account for what is left, in the order they are worth taking.
 
@@ -1391,14 +1394,22 @@ prefill, which is upside and risk in the same sentence - the llama.cpp
 comparison is settled at level-or-ahead and a regression there would cost more
 than the ASR gains.
 
-**The fused attention itself runs at 11.9 TFLOP/s**, which is 31 ms of the
-encoder. That is half what the tiled `gemm` reaches, and the reason is tile
-shape rather than arithmetic: at `hd` 64 a warp owns two output column
-fragments where at 128 it owns four, so each of the four block-wide barriers
-per key tile is amortised over half as many `m16n8k8` issues. The block does
-about 117 us of tensor-core work and about 200-500 us of K/V staging per
-layer and takes 967. A 64-key trip, or 64 query rows a block, would halve the
-barrier count; neither has been tried, so no factor is promised here.
+**The fused attention runs at 14.5 TFLOP/s**, which is 25 ms of the encoder,
+and getting it there is worth writing down because the first diagnosis was
+wrong. The kernel does about 117 us of tensor-core work a layer and took 967;
+the gap was read as the four block-wide barriers a key tile costs, each
+amortised over half as many `m16n8k8` issues at `hd` 64 as at 128. **A 64-key
+trip fixes exactly that and changed the encoder by nothing** - 124.9 ms against
+124.3, inside the noise. What the barrier account left out is that a block
+stages every key and value it walks past, so all of K and V is re-staged once
+per query block: 47 trips through 0.8 MB is 724 MB a layer, and a wider key
+tile moves the same bytes in fewer trips. **The query tile divides it**, and 64
+rows a block took the kernel to 791 us and the encoder to 119. Only about a
+third of the halved traffic came back as time, so L2 was already absorbing much
+of the re-read - which is also why the remaining ceiling is not obviously worth
+another attempt. 128 rows is not reachable: its tile wants 52 KB where sm_75
+gives a block 48 KB of static shared memory, and it fails in `ptxas` at module
+load rather than running slowly. A `static_assert` says so at the tile now.
 
 **The decode loop is 65 ms for six tokens.** Ten milliseconds a token for a
 1.5 B decoder is about a third of what this card's bandwidth allows: the

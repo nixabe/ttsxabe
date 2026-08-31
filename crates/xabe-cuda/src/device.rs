@@ -2809,9 +2809,12 @@ impl Gpu {
         // instantiated at would index across heads *in bounds* and return
         // plausible context, so it is refused by name and the caller falls
         // back to the unfused chain.
-        let name = match head_dim {
-            128 => "flash_attn",
-            64 => "flash_attn_64",
+        // The query rows a block owns, which is the kernel's own `QT` and
+        // therefore its grid stride. It is not the same at both widths: see
+        // the kernel's header for why the encoder's instantiation takes 64.
+        let (name, qt) = match head_dim {
+            128 => ("flash_attn", 32),
+            64 => ("flash_attn_64", 64),
             _ => {
                 return Err(CudaError::UnsupportedAttention {
                     head_dim,
@@ -2852,7 +2855,7 @@ impl Gpu {
             .arg(&scale)
             .arg(&causal_i);
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: ((tq as u32).div_ceil(32), heads as u32, 1),
+            grid_dim: ((tq as u32).div_ceil(qt), heads as u32, 1),
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };

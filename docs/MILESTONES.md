@@ -97,19 +97,19 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 **Item 17 is not met.** The last properly alternated pair, against a
 `whisper-server` started without `--vad` so both do the same job, was 264 ms
 against 144 on a 2.67 s clip and 296 against 177 on a 3.9 s one - 0.55x to
-0.60x, with identical transcripts on both. The engine side is now 223 ms on
-the 2.67 s clip, which is about 0.65x, but that pairing is arithmetic across
-two sittings rather than one alternated run: the machine that measured 223 has
+0.60x, with identical transcripts on both. The engine side is now 211 ms on
+the 2.67 s clip, which is about 0.68x, but that pairing is arithmetic across
+two sittings rather than one alternated run: the machine that measured 211 has
 no `whisper-server` on it. `docs/BENCHMARKS.md` says so at the table and the
 re-run is owed.
 
-One of the two levers that section costed has been spent. Flash attention took
+One of the two levers that section costed has been spent. Fused attention took
 the 38 ms the encoder was moving an attention score matrix it never needed to
-materialise, and the encoder went 162 ms to 125. What is left is the
-`ldmatrix` double-buffered matmul for the 85 ms of projections still running at
-22-25% of this card's peak, the fused attention's own tile shape, and a decode
-loop reading its cross-attention caches at f32. None of them has been costed to
-the point of promising 144 ms. Recorded as a miss rather than restated as a
+materialise, and tuning its query tile took 6 ms more: the encoder went 163 ms
+to 119. What is left is the `ldmatrix` double-buffered matmul for the 85 ms of
+projections still running at 22-25% of this card's peak, and a decode loop
+reading its cross-attention caches at f32. Neither has been costed to the point
+of promising 144 ms. Recorded as a miss rather than restated as a
 different target.
 
 The filter bank is computed rather than shipped, and matches the capture *bit

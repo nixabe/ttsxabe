@@ -102,7 +102,7 @@ a captured oracle layer by layer, and greedy decoding reproducing 🤗
 against `whisper-server` on the same card with the same model and no VAD on
 either side, it was **0.55x** — 264 ms against 144 on a 2.7-second clip, with
 identical transcripts. Fusing the encoder's attention has since taken the
-engine side to 223 ms, so the ratio is now about **0.65x** — but that half was
+engine side to 211 ms, so the ratio is now about **0.68x** — but that half was
 measured on a machine with no `whisper-server` on it, so it is two sittings
 rather than one alternated run and `docs/BENCHMARKS.md` flags it as the
 weakest number in the document. Either way it is a stated milestone that is not

@@ -1851,14 +1851,24 @@ GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K)
 // per instantiation. A width that is not instantiated is refused by name in
 // the wrapper rather than indexing across heads in bounds.
 
-#define FA_QT 32                       // query rows a block
-#define FA_KT 32                       // key positions a trip
 #define FA_WARPS 8
-#define FA_VSTR 20                     // words a Vs row (Vs is [d][pos])
-#define FA_PSTR 20                     // words a Ps row
-#define FA_SSTR 36                     // floats an Ss row
 
-template <int HD>
+// One block owns QT query rows of one head and walks the keys KT at a time.
+//
+// **QT is the knob that matters, and the reason is traffic rather than
+// arithmetic.** A block stages every key and value it walks past, so the whole
+// of K and V is re-staged once per query block: at 1500 encoder positions and
+// QT 32 that is 47 trips through 0.8 MB, or 724 MB a layer, against 117 us of
+// actual tensor-core work. KT does not appear in that figure at all - a wider
+// key tile moves the same bytes in fewer trips - and measuring KT 64 confirmed
+// it, changing the encoder by nothing. QT divides it directly. See
+// docs/BENCHMARKS.md for both measurements.
+//
+// The warp grid follows from QT: QG query groups of 16 rows, and the remaining
+// FA_WARPS / QG warps spread across the key fragments of the score product and
+// the column fragments of the value product. Every count below is derived, so
+// a new (QT, KT, HD) is a template argument rather than an edit.
+template <int HD, int KT, int QT>
 __device__ __forceinline__ void flash_attn_impl(
     const float* __restrict__ q,
     const float* __restrict__ kc,
@@ -1869,23 +1879,50 @@ __device__ __forceinline__ void flash_attn_impl(
     // Words a Qs/Ks row: HD/2 packed pairs, plus four to spread the banks.
     constexpr int QSTR = HD / 2 + 4;
     constexpr int KSTR = HD / 2 + 4;
-    // n8 output column fragments a warp owns: four column groups cover HD.
-    constexpr int NT = HD / 32;
-    constexpr int KVS = (HD * FA_VSTR > FA_KT * KSTR) ? HD * FA_VSTR
-                                                      : FA_KT * KSTR;
+    // Words a Vs or Ps row: KT/2 packed pairs, padded the same way.
+    constexpr int VSTR = KT / 2 + 4;
+    constexpr int PSTR = KT / 2 + 4;
+    constexpr int SSTR = KT + 4;             // floats an Ss row
+    // Query groups of 16 rows, and the warp columns left over for them.
+    constexpr int QG = QT / 16;
+    constexpr int CG = FA_WARPS / QG;
+    // n8 output column fragments a warp owns: CG column groups cover HD.
+    constexpr int NT = (HD / 8) / CG;
+    // n8 key fragments a warp owns in the score product: CG warp columns
+    // cover KT.
+    constexpr int KF = (KT / 8) / CG;
+    // Lanes that share a score row in the softmax passes, and the columns
+    // each of them reduces over.
+    constexpr int LPR = (FA_WARPS * 32) / QT;
+    constexpr int CPL = KT / LPR;
+    constexpr int KVS = (HD * VSTR > KT * KSTR) ? HD * VSTR : KT * KSTR;
 
-    __shared__ __align__(16) unsigned qs[FA_QT * QSTR];
+    // Every count above divides exactly or the warp grid silently drops work.
+    static_assert(QT % 16 == 0 && FA_WARPS % QG == 0, "QT does not tile");
+    static_assert(NT * CG * 8 == HD, "the column groups do not cover HD");
+    static_assert(KF * CG * 8 == KT, "the warp columns do not cover KT");
+    static_assert(CPL * LPR == KT && CPL % 2 == 0, "the lanes do not cover KT");
+
+    // sm_75 gives a block 48 KB of *static* shared memory - the 64 KB needs a
+    // dynamic opt-in this kernel does not take. QT 128 lands at 52 KB, so it
+    // is not reachable at all: it was tried, and without this assert it fails
+    // in ptxas at module load with `CUDA_ERROR_INVALID_PTX` and no reason.
+    // Never measured, therefore - the ceiling is the card's, not a result.
+    constexpr int SHARED = (QT * QSTR + KVS + QT * PSTR + QT * SSTR + 3 * QT) * 4;
+    static_assert(SHARED <= 48 * 1024, "the tile exceeds 48 KB of shared memory");
+
+    __shared__ __align__(16) unsigned qs[QT * QSTR];
     __shared__ __align__(16) unsigned kvs[KVS];
-    __shared__ __align__(16) unsigned ps[FA_QT * FA_PSTR];
-    __shared__ __align__(16) float ss[FA_QT * FA_SSTR];
-    __shared__ float sm_m[FA_QT], sm_l[FA_QT], sm_fac[FA_QT];
+    __shared__ __align__(16) unsigned ps[QT * PSTR];
+    __shared__ __align__(16) float ss[QT * SSTR];
+    __shared__ float sm_m[QT], sm_l[QT], sm_fac[QT];
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid = warp * 32 + lane;
     const int g = lane >> 2, tg = lane & 3;
 
-    const int qt0 = blockIdx.x * FA_QT;
+    const int qt0 = blockIdx.x * QT;
     const int h = blockIdx.y;
     const int kh = h / (heads / kv_heads);
     const int dq = heads * HD;
@@ -1895,7 +1932,7 @@ __device__ __forceinline__ void flash_attn_impl(
 
     // Queries once, rounded to f16 - the same rounding the tiled gemm applied
     // to its operands. A row past `tq` stages zeros and is never stored.
-    for (int i = tid; i < FA_QT * (HD / 2); i += FA_WARPS * 32) {
+    for (int i = tid; i < QT * (HD / 2); i += FA_WARPS * 32) {
         const int r = i / (HD / 2), j = i % (HD / 2);
         unsigned w = 0u;
         if (qt0 + r < tq) {
@@ -1906,15 +1943,15 @@ __device__ __forceinline__ void flash_attn_impl(
         }
         qs[r * QSTR + j] = w;
     }
-    if (tid < FA_QT) {
+    if (tid < QT) {
         sm_m[tid] = -1.0f / 0.0f;
         sm_l[tid] = 0.0f;
     }
 
-    // The output accumulator: warp `w` owns query group `w >> 2` (16 rows)
-    // and value columns `(w & 3) * NT * 8 .. + NT * 8 - 1`, as NT n8 fragments.
-    const int mg = warp >> 2;
-    const int ng0 = (warp & 3) * NT;
+    // The output accumulator: warp `w` owns query group `w / CG` (16 rows)
+    // and value columns `(w % CG) * NT * 8 .. + NT * 8 - 1`, as NT fragments.
+    const int mg = warp / CG;
+    const int ng0 = (warp % CG) * NT;
     float acc[NT][4];
     #pragma unroll
     for (int i = 0; i < NT; ++i) {
@@ -1926,14 +1963,14 @@ __device__ __forceinline__ void flash_attn_impl(
     __syncthreads();
 
     // Causal: the last key a row of this block may see is
-    // `past + qt0 + FA_QT - 1`, so the loop stops there and never touches the
+    // `past + qt0 + QT - 1`, so the loop stops there and never touches the
     // upper triangle. Non-causal: every row sees every key.
     const int ktot = past + tq;
-    const int kend = causal ? min(ktot, past + qt0 + FA_QT) : ktot;
-    for (int kv0 = 0; kv0 < kend; kv0 += FA_KT) {
+    const int kend = causal ? min(ktot, past + qt0 + QT) : ktot;
+    for (int kv0 = 0; kv0 < kend; kv0 += KT) {
         // Keys, `[pos][d]`, rounded like the queries. Positions past `kend`
         // stage zeros; the mask discards whatever the mma made of them.
-        for (int i = tid; i < FA_KT * (HD / 2); i += FA_WARPS * 32) {
+        for (int i = tid; i < KT * (HD / 2); i += FA_WARPS * 32) {
             const int r = i / (HD / 2), j = i % (HD / 2);
             unsigned w = 0u;
             if (kv0 + r < kend) {
@@ -1945,47 +1982,61 @@ __device__ __forceinline__ void flash_attn_impl(
         }
         __syncthreads();
 
-        // S = Q K^T for this tile. Warps 0-3 cover query group 0, warps 4-7
-        // group 1; each owns one n8 fragment of the 32 positions.
+        // S = Q K^T for this tile. Each warp covers one query group and KF
+        // of the tile's n8 key fragments. The `a` fragment is loaded once per
+        // contraction step and reused across them.
         {
-            const int smg = warp >> 2, sng = warp & 3;
-            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            const int smg = mg, sng = warp % CG;
+            float d[KF][4];
+            #pragma unroll
+            for (int f = 0; f < KF; ++f) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    d[f][j] = 0.0f;
+                }
+            }
             #pragma unroll
             for (int ks = 0; ks < HD / 8; ++ks) {
                 unsigned a0, a1;
                 gemm_ld_a(&qs[(smg * 16 + (lane & 15)) * QSTR + 4 * ks],
                           a0, a1);
-                const unsigned b0 =
-                    gemm_ld_b(&kvs[(sng * 8 + (lane & 7)) * KSTR + 4 * ks]);
-                gemm_mma_step(d0, d1, d2, d3, a0, a1, b0);
+                #pragma unroll
+                for (int f = 0; f < KF; ++f) {
+                    const unsigned b0 = gemm_ld_b(
+                        &kvs[((sng * KF + f) * 8 + (lane & 7)) * KSTR + 4 * ks]);
+                    gemm_mma_step(d[f][0], d[f][1], d[f][2], d[f][3], a0, a1, b0);
+                }
             }
-            const int c0 = sng * 8 + 2 * tg;
-            ss[(smg * 16 + g) * FA_SSTR + c0] = d0 * scale;
-            ss[(smg * 16 + g) * FA_SSTR + c0 + 1] = d1 * scale;
-            ss[(smg * 16 + g + 8) * FA_SSTR + c0] = d2 * scale;
-            ss[(smg * 16 + g + 8) * FA_SSTR + c0 + 1] = d3 * scale;
+            #pragma unroll
+            for (int f = 0; f < KF; ++f) {
+                const int c0 = (sng * KF + f) * 8 + 2 * tg;
+                ss[(smg * 16 + g) * SSTR + c0] = d[f][0] * scale;
+                ss[(smg * 16 + g) * SSTR + c0 + 1] = d[f][1] * scale;
+                ss[(smg * 16 + g + 8) * SSTR + c0] = d[f][2] * scale;
+                ss[(smg * 16 + g + 8) * SSTR + c0 + 1] = d[f][3] * scale;
+            }
         }
         __syncthreads();
 
-        // The running maximum. Eight lanes to a row, four columns each; the
+        // The running maximum. LPR lanes to a row, CPL columns each; the
         // leader folds the tile's maximum into the row's and leaves the
         // rescale factor for everyone. `lim` is the last key this row may
         // attend to - its own position when causal, the last key otherwise.
         {
-            const int r = tid >> 3, c0 = (tid & 7) * 4;
+            const int r = tid / LPR, c0 = (tid % LPR) * CPL;
             const int lim = causal ? (past + qt0 + r) : (ktot - 1);
             float mx = -1.0f / 0.0f;
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < CPL; ++c) {
                 if (kv0 + c0 + c <= lim) {
-                    mx = fmaxf(mx, ss[r * FA_SSTR + c0 + c]);
+                    mx = fmaxf(mx, ss[r * SSTR + c0 + c]);
                 }
             }
             #pragma unroll
-            for (int o = 4; o > 0; o >>= 1) {
+            for (int o = LPR / 2; o > 0; o >>= 1) {
                 mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
             }
-            if ((tid & 7) == 0) {
+            if ((tid % LPR) == 0) {
                 const float m_new = fmaxf(sm_m[r], mx);
                 sm_fac[r] = __expf(sm_m[r] - m_new);
                 sm_m[r] = m_new;
@@ -1996,31 +2047,33 @@ __device__ __forceinline__ void flash_attn_impl(
         // Probabilities, rounded to f16 on their way into the value product -
         // where the unfused chain rounded them too - and the running sum.
         {
-            const int r = tid >> 3, c0 = (tid & 7) * 4;
+            const int r = tid / LPR, c0 = (tid % LPR) * CPL;
             const int lim = causal ? (past + qt0 + r) : (ktot - 1);
             const float m = sm_m[r];
-            float p[4], sum = 0.0f;
+            float p[CPL], sum = 0.0f;
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                const float s = ss[r * FA_SSTR + c0 + c];
+            for (int c = 0; c < CPL; ++c) {
+                const float s = ss[r * SSTR + c0 + c];
                 p[c] = (kv0 + c0 + c <= lim) ? __expf(s - m) : 0.0f;
                 sum += p[c];
             }
-            ps[r * FA_PSTR + (c0 >> 1)] = gemm_pack(p[0], p[1]);
-            ps[r * FA_PSTR + (c0 >> 1) + 1] = gemm_pack(p[2], p[3]);
             #pragma unroll
-            for (int o = 4; o > 0; o >>= 1) {
+            for (int w = 0; w < CPL / 2; ++w) {
+                ps[r * PSTR + (c0 >> 1) + w] = gemm_pack(p[2 * w], p[2 * w + 1]);
+            }
+            #pragma unroll
+            for (int o = LPR / 2; o > 0; o >>= 1) {
                 sum += __shfl_down_sync(0xffffffff, sum, o);
             }
-            if ((tid & 7) == 0) {
+            if ((tid % LPR) == 0) {
                 sm_l[r] = sm_l[r] * sm_fac[r] + sum;
             }
         }
 
         // Values, `[d][pos]` - the cache's own transposed layout, which is
         // already the `[n][k]` shape the B fragment wants.
-        for (int i = tid; i < HD * (FA_KT / 2); i += FA_WARPS * 32) {
-            const int r = i / (FA_KT / 2), j = i % (FA_KT / 2);
+        for (int i = tid; i < HD * (KT / 2); i += FA_WARPS * 32) {
+            const int r = i / (KT / 2), j = i % (KT / 2);
             unsigned w = 0u;
             if (kv0 + 2 * j + 1 < kend) {
                 const float2 v = *reinterpret_cast<const float2*>(
@@ -2029,30 +2082,44 @@ __device__ __forceinline__ void flash_attn_impl(
             } else if (kv0 + 2 * j < kend) {
                 w = gemm_pack(vb[(size_t)r * cap + kv0 + 2 * j], 0.0f);
             }
-            kvs[r * FA_VSTR + j] = w;
+            kvs[r * VSTR + j] = w;
         }
         __syncthreads();
 
-        // O = O * fac + P V. The rescale factor is per row, and a lane's
-        // fragment rows are `g` and `g + 8` of its group.
-        const float f0 = sm_fac[mg * 16 + g];
-        const float f1 = sm_fac[mg * 16 + g + 8];
-        #pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        // O = O * fac + P V, with the `a` fragment again loaded once per
+        // contraction step and reused across the column fragments. The
+        // rescale factor is per row, and a lane's fragment rows are `g` and
+        // `g + 8` of its group.
+        {
+            float d[NT][4];
             #pragma unroll
-            for (int ks = 0; ks < FA_KT / 8; ++ks) {
-                unsigned a0, a1;
-                gemm_ld_a(&ps[(mg * 16 + (lane & 15)) * FA_PSTR + 4 * ks],
-                          a0, a1);
-                const unsigned b0 = gemm_ld_b(
-                    &kvs[((ng0 + nt) * 8 + (lane & 7)) * FA_VSTR + 4 * ks]);
-                gemm_mma_step(d0, d1, d2, d3, a0, a1, b0);
+            for (int nt = 0; nt < NT; ++nt) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    d[nt][j] = 0.0f;
+                }
             }
-            acc[nt][0] = acc[nt][0] * f0 + d0;
-            acc[nt][1] = acc[nt][1] * f0 + d1;
-            acc[nt][2] = acc[nt][2] * f1 + d2;
-            acc[nt][3] = acc[nt][3] * f1 + d3;
+            #pragma unroll
+            for (int ks = 0; ks < KT / 8; ++ks) {
+                unsigned a0, a1;
+                gemm_ld_a(&ps[(mg * 16 + (lane & 15)) * PSTR + 4 * ks], a0, a1);
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const unsigned b0 = gemm_ld_b(
+                        &kvs[((ng0 + nt) * 8 + (lane & 7)) * VSTR + 4 * ks]);
+                    gemm_mma_step(d[nt][0], d[nt][1], d[nt][2], d[nt][3],
+                                  a0, a1, b0);
+                }
+            }
+            const float f0 = sm_fac[mg * 16 + g];
+            const float f1 = sm_fac[mg * 16 + g + 8];
+            #pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                acc[nt][0] = acc[nt][0] * f0 + d[nt][0];
+                acc[nt][1] = acc[nt][1] * f0 + d[nt][1];
+                acc[nt][2] = acc[nt][2] * f1 + d[nt][2];
+                acc[nt][3] = acc[nt][3] * f1 + d[nt][3];
+            }
         }
         __syncthreads();
     }
@@ -2080,7 +2147,11 @@ __device__ __forceinline__ void flash_attn_impl(
 
 // The two head widths that exist in this engine: 128 for both Llama stages,
 // 64 for every Whisper size (large-v2's 1280 over 20 heads, and the smaller
-// ones' too - Whisper holds the head width fixed and varies the count).
+// ones' too - Whisper holds the head width fixed and varies the count). Each
+// takes the query tile its own traffic wants: the Whisper encoder walks 1500
+// keys and 64 rows a block halves what it re-stages, where a Llama prefill's
+// causal loop stops at the block's own diagonal and 32 is already enough.
+// Both were measured, and docs/BENCHMARKS.md has the numbers.
 extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     const float* __restrict__ q,
     const float* __restrict__ kc,
@@ -2088,8 +2159,8 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     float* __restrict__ out,
     int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
-    flash_attn_impl<128>(q, kc, vc, out, tq, past, heads, kv_heads, cap, scale,
-                         causal);
+    flash_attn_impl<128, 32, 32>(q, kc, vc, out, tq, past, heads, kv_heads,
+                                 cap, scale, causal);
 }
 
 extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
@@ -2099,8 +2170,8 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
     float* __restrict__ out,
     int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
-    flash_attn_impl<64>(q, kc, vc, out, tq, past, heads, kv_heads, cap, scale,
-                        causal);
+    flash_attn_impl<64, 32, 64>(q, kc, vc, out, tq, past, heads, kv_heads,
+                                cap, scale, causal);
 }
 
 // ---------------------------------------------------------------- convolution

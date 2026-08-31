@@ -79,10 +79,10 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **about 0.65x** against `whisper-server` — a stated
+medians. The ASR is **about 0.68x** against `whisper-server` — a stated
 milestone that is not met, recorded as a miss, and the one comparison in the
 repository whose two halves were not measured in the same sitting: the engine
-side moved from 264 ms to 223 (flash attention in the encoder, alternated
+side moved from 257 ms to 211 (fused attention in the encoder, alternated
 against the previous build) on a machine with no `whisper-server` installed, so
 the ratio is owed a re-run and `docs/BENCHMARKS.md` says so where it appears.
 And the Llama stages are **level with or ahead of llama.cpp on every measured
