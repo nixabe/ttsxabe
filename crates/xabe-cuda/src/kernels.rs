@@ -53,6 +53,12 @@ pub const SOURCE: &str = r#"
 #define GEMM_KSTEPS (GEMM_KC / 8)
 #define GEMM_NPW   (GEMM_NT / (GEMM_WARPS * 8))   // 8-wide n tiles per warp
 
+// Elements of the contraction one thread unpacks from a K-quant per trip. The
+// header decode is per call, so a longer run is fewer decodes for the same
+// weights; sixteen is the ceiling, because a Q6_K scale group is sixteen
+// elements and a run that crossed one would need two scales.
+#define GEMM_QRUN  (((GEMM_KC % 16) == 0) ? 16 : 8)
+
 // The block tile is chosen by *global* traffic, not by shared-memory capacity.
 //
 // A block reads the whole contraction for GEMM_MT rows of `a` and GEMM_NT rows
@@ -447,16 +453,50 @@ __device__ __forceinline__ float q6k_dot8(
 // Eight consecutive elements of one K-quant super-block, header decoded once.
 //
 // `gemm` stages the weight tile two elements per thread and was reaching them
+// `N` words of a byte run, read as one vector when it is aligned for one.
+//
+// The runs this reads are 16-byte aligned for every layout that reaches here -
+// `Quant::device_stride` is a multiple of sixteen, the allocation is
+// 256-aligned, and the element offset is a multiple of the run - but that is
+// an argument, not a guarantee, so it is tested. The byte-at-a-time fallback
+// is why nothing here casts a pointer it has not measured, the same rule
+// `xabe-st` applies to a mapped header.
+template <int N>
+__device__ __forceinline__ void q_words(const unsigned char* p, unsigned* w)
+{
+    if (N == 4 && (((size_t)p) & 15) == 0) {
+        *reinterpret_cast<uint4*>(w) = *reinterpret_cast<const uint4*>(p);
+    } else if ((((size_t)p) & 3) == 0) {
+        #pragma unroll
+        for (int t = 0; t < N; ++t) {
+            w[t] = *reinterpret_cast<const unsigned*>(p + 4 * t);
+        }
+    } else {
+        #pragma unroll
+        for (int t = 0; t < N; ++t) {
+            w[t] = p[4 * t] | (p[4 * t + 1] << 8)
+                 | (p[4 * t + 2] << 16) | (p[4 * t + 3] << 24);
+        }
+    }
+}
+
 // through `q_at`, which re-derives the block header for each - the same waste
 // `q4k_pair` exists to remove from `gemv`, left behind in the tiled kernel
 // because only the decode path had been measured. It is most of prefill.
 //
-// Eight *eight-aligned* elements stay inside one 32-element sub-block and one
+// `RUN` *RUN-aligned* elements stay inside one 32-element sub-block and one
 // 16-element Q6_K scale group, so the scales, the shift and the byte pointer
-// are all shared and the inner eight are a nibble extract and a multiply-add.
+// are all shared and the inner RUN are a nibble extract and a multiply-add.
 // Same addressing as `q6k_dot8` before it was regrouped; `gemm` wants a run of
 // the contraction where `gemv` wants a run of whole bytes.
-__device__ __forceinline__ void q4k_eight(
+//
+// The run length is a parameter because the header decode is per *call*, not
+// per element: at eight, four threads decoded the same super-block header to
+// cover one row of a `GEMM_KC = 32` trip. Sixteen halves that and reads the
+// quants as one 16-byte load instead of two 8-byte ones. It cannot go higher
+// while a Q6_K scale group is sixteen elements.
+template <int RUN>
+__device__ __forceinline__ void q4k_run(
     const unsigned char* blk, int j, float* e)
 {
     float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
@@ -472,22 +512,17 @@ __device__ __forceinline__ void q4k_eight(
     // 256-aligned, and `j` is a multiple of eight. That is an argument, not a
     // guarantee, so the alignment is tested rather than assumed - the same
     // reason `xabe-st` refuses to cast a header it has not measured.
-    unsigned w0, w1;
-    if ((((size_t)qs) & 3) == 0) {
-        w0 = *reinterpret_cast<const unsigned*>(qs);
-        w1 = *reinterpret_cast<const unsigned*>(qs + 4);
-    } else {
-        w0 = qs[0] | (qs[1] << 8) | (qs[2] << 16) | (qs[3] << 24);
-        w1 = qs[4] | (qs[5] << 8) | (qs[6] << 16) | (qs[7] << 24);
-    }
+    unsigned w[RUN / 4];
+    q_words<RUN / 4>(qs, w);
     #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-        unsigned byte = ((t < 4 ? w0 : w1) >> ((t & 3) << 3)) & 0xFF;
+    for (int t = 0; t < RUN; ++t) {
+        unsigned byte = (w[t >> 2] >> ((t & 3) << 3)) & 0xFF;
         e[t] = ds * (float)((byte >> shift) & 0x0F) - dm;
     }
 }
 
-__device__ __forceinline__ void q6k_eight(
+template <int RUN>
+__device__ __forceinline__ void q6k_run(
     const unsigned char* blk, int j, float* e)
 {
     const unsigned char* qh = blk + 128;
@@ -500,23 +535,14 @@ __device__ __forceinline__ void q6k_eight(
     float dsc = d * (float)((int)scales[j >> 4]);
     // Two eight-byte runs, read as words when they are aligned - see the note
     // in `q4k_eight`, which this follows exactly.
-    unsigned l0, l1, h0, h1;
-    if (((((size_t)qlp) | ((size_t)qhp)) & 3) == 0) {
-        l0 = *reinterpret_cast<const unsigned*>(qlp);
-        l1 = *reinterpret_cast<const unsigned*>(qlp + 4);
-        h0 = *reinterpret_cast<const unsigned*>(qhp);
-        h1 = *reinterpret_cast<const unsigned*>(qhp + 4);
-    } else {
-        l0 = qlp[0] | (qlp[1] << 8) | (qlp[2] << 16) | (qlp[3] << 24);
-        l1 = qlp[4] | (qlp[5] << 8) | (qlp[6] << 16) | (qlp[7] << 24);
-        h0 = qhp[0] | (qhp[1] << 8) | (qhp[2] << 16) | (qhp[3] << 24);
-        h1 = qhp[4] | (qhp[5] << 8) | (qhp[6] << 16) | (qhp[7] << 24);
-    }
+    unsigned lw[RUN / 4], hw[RUN / 4];
+    q_words<RUN / 4>(qlp, lw);
+    q_words<RUN / 4>(qhp, hw);
     #pragma unroll
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < RUN; ++t) {
         const int sft = (t & 3) << 3;
-        int lo = (((int)((t < 4 ? l0 : l1) >> sft) & 0xFF) >> (sl << 2)) & 0x0F;
-        int b = (((int)((t < 4 ? h0 : h1) >> sft) & 0xFF) >> (sh << 1)) & 0x03;
+        int lo = (((int)(lw[t >> 2] >> sft) & 0xFF) >> (sl << 2)) & 0x0F;
+        int b = (((int)(hw[t >> 2] >> sft) & 0xFF) >> (sh << 1)) & 0x03;
         e[t] = dsc * (float)((lo | (b << 4)) - 32);
     }
 }
@@ -870,8 +896,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     // `[ksplit, batch, m, n]`, written instead of `out` when `ksplit > 1`.
     float* __restrict__ partial)
 {
-    __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
-    __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
+    // Aligned for the quad-wide staging stores: `GEMM_WSTRIDE` is a multiple
+    // of four words, so a row start is 16-byte aligned when the array is.
+    __shared__ __align__(16) unsigned as[GEMM_MT * GEMM_WSTRIDE];
+    __shared__ __align__(16) unsigned bs[GEMM_NT * GEMM_WSTRIDE];
 
     // See the note in `gemv`: blockIdx.z selects one product of a batch, and
     // above it one slice of the contraction. Slice is the slower axis so that
@@ -934,74 +962,112 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         // nothing that can be measured - every contraction big enough to care
         // about (1280, 5120, 1500, 240, 3840) is even.
         const bool whole = (kc + GEMM_KC <= kend) && ((k & 1) == 0);
-        for (int i = tid; i < GEMM_MT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
-            int row = i / (GEMM_KC / 2);
-            int j   = i % (GEMM_KC / 2);
-            int kk  = kc + 2 * j;
-            unsigned packed = 0;
-            if (a_half) {
-                const int kh = k >> 1;
-                const int aj = (kc >> 1) + j;
-                if (m0 + row < m && aj < kh) {
-                    packed = ah[(size_t)(m0 + row) * kh + aj];
-                }
-            } else {
-                float lo = 0.0f, hi = 0.0f;
-                if (m0 + row < m) {
-                    const float* src = af + (size_t)(m0 + row) * k + kk;
-                    if (whole) {
-                        float2 v = *reinterpret_cast<const float2*>(src);
-                        lo = v.x;
-                        hi = v.y;
+
+        // Four staged words at a time.
+        //
+        // A row is `GEMM_KC / 2` words and that is a multiple of four, so a
+        // quad never straddles two rows, and `GEMM_WSTRIDE` is a multiple of
+        // four so every row starts 16-byte aligned. The eight separate loads
+        // and eight separate stores this replaces were, together with the
+        // weight side, the largest single cost in the kernel: with the whole
+        // staging removed - wrong results, timing only - the same mma loop ran
+        // a prefill in 41 ms against 107 with it.
+        //
+        // The f16 source is read as one `uint4` when it is aligned and the
+        // quad is wholly inside the contraction; otherwise word at a time. The
+        // f32 source needs two `float4` loads for the same four output words,
+        // and falls back the same way. Alignment is tested, not assumed.
+        for (int q = tid; q < GEMM_MT * (GEMM_KC / 8); q += GEMM_WARPS * 32) {
+            const int row = q / (GEMM_KC / 8);
+            const int j   = (q % (GEMM_KC / 8)) * 4;
+            const int kk  = kc + 2 * j;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            unsigned* out4 = &as[row * GEMM_WSTRIDE + j];
+            if (m0 + row < m) {
+                if (a_half) {
+                    const int kh = k >> 1;
+                    const int aj = (kc >> 1) + j;
+                    const unsigned* src = ah + (size_t)(m0 + row) * kh + aj;
+                    if (aj + 3 < kh && (((size_t)src) & 15) == 0) {
+                        v = *reinterpret_cast<const uint4*>(src);
                     } else {
-                        if (kk     < k) lo = src[0];
-                        if (kk + 1 < k) hi = src[1];
+                        unsigned* w = &v.x;
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            if (aj + t < kh) w[t] = src[t];
+                        }
+                    }
+                } else {
+                    const float* src = af + (size_t)(m0 + row) * k + kk;
+                    float e[8];
+                    if (whole && (((size_t)src) & 15) == 0) {
+                        const float4* s4 = reinterpret_cast<const float4*>(src);
+                        *reinterpret_cast<float4*>(e)     = s4[0];
+                        *reinterpret_cast<float4*>(e + 4) = s4[1];
+                    } else {
+                        #pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            e[t] = (kk + t < k) ? src[t] : 0.0f;
+                        }
+                    }
+                    unsigned* w = &v.x;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        w[t] = gemm_pack(e[2 * t], e[2 * t + 1]);
                     }
                 }
-                packed = gemm_pack(lo, hi);
             }
-            as[row * GEMM_WSTRIDE + j] = packed;
+            *reinterpret_cast<uint4*>(out4) = v;
         }
-        // The two K-quants every checkpoint here uses stage eight elements a
-        // thread so the header is decoded once for all of them. `GEMM_KC` is a
-        // multiple of eight and `kc` a multiple of `GEMM_KC`, so `kk` is
-        // eight-aligned and the run cannot straddle a sub-block.
+        // The two K-quants every checkpoint here uses stage `GEMM_QRUN`
+        // elements a thread so the header is decoded once for all of them.
+        // `GEMM_QRUN` divides `GEMM_KC` and `kc` is a multiple of `GEMM_KC`,
+        // so `kk` is run-aligned and the run cannot straddle a sub-block.
         const bool q_fast = w_quant && q_bs == 256
             && (w_quant == QT_Q4_K || w_quant == QT_Q6_K);
         if (q_fast) {
-            for (int i = tid; i < GEMM_NT * (GEMM_KC / 8); i += GEMM_WARPS * 32) {
-                int row = i / (GEMM_KC / 8);
-                int jq  = i % (GEMM_KC / 8);
-                int kk  = kc + 8 * jq;
-                float e[8];
+            for (int i = tid; i < GEMM_NT * (GEMM_KC / GEMM_QRUN);
+                 i += GEMM_WARPS * 32) {
+                int row = i / (GEMM_KC / GEMM_QRUN);
+                int jq  = i % (GEMM_KC / GEMM_QRUN);
+                int kk  = kc + GEMM_QRUN * jq;
+                float e[GEMM_QRUN];
                 #pragma unroll
-                for (int t = 0; t < 8; ++t) {
+                for (int t = 0; t < GEMM_QRUN; ++t) {
                     e[t] = 0.0f;
                 }
                 if (n0 + row < n) {
-                    if (kk + 7 < k) {
+                    if (kk + GEMM_QRUN - 1 < k) {
                         long nb = k / 256;
                         const unsigned char* blk = wq
                             + ((size_t)(n0 + row) * nb + (kk >> 8)) * (size_t)q_ts;
                         if (w_quant == QT_Q4_K) {
-                            q4k_eight(blk, kk & 255, e);
+                            q4k_run<GEMM_QRUN>(blk, kk & 255, e);
                         } else {
-                            q6k_eight(blk, kk & 255, e);
+                            q6k_run<GEMM_QRUN>(blk, kk & 255, e);
                         }
                     } else {
                         // The tail of a contraction that is not a whole tile.
                         #pragma unroll
-                        for (int t = 0; t < 8; ++t) {
+                        for (int t = 0; t < GEMM_QRUN; ++t) {
                             if (kk + t < k) {
                                 e[t] = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + t);
                             }
                         }
                     }
                 }
+                // The words a K-quant run produces are contiguous and
+                // quad-aligned, for the same reason the activation's are.
                 #pragma unroll
-                for (int t = 0; t < 4; ++t) {
-                    bs[row * GEMM_WSTRIDE + 4 * jq + t] =
-                        gemm_pack(e[2 * t], e[2 * t + 1]);
+                for (int h = 0; h < GEMM_QRUN / 8; ++h) {
+                    uint4 v;
+                    unsigned* w = &v.x;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        w[t] = gemm_pack(e[8 * h + 2 * t], e[8 * h + 2 * t + 1]);
+                    }
+                    *reinterpret_cast<uint4*>(
+                        &bs[row * GEMM_WSTRIDE + (GEMM_QRUN / 2) * jq + 4 * h]) = v;
                 }
             }
         }
