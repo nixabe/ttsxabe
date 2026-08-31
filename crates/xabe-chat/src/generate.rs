@@ -91,14 +91,12 @@ impl ChatModel {
         let mut stop = Stop::Limit;
 
         while produced.len() < s.max_tokens {
-            let logits = self.forward(&pending, &mut cache)?;
             // Only the last position's row predicts the next token; the rest
-            // exist so the cache is filled.
-            let n = pending.len();
-            let vocab = self.config().vocab_size;
-            let mut row =
-                self.gpu()
-                    .download(&self.gpu().copy_range(&logits, (n - 1) * vocab, vocab)?)?;
+            // are run so the cache is filled, and `forward_last` is how it
+            // says so - projecting them all is the single biggest thing a
+            // prefill can waste.
+            let logits = self.forward_last(&pending, &mut cache)?;
+            let mut row = self.gpu().download(&logits)?;
 
             let back = produced.len().min(s.repeat_last_n);
             let id = sample(&mut row, &produced[produced.len() - back..], s, &mut rng);

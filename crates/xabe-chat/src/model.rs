@@ -379,10 +379,24 @@ impl ChatModel {
 
     /// Runs `ids` through the model and returns the logits, `[n, vocab]`.
     pub fn forward(&self, ids: &[u32], cache: &mut Cache) -> Result<CudaSlice<f32>, ChatError> {
-        Ok(self.forward_tapped(ids, cache, 0)?.0)
+        Ok(self.run(ids, cache, 0, false)?.0)
     }
 
-    /// The same, also returning the first `taps` block outputs on the host.
+    /// The same, but only the last position's logits, `[1, vocab]`.
+    ///
+    /// What generation wants: the other rows are run so the cache is filled,
+    /// and their logits are thrown away. Projecting them through a
+    /// 128256-wide head is not free - see the note at the end of `run`.
+    pub fn forward_last(
+        &self,
+        ids: &[u32],
+        cache: &mut Cache,
+    ) -> Result<CudaSlice<f32>, ChatError> {
+        Ok(self.run(ids, cache, 0, true)?.0)
+    }
+
+    /// The same as [`Self::forward`], also returning the first `taps` block
+    /// outputs on the host.
     ///
     /// On the public surface for the same reason the translator's is: "the
     /// model is wrong" is not a fact anyone can act on, and "layer 7 is wrong"
@@ -392,6 +406,16 @@ impl ChatModel {
         ids: &[u32],
         cache: &mut Cache,
         taps: usize,
+    ) -> Result<(CudaSlice<f32>, Vec<Vec<f32>>), ChatError> {
+        self.run(ids, cache, taps, false)
+    }
+
+    fn run(
+        &self,
+        ids: &[u32],
+        cache: &mut Cache,
+        taps: usize,
+        last_only: bool,
     ) -> Result<(CudaSlice<f32>, Vec<Vec<f32>>), ChatError> {
         let h_dim = self.cfg.hidden_size;
         let heads = self.cfg.num_attention_heads;
@@ -586,13 +610,22 @@ impl ChatModel {
         if taps > 0 {
             tapped.push(self.gpu.download(&h)?);
         }
+        // Only the last row predicts the next token. A 128-token prompt
+        // projected all 128 of them through a 128256-wide head and threw 127
+        // away: 7.8 ms of a 95 ms prefill, measured. The rows are still *run*
+        // through every block - that is what fills the cache - they are just
+        // not projected.
+        let (rows, h) = match last_only && n > 1 {
+            true => (1, self.gpu.copy_range(&h, (n - 1) * h_dim, h_dim)?),
+            false => (n, h),
+        };
         Ok((
             self.gpu.gemm_batched(
                 Operand::F32(&h),
                 self.lm_head.operand(),
                 None,
-                Batch::single(n * self.cfg.vocab_size),
-                n,
+                Batch::single(rows * self.cfg.vocab_size),
+                rows,
                 h_dim,
                 self.cfg.vocab_size,
             )?,

@@ -118,7 +118,7 @@ fn main() -> ExitCode {
             for r in 0..args.rounds + 1 {
                 let mut cache = m.cache();
                 let t0 = Instant::now();
-                if m.forward(&ids, &mut cache).is_err() {
+                if m.forward_last(&ids, &mut cache).is_err() {
                     eprintln!("prefill failed");
                     return ExitCode::FAILURE;
                 }
@@ -127,7 +127,9 @@ fn main() -> ExitCode {
 
                 let t0 = Instant::now();
                 for i in 0..args.decode {
-                    if m.forward(&[1500 + i as u32 % 100], &mut cache).is_err() {
+                    if m.forward_last(&[1500 + i as u32 % 100], &mut cache)
+                        .is_err()
+                    {
                         eprintln!("decode failed");
                         return ExitCode::FAILURE;
                     }
@@ -166,7 +168,7 @@ fn main() -> ExitCode {
             for r in 0..args.rounds + 1 {
                 let mut cache = m.cache();
                 let t0 = Instant::now();
-                if m.forward(&ids, &mut cache).is_err() {
+                if m.forward_last(&ids, &mut cache).is_err() {
                     eprintln!("prefill failed");
                     return ExitCode::FAILURE;
                 }
@@ -175,7 +177,9 @@ fn main() -> ExitCode {
 
                 let t0 = Instant::now();
                 for i in 0..args.decode {
-                    if m.forward(&[1500 + i as u32 % 100], &mut cache).is_err() {
+                    if m.forward_last(&[1500 + i as u32 % 100], &mut cache)
+                        .is_err()
+                    {
                         eprintln!("decode failed");
                         return ExitCode::FAILURE;
                     }

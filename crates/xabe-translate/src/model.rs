@@ -441,10 +441,23 @@ impl Translator {
         ids: &[u32],
         cache: &mut Cache,
     ) -> Result<CudaSlice<f32>, TranslateError> {
-        Ok(self.forward_tapped(ids, cache, 0)?.0)
+        Ok(self.run(ids, cache, 0, false)?.0)
     }
 
-    /// The same, also returning the first `taps` block outputs on the host.
+    /// The same, but only the last position's logits, `[1, vocab]`.
+    ///
+    /// What generation wants: the other rows are run so the cache is filled,
+    /// and their logits are thrown away. See the note at the end of `run`.
+    pub fn forward_last(
+        &self,
+        ids: &[u32],
+        cache: &mut Cache,
+    ) -> Result<CudaSlice<f32>, TranslateError> {
+        Ok(self.run(ids, cache, 0, true)?.0)
+    }
+
+    /// The same as [`Self::forward`], also returning the first `taps` block
+    /// outputs on the host.
     ///
     /// On the public surface for the same reason the ASR's are: "the model is
     /// wrong" is not a fact anyone can act on, and "layer 7 is wrong" is.
@@ -453,6 +466,16 @@ impl Translator {
         ids: &[u32],
         cache: &mut Cache,
         taps: usize,
+    ) -> Result<(CudaSlice<f32>, Vec<Vec<f32>>), TranslateError> {
+        self.run(ids, cache, taps, false)
+    }
+
+    fn run(
+        &self,
+        ids: &[u32],
+        cache: &mut Cache,
+        taps: usize,
+        last_only: bool,
     ) -> Result<(CudaSlice<f32>, Vec<Vec<f32>>), TranslateError> {
         let (h_dim, heads) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
         let hd = self.cfg.head_dim();
@@ -609,13 +632,21 @@ impl Translator {
         if taps > 0 {
             tapped.push(self.gpu.download(&h)?);
         }
+        // Only the last row predicts the next token. A prompt projected every
+        // row through a 32000-wide head and threw all but one away; the rows
+        // are still *run* through every block - that is what fills the cache -
+        // they are just not projected.
+        let (rows, h) = match last_only && n > 1 {
+            true => (1, self.gpu.copy_range(&h, (n - 1) * h_dim, h_dim)?),
+            false => (n, h),
+        };
         Ok((
             self.gpu.gemm_batched(
                 Operand::F32(&h),
                 self.lm_head.operand(),
                 None,
-                Batch::single(n * self.cfg.vocab_size),
-                n,
+                Batch::single(rows * self.cfg.vocab_size),
+                rows,
                 h_dim,
                 self.cfg.vocab_size,
             )?,
@@ -668,12 +699,8 @@ impl Translator {
         ];
 
         for _ in 0..max_new {
-            let logits = self.forward(&pending, &mut cache)?;
-            let mut row = self.gpu.download(&self.gpu.copy_range(
-                &logits,
-                (pending.len() - 1) * self.cfg.vocab_size,
-                self.cfg.vocab_size,
-            )?)?;
+            let logits = self.forward_last(&pending, &mut cache)?;
+            let mut row = self.gpu.download(&logits)?;
             if penalty != 1.0 {
                 // llama.cpp's rule, and it is not the obvious one: a positive
                 // logit is *divided* by the penalty and a negative one
