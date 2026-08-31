@@ -44,17 +44,61 @@ const KSLICE_MIN: usize = 512;
 /// `ksplit * batch * m * n` scratch it reads.
 const KSPLIT_MAX: usize = 8;
 
+/// The shortest slice a *tail* split is allowed, against [`KSLICE_MIN`] for a
+/// fill split.
+///
+/// The two regimes tolerate different slices, and the sweep that says so is in
+/// `docs/BENCHMARKS.md`: a machine-filling split of an under-one-wave launch
+/// keeps winning down to 1024-element slices, where a tail split of a
+/// multi-wave launch falls off a cliff below about 2048 - at slices of 1707
+/// and shorter it measured slower than not splitting at all.
+const KSLICE_TAIL: usize = 2048;
+
+/// Past this idle fraction of the last wave, a tail split pays.
+///
+/// 160 blocks on 144 slots idles 44% of two waves and wants the split; 448
+/// blocks idles 22% of four and measured *worse* split. The boundary is
+/// between those two measurements, not derived.
+const TAIL_IDLE_MIN: f64 = 0.3;
+
 /// How many ways `gemm` splits the contraction at this shape. One is no split.
 ///
 /// A function rather than an expression at the call site so the geometry can be
 /// asserted without a device: what it returns decides whether a launch writes
 /// `out` or a scratch buffer, and getting it wrong is silent.
+///
+/// Two regimes, split on whether the launch fills one wave of `SM_TARGET`
+/// resident blocks:
+///
+/// * **Under a wave**, splitting turns idle SMs into concurrent slices and the
+///   old rule stands: fill the machine, keep a slice at least [`KSLICE_MIN`].
+/// * **Over a wave**, more blocks do not buy concurrency - they buy a shorter
+///   *tail*. A launch of 1.11 waves runs its last 16 blocks on an otherwise
+///   idle machine for a whole block's k-loop, and splitting s ways cuts that
+///   straggler's loop by s. That is worth having exactly when the idle
+///   fraction is large - the translator's 5120-wide projections at 512 tokens,
+///   160 blocks, 44% idle, measured 15-25% faster split four ways - and worth
+///   avoiding when the waves are already full: the same model's 13824-wide
+///   projections, three exact waves, measured 80% *slower* split in two. The
+///   slice floor is higher here too; see [`KSLICE_TAIL`].
 pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
     let blocks =
         n.div_ceil(kernels::GEMM_NT as usize) * m.div_ceil(kernels::GEMM_MT as usize) * batch;
-    (SM_TARGET / blocks.max(1))
-        .min(k / KSLICE_MIN)
-        .clamp(1, KSPLIT_MAX)
+    let blocks = blocks.max(1);
+    if blocks <= SM_TARGET {
+        return (SM_TARGET / blocks)
+            .min(k / KSLICE_MIN)
+            .clamp(1, KSPLIT_MAX);
+    }
+    let waves = blocks.div_ceil(SM_TARGET);
+    let idle = (waves * SM_TARGET - blocks) as f64 / (waves * SM_TARGET) as f64;
+    if idle < TAIL_IDLE_MIN {
+        return 1;
+    }
+    (2..=4usize)
+        .rev()
+        .find(|&s| k / s >= KSLICE_TAIL)
+        .unwrap_or(1)
 }
 
 /// Output channels each convolution thread accumulates. Must match `OC_TILE`
