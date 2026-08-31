@@ -53,6 +53,14 @@ struct Args {
     #[arg(long)]
     tts: Option<PathBuf>,
 
+    /// The converted Tacotron2 + WaveGlow directory, as the other alternative
+    /// synthesiser.
+    ///
+    /// Loaded before the ASR so that a run naming it and no VITS still charges
+    /// the CUDA context to a synthesiser rather than to the ASR.
+    #[arg(long)]
+    tacotron2: Option<PathBuf>,
+
     /// The converted CosyVoice directory, as the alternative synthesiser.
     ///
     /// Its three GPU-resident sub-models are opened directly rather than
@@ -116,6 +124,13 @@ fn main() {
         step("tts + ctx");
         m
     });
+    let _taco = args.tacotron2.as_ref().map(|p| {
+        // `sigma` and the seed steer synthesis, not residency; the defaults
+        // from `taco_bench` keep this the same object the pipeline builds.
+        let m = xabe_taco::Taco::open(p, dev, None, 0).expect("the Tacotron2 checkpoint");
+        step("tacotron2");
+        m
+    });
     let _asr = args.asr.as_ref().map(|p| {
         let m = xabe_asr::AsrModel::open(p, dev).expect("the ASR checkpoint");
         step("asr");
@@ -142,6 +157,12 @@ fn main() {
         step("cosyvoice");
         (llm, flow, hift)
     });
+
+    // The VAD is deliberately absent: `xabe_vad::open` takes no device
+    // ordinal, because Silero is 1.8 M parameters of CPU arithmetic and never
+    // reaches the card. A stage that occupies no VRAM is worth saying once
+    // rather than leaving a reader to wonder which stage was forgotten.
+    println!("{:<14} {:>12} {:>12}", "vad (cpu)", 0, last - base);
 
     let total = used_mib(dev) - base;
     let capacity = 49152u64;

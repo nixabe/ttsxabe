@@ -599,6 +599,49 @@ would answer a different question and give a smaller number.
 KV caches and activations. Without CosyVoice, which is the alternative
 synthesiser rather than a second stage, the four remaining are 18 505 MiB.
 
+The VAD is absent from that table because it occupies nothing: `xabe_vad::open`
+takes no device ordinal, Silero being 1.8 M parameters of CPU arithmetic. The
+report prints a zero row for it rather than leaving a reader to wonder which
+stage was forgotten.
+
+### The same card with Tacotron2 as the only synthesiser
+
+Neither VITS nor CosyVoice, which is the configuration to read if the reply
+path is Han text through Tacotron2:
+
+| stage | container | delta MiB | cumulative |
+| --- | --- | --- | --- |
+| Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 | 486 | 486 |
+| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 200 | 3 686 |
+| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 6 496 | 10 182 |
+| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 8 706 | **18 888** |
+
+**18 888 MiB — 18.4 GiB**, leaving 30 255 MiB. Tacotron2 costs 383 MiB more
+than VITS did in the row above, which is the two models' parameter counts and
+not the context; dropping CosyVoice is what saves the 3 266 MiB.
+
+### The caches are the part that grows, and the translator has no GQA
+
+Weights are what the table measures. The KV cache is f32 and its capacity
+doubles from 256, so a 2 100-token conversation has allocated 4 096 slots and
+pays the 4k column.
+
+| | kv heads | per token | 1k ctx | 4k ctx |
+| --- | ---: | ---: | ---: | ---: |
+| chat 8 B | 8 of 32 | 256 KiB | 256 MiB | 1.00 GiB |
+| translator 13 B | 40 of 40 | 1 600 KiB | 1 600 MiB | **6.25 GiB** |
+
+That arithmetic is checked against a measurement rather than left as
+arithmetic: the translator alone, a 2 048-token prefill and 64 decodes on an
+otherwise empty card, peaks at **18 031 MiB** - about 8.9 GiB of weights and
+context, 6.25 GiB of KV at the doubled 4 096 capacity, and the rest prefill
+activations.
+
+So the four stages at a 4k context on both models come to roughly 26 GiB of
+the 48. The headroom is real, and the translator's cache spends it four times
+faster than the chat model's: an f16 KV cache there is worth 3.1 GiB and is the
+first thing to try if it ever gets tight.
+
 The context is charged to the TTS row because it is created by whichever stage
 opens the device first, and 36 M parameters is where it is obviously the
 context rather than the weights. CosyVoice is measured as its three
