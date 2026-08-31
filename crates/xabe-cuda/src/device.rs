@@ -210,8 +210,10 @@ impl Quant {
     /// multiple of 16, costing 6.7% of the bytes of a Q6_K tensor.
     ///
     /// This is the one place the engine's copy of a checkpoint is not
-    /// byte-for-byte the file's. It is a stride, not a re-encoding: every block
-    /// is still the file's own 210 bytes, at a wider pitch.
+    /// byte-for-byte the file's. It began as a stride alone; the blocks are now
+    /// also re-packed on the way - same 210 bytes of payload, reordered so a
+    /// staged run of elements is one aligned read per operand. See
+    /// [`Gpu::upload_quant`] for the layout and why.
     pub const fn device_stride(self) -> usize {
         match self {
             Self::Q6K => 224,
@@ -779,10 +781,11 @@ impl Gpu {
     /// Copies packed blocks to the device at [`Quant::device_stride`].
     ///
     /// The path every model loader takes. For all but Q6_K it is
-    /// [`Gpu::upload_u8`] with a length check; for Q6_K it restrides the blocks
-    /// on the way, which is why the check is a rejection and not a
-    /// `debug_assert`: a `bytes` that is not a whole number of blocks would be
-    /// restrided into garbage that still decodes to plausible numbers.
+    /// [`Gpu::upload_u8`] with a length check; for Q6_K it re-strides *and*
+    /// re-packs the blocks on the way - see [`Gpu::q6k_device_block`] - which
+    /// is why the check is a rejection and not a `debug_assert`: a `bytes`
+    /// that is not a whole number of blocks would be rebuilt into garbage that
+    /// still decodes to plausible numbers.
     pub fn upload_quant(&self, q: Quant, bytes: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
         let ts = q.type_size();
         if !bytes.len().is_multiple_of(ts) {
@@ -798,9 +801,54 @@ impl Gpu {
         let blocks = bytes.len() / ts;
         let mut wide = vec![0u8; blocks * stride];
         for (b, src) in bytes.chunks_exact(ts).enumerate() {
-            wide[b * stride..b * stride + ts].copy_from_slice(src);
+            let dst = &mut wide[b * stride..(b + 1) * stride];
+            match q {
+                Quant::Q6K => Self::q6k_device_block(src, dst),
+                // No other format is re-strided today; if one ever is, it gets
+                // a plain copy until its kernels ask for more.
+                _ => dst[..ts].copy_from_slice(src),
+            }
         }
         self.upload_u8(&wide)
+    }
+
+    /// One Q6_K block, file layout to device layout.
+    ///
+    /// The file pairs a `ql` byte's nibbles 64 elements apart and scatters a
+    /// `qh` byte's four fields 32 apart, which makes every kernel that stages
+    /// a *run* of elements fetch twice the bytes it decodes. The device block
+    /// pairs nibbles 32 apart - exactly Q4_K's shape, elements `j` and
+    /// `j + 32` in one byte - and packs the 2-bit high fields one 16-element
+    /// run to a word, element `e` at bits `8 * (e % 4) + 2 * (e / 4)`, so a
+    /// staged run is one aligned read per operand and every fetched byte is
+    /// used. Scales and `d` keep their offsets; the tail of the 224 pads.
+    ///
+    /// Every device-side reader of a Q6_K block decodes this layout and only
+    /// this layout - `q_elem` documents it on the kernel side - and nothing
+    /// downloads a block back, so the file's own order exists on the card
+    /// nowhere at all.
+    fn q6k_device_block(src: &[u8], dst: &mut [u8]) {
+        let lo4 = |e: usize| (src[(e >> 7) * 64 + (e & 63)] >> (4 * ((e >> 6) & 1))) & 0x0F;
+        let hi2 =
+            |e: usize| (src[128 + (e >> 7) * 32 + (e & 31)] >> (2 * ((e >> 5) & 3))) & 0x03;
+        for p in 0..4 {
+            for b in 0..32 {
+                let e = 64 * p + b;
+                dst[32 * p + b] = lo4(e) | (lo4(e + 32) << 4);
+            }
+            for h in 0..2 {
+                for s in 0..2 {
+                    for v in 0..4 {
+                        let e0 = 64 * p + 32 * s + 16 * h + v;
+                        dst[128 + 16 * p + 8 * h + 4 * s + v] = hi2(e0)
+                            | (hi2(e0 + 4) << 2)
+                            | (hi2(e0 + 8) << 4)
+                            | (hi2(e0 + 12) << 6);
+                    }
+                }
+            }
+        }
+        dst[192..210].copy_from_slice(&src[192..210]);
     }
 
     /// Copies a slice to the device as f16, rounding once.

@@ -378,19 +378,24 @@ __device__ __forceinline__ float q_elem(int ty, const unsigned char* blk, int j)
         unsigned char bit = (qh[j % 32] >> jj) & 1;
         return d * (float)sc * (float)(lo | (bit << 4)) - dmin * (float)mn;
     }
-    // ql(128) + qh(64) + scales(16, signed) + d(2). The low part runs in
-    // groups of 64 and the high part in groups of 32.
+    // ql(128) + qh(64) + scales(16, signed) + d(2), in the *device* layout,
+    // not the file's. `Gpu::upload_quant` re-packs a Q6_K block on the way to
+    // the card: the low nibbles are paired 32 elements apart the way Q4_K's
+    // are, and the 2-bit high fields are packed one 16-element run to a word,
+    // element `e` at bits `8*(e%4) + 2*(e/4)`. The file's own grouping - low
+    // halves 64 apart, high fields four to a byte across 128 elements - made
+    // every kernel that stages a run fetch twice what it used.
     case QT_Q6_K: {
         const unsigned char* ql = blk;
         const unsigned char* qh = blk + 128;
         const unsigned char* scales = blk + 192;
         float d = q_f16(blk, 208);
         int g = j / 16;
-        int hi = j / 128, r = j % 128;
-        int sl = r / 64, k64 = r % 64;
-        int sh = r / 32, k32 = r % 32;
-        unsigned char lo = (ql[hi * 64 + k64] >> (4 * sl)) & 0x0F;
-        unsigned char bits = (qh[hi * 32 + k32] >> (2 * sh)) & 0x03;
+        int p = j / 64, r = j % 64;
+        int s = r / 32, h = (r / 16) & 1, e = r % 16;
+        unsigned char lo = (ql[p * 32 + (r % 32)] >> (4 * s)) & 0x0F;
+        unsigned char bits =
+            (qh[p * 16 + h * 8 + s * 4 + (e % 4)] >> (2 * (e / 4))) & 0x03;
         int q = (int)(lo | (bits << 4)) - 32;
         return d * (float)((int)(signed char)scales[g]) * (float)q;
     }
@@ -471,55 +476,38 @@ __device__ __forceinline__ float q4k_pair(
     return acc;
 }
 
-// Eight elements of a Q6_K super-block, chosen so no packed byte is read twice.
+// Eight consecutive elements of a Q6_K super-block, in the device layout.
 //
-// A Q6_K element takes a nibble of `ql` and a 2-bit field of `qh`. The nibbles
-// of one `ql` byte are 64 apart and the four fields of one `qh` byte are 32
-// apart, so eight *adjacent* elements touch eight `ql` bytes and eight `qh`
-// bytes and use an eighth of what they fetch: the warp reads every byte twice
-// over for `ql` and four times over for `qh`.
+// `Gpu::upload_quant` re-packs Q6_K so that eight consecutive elements are
+// eight consecutive `ql` bytes' nibbles of one rank and one word of `qh` -
+// two word loads and one, all aligned, every fetched byte used. The file's
+// own grouping needed a lane to own two columns across all four `qh` fields
+// to avoid re-reading bytes, and even then the reads were 16-bit.
 //
-// A lane instead owns two adjacent columns across all four fields - elements
-// hi * 128 + sh * 32 + b + c for sh in 0..3 and c in 0..1. Those eight need
-// three 16-bit reads, two of `ql` and one of `qh`, and across the warp they
-// cover ql[0..127] and qh[0..63] exactly once. Sixteen byte loads become three
-// short ones. Measured standalone on this card at n=14336, k=4096: 410 us to
-// 129 us, agreeing with the layout above to 2.8e-07 relative.
-//
-// Shorts and not words because a Q6_K block is 210 bytes: the stride is even
-// but not a multiple of four, so successive blocks are 2-byte aligned and
-// nothing wider is safe.
+// `j` is the first element and must be a multiple of eight, so the run stays
+// inside one 16-element scale group and one nibble rank.
 __device__ __forceinline__ float q6k_dot8(
-    const unsigned char* blk, const float* ap, int hi, int bb, int g0)
+    const unsigned char* blk, const float* ap, int j)
 {
     float d = q_f16(blk, 208);
     const signed char* scales = (const signed char*)(blk + 192);
-    unsigned h  = *(const unsigned short*)(blk + 128 + (hi << 5) + bb);
-    unsigned l0 = *(const unsigned short*)(blk + (hi << 6) + bb);
-    unsigned l1 = *(const unsigned short*)(blk + (hi << 6) + 32 + bb);
-
-    // Scale group j / 16 is hi * 8 + sh * 2 + b / 16, and the last term is the
-    // same for both columns because `bb` is even.
-    float ds[4];
-    #pragma unroll
-    for (int sh = 0; sh < 4; ++sh) {
-        ds[sh] = d * (float)((int)scales[g0 + (sh << 1)]);
-    }
-
+    const int p = j >> 6, s = (j >> 5) & 1, h = (j >> 4) & 1, e0 = j & 15;
+    // Both words are 4-byte aligned: the device stride is 224, the allocation
+    // is 256-aligned, and `j` is a multiple of eight.
+    const unsigned char* qlp = blk + (p << 5) + (h << 4) + e0;
+    unsigned lw[2];
+    lw[0] = *(const unsigned*)qlp;
+    lw[1] = *(const unsigned*)(qlp + 4);
+    const unsigned W =
+        *(const unsigned*)(blk + 128 + (p << 4) + (h << 3) + (s << 2));
+    const float ds = d * (float)((int)scales[j >> 4]);
     float acc = 0.0f;
     #pragma unroll
-    for (int c = 0; c < 2; ++c) {
-        unsigned hb = (h >> (c << 3)) & 0xFFu;
-        unsigned b0 = (l0 >> (c << 3)) & 0xFFu;
-        unsigned b1 = (l1 >> (c << 3)) & 0xFFu;
-        // sh 0 and 2 share a `ql` byte, as do sh 1 and 3; the low nibble is the
-        // lower field of the pair.
-        unsigned nib[4] = { b0 & 0x0Fu, b1 & 0x0Fu, b0 >> 4, b1 >> 4 };
-        #pragma unroll
-        for (int sh = 0; sh < 4; ++sh) {
-            int q = (int)(nib[sh] | (((hb >> (sh << 1)) & 3u) << 4)) - 32;
-            acc += ap[(sh << 5) + c] * (ds[sh] * (float)q);
-        }
+    for (int i = 0; i < 8; ++i) {
+        int lo = ((int)(lw[i >> 2] >> ((i & 3) << 3)) >> (s << 2)) & 0x0F;
+        const int e = e0 + i;
+        int b = (int)(W >> (((e & 3) << 3) + ((e >> 2) << 1))) & 3;
+        acc += ap[i] * (ds * (float)((lo | (b << 4)) - 32));
     }
     return acc;
 }
@@ -540,6 +528,9 @@ __device__ __forceinline__ void q_words(const unsigned char* p, unsigned* w)
 {
     if (N == 4 && (((size_t)p) & 15) == 0) {
         *reinterpret_cast<uint4*>(w) = *reinterpret_cast<const uint4*>(p);
+    } else if (N == 8 && (((size_t)p) & 15) == 0) {
+        *reinterpret_cast<uint4*>(w)     = *reinterpret_cast<const uint4*>(p);
+        *reinterpret_cast<uint4*>(w + 4) = *reinterpret_cast<const uint4*>(p + 16);
     } else if ((((size_t)p) & 3) == 0) {
         #pragma unroll
         for (int t = 0; t < N; ++t) {
@@ -644,24 +635,25 @@ template <int RUN>
 __device__ __forceinline__ void q6k_run(
     const unsigned char* blk, int j, float* e)
 {
-    const unsigned char* qh = blk + 128;
     const signed char* scales = (const signed char*)(blk + 192);
     float d = q_f16(blk, 208);
-    int g = j >> 7, r = j & 127;
-    int sl = (r >> 6) & 1, sh = (r >> 5) & 3;
-    const unsigned char* qlp = blk + (g << 6) + (r & 63);
-    const unsigned char* qhp = qh + (g << 5) + (r & 31);
+    // Device layout: the run's low nibbles are `RUN` consecutive bytes of one
+    // rank, and its 2-bit high fields are one word, element `e` of the
+    // 16-element run at bits `8*(e%4) + 2*(e/4)`. The file's own grouping
+    // needed a second full-width read of `qh` per run.
+    const int p = j >> 6, s = (j >> 5) & 1;
+    const unsigned char* qlp = blk + (p << 5) + (j & 31);
+    const unsigned W = *(const unsigned*)(
+        blk + 128 + (p << 4) + (((j >> 4) & 1) << 3) + (s << 2));
     float dsc = d * (float)((int)scales[j >> 4]);
-    // Two eight-byte runs, read as words when they are aligned - see the note
-    // in `q4k_eight`, which this follows exactly.
-    unsigned lw[RUN / 4], hw[RUN / 4];
+    unsigned lw[RUN / 4];
     q_words<RUN / 4>(qlp, lw);
-    q_words<RUN / 4>(qhp, hw);
     #pragma unroll
     for (int t = 0; t < RUN; ++t) {
         const int sft = (t & 3) << 3;
-        int lo = (((int)(lw[t >> 2] >> sft) & 0xFF) >> (sl << 2)) & 0x0F;
-        int b = (((int)(hw[t >> 2] >> sft) & 0xFF) >> (sh << 1)) & 0x03;
+        const int ee = (j & 15) + t;
+        int lo = (((int)(lw[t >> 2] >> sft) & 0xFF) >> (s << 2)) & 0x0F;
+        int b = (int)(W >> (((ee & 3) << 3) + ((ee >> 2) << 1))) & 3;
         e[t] = dsc * (float)((lo | (b << 4)) - 32);
     }
 }
@@ -749,52 +741,53 @@ __device__ __forceinline__ float q4k_wide(
          + a1 * (d * (float)s1 * (float)dot1 - dmin * (float)m1 * (float)sum1);
 }
 
-// Sixteen bytes of one Q6_K super-block's low quants and sixteen of its high
+// Sixteen bytes of one Q6_K super-block's low quants and eight of its high
 // bits, against an int8 activation.
 //
 // The same shape as `q4k_wide` and it needs the same thing to work: a 16-byte
 // load has to be 16-byte aligned, and a Q6_K block is 210 bytes, so consecutive
 // blocks in a file are aligned to 2 and nothing more. `Gpu::upload_quant` pads
-// the stride to 224 for exactly this reason - it is the only place in the
-// engine where what sits in VRAM is not byte-for-byte what sits in the file,
-// and it is a stride change rather than a format change.
+// the stride to 224 and re-packs the block on the way - the device layout
+// `q_elem` documents - which is the only place in the engine where what sits
+// in VRAM is not byte-for-byte what sits in the file.
 //
-// Eight lanes cover a block. A lane owns sixteen `ql` bytes and the sixteen
-// `qh` bytes that share their `l`, which between them carry 32 elements: the
-// low nibbles at `j0` and the high ones 64 further along. Two of the block's
-// sixteen signed scales cover them.
+// Eight lanes cover a block. In the device layout a lane owns sixteen `ql`
+// bytes whose two nibble ranks are the elements at `j0` and 32 further along -
+// the same pairing Q4_K ships with - and the eight `qh` bytes beside them,
+// one word per 16-element run, element `e` at bits `8*(e%4) + 2*(e/4)`. Two
+// of the block's sixteen signed scales cover them. The file's own grouping
+// made this read sixteen `qh` bytes and use half of each.
 //
 // The -32 bias is not applied per element. `sum(x)` comes out of a second
 // `dp4a` against a word of ones and the bias is one multiply at the end, which
 // is what keeps the inner loop to eight instructions.
 __device__ __forceinline__ float q6k_wide(
     const unsigned char* blk, const signed char* xa, const float* asc,
-    int qlo, int qho, int sc_lo, int shift, int j0)
+    int qlo, int qho, int sc_lo, int j0)
 {
     uint4 v = *(const uint4*)(blk + qlo);
-    uint4 u = *(const uint4*)(blk + qho);
+    uint2 u = *(const uint2*)(blk + qho);
     float d = q_f16(blk, 208);
     const signed char* sc = (const signed char*)(blk + 192);
-    float slo = (float)sc[sc_lo], shi = (float)sc[sc_lo + 4];
+    float slo = (float)sc[sc_lo], shi = (float)sc[sc_lo + 2];
     uint4 xl = *(const uint4*)(xa + j0);
-    uint4 xh = *(const uint4*)(xa + j0 + 64);
+    uint4 xh = *(const uint4*)(xa + j0 + 32);
     const unsigned* vw = (const unsigned*)&v;
-    const unsigned* uw = (const unsigned*)&u;
     const unsigned* xlw = (const unsigned*)&xl;
     const unsigned* xhw = (const unsigned*)&xh;
     int dot0 = 0, sum0 = 0, dot1 = 0, sum1 = 0;
     #pragma unroll
     for (int w = 0; w < 4; ++w) {
         unsigned lo = (vw[w] & 0x0F0F0F0Fu)
-                    | (((uw[w] >> shift) & 0x03030303u) << 4);
+                    | (((u.x >> (w << 1)) & 0x03030303u) << 4);
         unsigned hi = ((vw[w] >> 4) & 0x0F0F0F0Fu)
-                    | (((uw[w] >> (shift + 4)) & 0x03030303u) << 4);
+                    | (((u.y >> (w << 1)) & 0x03030303u) << 4);
         dot0 = __dp4a((int)lo, (int)xlw[w], dot0);
         sum0 = __dp4a(0x01010101, (int)xlw[w], sum0);
         dot1 = __dp4a((int)hi, (int)xhw[w], dot1);
         sum1 = __dp4a(0x01010101, (int)xhw[w], sum1);
     }
-    float a0 = asc[j0 >> 5], a1 = asc[(j0 + 64) >> 5];
+    float a0 = asc[j0 >> 5], a1 = asc[(j0 + 32) >> 5];
     return a0 * d * slo * (float)(dot0 - 32 * sum0)
          + a1 * d * shi * (float)(dot1 - 32 * sum1);
 }
@@ -912,14 +905,14 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         } else if (qa && q_bs == 256 && w_quant == QT_Q6_K) {
             const int nb = k >> 8;
             const int sub = lane >> 3, slot = lane & 7;
-            const int nn = slot >> 2, gg = (slot >> 1) & 1, hh = slot & 1;
-            const int qlo = (nn << 6) + (gg << 5) + (hh << 4);
-            const int qho = 128 + (nn << 5) + (hh << 4);
-            const int sc_lo = (nn << 3) + (gg << 1) + hh;
-            // Not `qlo`: a lane's sixteen `ql` bytes sit at `nn * 64` inside the
-            // block and the elements they carry sit at `nn * 128`, because the
-            // high nibbles are 64 elements further along.
-            const int jlo = (nn << 7) + (gg << 5) + (hh << 4);
+            // The device layout indexes like Q4_K: a lane's sixteen `ql` bytes
+            // carry elements `jlo` and `jlo + 32`, and its eight `qh` bytes
+            // sit beside them.
+            const int pp = slot >> 1, hh = slot & 1;
+            const int qlo = (pp << 5) + (hh << 4);
+            const int qho = 128 + (pp << 4) + (hh << 3);
+            const int sc_lo = (pp << 2) + hh;
+            const int jlo = (pp << 6) + (hh << 4);
             const size_t r = (size_t)blockIdx.z * m + row;
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
@@ -927,18 +920,17 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             for (int b = 0; b < nb; b += 4) {
                 if (b + sub < nb) {
                     acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
-                                    xa, xs, qlo, qho, sc_lo, gg << 1,
+                                    xa, xs, qlo, qho, sc_lo,
                                     ((b + sub) << 8) + jlo);
                 }
             }
         } else if (!a_half && q_bs == 256 && w_quant == QT_Q6_K) {
             const int nb = k >> 8;
-            const int hi = lane >> 4, bb = (lane & 15) << 1;
-            const int g0 = (hi << 3) + (bb >> 4);
-            const float* av = af + (hi << 7) + bb;
+            const int j = lane << 3;
+            const float* av = af + j;
             for (int b = 0; b < nb; ++b) {
                 acc += q6k_dot8(wq + ((size_t)col * nb + b) * (size_t)q_ts,
-                                av + (b << 8), hi, bb, g0);
+                                av + (b << 8), j);
             }
         } else {
             for (int i = lane; i < k; i += 32) {
