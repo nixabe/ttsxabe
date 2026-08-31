@@ -20,10 +20,19 @@ replaces: it says *which layer* a divergence enters at, and a reply cannot.
 Run with `-ngl 0`. The CPU and CUDA backends were measured to agree to the
 printed precision at every layer, so the choice is about reproducibility rather
 than accuracy, and the CPU one does not depend on which card is free.
+
+The capture records **which file it came from**, and `tests/layer_taps.rs`
+refuses one taken from a different model. That is not bookkeeping. A capture of
+the Q4_K build compared against the engine reading the f16 build of the same
+model diverges by 0.36 of the layer magnitude at block 1 and stays there - the
+signature of a real wiring fault, produced by nothing worse than pointing the
+test at the wrong file. The same class of mistake already cost this project a
+day once; `docs/TESTING.md` has that one.
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +40,16 @@ import sys
 # One node: the name, then somewhere below it a line "sum = <float>".
 NODE = re.compile(r"common_debug_cb_eval:\s+(\S+)\s+=")
 SUM = re.compile(r"sum = (-?[\d.]+)")
+
+
+def identity(model: str) -> dict:
+    """What the capture was taken from, in terms a test can check.
+
+    Name and byte count rather than a hash: it has to be cheap for the test to
+    compute on a 16 GB file, and two GGUFs of the same model at different
+    quantizations differ in both.
+    """
+    return {"name": os.path.basename(model), "bytes": os.path.getsize(model)}
 
 
 def capture(binary: str, model: str, prompt: str, ngl: int) -> dict:
@@ -55,6 +74,7 @@ def capture(binary: str, model: str, prompt: str, ngl: int) -> dict:
     tokens = re.search(r"number of input tokens = (\d+)", text)
     return {
         "prompt": prompt,
+        "model": identity(model),
         "tokens": int(tokens.group(1)) if tokens else None,
         # The last occurrence of a name is the node in its final form: llama.cpp
         # reuses a name across a reshape and a rope, and the last is the one a
@@ -76,7 +96,10 @@ def main() -> None:
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(got, f, ensure_ascii=False, indent=1)
     layers = sum(1 for k in got["nodes"] if k.startswith("l_out-"))
-    print(f"wrote {a.out}: {got['tokens']} tokens, {layers} block outputs")
+    print(
+        f"wrote {a.out}: {got['tokens']} tokens, {layers} block outputs, "
+        f"from {got['model']['name']}"
+    )
 
 
 if __name__ == "__main__":

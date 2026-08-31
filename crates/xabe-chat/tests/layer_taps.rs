@@ -33,7 +33,26 @@ use std::path::PathBuf;
 #[derive(serde::Deserialize)]
 struct Golden {
     tokens: Option<usize>,
+    /// The file the capture was taken from. See [`Model`].
+    model: Option<Model>,
     nodes: HashMap<String, f64>,
+}
+
+/// Which GGUF `eval-callback` read, as the capture recorded it.
+///
+/// Checked before anything is compared, because the failure it prevents does
+/// not look like a mismatch - it looks like a wiring fault. A capture of the
+/// Q4_K build against the engine reading the f16 build of the same model sits
+/// at 0.36 of the layer magnitude from block 1 onward and stays flat, which is
+/// exactly the shape of a real defect: an offset that enters at one layer and
+/// rides the residual stream. It is two different models being compared.
+///
+/// Name and size rather than a hash, so the check costs a `stat` on a file
+/// that can be 16 GB. Two quantizations of one model differ in both.
+#[derive(serde::Deserialize)]
+struct Model {
+    name: String,
+    bytes: u64,
 }
 
 /// Ratio of the disagreement to the layer's own working magnitude.
@@ -73,6 +92,26 @@ fn every_block_output_tracks_the_reference_graph() {
         return;
     };
     let Some(g) = golden() else { return };
+
+    // Refuse a capture of a different file before comparing anything to it.
+    let want = g.model.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the capture predates recording which model it came from; \
+             re-take it with tools/oracle/capture_chat_layers.py"
+        )
+    });
+    let name = m
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bytes = std::fs::metadata(&m).map(|x| x.len()).unwrap_or(0);
+    assert!(
+        name == want.name && bytes == want.bytes,
+        "the capture is of {} ({} bytes) and XABE_CHAT_MODEL is {name} ({bytes} bytes); \
+         these are different models and the comparison would be meaningless",
+        want.name,
+        want.bytes,
+    );
 
     let model = xabe_chat::ChatModel::open(&m, d).expect("open the chat model");
     // The capture's own prompt, tokenized here. Its token count is recorded so
