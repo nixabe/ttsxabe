@@ -243,6 +243,41 @@ __device__ __forceinline__ void q_scale_min(
     }
 }
 
+// The two halves of a 32-bit word, as floats.
+__device__ __forceinline__ float q_half_lo(unsigned w) {
+    float r;
+    asm("{ .reg .f16 x; mov.b16 x, %1; cvt.f32.f16 %0, x; }"
+        : "=f"(r) : "h"((unsigned short)(w & 0xFFFF)));
+    return r;
+}
+
+__device__ __forceinline__ float q_half_hi(unsigned w) {
+    float r;
+    asm("{ .reg .f16 x; mov.b16 x, %1; cvt.f32.f16 %0, x; }"
+        : "=f"(r) : "h"((unsigned short)(w >> 16)));
+    return r;
+}
+
+// `q_scale_min` again, reading the twelve scale bytes out of the three words a
+// single header load produced rather than out of memory. Same packing, same
+// answer; `the_wide_kquant_matvec_agrees_with_the_f32_product` and the
+// block-format tests hold both to the Rust in `xabe_gguf::dequant`.
+__device__ __forceinline__ void q_scale_min_words(
+    unsigned y, unsigned z, unsigned w, int q, unsigned char& sc, unsigned char& mn)
+{
+    // byte 0..3 in `y`, 4..7 in `z`, 8..11 in `w`.
+    #define Q_SB(i) ((unsigned char)(((i) < 4 ? y : (i) < 8 ? z : w) >> ((((i) & 3)) << 3)))
+    if (q < 4) {
+        sc = Q_SB(q) & 0x3F;
+        mn = Q_SB(q + 4) & 0x3F;
+    } else {
+        int i = q - 4;
+        sc = (Q_SB(i + 8) & 0x0F) | ((Q_SB(i) >> 2) & 0x30);
+        mn = (Q_SB(i + 8) >> 4) | ((Q_SB(i + 4) >> 2) & 0x30);
+    }
+    #undef Q_SB
+}
+
 // Element `j` of the block at `blk`. One switch, one case per format, in the
 // same order as the Rust.
 __device__ __forceinline__ float q_elem(int ty, const unsigned char* blk, int j) {
@@ -532,9 +567,28 @@ template <int RUN>
 __device__ __forceinline__ void q4k_run(
     const unsigned char* blk, int j, float* e)
 {
-    float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+    // The whole header in one load. A Q4_K block opens with `d`, `dmin` and
+    // the twelve packed scale bytes - exactly sixteen - and a block is
+    // 16-byte aligned, so `d`, `dmin` and both 6-bit fields come out of one
+    // `uint4` instead of the eight separate byte loads they used to cost.
+    //
+    // That mattered more than it looks: staging the weights was measured at 40
+    // ms of an 88 ms prefill against 13 for the activations, and only 3 of it
+    // was the arithmetic. The rest was this - narrow, scattered loads, two
+    // threads of every warp re-reading the same header 144 bytes away from
+    // its neighbours.
+    float d, dmin;
     unsigned char sc, mn;
-    q_scale_min(blk + 4, j >> 5, sc, mn);
+    if ((((size_t)blk) & 15) == 0) {
+        uint4 h = *reinterpret_cast<const uint4*>(blk);
+        d    = q_half_lo(h.x);
+        dmin = q_half_hi(h.x);
+        q_scale_min_words(h.y, h.z, h.w, j >> 5, sc, mn);
+    } else {
+        d = q_f16(blk, 0);
+        dmin = q_f16(blk, 2);
+        q_scale_min(blk + 4, j >> 5, sc, mn);
+    }
     const unsigned char* qs = blk + 16 + ((j >> 6) << 5) + (j & 31);
     int shift = ((j >> 5) & 1) << 2;
     float ds = d * (float)sc, dm = dmin * (float)mn;
