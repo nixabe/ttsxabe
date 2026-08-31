@@ -508,6 +508,30 @@ impl Gpu {
         let ctx = Self::context(ordinal)?;
         let stream = ctx.default_stream();
 
+        // Keep freed stream-ordered allocations in the pool across
+        // synchronises. The default release threshold is zero, which hands
+        // every freed block back to the OS at the next sync - so the first
+        // sizeable allocation after one is a real `cuMemCreate`, and a
+        // multi-megabyte scratch buffer costs most of a millisecond that the
+        // pool exists to not charge. Measured, not read off a manual: with
+        // the threshold at zero a 19 MB per-launch scratch put a constant
+        // ~0.9 ms floor under every tiled matmul in a synchronise-per-round
+        // benchmark, and raising it removed the floor. Best effort: a driver
+        // too old to have pools still runs everything else.
+        unsafe {
+            use cudarc::driver::{result, sys};
+            if let Ok(dev) = result::device::get(ordinal as i32)
+                && let Ok(pool) = result::device::get_default_mem_pool(dev)
+            {
+                let threshold: u64 = u64::MAX;
+                let _ = result::mem_pool::set_attribute(
+                    pool,
+                    sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &threshold as *const u64 as *mut core::ffi::c_void,
+                );
+            }
+        }
+
         // Compiled for the development target. NVRTC will happily target a
         // newer architecture, but pinning it keeps the generated code the same
         // on every machine that runs the differential tests.
