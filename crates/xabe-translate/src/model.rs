@@ -399,7 +399,7 @@ impl Translator {
         weight: &CudaSlice<f32>,
     ) -> Result<(CudaSlice<f32>, Option<Q8>), TranslateError> {
         let eps = self.cfg.rms_norm_eps;
-        if rows > GEMV_MAX_M || !k.is_multiple_of(1024) {
+        if rows > GEMV_MAX_M || !k.is_multiple_of(256) {
             if let Some(a) = add {
                 self.gpu.add_inplace(h, a, rows * k)?;
             }
@@ -579,7 +579,7 @@ impl Translator {
             let mut gate = self.project(xo, &l.gate, n)?;
             let up = self.project(xo, &l.up, n)?;
             let inter = self.cfg.intermediate_size;
-            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(1024) {
+            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(256) {
                 true => Some(self.gpu.silu_mul_q(&mut gate, &up, n, inter)?),
                 false => {
                     self.gpu.silu_mul(&mut gate, &up, n * inter)?;

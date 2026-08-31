@@ -197,18 +197,24 @@ fn every_block_format_unpacks_element_for_element() {
                 for col in 0..n {
                     let w = want[col * k + j0 + r];
                     let e = got[r * n + col];
-                    // `==` and not `to_bits()`, for one reason found by this
-                    // test: a negative scale times a zero quantum is `-0.0` on
-                    // the CPU, and the warp reduction adds it to `0.0` and gets
-                    // `+0.0`. The bit patterns differ, the numbers do not, and
-                    // IEEE says they are equal. Every other value here is
-                    // reproduced exactly, so this stays an equality rather
-                    // than becoming a tolerance.
-                    assert!(
-                        w == e,
-                        "{q:?}: element [{col}][{}] is {e}, wanted {w}",
-                        j0 + r,
-                    );
+                    // Equality and not `to_bits()`, for one reason found by
+                    // this test: a negative scale times a zero quantum is
+                    // `-0.0` on the CPU, and the warp reduction adds it to
+                    // `0.0` and gets `+0.0`. The bit patterns differ, the
+                    // numbers do not, and IEEE says they are equal.
+                    //
+                    // The two K-quants are the exception and it is one rounding
+                    // wide. They take the packed mat-vec's int8 path, so the
+                    // one-hot arrives as the code 127 with a scale of 1/127 and
+                    // the product is `w * (127/127)` - exact in real arithmetic
+                    // and one ulp off in binary. A permuted block moves a value
+                    // by the size of the value, so this still separates the two
+                    // things it exists to separate.
+                    let ok = match q {
+                        Quant::Q4K | Quant::Q6K => (w - e).abs() <= 1e-6 * w.abs(),
+                        _ => w == e,
+                    };
+                    assert!(ok, "{q:?}: element [{col}][{}] is {e}, wanted {w}", j0 + r,);
                 }
             }
         }
@@ -265,7 +271,17 @@ fn quantized_gemv_matches_the_cpu_dequantizer() {
                 let scale: f32 = (0..k)
                     .map(|j| (a[row * k + j] * w[col * k + j]).abs())
                     .sum();
-                let tol = ATOL + RTOL * scale;
+                // The two K-quants quantize the activation to int8 on the way
+                // in, which is a far larger and entirely deliberate error than
+                // any reordering - see `Gpu::quantize_activation`. Their bound
+                // is that approximation's size against the terms, and it is
+                // still two orders of magnitude below what permuting a block
+                // would move.
+                let rtol = match q {
+                    Quant::Q4K | Quant::Q6K => 1e-3,
+                    _ => RTOL,
+                };
+                let tol = ATOL + rtol * scale;
                 assert!(
                     (want[i] - got[i]).abs() <= tol,
                     "{name}: element {i} is {}, wanted {} (tolerance {tol})",

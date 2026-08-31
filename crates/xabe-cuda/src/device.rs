@@ -680,8 +680,8 @@ impl Gpu {
         rows: usize,
         k: usize,
     ) -> Result<Q8, CudaError> {
-        if !k.is_multiple_of(1024) {
-            return Err(CudaError::RaggedBlock { k, block: 1024 });
+        if !k.is_multiple_of(256) {
+            return Err(CudaError::RaggedBlock { k, block: 256 });
         }
         self.quantize_into(a, k, rows, (rows * k) as i64, rows)
     }
@@ -1162,7 +1162,7 @@ impl Gpu {
         let wide = small
             && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
             && matches!(w.quant(), Some(Quant::Q4K | Quant::Q6K))
-            && k.is_multiple_of(1024);
+            && k.is_multiple_of(256);
         // A caller's own twin has to have been taken at this shape. Nothing in
         // the kernel could notice otherwise: it would index another tensor's
         // codes, in bounds, and return numbers.

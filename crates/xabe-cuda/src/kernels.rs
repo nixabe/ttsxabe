@@ -704,9 +704,16 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
             const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
+            // A warp covers four super-blocks a trip, and a row is not always a
+            // multiple of four of them - the 13 B translator's down projection
+            // contracts over 13824, which is 54. The lanes past the end sit out
+            // rather than the row being refused: their contribution is a
+            // separate term of the warp reduction, so skipping it is exact.
             for (int b = 0; b < nb; b += 4) {
-                acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
-                                xa, xs, slot, jlo, q0, ((b + sub) << 8) + jlo);
+                if (b + sub < nb) {
+                    acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                    xa, xs, slot, jlo, q0, ((b + sub) << 8) + jlo);
+                }
             }
         } else if (!a_half && q_bs == 256 && w_quant == QT_Q4_K) {
             const int nb = k >> 8;
@@ -742,9 +749,11 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const float* xs = asc + r * (k >> 5);
             const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
             for (int b = 0; b < nb; b += 4) {
-                acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
-                                xa, xs, qlo, qho, sc_lo, gg << 1,
-                                ((b + sub) << 8) + jlo);
+                if (b + sub < nb) {
+                    acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                    xa, xs, qlo, qho, sc_lo, gg << 1,
+                                    ((b + sub) << 8) + jlo);
+                }
             }
         } else if (!a_half && q_bs == 256 && w_quant == QT_Q6_K) {
             const int nb = k >> 8;
