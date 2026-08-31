@@ -3,8 +3,9 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-roughly 0.68x against `whisper-server` - a milestone still missed, and the one
-figure here whose two halves were not measured in one sitting - and both Llama
+0.83x and 0.88x against `whisper-server` on two clips - a milestone still
+missed, now alternated in one sitting against a `whisper-server` built here
+from the same checkpoint - and both Llama
 stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
 three of its rows (1.08x and 1.17x prefill, 1.06x decode), the translator
@@ -44,44 +45,120 @@ and to be correct.
 ### ASR
 
 One Quadro RTX 8000, `Breeze-ASR-26` (large-v2, 1.54 B), greedy, `language=zh`.
-Medians after three warm-up, against a `whisper-server` started **without**
-`--vad` so that both sides do the same job. Both produced identical transcripts
-on every clip. The `whisper-server` column is twenty timed transcriptions
-alternated in pairs; the engine column is the median of three rounds of nine,
-which is the protocol the llama.cpp sections settled on and the reason the two
-columns are not a pair - see below.
+Medians of twenty rounds after three warm-up, each round running one of each,
+against a `whisper-server` started **without** `--vad` so that both sides do
+the same job. Both produced identical transcripts on both clips.
+
+**Both halves of every ratio here were measured in one sitting**, on the same
+card, against a `whisper-server` built from this repository's own
+`whisper.cpp` checkout with `GGML_CUDA=ON` and `CMAKE_CUDA_ARCHITECTURES=75`,
+reading the same checkpoint converted by that tree's own
+`models/convert-h5-to-ggml.py`. The version of this table that stood before
+was arithmetic across two sittings and said so; it is superseded rather than
+appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
 | --- | --- | --- | --- |
-| 2.67 s | 211 ms | 144 ms | 0.68x |
-| 3.90 s | not re-run | 177 ms | — |
+| 2.93 s | 222.3 ms | 185.3 ms | 0.83x |
+| 4.98 s | 265.9 ms | 233.4 ms | 0.88x |
 
 **This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
-for an ASR faster than `whisper-server`; it is still about 1.5x slower.
+for an ASR faster than `whisper-server`; it is 1.14x to 1.20x slower.
 
-**Both cells in that ratio were not taken in one sitting, and it is therefore
-the weakest number in this document.** The engine column was re-measured on a
-machine with no `whisper-server` installed, so the 0.68x is arithmetic against
-a `whisper-server` figure from the sitting that produced the 264 ms this
-supersedes - exactly the cross-sitting pairing the llama.cpp section refuses to
-trust. It is written down because the milestone is stated in those terms and a
-blank would read as progress; it should be re-alternated, on both clips,
-before it is quoted anywhere. What *was* properly paired is the engine against
-itself: the builds alternated in threes on the 2.67 s clip, nine timed runs
-each, 257 ms before the fused attention below and 211 after.
+The clips are synthesised rather than recorded, so the row is reproducible on
+any box that has the checkpoints - `bench/` is gitignored and the two lines are
+`lí hó, guá sī tâi-uân-lâng, tsin hoaⁿ-hí bat lí.` and `kin-á-jit ê thiⁿ-khì
+tsin hó, lán lâi khì kong-hn̂g sàn-pōo, hó bô?`, spoken by `mms-tts-nan` at
+16 kHz. They transcribe to ten and sixteen tokens.
 
-Where the 211 ms goes, measured with `xabe-asr-bench --stages`:
+Where the 222.3 ms goes, measured with `xabe-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
-| encoder | 119 | 56% |
-| decode loop, 6 tokens | 60 | 28% |
-| cross-attention KV | 20 | 9% |
-| mel frontend (CPU) | 17 | 8% |
+| encoder | 115 | 52% |
+| decode loop, 10 tokens | 76 | 34% |
+| cross-attention KV | 19 | 9% |
+| mel frontend (CPU) | 11 | 5% |
 
-The encoder is 2.26 TFLOP for a 30-second window, so 119 ms is 19.0 TFLOP/s -
-19% of the card's 99 TFLOP/s f16 tensor-core peak. Note that the window is
-fixed: a 2.67 s clip and a 29 s one cost the same encoder.
+The encoder is 2.26 TFLOP for a 30-second window, so 115 ms is 19.6 TFLOP/s.
+Note that the window is fixed: a 2.93 s clip and a 29 s one cost the same
+encoder, which is why the longer clip's ratio is the better one.
+
+**The encoder is the whole of the remaining gap.** `whisper-bench` on the same
+build and the same weights puts `whisper.cpp`'s encoder at 83.3 ms against this
+one's 115, which is 32 of the 37 ms between the two columns on the 2.93 s clip.
+Everything else is level. What that 32 ms is made of is in WHY NOT below, and
+the short version is that it is the accumulator type: 86 of the 115 ms is the
+tiled `gemm`, which `docs/KERNELS.md` measured at 86% of this card's
+`m16n8k8.f32.f16.f16.f32` ceiling, and the only way past that shape is f16
+accumulation - which this engine refuses on a measurement, not on caution.
+
+### The round that took the ASR from 0.74x to 0.83x
+
+Three changes, all of them outside the encoder, and none of them arithmetic.
+Alternated against `whisper-server` in the same sitting throughout, so the
+column on the right is a control as well as a target:
+
+| end to end, 2.93 s clip | `xabe-asr` | `whisper-server` | ratio |
+| --- | ---: | ---: | ---: |
+| before | 249.4 ms | 184.2 ms | 0.74x |
+| after | 222.3 ms | 185.3 ms | **0.83x** |
+
+The three changes were measured by stage rather than end to end, because two of
+them are in the frontend and one is in the decoder and an end-to-end median
+cannot tell them apart. `xabe-asr-bench --stages`, medians of nine:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| decode loop, 10 tokens | 88.3 ms | 76.4 ms |
+| mel frontend (CPU) | 18.0 ms | 10.7 ms |
+| encoder | 116.8 ms | 115.2 ms |
+| cross-attention KV | 19.1 ms | 19.2 ms |
+
+The encoder and the cross-attention row are the control: nothing in this round
+touched either, and neither moved.
+
+**The cache** is the chat model's finding arrived at again. The decoder's
+self-attention cache was stored the way the projection produced it,
+`[t, d_model]`, and grown
+by allocating a larger pair, zeroing them, copying the whole cache in and then
+permuting both into head order - four allocations and six launches a layer,
+128 and 192 a token, every one of them producing a tensor thrown away before
+the next token. `Gpu::cache_append` already existed for exactly this and was
+already scattering straight into the layout attention reads; the ASR simply was
+not using it. With the cache head-major the two head splits go too, the mask
+and softmax fuse into `softmax_causal`, and a single decode step's head split
+and merge become no-ops. Decode loop 88.3 ms to 76.4 on ten tokens.
+
+The comment that stood over the old code argued the permutation was cheaper
+than a scattered append. It was comparing against the wrong alternative: the
+append and the permutation are the same kernel, so writing the cache in the
+read layout costs nothing and saves all of it.
+
+**The frontend** is two changes, and both were found by splitting it: 10.2 ms
+of the 15.7 was the transform and 5.5 was everything else.
+
+The transform's inner butterfly indexed its twiddle table with
+`tw[step * ((j * (q * m + k)) % n)]`. `n` is a runtime value, so that `%` is a
+hardware division, and a 400-point transform executes a few thousand of them.
+The exponent can be carried instead: `j*q*m mod n` is `((j*q) mod r) * m`
+because `m * r == n`, and `j*k` never reaches `n`, so the running index stays
+below `2n` and one conditional subtraction reduces it. Making `j` the innermost
+loop is what allows the carry, and accumulating into the destination rather
+than a scalar is what allows that - which also lets `j == 0` be a copy and
+removes the zeroing pass.
+
+The rest was the filter bank, which accumulated straight into the output:
+`out[m * frames + t] += w * p` for 201 frequency bins times 80 mel bins, which
+is sixteen thousand strided read-modify-writes a frame over 940 KB, none of it
+staying in cache. Accumulating a contiguous 80-float row and storing it once
+took that half from 5.5 ms to 1.3.
+
+`Fft::forward_real` also allocated three `n`-long arrays per call, which is
+three per frame of a spectrogram. `Fft::forward_real_with` takes a `Scratch`
+the caller owns instead - not interior mutability, because the plan is shared
+and has to stay `Sync` for two threads to transform different frames against
+it.
 
 ### Translator
 
@@ -1597,6 +1674,38 @@ time and VRAM budgets should be computed on the inference subset.
 ## WHY NOT
 
 Measured rejections. Things that looked like they should help and did not.
+
+### The encoder's fused attention read an f16 cache and did not get faster
+
+`flash_attn_64` was 25.2 ms of the ASR's 115 ms encoder and was doing 5.76
+GFLOP a layer, which is 7.3 TFLOP/s - a third of what the tiled `gemm` beside
+it manages. The arithmetic said traffic: the encoder's window is 1500
+positions in 24 query tiles, so every block re-stages the whole key and value
+cache and the kernel reads 361 MB a layer, which at 0.787 ms is 459 GB/s and
+looks like the card's ceiling.
+
+So the cache was stored at f16 instead. This is not an approximation and the
+test asserted so: the kernel rounds the cache to f16 on its way into shared
+memory anyway, `to_f16` rounds the same round-to-nearest-even way, and a
+differential test compared the two paths at **exact equality of every output
+bit** rather than at a tolerance. It passed, and the ASR oracle tests passed.
+
+The kernel measured 25.0 ms against 25.2, and the encoder 116.4 against 115.2 -
+worse, by the 1.5 ms the two conversion passes cost. **The re-reads were never
+reaching memory.** One head's keys and values are 768 KB, 144 blocks are
+resident at two per SM, and the blocks that share a head are adjacent in the
+grid - so the working set is about 4.6 MB against a 6 MB L2, and the twenty-four
+re-reads were already L2 hits. Halving a number that was already free bought
+exactly nothing.
+
+What that leaves is the real answer for the kernel, which is not bandwidth: at
+`QT` 64 the tile takes 28.8 KB of shared memory, which is two blocks an SM and
+50% occupancy, and each of the 47 key steps writes the score tile to shared,
+reads it twice for the running maximum and the exponential, writes the
+probabilities back and reads them again - four `__syncthreads` a step with the
+tensor cores idle across each. That is a kernel project rather than a
+parameter, and it is where the encoder's remaining 32 ms against `whisper.cpp`
+is. It was reverted whole; the entry point is not carried unused.
 
 ### Stopping the translator at its stop string saved nothing measurable
 

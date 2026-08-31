@@ -9,3 +9,8 @@ __pycache__/
 # than engine behaviour, and the engine ships built-ins so that an absent
 # `prompts/` changes nothing. `XABE_PROMPT_FILE` points at one.
 prompts/
+
+# Benchmark clips. Synthesised from the checkpoint rather than checked in -
+# `docs/BENCHMARKS.md` says which lines, and the weights are not redistributed
+# here for the same reason `models/` is not.
+bench/
