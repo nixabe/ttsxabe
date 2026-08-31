@@ -1,0 +1,164 @@
+# The two shapes `docs/CLI.md` describes, as services.
+#
+# The default is the monolith: one process, every stage, one card. `--profile
+# split` is the other one - the ASR and the synthesiser as their own workers
+# with a gateway in front, which is what `run.sh` does on the host today.
+#
+# One image serves both. A stage is turned on by giving it a model or a URL and
+# turned off by *leaving its variables unset*, so the difference between an ASR
+# worker and the whole pipeline is which `XABE_*` names appear below and
+# nothing else. That is also why optional variables are absent here rather than
+# set to an empty string: clap reads an empty `XABE_TRANSLATOR_MODEL` as the
+# path `""` and fails inside a weight schema, not as "no translator".
+
+name: ttsxabe
+
+x-engine: &engine
+  image: ttsxabe:latest
+  build:
+    context: .
+  # Read-only, and the container's uid 1000 reads it as it stands. `models/`
+  # here has the same shape as `/models` inside, which is what lets the paths
+  # below be the same ones `docs/CLI.md` uses on the host.
+  volumes:
+    - ${XABE_MODELS:-./models}:/models:ro
+  # Every container sees every card and `XABE_*_DEVICE` picks the ordinal, so
+  # the placement story stays the engine's own rather than being half here and
+  # half in `docs/CLI.md`.
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: unless-stopped
+
+x-engine-env: &engine-env
+  RUST_LOG: ${RUST_LOG:-info}
+
+# Loading is minutes, not seconds - the checkpoints are tens of gigabytes and
+# the first NVRTC compile happens on top of that. `start_period` is what keeps
+# that from reading as a crash loop: failures inside it do not count against
+# `retries`, and the container reports `starting` rather than `unhealthy`.
+x-healthcheck: &healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: ${XABE_START_PERIOD:-600s}
+
+services:
+  # ---------------------------------------------------------------- monolith
+  #
+  # Everything in one process on one card, which is the layout `--*-device`
+  # already defaults to and which docs/CLI.md says the packed checkpoints leave
+  # room for. About 16 GB resident: the chat model and the translator at
+  # Q4_K_M, the ASR at f16, the synthesiser rounding to nothing beside them.
+  #
+  # The translator is here rather than `--direct-taigi` because of what the
+  # synthesiser reads. `mms` reads POJ; direct Taigi has the chat model answer
+  # in Han and the engine refuses the pair by name - `engine mms reads POJ and
+  # there is no translator to produce it`. Direct Taigi is the faster path and
+  # docs/BENCHMARKS.md measures it at 3.8 s -> 1.6 s on a voice turn, but it
+  # needs an engine that reads Han. docs/DOCKER.md has that variant.
+  xabe:
+    <<: *engine
+    # Profiled, and so is every split service, because the two shapes are
+    # alternatives rather than layers: both publish 8000, and a service with no
+    # `profiles` is enabled unconditionally - `--profile split` would bring
+    # this one up alongside the gateway and lose the port. `.env` names `mono`
+    # as the default so the bare `docker compose up` still means the monolith,
+    # and `--profile split` replaces that value rather than adding to it.
+    profiles: ["mono"]
+    environment:
+      <<: *engine-env
+      # 0.0.0.0, not the 127.0.0.1 of the host-side examples: a server bound to
+      # loopback inside a container is reachable from nothing, including the
+      # healthcheck's own `curl`.
+      XABE_SERVE: 0.0.0.0:8000
+      XABE_ASR_MODEL: /models/asr/breeze-asr-26
+      XABE_ASR_DEVICE: "${XABE_ASR_DEVICE:-0}"
+      # No `XABE_VAD_DEVICE`. The VAD has no CUDA implementation and the engine
+      # refuses the flag rather than accepting it and doing something else.
+      XABE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
+      XABE_TTS_MODEL: /models/tts/mms-tts-nan
+      XABE_TTS_DEVICE: "${XABE_TTS_DEVICE:-0}"
+      XABE_LLM_MODEL: /models/${XABE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
+      XABE_LLM_DEVICE: "${XABE_LLM_DEVICE:-0}"
+      # Produces the POJ that `mms` reads. On a second card set
+      # XABE_TRANSLATOR_DEVICE=1: docs/BENCHMARKS.md measures first audio at
+      # 2659 ms with both on one card and 2000 ms with the translator moved,
+      # because the chat model and the translator decode at the same time.
+      XABE_TRANSLATOR_MODEL: /models/${XABE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
+      XABE_TRANSLATOR_DEVICE: "${XABE_TRANSLATOR_DEVICE:-0}"
+    ports:
+      - "${XABE_PORT:-8000}:8000"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+
+  # ------------------------------------------------------------------ split
+  #
+  # The same image three times. Worth it when the stages want different cards:
+  # a worker holds one checkpoint and one card's worth of VRAM, and the gateway
+  # holds the chat model and dials the other two by service name.
+  asr:
+    <<: *engine
+    profiles: ["split"]
+    environment:
+      <<: *engine-env
+      XABE_SERVE: 0.0.0.0:8080
+      XABE_ASR_MODEL: /models/asr/breeze-asr-26
+      XABE_ASR_DEVICE: "${XABE_ASR_DEVICE:-0}"
+      XABE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+
+  tts:
+    <<: *engine
+    profiles: ["split"]
+    environment:
+      <<: *engine-env
+      XABE_SERVE: 0.0.0.0:8100
+      XABE_TTS_MODEL: /models/tts/mms-tts-nan
+      XABE_TTS_DEVICE: "${XABE_TTS_DEVICE:-1}"
+      # No `XABE_TTS_SCRIPTS` workaround. What an engine reads is checked only
+      # where the reply is written - a process with a chat model - and this
+      # worker has none: it is POSTed text over `/tts` and speaks what it is
+      # given, having been romanised by whoever sent it. Give this worker an
+      # LLM and the check applies again, which is the configuration where it
+      # means something. See docs/DOCKER.md.
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/health"]
+
+  gateway:
+    <<: *engine
+    profiles: ["split"]
+    environment:
+      <<: *engine-env
+      XABE_SERVE: 0.0.0.0:8000
+      # Service names, not addresses. Compose's own DNS resolves them on the
+      # project network, so nothing here has to know a container's IP.
+      XABE_ASR_URL: http://asr:8080
+      XABE_TTS_URL: http://tts:8100
+      XABE_LLM_MODEL: /models/${XABE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
+      XABE_LLM_DEVICE: "${XABE_LLM_DEVICE:-0}"
+      # The split exists to spread cards, so the translator defaults to its own
+      # here where the monolith puts it on 0.
+      XABE_TRANSLATOR_MODEL: /models/${XABE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
+      XABE_TRANSLATOR_DEVICE: "${XABE_TRANSLATOR_DEVICE:-1}"
+    ports:
+      - "${XABE_PORT:-8000}:8000"
+    # `service_healthy`, not `service_started`: a worker that is still mapping
+    # its checkpoint answers nothing, and a gateway that came up first would
+    # spend its first requests failing for a reason that is not a fault.
+    depends_on:
+      asr:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]

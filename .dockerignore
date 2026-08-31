@@ -1,0 +1,17 @@
+# Deny everything, then name what the build actually reads.
+#
+# The allow-list is the safe direction here rather than a matter of taste:
+# `models/` is 43 GB and `target/` is another 8, and an exclude-list that
+# forgets one of them does not fail - it silently ships the context to the
+# daemon on every build.
+*
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates
+
+# `crates/*/static/` is read by `include_str!` at compile time and has to be
+# here; nothing else under `crates/` is optional either, so the tree goes in
+# whole and only build artefacts are taken back out.
+crates/**/target
