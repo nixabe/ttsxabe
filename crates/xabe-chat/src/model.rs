@@ -2,7 +2,7 @@
 
 use crate::ChatError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand, Q8, Quant};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, Bpe, LlamaConfig, LlamaWeights};
 
@@ -544,7 +544,11 @@ impl ChatModel {
             let want = (past + n).next_power_of_two().max(256);
             for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
                 let mut grown = self.gpu.zeros(want * kv_dim)?;
-                self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
+                // A fresh conversation grows from empty, and sixty-four
+                // zero-byte copies are still sixty-four launches.
+                if past > 0 {
+                    self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
+                }
                 *slot = grown;
             }
             cache.cap = want;
@@ -726,14 +730,22 @@ impl ChatModel {
             // `[kv_head][group * n][hd]` is `[head][t][hd]`, which for a single
             // step is already `[heads * hd]` - the shape the output projection
             // wants. Only a multi-row pass has anything to merge.
-            let ctx = match n {
-                1 => ctx,
-                _ => self.gpu.merge_heads(&ctx, n, heads, hd)?,
+            // The merge takes the context's int8 twin in the same pass when
+            // the output projection is packed and will read it - the same
+            // reasoning that gives the normalisation and the gating theirs.
+            let packed_o = matches!(l.o.w, GWeight::Packed { .. });
+            let (ctx, cq) = match n {
+                1 => (ctx, None),
+                _ if packed_o && (heads * hd).is_multiple_of(256) => {
+                    let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
+                    (c, Some(q))
+                }
+                _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
             };
             // Not added here. The next normalisation reads `h + out` and
             // nothing between now and then does, so the sum is left for it to
             // take in the pass it was going to make anyway.
-            let out = self.project(Operand::F32(&ctx), &l.o, n)?;
+            let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
             residual = Some(out);
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
@@ -742,8 +754,12 @@ impl ChatModel {
             let up = self.project(xo, &l.up, n)?;
             let inter = self.cfg.intermediate_size;
             // The gate is projected back down by a packed weight, so its twin
-            // comes from the gating rather than from a kernel of its own.
-            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(256) {
+            // comes from the gating rather than from a kernel of its own - at
+            // every row count, because the tiled integer kernel reads the same
+            // codes the mat-vec does. Only for a packed `down`; an f16 one
+            // would leave the codes unread.
+            let packed_down = matches!(l.down.w, GWeight::Packed { .. });
+            let gq = match packed_down && inter.is_multiple_of(256) {
                 true => Some(self.gpu.silu_mul_q(&mut gate, &up, n, inter)?),
                 false => {
                     self.gpu.silu_mul(&mut gate, &up, n * inter)?;

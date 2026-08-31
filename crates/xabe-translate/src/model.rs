@@ -2,7 +2,7 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand, Q8, Quant};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -602,7 +602,11 @@ impl Translator {
             let want = (past + n).next_power_of_two().max(256);
             for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
                 let mut grown = self.gpu.zeros(want * h_dim)?;
-                self.gpu.copy_into(&mut grown, slot, 0, past * h_dim)?;
+                // A fresh conversation grows from empty, and eighty zero-byte
+                // copies are still eighty launches.
+                if past > 0 {
+                    self.gpu.copy_into(&mut grown, slot, 0, past * h_dim)?;
+                }
                 *slot = grown;
             }
             cache.cap = want;
@@ -754,13 +758,23 @@ impl Translator {
                 tk,
                 hd,
             )?;
-            let ctx = match n {
-                1 => ctx,
-                _ => self.gpu.merge_heads(&ctx, n, heads, hd)?,
+            // The merge takes the context's int8 twin in the same pass when
+            // the output projection is packed and will read it - the same
+            // reasoning that gives the normalisation and the gating theirs. A
+            // single step has nothing to merge, and its twin is taken by
+            // `project` as before.
+            let packed_o = matches!(l.o.w, GWeight::Packed { .. });
+            let (ctx, cq) = match n {
+                1 => (ctx, None),
+                _ if packed_o && (heads * hd).is_multiple_of(256) => {
+                    let (c, q) = self.gpu.merge_heads_q(&ctx, n, heads, hd)?;
+                    (c, Some(q))
+                }
+                _ => (self.gpu.merge_heads(&ctx, n, heads, hd)?, None),
             };
             // Not added here: the next normalisation reads `h + out` and
             // nothing between now and then does.
-            let out = self.project(Operand::F32(&ctx), &l.o, n)?;
+            let out = self.project(Self::operand(&ctx, cq.as_ref()), &l.o, n)?;
             residual = Some(out);
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
@@ -768,7 +782,13 @@ impl Translator {
             let mut gate = self.project(xo, &l.gate, n)?;
             let up = self.project(xo, &l.up, n)?;
             let inter = self.cfg.intermediate_size;
-            let gq = match n <= GEMV_MAX_M && inter.is_multiple_of(256) {
+            // The twin is taken at every row count, not only decode's: the
+            // tiled integer kernel reads the same codes the mat-vec does, and
+            // quantizing inside `project` instead re-reads the whole
+            // activation - 28 MB a layer at 512 tokens. Only for a packed
+            // `down`, because an f16 one would leave the codes unread.
+            let packed_down = matches!(l.down.w, GWeight::Packed { .. });
+            let gq = match packed_down && inter.is_multiple_of(256) {
                 true => Some(self.gpu.silu_mul_q(&mut gate, &up, n, inter)?),
                 false => {
                     self.gpu.silu_mul(&mut gate, &up, n * inter)?;

@@ -778,6 +778,12 @@ impl Gpu {
         rows: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), CudaError> {
         let q = self.quantize_into(a, k, rows, (rows * k) as i64, rows)?;
+        self.q8_parts_for_test(&q)
+    }
+
+    /// A twin's codes and scales, back on the host, for the differential
+    /// tests only.
+    pub fn q8_parts_for_test(&self, q: &Q8) -> Result<(Vec<i8>, Vec<f32>), CudaError> {
         let raw = self
             .stream
             .clone_dtoh(&q.buf)
@@ -2728,7 +2734,64 @@ impl Gpu {
         heads: usize,
         head_dim: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        self.reshape_heads("merge_heads", x, t, heads, head_dim)
+        Ok(self.merge_heads_inner(x, t, heads, head_dim, false)?.0)
+    }
+
+    /// The merge and the int8 twin of its output, in one pass.
+    ///
+    /// The merged context is what the output projection multiplies, and both
+    /// packed matmul paths read it as int8 - so quantizing it in a pass of its
+    /// own re-reads the whole row for numbers the merge is already holding.
+    /// The same reasoning gave `rms_norm` and `silu_mul` their twins.
+    pub fn merge_heads_q(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<(CudaSlice<f32>, Q8), CudaError> {
+        let k = heads * head_dim;
+        if !k.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock { k, block: 32 });
+        }
+        let (out, q8) = self.merge_heads_inner(x, t, heads, head_dim, true)?;
+        Ok((out, q8.expect("asked for the twin")))
+    }
+
+    fn merge_heads_inner(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+        quantize: bool,
+    ) -> Result<(CudaSlice<f32>, Option<Q8>), CudaError> {
+        let k = heads * head_dim;
+        let n = t * k;
+        let mut out = self.zeros(n)?;
+        // SAFETY: one thread per element writes every code, and its group's
+        // first lane every scale.
+        let mut q8 = match quantize {
+            true => Some(Q8 {
+                buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
+                rows: t,
+                k,
+            }),
+            false => None,
+        };
+        let off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
+        let null: u64 = 0;
+        let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
+        let f = self.func("merge_heads");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out);
+        match &mut q8 {
+            Some(q) => lb.arg(&mut q.buf),
+            None => lb.arg(&null),
+        };
+        lb.arg(&off).arg(&a).arg(&b_).arg(&c);
+        launched("merge_heads", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok((out, q8))
     }
 
     /// The body of the three head permutations, which differ only in kernel.

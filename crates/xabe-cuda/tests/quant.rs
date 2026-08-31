@@ -670,3 +670,38 @@ fn a_batch_over_one_activation_matches_the_same_products_apart() {
         }
     }
 }
+
+/// `merge_heads_q` quantizes exactly as `quantize_q8` would have, after the
+/// same merge.
+///
+/// Exact equality, same as the runtime quantiser's own test and for the same
+/// reason: the fused twin exists to *replace* a separate quantise pass over
+/// the merged context, so the thing worth checking is that the two produce
+/// identical codes and scales - a tolerance would hide precisely the
+/// group-boundary disagreement a wrong index would cause.
+#[test]
+fn the_merged_context_twin_matches_a_separate_quantise() {
+    let Some(g) = gpu() else { return };
+
+    // Odd-shaped on purpose: three tokens, and a head count times head_dim
+    // that is several groups of 32 without being a power of two.
+    let (t, heads, hd) = (3usize, 6usize, 64usize);
+    let x = seq(t * heads * hd, 61);
+    let dx = g.upload(&x).unwrap();
+
+    let merged = g.merge_heads(&dx, t, heads, hd).unwrap();
+    let (want_c, want_s) = g
+        .quantize_q8_for_test(&merged, heads * hd, t)
+        .unwrap();
+
+    let (fused, q8) = g.merge_heads_q(&dx, t, heads, hd).unwrap();
+    let (got_c, got_s) = g.q8_parts_for_test(&q8).unwrap();
+
+    assert_eq!(
+        g.download(&fused).unwrap(),
+        g.download(&merged).unwrap(),
+        "the fused merge changed the f32 output"
+    );
+    assert_eq!(got_c, want_c, "codes");
+    assert_eq!(got_s, want_s, "scales");
+}

@@ -2809,20 +2809,50 @@ extern "C" __global__ void split_heads_t(
 }
 
 // [heads, t, head_dim] -> [t, heads * head_dim]. The inverse of `split_heads`.
+//
+// `qa` non-null asks for the int8 twin beside the merge, exactly as
+// `silu_mul` and `rms_norm` produce one: the merged row is what the output
+// projection multiplies, and quantizing it in a pass of its own re-reads the
+// whole context - 10 MB a layer at 512 tokens - for numbers this kernel is
+// already holding. A group of 32 is one warp because consecutive threads
+// write consecutive output elements.
 extern "C" __global__ void merge_heads(
     const float* __restrict__ x,
     float* __restrict__ out,
+    signed char* __restrict__ qa,
+    int asc_off,
     int t, int heads, int head_dim)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int d = heads * head_dim;
-    if (i >= t * d) {
+    if (i >= t * d && !qa) {
         return;
     }
-    int ti = i / d;
-    int h  = (i % d) / head_dim;
-    int j  = i % head_dim;
-    out[i] = x[((size_t)h * t + ti) * head_dim + j];
+    float y = 0.0f;
+    if (i < t * d) {
+        int ti = i / d;
+        int h  = (i % d) / head_dim;
+        int j  = i % head_dim;
+        y = x[((size_t)h * t + ti) * head_dim + j];
+        out[i] = y;
+    }
+    if (!qa) {
+        return;
+    }
+    float* asc = (float*)(qa + asc_off);
+    float mx = fabsf(y);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    }
+    const float dd = mx * (1.0f / 127.0f);
+    const float inv = dd > 0.0f ? 1.0f / dd : 0.0f;
+    if (i < t * d) {
+        qa[i] = (signed char)__float2int_rn(y * inv);
+        if ((threadIdx.x & 31) == 0) {
+            asc[i >> 5] = dd;
+        }
+    }
 }
 
 // Masks a batch of score matrices so a query cannot see a later key.
