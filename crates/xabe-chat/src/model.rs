@@ -349,7 +349,11 @@ impl ChatModel {
     /// admits it.
     ///
     /// `None` is not a failure: `gemm_batched` quantises for itself when it has
-    /// to, so the only thing lost is the sharing.
+    /// to, so the only thing lost is the sharing. But the sharing is worth
+    /// having at every length now that the tiled matmul reads int8 too: this
+    /// activation feeds three projections at attention and two at the MLP, and
+    /// without the twin each of them quantises it again. That was 4.4% of the
+    /// prefill in one kernel, and it was the same numbers five times.
     fn normed(
         &self,
         h: &mut CudaSlice<f32>,
@@ -359,7 +363,7 @@ impl ChatModel {
         weight: &CudaSlice<f32>,
     ) -> Result<(CudaSlice<f32>, Option<Q8>), ChatError> {
         let eps = self.cfg.rms_norm_eps;
-        if rows > GEMV_MAX_M || !k.is_multiple_of(256) {
+        if !k.is_multiple_of(256) {
             if let Some(a) = add {
                 self.gpu.add_inplace(h, a, rows * k)?;
             }

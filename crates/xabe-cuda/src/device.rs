@@ -403,6 +403,8 @@ const NAMES: &[&str] = &[
     "transposed_conv1d",
     "linear",
     "gemm",
+    "gemm_i8_q4k",
+    "gemm_i8_q6k",
     "gemm_reduce",
     "gemv",
     "quantize_q8",
@@ -1229,6 +1231,24 @@ impl Gpu {
         // `#define`s rather than written again here - see `kernels::define`.
         let small = m <= GEMV_MAX_M;
 
+        // The integer tensor cores, when the weight is a K-quant.
+        //
+        // Both operands are quantized on this path where the f16 kernel
+        // rounded only the operands and kept f32 accumulation, so it is a
+        // second deliberate approximation and a larger one - see `gemm_i8`. It
+        // is what llama.cpp does for the same shapes, and what the f16 kernel
+        // cannot reach: that measured 86% of its own ceiling and the ceiling
+        // is a quarter of the integer one.
+        //
+        // `k` must be a multiple of 256 because that is what the quantiser
+        // wants; the block check above already requires it of these two
+        // formats, so the condition costs nothing and says what it needs.
+        let use_i8 = !small
+            && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
+            && matches!(w.quant(), Some(Quant::Q4K | Quant::Q6K))
+            && q_bs == 256
+            && k.is_multiple_of(256);
+
         // The wide packed mat-vec reads the activation as int8, because a lane
         // that loads sixteen bytes of quants covers 32 elements and 32 f32
         // activations cost more to fetch than the wide load saves. Quantising
@@ -1256,11 +1276,14 @@ impl Gpu {
                 want_k: k,
             });
         }
-        let taken = match (wide, a) {
+        // The mat-vec's fast path and the tiled integer kernel read the same
+        // codes in the same layout, so they share one quantisation.
+        let int8 = wide || use_i8;
+        let taken = match (int8, a) {
             (true, Operand::F32(v)) => Some(self.quantize_into(v, k, batch.count * m, sa, m)?),
             _ => None,
         };
-        let q8 = match (wide, a.q8()) {
+        let q8 = match (int8, a.q8()) {
             (true, Some(q)) => Some(q),
             _ => taken.as_ref(),
         };
@@ -1283,12 +1306,19 @@ impl Gpu {
         } else {
             ksplit_for(m, k, n, batch.count)
         };
+        // Uninitialised, not zeroed. Every slice assigns every element of the
+        // tile it owns - a slice with no contraction left assigns the zero it
+        // started with - so the memset was one pass over `ksplit * m * n`
+        // floats that nothing ever read.
+        //
+        // SAFETY: the same coverage argument as `out` above, once per slice.
         let mut partial = if ksplit > 1 {
-            Some(self.zeros(ksplit * batch.count * m * n)?)
+            Some(unsafe { self.uninit(ksplit * batch.count * m * n) }?)
         } else {
             None
         };
         let ks = ksplit as i32;
+
 
         // Round an f32 activation once rather than on every trip.
         //
@@ -1323,6 +1353,7 @@ impl Gpu {
         let widened = match a {
             Operand::F32(v) | Operand::F32Q { data: v, .. }
                 if !small
+                    && !use_i8
                     && w.quant().is_some()
                     && k.is_multiple_of(2)
                     && batch.a.is_multiple_of(2) =>
@@ -1332,6 +1363,62 @@ impl Gpu {
             _ => None,
         };
         let a_half = if widened.is_some() { 1 } else { a_half };
+
+        // The codes are dense `[batch, m, k]`: each batch element of the
+        // twin starts `m` rows after the last.
+        let a_rows = m as i32;
+        if use_i8 {
+            let q = q8.expect("`use_i8` implies the activation was quantized");
+            let off = q.scale_offset() as i32;
+            // One kernel per block format: the staging differs entirely and
+            // compiling both into one entry point cost registers on both.
+            let name = match w.quant() {
+                Some(Quant::Q6K) => "gemm_i8_q6k",
+                _ => "gemm_i8_q4k",
+            };
+            let mut lb = self.stream.launch_builder(self.func(name));
+            lb.arg(&q.buf).arg(&off);
+            match w {
+                Operand::Q { data, .. } => lb.arg(data),
+                // Refused by `use_i8`, but the arm has to exist.
+                Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
+                Operand::F16(v) => lb.arg(v),
+            };
+            match bias {
+                Some(v) => lb.arg(v),
+                None => lb.arg(&null),
+            };
+            lb.arg(&mut out)
+                .arg(&mi)
+                .arg(&ki)
+                .arg(&ni)
+                .arg(&sw)
+                .arg(&so)
+                .arg(&q_ts)
+                .arg(&a_rows)
+                .arg(&ks);
+            match &mut partial {
+                Some(p) => lb.arg(p),
+                None => lb.arg(&null),
+            };
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (
+                    (m as u32).div_ceil(kernels::GEMM_I8_MT),
+                    (n as u32).div_ceil(kernels::GEMM_I8_NT),
+                    (batch.count * ksplit) as u32,
+                ),
+                block_dim: (32, kernels::GEMM_I8_WARPS, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the grid covers every (batch, m, n) exactly once, `out`
+            // is batch*m*n elements, and every global read and write inside
+            // the kernel is bounds checked against m, k and n.
+            launched(name, unsafe { lb.launch(cfg) })?;
+            if let Some(p) = &partial {
+                self.reduce_partials(p, bias, &mut out, batch.count, m, n, ksplit)?;
+            }
+            return Ok(out);
+        }
 
         let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
@@ -1400,22 +1487,42 @@ impl Gpu {
         })?;
 
         if let Some(p) = &partial {
-            let total = batch.count * m * n;
-            let (mn, ni, bi) = ((m * n) as i32, n as i32, batch.count as i32);
-            let mut lb = self.stream.launch_builder(self.func("gemm_reduce"));
-            lb.arg(p);
-            match bias {
-                Some(v) => lb.arg(v),
-                None => lb.arg(&null),
-            };
-            lb.arg(&mut out).arg(&mn).arg(&ni).arg(&bi).arg(&ks);
-            // SAFETY: one thread per output element, bounds checked in the
-            // kernel, and `partial` holds exactly `ksplit * batch * m * n`.
-            launched("gemm_reduce", unsafe {
-                lb.launch(cudarc::driver::LaunchConfig::for_num_elems(total as u32))
-            })?;
+            self.reduce_partials(p, bias, &mut out, batch.count, m, n, ksplit)?;
         }
         Ok(out)
+    }
+
+    /// Sums a split contraction's slices and adds the bias.
+    ///
+    /// Shared by both tiled kernels: they disagree about everything else and
+    /// agree about what a partial looks like.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_partials(
+        &self,
+        partial: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        batch: usize,
+        m: usize,
+        n: usize,
+        ksplit: usize,
+    ) -> Result<(), CudaError> {
+        let null: u64 = 0;
+        let total = batch * m * n;
+        let (mn, ni, bi, ks) = ((m * n) as i32, n as i32, batch as i32, ksplit as i32);
+        let mut lb = self.stream.launch_builder(self.func("gemm_reduce"));
+        lb.arg(partial);
+        match bias {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(out).arg(&mn).arg(&ni).arg(&bi).arg(&ks);
+        // SAFETY: one thread per output element, bounds checked in the kernel,
+        // and `partial` holds exactly `ksplit * batch * m * n`.
+        launched("gemm_reduce", unsafe {
+            lb.launch(cudarc::driver::LaunchConfig::for_num_elems(total as u32))
+        })?;
+        Ok(())
     }
 
     /// Writes one step's keys or values into a head-major cache.

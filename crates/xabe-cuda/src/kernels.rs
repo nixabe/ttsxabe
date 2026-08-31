@@ -1331,6 +1331,472 @@ extern "C" __global__ void gemm_reduce(
     }
     out[i] = acc + (bias ? bias[i % n] : 0.0f);
 }
+// ------------------------------------------------------- the integer matmul
+//
+// The same product as `gemm`, on the int8 tensor cores instead of the f16 ones.
+//
+// Turing does `m16n8k8.f32.f16.f16.f32` at 65.3 TFLOP/s and `m8n8k16.s32.s8.s8`
+// at four times that, and the f16 kernel measured 86% of its own ceiling - so
+// no amount of work on it reaches llama.cpp, which uses the integer path. This
+// is that path. It is **the engine's second deliberate approximation**, and a
+// larger one than the mat-vec's: both operands are quantized, where the f16
+// kernel rounded a weight that was already 4-bit and left the arithmetic exact
+// to f32 accumulation.
+//
+// # Why the shape works out
+//
+// `GEMM_I8_KC` is 32 elements a trip, and that is the number that makes the
+// scales constant rather than a convenience:
+//
+// - A Q4_K sub-block is 32 elements with one `(d*sc, dmin*mn)` pair, so a trip
+//   sees exactly one pair per weight row.
+// - `xabe_dsp::quantize_q8` quantizes activations in groups of 32, so a trip
+//   sees exactly one scale per activation row.
+//
+// The integer accumulator therefore runs a whole `mma` step - sixteen
+// elements, the finest group Q6_K has - before anything is scaled.
+//
+// # The minimum is a rank-one correction, not a matmul
+//
+// Q4_K is `w = ds*q - dm` with `q` in 0..15, so
+//
+//     sum_k a_k w_k  =  ds * sum_k(a_k q_k)  -  dm * sum_k(a_k)
+//
+// The first term is what the integer `mma` computes. The second needs only
+// `sum_k a_k` over the step, which depends on the activation row and not on the
+// weight column - so it is computed once per row while staging and applied as
+// one multiply-add per output. Q6_K carries no minimum at all: its value is
+// `d * sc * (q - 32)`, and the -32 - but not `sc` - folds into the code.
+//
+// # Fragments
+//
+// `m8n8k16` wants four int8 in a lane's register: lane `l` holds row `l>>2` and
+// contraction `4*(l&3) .. +3` for both operands, and holds `D[l>>2][2*(l&3)]`
+// and the column after it. Shared memory is therefore staged as *words* of four
+// codes, which is also how the staging writes them, so no lane ever addresses a
+// byte.
+
+#define GEMM_I8_WARPS  8
+#define GEMM_I8_MT     128     // rows of `a` per block
+#define GEMM_I8_NT     128     // rows of `w` per block
+// 64 of contraction a trip, which is two Q4_K sub-blocks - and the pairing is
+// the point. Q4_K stores the low nibble of a byte at element `j` and the high
+// nibble at `j + 32`, so a trip of 32 reads sixteen bytes and uses half of each
+// one. A trip of 64 uses both, which halves what this kernel reads from global
+// memory for four fifths of the weights. It also halves the barriers, and it
+// gives the activation staging one 32-byte row per thread instead of leaving
+// half the block idle - that staging measured 15% of the kernel at 32.
+#define GEMM_I8_KC     64
+#define GEMM_I8_SUB    (GEMM_I8_KC / 32)             // sub-blocks a trip
+#define GEMM_I8_KS     2                             // `mma` steps a sub-block
+#define GEMM_I8_KG     16                            // elements an `mma` step
+#define GEMM_I8_WM     2       // warps down the tile
+#define GEMM_I8_WN     4       // and across it
+#define GEMM_I8_MR     (GEMM_I8_MT / GEMM_I8_WM)     // rows one warp owns
+#define GEMM_I8_NR     (GEMM_I8_NT / GEMM_I8_WN)     // columns one warp owns
+#define GEMM_I8_MS     (GEMM_I8_MR / 8)              // m8n8k16 is 8 rows
+#define GEMM_I8_NPW    (GEMM_I8_NR / 8)
+#define GEMM_I8_WORDS  (GEMM_I8_KC / 4)              // 4 codes to a word
+// A multiple of four, so every 16-byte fragment row is 16-byte aligned -
+// `ldmatrix` requires it - and twenty rather than sixteen, so that eight
+// consecutive rows cover all 32 banks: `20r mod 32` runs 0, 20, 8, 28, 16, 4,
+// 24, 12, which is the eight distinct multiples of four.
+#define GEMM_I8_STRIDE (GEMM_I8_WORDS + 4)
+#define GEMM_I8_THREADS (GEMM_I8_WARPS * 32)
+// Weight runs one thread stages, as a compile-time trip count: the header
+// cache below is a register array and a runtime bound would put it in local
+// memory, which is the thing it exists to avoid.
+#define GEMM_I8_BITER \
+    ((GEMM_I8_NT * GEMM_I8_KS + GEMM_I8_THREADS - 1) / GEMM_I8_THREADS)
+
+__device__ __forceinline__ void mma_s8(
+    int& d0, int& d1, unsigned a, unsigned b)
+{
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1}, {%2}, {%3}, {%0,%1};\n"
+        : "+r"(d0), "+r"(d1) : "r"(a), "r"(b));
+}
+
+// Sum of the four signed codes in a word. `dp4a` against ones, which is one
+// instruction where the shifts and sign extensions are eight.
+__device__ __forceinline__ int sum4(unsigned w, int acc) {
+    return __dp4a((int)w, 0x01010101, acc);
+}
+
+// Four `m8n8k16` int8 fragments in one instruction.
+//
+// `ldmatrix` is a 16-bit instruction and this is an 8-bit matmul, and they fit
+// anyway: an 8x8 tile of b16 is 8 rows of 16 bytes, and a lane ends up holding
+// bytes `4*(l&3) .. +3` of row `l>>2` - which is the int8 fragment layout for
+// both operands, exactly. So the same instruction that feeds the f16 kernel
+// feeds this one, and the alternative is 32 scalar shared loads a trip.
+//
+// Lane `l` supplies the address of row `l&7` of matrix `l>>3`.
+__device__ __forceinline__ void ld_i8_x4(unsigned* d, const unsigned* row)
+{
+    unsigned p = (unsigned)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(p));
+}
+
+// One body, two entry points. The format is a template parameter and not an
+// argument because it decides which staging code exists at all and whether the
+// two `mma` steps of a sub-block share an accumulator: as a runtime branch,
+// ptxas allocated registers for the union of both and scheduled for neither.
+template <int QT>
+__device__ __forceinline__ void gemm_i8_body(
+    const signed char* __restrict__ qa,
+    int asc_off,
+    const unsigned char* __restrict__ wq,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int m, int k, int n,
+    long sw, long so,
+    int q_ts, int a_rows,
+    int ksplit, float* __restrict__ partial)
+{
+    __shared__ __align__(16) unsigned au[GEMM_I8_MT * GEMM_I8_STRIDE];
+    __shared__ __align__(16) unsigned bu[GEMM_I8_NT * GEMM_I8_STRIDE];
+    // Scales, paired so that a lane fetches both halves of what it needs in one
+    // eight-byte load. This is the difference between the scales costing more
+    // shared traffic than the fragments and costing a fraction of them.
+    //
+    // `asx` is (scale, sum of codes) per row per sub-block; `bds` is `d * sc`
+    // per `mma` step, because Q6_K changes scale every sixteen weights; `bdm`
+    // is `dmin * mn` per sub-block, which Q6_K does not have at all.
+    __shared__ __align__(8) float asx[GEMM_I8_MT * GEMM_I8_SUB * 2];
+    __shared__ __align__(8) float bds[GEMM_I8_SUB][GEMM_I8_KS][GEMM_I8_NT];
+    __shared__ __align__(8) float bdm[GEMM_I8_SUB][GEMM_I8_NT];
+
+    // Codes then scales in one allocation, the layout `quantize_q8` writes.
+    const float* __restrict__ ascale = (const float*)(qa + asc_off);
+
+    const int slice = (int)(blockIdx.z / (gridDim.z / ksplit));
+    const int bat   = (int)(blockIdx.z % (gridDim.z / ksplit));
+
+    out += (size_t)bat * so;
+    const unsigned char* wb = wq + (size_t)bat * (size_t)((sw / 256) * (long)q_ts);
+    // `quantize_q8` writes one dense row per (batch, row), so the batch stride
+    // here is a row count and not the activation's own stride - and it is zero
+    // when every product of the batch reads the *same* activation, which is
+    // what the attention projections do.
+    const size_t arow = (size_t)bat * (size_t)a_rows;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * 32 + lane;
+    const int g    = lane >> 2;
+    const int tg   = lane & 3;
+
+    // `x` is the row tile, not the column tile, and that ordering is the point:
+    // the blocks that share a weight tile are the ones that differ in `m`, so
+    // making them consecutive puts them on the machine together and lets L2
+    // serve the weight to all but the first.
+    const int m0 = blockIdx.x * GEMM_I8_MT;
+    const int n0 = blockIdx.y * GEMM_I8_NT;
+    // A square-ish warp grid, because a warp's shared traffic is
+    // `(MS + NPW) * KS` words and `MS * NPW` is fixed by the `mma` count. One
+    // warp per column strip made that 18 words a trip; two by four makes it 12.
+    const int mb0 = (warp / GEMM_I8_WN) * GEMM_I8_MR;
+    const int nb0 = (warp % GEMM_I8_WN) * GEMM_I8_NR;
+
+    const int kstep = ((k + ksplit - 1) / ksplit + GEMM_I8_KC - 1)
+                      / GEMM_I8_KC * GEMM_I8_KC;
+    const int kbeg  = slice * kstep;
+    const int kend  = min(k, kbeg + kstep);
+
+    float acc[GEMM_I8_MS][GEMM_I8_NPW][2];
+    #pragma unroll
+    for (int i = 0; i < GEMM_I8_MS; ++i) {
+        #pragma unroll
+        for (int j = 0; j < GEMM_I8_NPW; ++j) {
+            acc[i][j][0] = acc[i][j][1] = 0.0f;
+        }
+    }
+
+    const long nb = k / 256;
+    const int groups = k >> 5;
+
+    // A staging thread reads the same weight row on every trip, so it crosses a
+    // super-block only once in four - and the scales it needs live in the
+    // sixteen bytes at the front of one (Q4_K) or at byte 192 of one (Q6_K).
+    // Re-reading those every trip measured 17.5% of this kernel; caching them
+    // per thread is the same trick `gemm` uses, for the same reason.
+    uint4 whdr[GEMM_I8_BITER];
+    float wd[GEMM_I8_BITER];
+    long  wsb[GEMM_I8_BITER];
+    #pragma unroll
+    for (int u = 0; u < GEMM_I8_BITER; ++u) {
+        wsb[u] = -1;
+        wd[u] = 0.0f;
+    }
+
+    for (int kc = kbeg; kc < kend; kc += GEMM_I8_KC) {
+        // The activation is already int8: `gemm_batched` quantizes it once for
+        // the whole launch. Doing it here instead - which the first version of
+        // this kernel did - repeats the maximum, the reciprocal and the
+        // rounding once per column tile, 32 times over on a 4096-wide
+        // projection, and measured 640 tok/s against the f16 kernel's 1926. So
+        // this is a copy: one sub-block a thread, 32 bytes in and 32 out.
+        for (int i = tid; i < GEMM_I8_MT * GEMM_I8_SUB; i += GEMM_I8_THREADS) {
+            const int r = i / GEMM_I8_SUB, sb = i % GEMM_I8_SUB;
+            const int row = m0 + r;
+            uint4 v0 = make_uint4(0u, 0u, 0u, 0u), v1 = v0;
+            float d = 0.0f;
+            if (row < m) {
+                const uint4* src = reinterpret_cast<const uint4*>(
+                    qa + (arow + row) * (size_t)k + kc + 32 * sb);
+                v0 = src[0];
+                v1 = src[1];
+                d = ascale[(arow + row) * (size_t)groups + (kc >> 5) + sb];
+            }
+            uint4* dst = reinterpret_cast<uint4*>(
+                &au[r * GEMM_I8_STRIDE + 8 * sb]);
+            dst[0] = v0;
+            dst[1] = v1;
+            // The code sum is wanted per sub-block rather than per step: it is
+            // only ever multiplied by `dmin * mn`, which Q4_K holds constant
+            // across a sub-block and Q6_K does not have.
+            int t = sum4(v0.w, sum4(v0.z, sum4(v0.y, sum4(v0.x, 0))));
+            t = sum4(v1.w, sum4(v1.z, sum4(v1.y, sum4(v1.x, t))));
+            asx[2 * (GEMM_I8_SUB * r + sb)] = d;
+            asx[2 * (GEMM_I8_SUB * r + sb) + 1] = (float)t;
+        }
+
+        // The weights. One thread stages sixteen bytes and both nibbles of
+        // them, which is one `mma` step of each of the trip's two sub-blocks -
+        // and for Q4_K the nibbles need no unpacking loop at all, because
+        // `w & 0x0F0F0F0F` already *is* four int8 codes in the order the
+        // tensor core reads them.
+        #pragma unroll
+        for (int u = 0; u < GEMM_I8_BITER; ++u) {
+            const int i = tid + u * GEMM_I8_THREADS;
+            if (i >= GEMM_I8_NT * GEMM_I8_KS) break;
+            const int r = i / GEMM_I8_KS, h = i % GEMM_I8_KS;
+            const int col = n0 + r;
+            unsigned lo[GEMM_I8_KG / 4], hi[GEMM_I8_KG / 4];
+            #pragma unroll
+            for (int t = 0; t < GEMM_I8_KG / 4; ++t) lo[t] = hi[t] = 0u;
+            float ds0 = 0.0f, ds1 = 0.0f, dm0 = 0.0f, dm1 = 0.0f;
+            if (col < n) {
+                const long sb = (long)col * nb + (kc >> 8);
+                const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
+                const int j = (kc & 255) + GEMM_I8_KG * h;
+                if (sb != wsb[u]) {
+                    wsb[u] = sb;
+                    if (QT == QT_Q4_K) {
+                        whdr[u] = *reinterpret_cast<const uint4*>(blk);
+                    } else {
+                        whdr[u] = *reinterpret_cast<const uint4*>(blk + 192);
+                        wd[u] = q_f16(blk, 208);
+                    }
+                }
+                if (QT == QT_Q4_K) {
+                    // One sixteen-byte run, low nibbles for elements `j` and
+                    // high nibbles for `j + 32` - the trip's other sub-block.
+                    unsigned char sc, mn;
+                    q_scale_min_words(whdr[u].y, whdr[u].z, whdr[u].w, j >> 5, sc, mn);
+                    ds0 = q_half_lo(whdr[u].x) * (float)sc;
+                    dm0 = q_half_hi(whdr[u].x) * (float)mn;
+                    q_scale_min_words(whdr[u].y, whdr[u].z, whdr[u].w,
+                                      (j >> 5) + 1, sc, mn);
+                    ds1 = q_half_lo(whdr[u].x) * (float)sc;
+                    dm1 = q_half_hi(whdr[u].x) * (float)mn;
+                    unsigned w[GEMM_I8_KG / 4];
+                    q_words<GEMM_I8_KG / 4>(blk + 16 + ((j >> 6) << 5) + (j & 31), w);
+                    #pragma unroll
+                    for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
+                        lo[t] = w[t] & 0x0F0F0F0Fu;
+                        hi[t] = (w[t] >> 4) & 0x0F0F0F0Fu;
+                    }
+                } else {
+                    // Q6_K: `d * scales[j/16] * (q - 32)`, no minimum. In the
+                    // device layout its low nibbles are paired 32 apart the
+                    // way Q4_K's are, so one sixteen-byte run is both of the
+                    // trip's sub-blocks, and their 2-bit high fields are the
+                    // two words beside it - 24 bytes a step where the file's
+                    // own grouping cost 48 and used half of every one.
+                    //
+                    // The scale is one of the sixteen cached bytes, picked with
+                    // selects rather than a subscript: `whdr` is a register
+                    // array and indexing it by a loop variable would spill the
+                    // whole thing to local memory.
+                    // The two sub-scales go to shared as *integers*, bit-cast
+                    // through the float array, and `d` goes to `bdm` beside
+                    // them: the mma loop folds the scales into the integer
+                    // accumulation and converts once per sub-block, like
+                    // Q4_K's merged path, instead of paying a quarter-rate
+                    // I2F per step. `|sc * dot|` is at most 128 * 65024 and
+                    // the folded sum at most 16,646,144 - under 2^24, so the
+                    // one conversion is still exact.
+                    const unsigned w0 = ((j >> 4) & 4) ? whdr[u].y : whdr[u].x;
+                    const unsigned w1 = ((j >> 4) & 4) ? whdr[u].w : whdr[u].z;
+                    const unsigned ws = ((j >> 4) & 8) ? w1 : w0;
+                    ds0 = __int_as_float((int)(signed char)
+                          ((ws >> (((j >> 4) & 3) << 3)) & 0xFF));
+                    const int j1 = j + 32;
+                    const unsigned x0 = ((j1 >> 4) & 4) ? whdr[u].y : whdr[u].x;
+                    const unsigned x1 = ((j1 >> 4) & 4) ? whdr[u].w : whdr[u].z;
+                    const unsigned xs = ((j1 >> 4) & 8) ? x1 : x0;
+                    ds1 = __int_as_float((int)(signed char)
+                          ((xs >> (((j1 >> 4) & 3) << 3)) & 0xFF));
+                    // `bdm` is indexed by sub-block and both of the trip's
+                    // sub-blocks sit in one super-block, so `d` is the same
+                    // value twice.
+                    dm0 = wd[u];
+                    dm1 = wd[u];
+
+                    const int pq = j >> 6, hq = (j >> 4) & 1;
+                    unsigned w[GEMM_I8_KG / 4], hw[2];
+                    q_words<GEMM_I8_KG / 4>(blk + (pq << 5) + (hq << 4), w);
+                    q_words<2>(blk + 128 + (pq << 4) + (hq << 3), hw);
+                    #pragma unroll
+                    for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
+                        const unsigned a0 = w[t] & 0x0F0F0F0Fu;
+                        const unsigned a1 = (w[t] >> 4) & 0x0F0F0F0Fu;
+                        const unsigned b0 = (hw[0] >> (t << 1)) & 0x03030303u;
+                        const unsigned b1 = (hw[1] >> (t << 1)) & 0x03030303u;
+                        lo[t] = __vsub4(a0 | (b0 << 4), 0x20202020u);
+                        hi[t] = __vsub4(a1 | (b1 << 4), 0x20202020u);
+                    }
+                }
+            }
+            unsigned* dst = &bu[r * GEMM_I8_STRIDE + (GEMM_I8_KG / 4) * h];
+            #pragma unroll
+            for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
+                dst[t] = lo[t];
+                dst[8 + t] = hi[t];
+            }
+            bds[0][h][r] = ds0;
+            bds[1][h][r] = ds1;
+            if (h == 0) {
+                bdm[0][r] = dm0;
+                bdm[1][r] = dm1;
+            }
+        }
+        __syncthreads();
+
+        // Deliberately not unrolled: the two sub-blocks each want a full set
+        // of fragments and scales in registers, and holding both sets at once
+        // spills 160 bytes to local memory.
+        #pragma unroll 1
+        for (int sb = 0; sb < GEMM_I8_SUB; ++sb) {
+            // Both `mma` steps of a sub-block, and their scales, hoisted out of
+            // the row loop: neither depends on which row is being multiplied.
+            unsigned bfr[GEMM_I8_KS][GEMM_I8_NPW];
+            float2 ds2[GEMM_I8_KS][GEMM_I8_NPW], dm2[GEMM_I8_NPW];
+            #pragma unroll
+            for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
+                ld_i8_x4(bfr[ks], &bu[(nb0 + 8 * (lane >> 3) + (lane & 7))
+                                      * GEMM_I8_STRIDE + 8 * sb + 4 * ks]);
+                #pragma unroll
+                for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
+                    const int c = nb0 + 8 * nt + 2 * tg;
+                    ds2[ks][nt] = *reinterpret_cast<const float2*>(&bds[sb][ks][c]);
+                    if (ks == 0) dm2[nt] = *reinterpret_cast<const float2*>(&bdm[sb][c]);
+                }
+            }
+            // Q4_K holds one scale across all 32 elements of a sub-block, so
+            // both steps can run into the same integer accumulator and be
+            // converted once. Q6_K changes scale every sixteen and has to
+            // convert twice.
+            const bool merged = (QT == QT_Q4_K);
+
+            #pragma unroll
+            for (int m4 = 0; m4 < GEMM_I8_MS / 4; ++m4) {
+                unsigned afr[GEMM_I8_KS][4];
+                #pragma unroll
+                for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
+                    ld_i8_x4(afr[ks],
+                             &au[(mb0 + 8 * (4 * m4 + (lane >> 3)) + (lane & 7))
+                                 * GEMM_I8_STRIDE + 8 * sb + 4 * ks]);
+                }
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int ms = 4 * m4 + q;
+                    // (scale, sum of codes) for this row and sub-block, in one
+                    // load.
+                    const float2 a2 = *reinterpret_cast<const float2*>(
+                        &asx[2 * (GEMM_I8_SUB * (mb0 + 8 * ms + g) + sb)]);
+                    #pragma unroll
+                    for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
+                        // `sum a*w = as*ds*sum(ia*q) - as*dm*sum(ia)`, where
+                        // the second term is per sub-block: Q4_K's minimum is
+                        // constant over one and Q6_K has none.
+                        if (merged) {
+                            int d0 = 0, d1 = 0;
+                            #pragma unroll
+                            for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
+                                mma_s8(d0, d1, afr[ks][q], bfr[ks][nt]);
+                            }
+                            acc[ms][nt][0] +=
+                                a2.x * (ds2[0][nt].x * (float)d0 - dm2[nt].x * a2.y);
+                            acc[ms][nt][1] +=
+                                a2.x * (ds2[0][nt].y * (float)d1 - dm2[nt].y * a2.y);
+                        } else {
+                            // Q6_K's scale changes every sixteen elements, so
+                            // its two steps cannot share a bare accumulator -
+                            // but the scales are 8-bit integers, so they fold
+                            // into the *integer* sum instead: two full-rate
+                            // IMADs and one exact conversion, where a
+                            // conversion per step was a quarter-rate I2F each.
+                            // `ds2` holds the scales as bit-cast ints and
+                            // `dm2` holds `d`; the staging says why the fold
+                            // stays under 2^24 and therefore exact.
+                            int dA0 = 0, dA1 = 0, dB0 = 0, dB1 = 0;
+                            mma_s8(dA0, dA1, afr[0][q], bfr[0][nt]);
+                            mma_s8(dB0, dB1, afr[1][q], bfr[1][nt]);
+                            const int t0 = __float_as_int(ds2[0][nt].x) * dA0
+                                         + __float_as_int(ds2[1][nt].x) * dB0;
+                            const int t1 = __float_as_int(ds2[0][nt].y) * dA1
+                                         + __float_as_int(ds2[1][nt].y) * dB1;
+                            acc[ms][nt][0] += a2.x * dm2[nt].x * (float)t0;
+                            acc[ms][nt][1] += a2.x * dm2[nt].y * (float)t1;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ksplit > 1) {
+        out = partial + ((size_t)slice * (gridDim.z / ksplit) + bat) * (size_t)m * n;
+    }
+    #pragma unroll
+    for (int ms = 0; ms < GEMM_I8_MS; ++ms) {
+        const int row = m0 + mb0 + 8 * ms + g;
+        if (row >= m) continue;
+        #pragma unroll
+        for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
+            const int col0 = n0 + nb0 + 8 * nt + 2 * tg;
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int col = col0 + u;
+                if (col < n) {
+                    const float b = (bias && ksplit == 1) ? bias[col] : 0.0f;
+                    out[(size_t)row * n + col] = acc[ms][nt][u] + b;
+                }
+            }
+        }
+    }
+}
+
+#define GEMM_I8_ENTRY(name, qt)                                               \
+    extern "C" __global__ __launch_bounds__(GEMM_I8_THREADS, 2) void name(    \
+        const signed char* __restrict__ qa, int asc_off,                      \
+        const unsigned char* __restrict__ wq, const float* __restrict__ bias, \
+        float* __restrict__ out, int m, int k, int n, long sw, long so,       \
+        int q_ts, int a_rows, int ksplit, float* __restrict__ partial)        \
+    {                                                                         \
+        gemm_i8_body<qt>(qa, asc_off, wq, bias, out, m, k, n, sw, so, q_ts,   \
+                         a_rows, ksplit, partial);                            \
+    }
+
+GEMM_I8_ENTRY(gemm_i8_q4k, QT_Q4_K)
+GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K)
+
 // ---------------------------------------------------------------- convolution
 
 // Cross-correlation over time. `w` is [out_ch, in_ch, k].
@@ -2766,3 +3232,10 @@ pub const GEMM_WARPS: u32 = define("GEMM_WARPS");
 pub const GEMM_MT: u32 = define("GEMM_MT");
 /// Rows of the weight one `gemm` block covers; the grid's `x` step.
 pub const GEMM_NT: u32 = define("GEMM_NT");
+
+/// Warps per `gemm_i8` block.
+pub const GEMM_I8_WARPS: u32 = define("GEMM_I8_WARPS");
+/// Rows of the activation one `gemm_i8` block covers.
+pub const GEMM_I8_MT: u32 = define("GEMM_I8_MT");
+/// Rows of the weight one `gemm_i8` block covers.
+pub const GEMM_I8_NT: u32 = define("GEMM_I8_NT");

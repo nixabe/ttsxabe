@@ -293,12 +293,40 @@ fn quantized_gemv_matches_the_cpu_dequantizer() {
     }
 }
 
-/// The whole product on the tiled kernel, which rounds its operands to f16.
+/// The activation as the int8 tiled kernel sees it: quantised in groups of
+/// `GROUP` and read back.
 ///
-/// The reference sees the rounded weights for the same reason
-/// `gemm_matches_the_scalar_linear_at_every_awkward_shape` does: comparing
-/// against the unrounded ones would measure the staging rather than the
-/// unpacking, and would need a tolerance loose enough to hide a real mistake.
+/// This is `xabe_dsp::quantize_q8` applied a row at a time, which is what the
+/// kernel does - `GEMM_I8_KC` is `GROUP`, so a trip is a group and no lane's
+/// maximum crosses one. The rounding is the same to the bit; only the order of
+/// the sum that follows differs.
+fn as_int8(v: &[f32], k: usize) -> Vec<f32> {
+    v.chunks(k)
+        .flat_map(|row| {
+            let (codes, scales) = xabe_dsp::quantize_q8(row);
+            let out: Vec<f32> = codes
+                .iter()
+                .enumerate()
+                .map(|(j, &c)| f32::from(c) * scales[j / xabe_dsp::GROUP])
+                .collect();
+            out
+        })
+        .collect()
+}
+
+/// The whole product on the tiled kernel, against the operands it truly reads.
+///
+/// Two dispatches hide behind one call and the reference has to follow them,
+/// because a tolerance wide enough to cover both would be wide enough to hide
+/// a permuted block:
+///
+///   * the two K-quants take `gemm_i8`, which hands the tensor core the
+///     checkpoint's own codes and quantises the *activation* to int8. Exact
+///     weights, approximate activation.
+///   * everything else takes `gemm`, which rounds both operands to f16.
+///
+/// Comparing either against unrounded operands would measure the staging
+/// rather than the unpacking, which is not what this test is for.
 #[test]
 fn quantized_gemm_matches_the_cpu_dequantizer() {
     let Some(g) = gpu() else { return };
@@ -317,7 +345,11 @@ fn quantized_gemm_matches_the_cpu_dequantizer() {
                 .map(|&x| f32::from(half::f16::from_f32(x)))
                 .collect()
         };
-        let (ah, wh) = (half_of(&a), half_of(&w));
+        let int8 = matches!(q, Quant::Q4K | Quant::Q6K);
+        let (ah, wh) = match int8 {
+            true => (as_int8(&a, k), w.clone()),
+            false => (half_of(&a), half_of(&w)),
+        };
         let want = xabe_dsp::linear(&ah, m, k, &wh, None, n);
 
         let da = g.upload(&a).unwrap();
