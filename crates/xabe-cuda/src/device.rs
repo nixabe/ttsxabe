@@ -1242,14 +1242,41 @@ impl Gpu {
         };
         let ks = ksplit as i32;
 
+        // Round an f32 activation once rather than on every trip.
+        //
+        // The tiled kernel converts both operands to f16 going into shared
+        // memory anyway, and re-reads the activation once per column tile - a
+        // 14336-wide projection reads it 112 times. Converting it up front is
+        // one pass in exchange for halving all of those, and `pack_f16` uses
+        // the same `cvt.rn.f16.f32` the staging does, so the arithmetic is not
+        // approximated differently - it is the same bits.
+        //
+        // Only for the tiled path: `gemv` accumulates an f32 operand exactly,
+        // and rounding its activation would be a precision change rather than
+        // a layout one. Two halves share a 32-bit word, so an odd `k` has no
+        // f16 layout at all - decoding attends over the 1, 2, 3, ... tokens
+        // emitted so far and half of those are odd. The half pointer is
+        // `sa >> 1` for the same reason, so an odd stride would land every
+        // batch after the first half an element out.
+        let widened = match a {
+            Operand::F32(v) | Operand::F32Q { data: v, .. }
+                if !small && k.is_multiple_of(2) && batch.a.is_multiple_of(2) =>
+            {
+                Some(self.to_f16(v, v.len())?)
+            }
+            _ => None,
+        };
+        let a_half = if widened.is_some() { 1 } else { a_half };
+
         let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
-        match a {
-            Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
-            Operand::F16(v) => lb.arg(v),
+        match (&widened, a) {
+            (Some(h), _) => lb.arg(h),
+            (None, Operand::F32(v) | Operand::F32Q { data: v, .. }) => lb.arg(v),
+            (None, Operand::F16(v)) => lb.arg(v),
             // Refused above, but the arm has to exist. Passing the pointer
             // keeps this a rejected input rather than an unreachable panic.
-            Operand::Q { data, .. } => lb.arg(data),
+            (None, Operand::Q { data, .. }) => lb.arg(data),
         };
         match w {
             Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
