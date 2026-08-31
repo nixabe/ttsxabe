@@ -1005,6 +1005,29 @@ comparison above was run three times with the new kernel switched off by an
 environment variable, and reported the f16 path's accuracy as the integer
 path's each time.
 
+### Attention in exact f32, which fixed the wrong thing
+
+The batched path stages the two attention matmuls to f16 like everything else;
+the one-token-at-a-time path runs them on the scalar mat-vec, which is exact.
+That was the last structural difference between the path that agrees with
+llama-server at 1 of 105 decisions and the path that agrees at 10, so it was
+built: a batched f32 kernel, one thread an output element, no staging.
+
+It worked, at what it actually does. This engine's own two paths went from
+forking on **5 of 179 argmaxes to 2** - so rounding the scores and the context
+is a real error source and now has a number.
+
+It moved the disagreement with llama-server by nothing at all. Ten before, ten
+after, the same ten. And it costs 23% of a prefill and 11% of a decode - the
+decode half is pure loss, because at one token attention already runs on the
+exact mat-vec and this only replaces it with something slower.
+
+That is the third arithmetic intervention on this problem to change the
+disagreement list by zero, after the integer matmul above and pre-rounding the
+activation to the int8 grid. All three produced byte-identical lists. What that
+rules out is arithmetic in the batched path; what it leaves is recorded in
+`docs/TESTING.md`, and it is not yet an answer.
+
 ### A normalisation block sized to divide the row exactly
 
 The fused normalise-and-quantise kernel runs one block a row and reads four

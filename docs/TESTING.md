@@ -239,9 +239,19 @@ measured *less* accurate than the f16 staging it replaced (`docs/BENCHMARKS.md`
 has the numbers and the kernel is gone). Feeding the f16 kernel an activation
 pre-rounded to the int8 grid moved none of them either.
 
-The remaining difference between the two paths is the **attention** matmuls:
-the mat-vec runs them in exact f32 and the tiled one stages them to f16. That
-is where to look next, and it has not been looked at.
+Attention was the next suspect and it is not the answer either. Computing both
+attention matmuls in exact f32 in the batched path takes this engine's own two
+paths from forking on 5 of 179 argmaxes to 2 - so rounding them is a real error
+source - and leaves the disagreement with llama-server at exactly ten, the same
+ten. It costs 23% of a prefill and was not kept; `docs/BENCHMARKS.md` has it.
+
+So three arithmetic interventions have now moved this by zero: an integer
+matmul, an activation pre-rounded to the int8 grid, and exact attention. Each
+produced a byte-identical disagreement list. **The cause is not the precision of
+the batched path**, and what is left is the small set of things that path does
+and the one-token path does not: the head split and merge, the causal mask, and
+writing the whole KV cache in one call rather than a position at a time. None of
+those has been ruled out.
 
 `tests/consistency.rs` bounds how much of this is anyone's fault. It runs the
 batched prefill against the same tokens fed one at a time - both this engine,
