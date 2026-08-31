@@ -611,36 +611,84 @@ out of the projection buffer and the merged context written straight back in
 disappear from the prompt path rather than getting faster. A grouped-query
 model maps `head / (heads / kv_heads)` and reads the one cached copy.
 
-### The tile, and which knob actually mattered
+### The tile: traffic first, then `mma` per load
 
 QT, KT and HD are all template parameters and the warp grid is derived from
 them, so a new shape is an argument rather than an edit. HD is forced by the
-model. **QT is the one that pays, and the reason is traffic rather than
-arithmetic.**
+model. The other two have each been the binding constraint in turn, and the
+order matters because the second one was invisible until the first was fixed.
 
-A block stages every key and value it walks past, so the whole of K and V is
-re-staged once per query block. At the encoder's 1500 positions and QT 32 that
-is 47 trips through 0.8 MB - 724 MB a layer, against 117 us of actual
-tensor-core work in the same kernel. KT does not appear in that number at all:
-a wider key tile moves the same bytes in fewer trips. It was tried anyway,
-because the first diagnosis was that the four block-wide barriers a trip costs
-were the constraint, and at `hd` 64 each of them is amortised over half as many
-`m16n8k8` issues as at 128. **KT 64 changed the encoder by nothing**, which is
-what sent the analysis back to the traffic. QT 64 halved the re-staging and
-took the kernel from 967 us a layer to 791.
+**QT paid first, and the reason was traffic.** A block stages every key and
+value it walks past, so the whole of K and V is re-staged once per query block.
+At the encoder's 1500 positions and QT 32 that is 47 trips through 0.8 MB -
+724 MB a layer. QT 64 halved the re-staging and took the kernel from 967 us a
+layer to 791. A Llama prefill keeps 32, whose causal loop stops at the block's
+own diagonal and never walks a long key axis to begin with.
 
-Two limits worth knowing. Only about a third of the halved traffic came back as
-time, so L2 was already absorbing much of the re-read - the next doubling would
-return less again. And QT 128 is not reachable at all: its tile wants 52 KB
-where sm_75 gives a block 48 KB of *static* shared memory, so it fails in
-`ptxas` at module load with `CUDA_ERROR_INVALID_PTX` and no reason attached. A
-`static_assert` on the computed tile size now says which limit and by how much,
-alongside four more that check the derived warp counts divide exactly - a
-warp grid that does not cover its tile drops work silently rather than failing.
+**Traffic then stopped being the answer**, and two measurements say so rather
+than one. Only about a third of the halved re-staging came back as time; and
+holding the whole cache at f16, which halves those same bytes again and is
+*bit-for-bit* the same arithmetic because the kernel rounded them on the way
+into shared memory anyway, changed nothing at all. One head's keys and values
+are 768 KB and 144 blocks are resident, so the re-reads were already inside a
+6 MB L2. `docs/BENCHMARKS.md` has both.
 
-So the encoder takes QT 64 and a Llama prefill keeps 32, whose causal loop
-stops at the block's own diagonal and never walks a long key axis to begin
-with.
+**What was left is shared loads per `mma`, and that is what KT buys.** A warp
+issuing `MT * NF` products for `MT` `a` fragments and `NF` `b` fragments spends
+`(2*MT + NF) / (MT*NF)` shared words a product - `ldmatrix.x2` for the row
+fragment, `.x1` for the column. The tiled `gemm` next door has always been
+shaped for this: `GEMM_MSTEPS` 8 by `GEMM_NPW` 2 is 1.125 words a product, and
+it runs at three times this kernel's rate on the same tensor cores. The
+encoder's fused attention sat at 1.75.
+
+At `hd` 64 and QT 64 the warp grid is four query groups by two column groups,
+so a warp's column fragment count is `KT / 16`. KT 32 leaves it at 2; **KT 64
+puts it at 4 and takes the kernel to 1.5 words a product**, and halves the trip
+count and its barriers on the way. Measured on the encoder, three rounds
+alternated against the previous build: 117.5 ms to 112.5.
+
+**KT 64 had been measured before and rejected, and that measurement was
+confounded.** With the score tile still in shared memory a KT 64 block wanted
+45.8 KB, which is one resident block on an SM's 64 KB and half the threads -
+just enough to cancel what the wider tile gains, which is why it read as
+"changed the encoder by nothing". Removing the score tile is what made the
+knob work. The general lesson is in `docs/BENCHMARKS.md`: **a parameter that
+measures flat may be paying for itself in a currency you are not looking at.**
+
+Residency is the currency here, and it dominated everything in a thirteen-shape
+sweep: every shape measured at one resident block came in at 114 ms or worse
+and every one at two or three came in under 116, regardless of its load ratio.
+The `static_assert` on the computed tile size says which limit and by how much -
+QT 128 wants more than sm_75 gives a block in *static* shared memory and
+otherwise fails in `ptxas` at module load with `CUDA_ERROR_INVALID_PTX` and no
+reason attached - and three more check that the derived warp counts divide
+exactly, because a warp grid that does not cover its tile drops work silently.
+
+### The scores never leave the registers the `mma` wrote them to
+
+This is what freed the shared memory KT 64 needed, and it is a saving twice
+over. The scores used to go to a `[QT][KT]` f32 tile in shared memory, be read
+back to find each row's maximum, and be read again to exponentiate - three
+passes over 9 KB a trip, and a third of the block's shared budget, which is to
+say a third of its residency.
+
+None of that is necessary, because **what the warps have to tell each other is
+not the scores but the reduction over them**. The `m16n8k8` accumulator hands a
+lane two rows of its fragment and two adjacent columns, and the four lanes
+sharing a `g` hold the rest of those two rows - so an xor butterfly over those
+four lanes folds a warp's own columns without touching memory, and only CG
+partials a row, one per warp column, reach shared memory at all. A `[QT][CG]`
+array replaces a `[QT][KT]` one: at the encoder's shape, 512 bytes for 9216.
+
+The masking moves with them. A lane knows its own row and its own two columns,
+so the per-row key limit is applied to the accumulator directly rather than to
+a shared tile - which is a different index than the old pass used, and is why
+the differential tests now drive the narrow instantiation causally even though
+nothing in the engine asks it to.
+
+The probability layout falls out rather than being arranged: a lane's two
+columns are adjacent and the first is even, so the pair it holds is exactly one
+packed word of the `ps` tile the value product's `a` fragment reads.
 
 ### The head width
 
@@ -650,9 +698,10 @@ holds the head width fixed and varies the count, so large-v2's 1280 over 20
 heads and tiny's 384 over 6 are the same 64. The width is the only thing the
 fragment layout depends on: a warp owns `hd / 32` of the output's n8 column
 fragments, four at 128 and two at 64, and the shared-memory strides follow.
-Every other tile shape - 32 query rows, 32 keys a trip, eight warps as two
-query groups by four column groups - is width-independent and is not repeated
-per instantiation. A width the kernel is *not* instantiated at is refused by
+The query and key tiles are not width-independent and are chosen per
+instantiation - 64 rows and 64 keys a trip for the encoder, 32 and 32 for a
+Llama prefill - but the eight warps and the derivation of the grid from them
+are the same at both. A width the kernel is *not* instantiated at is refused by
 construction rather than by tolerance: it would index another head's values, in
 bounds, and return plausible context. `Gpu::supports_flash` is the predicate
 callers use to pick a path, so choosing the unfused chain does not mean

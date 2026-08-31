@@ -3,7 +3,7 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.83x and 0.88x against `whisper-server` on two clips - a milestone still
+0.85x and 0.89x against `whisper-server` on two clips - a milestone still
 missed, now alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
 stages are **level with or
@@ -59,11 +59,11 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
 | --- | --- | --- | --- |
-| 2.93 s | 222.3 ms | 185.3 ms | 0.83x |
-| 4.98 s | 265.9 ms | 233.4 ms | 0.88x |
+| 2.93 s | 218.0 ms | 185.0 ms | 0.85x |
+| 4.98 s | 262.5 ms | 233.6 ms | 0.89x |
 
 **This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
-for an ASR faster than `whisper-server`; it is 1.14x to 1.20x slower.
+for an ASR faster than `whisper-server`; it is 1.12x to 1.18x slower.
 
 The clips are synthesised rather than recorded, so the row is reproducible on
 any box that has the checkpoints - `bench/` is gitignored and the two lines are
@@ -71,27 +71,27 @@ any box that has the checkpoints - `bench/` is gitignored and the two lines are
 tsin hó, lán lâi khì kong-hn̂g sàn-pōo, hó bô?`, spoken by `mms-tts-nan` at
 16 kHz. They transcribe to ten and sixteen tokens.
 
-Where the 222.3 ms goes, measured with `xabe-asr-bench --stages`:
+Where the 218.0 ms goes, measured with `xabe-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
-| encoder | 115 | 52% |
-| decode loop, 10 tokens | 76 | 34% |
+| encoder | 111 | 51% |
+| decode loop, 10 tokens | 76 | 35% |
 | cross-attention KV | 19 | 9% |
 | mel frontend (CPU) | 11 | 5% |
 
-The encoder is 2.26 TFLOP for a 30-second window, so 115 ms is 19.6 TFLOP/s.
+The encoder is 2.26 TFLOP for a 30-second window, so 111 ms is 20.4 TFLOP/s.
 Note that the window is fixed: a 2.93 s clip and a 29 s one cost the same
 encoder, which is why the longer clip's ratio is the better one.
 
 **The encoder is the whole of the remaining gap.** `whisper-bench` on the same
 build and the same weights puts `whisper.cpp`'s encoder at 83.3 ms against this
-one's 115, which is 32 of the 37 ms between the two columns on the 2.93 s clip.
-Everything else is level. What that 32 ms is made of is in WHY NOT below, and
-the short version is that it is the accumulator type: 86 of the 115 ms is the
-tiled `gemm`, which `docs/KERNELS.md` measured at 86% of this card's
-`m16n8k8.f32.f16.f16.f32` ceiling, and the only way past that shape is f16
-accumulation - which this engine refuses on a measurement, not on caution.
+one's 111, which is 28 of the 33 ms between the two columns on the 2.93 s clip.
+Everything else is level. Of those 111 ms, 86 are the tiled `gemm`, which
+`docs/KERNELS.md` measured at 86% of this card's `m16n8k8.f32.f16.f16.f32`
+ceiling - so the remaining gap is mostly the accumulator type, and the only way
+past that shape is f16 accumulation, which this engine refuses on a
+measurement rather than on caution.
 
 ### The round that took the ASR from 0.74x to 0.83x
 
@@ -159,6 +159,85 @@ three per frame of a spectrogram. `Fft::forward_real_with` takes a `Scratch`
 the caller owns instead - not interior mutability, because the plan is shared
 and has to stay `Sync` for two threads to transform different frames against
 it.
+
+### The encoder's fused attention: 117.5 ms to 112.5, and why the sweep matters
+
+The kernel was 25 ms of the encoder at 7.3 TFLOP/s while the tiled `gemm`
+beside it managed 22 on the same tensor cores. Bandwidth and occupancy had
+both been tried and rejected (WHY NOT, below), which left the instruction mix:
+a warp issuing `MT * NF` products for `MT` row fragments and `NF` column
+fragments spends `(2*MT + NF) / (MT*NF)` shared words a product, and the fused
+attention sat at 1.75 where `gemm` sits at 1.125.
+
+Two changes, and the second is only reachable because of the first.
+
+**The scores stay in the registers the `mma` wrote them to.** They used to go
+to a `[QT][KT]` f32 tile in shared memory and be read back twice, for the row
+maximum and the exponential. What warps actually have to exchange is the
+reduction, not the scores: an xor butterfly over the four lanes that share a
+fragment row folds a warp's own columns for free, and only one partial a row
+per warp column reaches memory. `[QT][CG]` replaces `[QT][KT]` - 512 bytes for
+9216 - and three passes over 9 KB a trip go with it.
+
+**KT 64 then fits, and it is what raises the ratio.** At `hd` 64 a warp's
+column fragment count is `KT / 16`: 2 at KT 32, 4 at KT 64, which is 1.5 words
+a product instead of 1.75. The trip count halves too, and its barriers with it.
+
+Three rounds alternated against the previous build, nine timed runs each:
+
+| round | before | after |
+| --- | ---: | ---: |
+| 1 | 117.1 ms | 112.4 ms |
+| 2 | 117.9 ms | 112.5 ms |
+| 3 | 117.5 ms | 112.8 ms |
+
+**KT 64 had been measured before and recorded here as changing nothing.** That
+measurement was not wrong, it was confounded: with the score tile still in
+shared memory a KT 64 block wanted 45.8 KB, which is one resident block on an
+SM's 64 KB against two at 28.75 - and half the threads is about what the wider
+tile gains. The two effects cancelled. **A parameter that measures flat may be
+paying for itself in a currency you are not measuring**, and the currency here
+was residency.
+
+The sweep says how much residency dominates. Thirteen shapes, encoder median of
+nine each, `(KT, QT, warps, row fragments a warp)`:
+
+| shape | words per `mma` | blocks/SM | threads/SM | encoder |
+| --- | ---: | ---: | ---: | ---: |
+| 32, 64, 8, 1 *(the shipped one, with the score tile)* | 1.75 | 2 | 512 | 115.2 |
+| 32, 64, 4, 2 *(with the score tile)* | 1.25 | 2 | 256 | 122.8 |
+| 64, 64, 8, 1 | 1.50 | 2 | 512 | **111.2** |
+| 64, 64, 8, 2 | 1.50 | 2 | 512 | 111.5 |
+| 32, 64, 8, 1 | 1.75 | 3 | 768 | 112.5 |
+| 32, 64, 8, 2 | 2.00 | 3 | 768 | 114.5 |
+| 64, 32, 8, 1 | 1.50 | 3 | 768 | 115.1 |
+| 32, 64, 4, 2 | 1.25 | 3 | 384 | 115.4 |
+| 64, 128, 8, 2 | 1.00 | 1 | 256 | 114.4 |
+| 32, 128, 8, 2 | 1.25 | 1 | 256 | 116.2 |
+| 64, 64, 4, 2 | 1.00 | 2 | 256 | 120.6 |
+| 128, 64, 8, 2 | — | 1 | 256 | 121.2 |
+| 96, 64, 8, 1 | — | 1 | 256 | 121.8 |
+
+Everything at one resident block is 114 ms or worse and everything at two or
+three is under 116, whatever its load ratio - the two best load ratios in the
+table are the third and fourth *worst* rows. Within a fixed residency the ratio
+then orders things cleanly: at 768 threads, 1.75 beats 2.00 by 2.0 ms; at 512,
+1.50 beats 1.75 by 1.3.
+
+**Giving a warp two row fragments - the obvious way to raise the ratio - is not
+what did it, and was dropped.** For a fixed warp count and query tile, doubling
+the row fragments a warp owns doubles the warp *columns* and so halves the
+column fragments, which is why `64, 64, 8, 2` measures no better than
+`64, 64, 8, 1` at the same ratio and `32, 64, 8, 2` measures worse than
+`32, 64, 8, 1`. Escaping that needs QT 128, which costs a resident block and
+lands at 114.4. The template parameter was removed rather than shipped at 1.
+
+Both Llama stages take the same kernel at `hd` 128 and were checked for
+regression the same way - three rounds alternated, 512-token prefill on the
+chat model: 3058.8, 3028.4, 3010.4 tok/s before against 3038.2, 3013.7, 3005.8
+after, which is inside the drift each column shows on its own. Their tile is
+unchanged; what reaches them is the smaller shared footprint, and it does not
+cross a residency boundary for them.
 
 ### Translator
 
@@ -1698,7 +1777,10 @@ grid - so the working set is about 4.6 MB against a 6 MB L2, and the twenty-four
 re-reads were already L2 hits. Halving a number that was already free bought
 exactly nothing.
 
-### Nor is the fused attention short of occupancy
+This is the measurement that redirected the work to shared memory rather than
+global, and the round that fixed the kernel is above.
+
+### Nor is the fused attention short of occupancy, taken on its own
 
 The obvious next suspect, after bandwidth: at `QT` 64 the tile takes 28.8 KB of
 shared memory, which is two blocks an SM and 50% of the threads this card will
@@ -1707,16 +1789,18 @@ hold. `QT` 32 takes 16.9 KB, which is three - so the kernel was instantiated at
 know. The encoder measured **121.1 ms against 115.2**. Worse, and by more than
 the earlier `QT` sweep found when it picked 64 at two blocks an SM.
 
-So it is neither the memory system nor the thread count, and what is left is
-the instruction mix. At `QT` 64 a warp issues 32 `m16n8k8` against 44 shared
-loads per key step - twelve `a` fragments and thirty-two `b` - which is a
-ratio the tiled `gemm` beats by covering far more output per fragment it
-loads. Fixing that means more accumulator per warp, which means fewer warps or
-a larger tile, which means the register and shared budgets again. That is a
-kernel project rather than a parameter, and it is where the encoder's remaining
-32 ms against `whisper.cpp` is.
+Buying residency with a smaller query tile costs load ratio - `QT` 32 puts the
+warp grid at two query groups by four column groups, so a warp owns one key
+fragment where `QT` 64 gives it two, and the kernel goes from 1.75 shared words
+a product to 2.5. That is what this row measures, and it is why the pair of
+rejections here reads as "neither" rather than "not residency": **residency
+turned out to dominate, and this experiment could not show it because it paid
+for residency in the only currency that mattered more.**
 
-Both experiments were reverted whole; neither entry point is carried unused.
+What both rejections did establish is that the constraint was the instruction
+mix, and the round above acts on that. Both experiments themselves were
+reverted whole; neither entry point is carried unused, and the f16 cache is not
+in the shipped kernel.
 
 ### Stopping the translator at its stop string saved nothing measurable
 

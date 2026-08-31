@@ -1754,6 +1754,21 @@ fn fused_attention_crosses_head_width_with_grouping() {
     fused_attention_case(4, 4, 128, true);
 }
 
+/// The 64-wide instantiation masked, which production never asks it for.
+///
+/// Only the encoder takes this width and it attends over the whole window, so
+/// nothing in the engine reaches the causal branch here. The branch exists
+/// anyway - the width is a template argument and the flag is a runtime one -
+/// and the masking is per lane against its own `mma` accumulator columns, so
+/// this width and that flag exercise a different index than the 128-wide
+/// causal case does. An unreachable path that is wrong is a trap for whoever
+/// makes it reachable.
+#[test]
+fn the_narrow_instantiation_masks_as_well_as_the_wide_one() {
+    fused_attention_case(4, 4, 64, true);
+    fused_attention_case(4, 2, 64, true);
+}
+
 /// A head width the kernel is not instantiated at is refused, not indexed.
 #[test]
 fn an_uninstantiated_head_width_is_refused() {

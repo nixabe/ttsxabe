@@ -97,14 +97,14 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 **Item 17 is not met, and it is now measured the way the item asks for.**
 Against a `whisper-server` built here with CUDA from the same checkpoint and
 started without `--vad` so both do the same job, alternated in pairs over
-twenty rounds in one sitting: 222 ms against 185 on a 2.93 s clip and 266
-against 233 on a 4.98 s one - 0.83x and 0.88x, with identical transcripts on
+twenty rounds in one sitting: 218 ms against 185 on a 2.93 s clip and 263
+against 234 on a 4.98 s one - 0.85x and 0.89x, with identical transcripts on
 both. The "measured and interleaved" half of this item is satisfied; the
 "faster" half is not.
 
 The remaining gap is the **encoder**, entirely. `whisper-bench` on the same
-build puts `whisper.cpp`'s encoder at 83 ms against this one's 115, which is 32
-of the 37 ms between the columns, and 86 of those 115 are a tiled `gemm` that
+build puts `whisper.cpp`'s encoder at 83 ms against this one's 111, which is 28
+of the 33 ms between the columns, and 86 of those 111 are a tiled `gemm` that
 `docs/KERNELS.md` measured at 86% of this card's `m16n8k8.f32.f16.f16.f32`
 ceiling. Closing it means f16 accumulation, which is a refusal with a
 measurement behind it rather than a lever left unpulled - so this item may not
