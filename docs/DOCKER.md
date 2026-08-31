@@ -106,11 +106,23 @@ than a shell's.
 
 **The system prompt is one of these variables**, which is the point of it
 having an inline form: `XABE_SYSTEM_PROMPT` carries the whole prompt, and
-`XABE_PROMPT_FILE` points at one under the mounted tree for anything long
-enough that a variable is the wrong shape. They are alternatives; both is
-refused. `.env` has both lines commented, and [CLI.md](CLI.md) has the rules -
-the important one being that a given prompt replaces the built-in whole and
-must be written in whatever script the configured synthesiser reads.
+`XABE_PROMPT_FILE` points at a file for anything long enough that a variable is
+the wrong shape. They are alternatives; both is refused. [CLI.md](CLI.md) has
+the rules - the important ones being that a given prompt replaces the built-in
+whole, and must be written in whatever script the configured synthesiser reads.
+
+`prompts/` is bind-mounted read-only at `/prompts` for that second form. It is
+**gitignored**, because a system prompt names a character and whose character
+that is differs per deployment, so the repository ships the engine's built-ins
+and nothing else. The mount is unconditional and an empty directory is fine:
+with `XABE_PROMPT_FILE` unset the engine uses a built-in and never looks. Both
+lines ship commented in `.env` for that reason - a committed default pointing
+into a gitignored directory would leave a fresh clone unable to start.
+
+Uncomment `XABE_PROMPT_FILE` and `XABE_BOT` together. A file is read literally,
+with no `{person}`/`{bot}` substitution, so the name written into it has to be
+the name the transcript uses; the stop strings are derived from `XABE_BOT`, and
+a mismatch lets the model write the user's next turn itself.
 
 ## The two shapes
 

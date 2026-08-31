@@ -191,10 +191,16 @@ rather than layers**, and giving both is refused:
 
 ```sh
 xabe-engine --serve 0.0.0.0:8000 --llm-model models/breeze2-8b-Q4_K_M.gguf \
-            --system-prompt "你是小哇，用台語漢字講話，逐句 8-12 字。"
+            --system-prompt "用台語漢字回答，逐句八到十二字。"
 
-XABE_PROMPT_FILE=prompts/xiaowa.txt xabe-engine --serve 0.0.0.0:8000 ...
+XABE_PROMPT_FILE=prompts/system-taigi.txt xabe-engine --serve 0.0.0.0:8000 ...
 ```
+
+`prompts/` is gitignored. A system prompt is deployment content rather than
+engine behaviour - it names a character, and whose character that is differs
+per deployment - so the repository ships the built-ins and nothing else, and
+the directory is yours to fill. `docker-compose.yml` mounts it read-only at
+`/prompts` whether or not anything is in it.
 
 A given prompt **replaces** the built-in whole rather than being prepended to
 it. That is the decision worth knowing: a system prompt is one instruction to
@@ -207,7 +213,9 @@ Three consequences follow, and each is a thing to get wrong once:
   interpolate those because they are the engine's own text; a prompt from
   outside is not the engine's to rewrite, and one containing a brace would
   otherwise change meaning depending on where it was written. Write the names
-  in directly.
+  in directly - and write the *same* name `--bot` gives the transcript, since
+  the stop strings are derived from that and a mismatch lets the model write
+  the user's next turn itself.
 - **`--direct-taigi` still places the translator.** Giving a prompt takes over
   the text and nothing else, so the two flags are not the same switch. A
   prompt handed in here has to write in whatever script the configured

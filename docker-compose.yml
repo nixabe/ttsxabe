@@ -22,6 +22,11 @@ x-engine: &engine
   # below be the same ones `docs/CLI.md` uses on the host.
   volumes:
     - ${XABE_MODELS:-./models}:/models:ro
+    # System prompts, mounted whether or not one is selected. `prompts/` is
+    # gitignored - the text is deployment content rather than engine
+    # behaviour - so this directory may be empty, and an empty one changes
+    # nothing: with `XABE_PROMPT_FILE` unset the engine uses its built-in.
+    - ${XABE_PROMPTS:-./prompts}:/prompts:ro
   # Every container sees every card and `XABE_*_DEVICE` picks the ordinal, so
   # the placement story stays the engine's own rather than being half here and
   # half in `docs/CLI.md`.

@@ -4,3 +4,8 @@ target/
 models/
 __pycache__/
 .omc/
+
+# System prompts. Not in the repository: they are deployment content rather
+# than engine behaviour, and the engine ships built-ins so that an absent
+# `prompts/` changes nothing. `XABE_PROMPT_FILE` points at one.
+prompts/
