@@ -1698,14 +1698,25 @@ grid - so the working set is about 4.6 MB against a 6 MB L2, and the twenty-four
 re-reads were already L2 hits. Halving a number that was already free bought
 exactly nothing.
 
-What that leaves is the real answer for the kernel, which is not bandwidth: at
-`QT` 64 the tile takes 28.8 KB of shared memory, which is two blocks an SM and
-50% occupancy, and each of the 47 key steps writes the score tile to shared,
-reads it twice for the running maximum and the exponential, writes the
-probabilities back and reads them again - four `__syncthreads` a step with the
-tensor cores idle across each. That is a kernel project rather than a
-parameter, and it is where the encoder's remaining 32 ms against `whisper.cpp`
-is. It was reverted whole; the entry point is not carried unused.
+### Nor is the fused attention short of occupancy
+
+The obvious next suspect, after bandwidth: at `QT` 64 the tile takes 28.8 KB of
+shared memory, which is two blocks an SM and 50% of the threads this card will
+hold. `QT` 32 takes 16.9 KB, which is three - so the kernel was instantiated at
+`<64, 32, 32>` with `__launch_bounds__(256, 3)` to let the register allocator
+know. The encoder measured **121.1 ms against 115.2**. Worse, and by more than
+the earlier `QT` sweep found when it picked 64 at two blocks an SM.
+
+So it is neither the memory system nor the thread count, and what is left is
+the instruction mix. At `QT` 64 a warp issues 32 `m16n8k8` against 44 shared
+loads per key step - twelve `a` fragments and thirty-two `b` - which is a
+ratio the tiled `gemm` beats by covering far more output per fragment it
+loads. Fixing that means more accumulator per warp, which means fewer warps or
+a larger tile, which means the register and shared budgets again. That is a
+kernel project rather than a parameter, and it is where the encoder's remaining
+32 ms against `whisper.cpp` is.
+
+Both experiments were reverted whole; neither entry point is carried unused.
 
 ### Stopping the translator at its stop string saved nothing measurable
 
