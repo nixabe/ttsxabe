@@ -465,9 +465,25 @@ __device__ __forceinline__ void q4k_eight(
     const unsigned char* qs = blk + 16 + ((j >> 6) << 5) + (j & 31);
     int shift = ((j >> 5) & 1) << 2;
     float ds = d * (float)sc, dm = dmin * (float)mn;
+    // Eight nibbles come from eight consecutive bytes, which is eight byte
+    // loads - one per element produced. Two word loads do the same work when
+    // the run is word-aligned, and it is for every layout that reaches here:
+    // `Quant::device_stride` is a multiple of sixteen, the allocation is
+    // 256-aligned, and `j` is a multiple of eight. That is an argument, not a
+    // guarantee, so the alignment is tested rather than assumed - the same
+    // reason `xabe-st` refuses to cast a header it has not measured.
+    unsigned w0, w1;
+    if ((((size_t)qs) & 3) == 0) {
+        w0 = *reinterpret_cast<const unsigned*>(qs);
+        w1 = *reinterpret_cast<const unsigned*>(qs + 4);
+    } else {
+        w0 = qs[0] | (qs[1] << 8) | (qs[2] << 16) | (qs[3] << 24);
+        w1 = qs[4] | (qs[5] << 8) | (qs[6] << 16) | (qs[7] << 24);
+    }
     #pragma unroll
     for (int t = 0; t < 8; ++t) {
-        e[t] = ds * (float)((qs[t] >> shift) & 0x0F) - dm;
+        unsigned byte = ((t < 4 ? w0 : w1) >> ((t & 3) << 3)) & 0xFF;
+        e[t] = ds * (float)((byte >> shift) & 0x0F) - dm;
     }
 }
 
@@ -482,10 +498,25 @@ __device__ __forceinline__ void q6k_eight(
     const unsigned char* qlp = blk + (g << 6) + (r & 63);
     const unsigned char* qhp = qh + (g << 5) + (r & 31);
     float dsc = d * (float)((int)scales[j >> 4]);
+    // Two eight-byte runs, read as words when they are aligned - see the note
+    // in `q4k_eight`, which this follows exactly.
+    unsigned l0, l1, h0, h1;
+    if (((((size_t)qlp) | ((size_t)qhp)) & 3) == 0) {
+        l0 = *reinterpret_cast<const unsigned*>(qlp);
+        l1 = *reinterpret_cast<const unsigned*>(qlp + 4);
+        h0 = *reinterpret_cast<const unsigned*>(qhp);
+        h1 = *reinterpret_cast<const unsigned*>(qhp + 4);
+    } else {
+        l0 = qlp[0] | (qlp[1] << 8) | (qlp[2] << 16) | (qlp[3] << 24);
+        l1 = qlp[4] | (qlp[5] << 8) | (qlp[6] << 16) | (qlp[7] << 24);
+        h0 = qhp[0] | (qhp[1] << 8) | (qhp[2] << 16) | (qhp[3] << 24);
+        h1 = qhp[4] | (qhp[5] << 8) | (qhp[6] << 16) | (qhp[7] << 24);
+    }
     #pragma unroll
     for (int t = 0; t < 8; ++t) {
-        int lo = (qlp[t] >> (sl << 2)) & 0x0F;
-        int b = (qhp[t] >> (sh << 1)) & 0x03;
+        const int sft = (t & 3) << 3;
+        int lo = (((int)((t < 4 ? l0 : l1) >> sft) & 0xFF) >> (sl << 2)) & 0x0F;
+        int b = (((int)((t < 4 ? h0 : h1) >> sft) & 0xFF) >> (sh << 1)) & 0x03;
         e[t] = dsc * (float)((lo | (b << 4)) - 32);
     }
 }
