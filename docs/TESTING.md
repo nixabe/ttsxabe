@@ -167,10 +167,32 @@ the layout wanted `n * 128` - by being wrong by 74%.
 
 The quantiser itself is compared to `xabe_dsp::quantize_q8` at **exact
 equality**, on both codes and scales, including an all-zero group and one whose
-maximum is a power of two so ties are reachable. It is the one approximation in
-the engine, and the thing worth checking is that the two implementations
-approximate identically; a tolerance there would hide the group-boundary or
-rounding-mode disagreement the test exists to find.
+maximum is a power of two so ties are reachable. The thing worth checking is
+that the two implementations approximate identically; a tolerance there would
+hide the group-boundary or rounding-mode disagreement the test exists to find.
+
+Two kernels read those codes now rather than one - the packed mat-vec and
+`gemm_i8`, the tiled matmul on the integer tensor cores - so the tiled path has
+a reference of its own. `quantized_gemm_matches_the_cpu_dequantizer` builds the
+*same* approximation on the host, quantizing the activation a row at a time
+with `quantize_q8` and leaving the weights exact, and compares at 1e-5 relative
+to the sum of the term magnitudes. Comparing the integer path against unrounded
+operands instead would need a tolerance wide enough to hide a permuted block,
+which is the failure this whole file exists to catch.
+
+The fused attention kernel's test,
+`fused_attention_matches_the_unfused_arithmetic`, carries the same lesson from
+the other direction: it is about test *data*, not tolerances. Its scalar
+reference rounds where the unfused chain rounds - scores and probabilities
+through f16 - and its first version drove random queries whose scores all
+landed within a few percent of each other, so every softmax row was nearly
+uniform. Nearly-uniform attention is the one distribution that cannot catch a
+fetched-from-the-wrong-position bug: attend everywhere equally and it barely
+matters which value came back. The queries are scaled until the softmax is
+peaked, the causal boundary is exercised, and the heads share KV heads
+grouped-query style - and the tolerance is tight *because* the data is strong.
+A test that passes on weak data is the same defect as a tolerance wide enough
+to hide a permutation.
 
 **Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
 `xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
@@ -180,6 +202,24 @@ tolerance and a permutation inside a block cannot hide behind a dot product. It
 also runs the whole product on both kernels, and pins the two size tables that
 `xabe-cuda` duplicates because it may not depend on `xabe-gguf`.
 
+`a_batch_over_one_activation_matches_the_same_products_apart` covers the shape
+the attention projections are issued in: several matrices against one shared
+left operand, in one product. It compares **bit for bit** against the same
+matrices run separately, because the two do the same arithmetic in the same
+order - the only things that can differ are the weight stride, which would read
+the neighbouring matrix, and the activation's row stride, which both packed
+paths derive from a row count and which has to stop advancing when the operand
+is shared. `gemv` was the kernel that got that second one wrong, and this is
+the test that would have said so first.
+
+Alongside it in `tests/kernels.rs`,
+`rope_at_an_offset_rotates_that_block_and_only_that_block` and
+`cache_append_reads_its_own_block_of_a_batched_projection` pin the other half
+of that change - the offsets that let those two kernels read one product's
+block out of a shared output rather than copying it first. Each checks the
+block against its scalar twin *and* checks that the bytes on either side did
+not move, which is the half an in-place kernel can get wrong silently.
+
 **Further out**, `xabe-chat`'s `tests/packed.rs` loads the same quantized file
 twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
 only check on the *wiring*: that the ggml type maps to the right layout, that
@@ -188,24 +228,25 @@ the packed operand gets to every projection rather than most of them. It needs
 `XABE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
 comparison is the unpacked 16 GB.
 
-The two paths are close rather than identical, and the asymmetry has a reason:
-on the tiled kernel both stage the same f16 bits, while on the mat-vec the
-packed path quantizes the *activation* to int8 to feed its wide loads. Decode
-runs on the mat-vec, so that is where the difference shows, and it is now the
-larger of the two effects by two orders of magnitude.
+The two paths are close rather than identical, and the reason is now the same
+on both sides: **both** the mat-vec and the tiled matmul quantize the
+*activation* to int8. The mat-vec does it to feed its wide loads; the tiled
+matmul does it because `gemm_i8` multiplies on the integer tensor cores. So
+this is a bound on what int8 activations cost, and nothing here is
+bit-identical any more.
 
-Measured, and the two crates land on opposite sides of exactly that:
+| | prompt | worst logit difference | logit span | |
+| --- | --- | --- | --- | ---: |
+| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | 0.120685 | 28.657 | 0.42% |
+| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.174942 | 25.323 | 0.69% |
 
-| | prompt | worst logit difference | logit span |
-| --- | --- | --- | --- |
-| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | **0.000000** | 28.655 |
-| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.167409 | 25.323 |
-
-The translator's prompt is past `GEMV_MAX_M`, so every projection takes the
-tiled kernel, no activation is quantized, and the two paths are bit-identical -
-its translation is character-identical as well. The chat prompt is not, so its
-projections run on the mat-vec, and 0.167 against a span of 25.3 is **0.66%**,
-which is what int8 activations cost. It was 0.004566 before that change.
+An earlier version of this table read 0.000000 for the translator, and the
+paragraph under it explained that its prompt is past `GEMV_MAX_M`, so every
+projection takes the tiled kernel, "no activation is quantized, and the two
+paths are bit-identical". The first half is still true and the second half is
+not: since `gemm_i8`, being past `GEMV_MAX_M` is what puts a projection *on*
+the integer path rather than what keeps it off one. The chat figure moved from
+0.167 to 0.175 for the same reason - its prefill joined its decode.
 
 That number is a bound on the arithmetic, not on the output. What it costs in
 *tokens* is measured separately and is zero: greedy decoding against the
@@ -237,6 +278,50 @@ checkpoint does not.
 `.golden/chat/llama_server.json` is therefore captured from the f16 build, and
 `tools/oracle/capture_chat_server.py` says so at the top with the numbers.
 
+### Reading a consistency number against the wrong model
+
+`a_batched_prefill_matches_the_same_tokens_one_at_a_time` reported 0.16% of the
+logit span and one argmax fork in 179, and then 2.92% and seven. That looked
+like the projection grouping had cost accuracy. It had not: the first number
+was measured on the **f16** GGUF and the second on the **Q4_K** one. Run on the
+f16 build after the change, it is 0.18% and zero forks.
+
+The quantized number is larger for a reason that is not a defect. This test
+compares a batched prefill against the same tokens fed one at a time, which on
+a quantized model is the tiled integer matmul against the packed mat-vec - two
+different kernels quantizing the activation in different groupings. On an f16
+model both paths do the same arithmetic and the comparison is tight.
+
+Two lessons, and the second is the one that keeps costing time. A test whose
+tolerance is wide enough to pass on both checkpoints will not tell you which
+one you ran. And **the model under test belongs in the number**: the same
+oversight, in a stronger form, is the section below.
+
+### The same mistake a second time, and what now prevents it
+
+`tests/layer_taps.rs` compares this engine's per-block sums against
+`llama-eval-callback` reading the same file. It failed at 0.36 of the layer
+magnitude at block 1, and stayed flat there across every block after it - an
+offset that enters at one layer and rides the residual stream, which is exactly
+the shape of a wiring fault.
+
+It was not one. `.golden/chat/layers.json` had been captured from the **Q4_K**
+build and the test was pointed at the **f16** one. Two different models. Run
+against the file the capture came from, the same comparison is 0.0986 of the
+layer magnitude against a bound of 0.25.
+
+Nothing in the capture said which file it came from, so nothing could refuse
+this. Now something does: `capture_chat_layers.py` records the model's name and
+byte count, and the test checks both before comparing anything, failing with
+both names rather than with a number. A capture that predates the field is
+refused as well - an oracle whose provenance is unknown is invalid state, and
+the house rule is to reject invalid state rather than compute with it.
+
+This is the second time a capture of the quantized build has been mistaken for
+a defect in the engine, and both times the shape of the divergence was
+convincing. **When a per-layer comparison shows a constant offset from an early
+block, check what the capture was taken from before reading the kernel.**
+
 Three arithmetic interventions were made before the reference was suspected, and
 each moved the disagreement list by exactly zero: an integer tiled matmul
 multiplying the packed blocks the way llama.cpp does, an activation pre-rounded
@@ -267,76 +352,13 @@ llama.cpp makes, and the number is here so that it is not assumed to be small.
 tokens one at a time - both this engine, no oracle - fork on 5 of 179 argmaxes.
 A greedy comparison of an 8 B model is measuring chaos alongside correctness.
 
-### The packed matmul is tested at two distances
-
-`Operand::Q` lets a quantized weight stay packed in VRAM, and being wrong about
-a block layout produces a *permuted* tensor rather than an error - a model that
-loads, runs, and speaks fluent nonsense. So it is checked twice, at different
-distances from the bytes, and neither check subsumes the other.
-
-A third check sits between them and covers what the other two cannot. The wide
-mat-vec is a different addressing scheme from the element-for-element path, and
-the int8 activation makes exact comparison impossible - so
-`the_wide_kquant_matvec_agrees_with_the_f32_product` runs both formats at a `k`
-that takes the fast path and bounds the disagreement at 1% of the output span,
-which is what quantizing the activation costs and nothing more. The bound is
-loose on purpose and it is not what catches an addressing mistake: a lane
-reading the wrong sixteen bytes does not land within a percent of the right
-answer. It caught one during development - an element offset of `n * 64` where
-the layout wanted `n * 128` - by being wrong by 74%.
-
-The quantiser itself is compared to `xabe_dsp::quantize_q8` at **exact
-equality**, on both codes and scales, including an all-zero group and one whose
-maximum is a power of two so ties are reachable. It is the one approximation in
-the engine, and the thing worth checking is that the two implementations
-approximate identically; a tolerance there would hide the group-boundary or
-rounding-mode disagreement the test exists to find.
-
-**Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
-`xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
-at exact equality. It extracts weights *element for element* through a one-hot
-activation on the exact f32 path, so the comparison is equality rather than a
-tolerance and a permutation inside a block cannot hide behind a dot product. It
-also runs the whole product on both kernels, and pins the two size tables that
-`xabe-cuda` duplicates because it may not depend on `xabe-gguf`.
-
-**Further out**, `xabe-chat`'s `tests/packed.rs` loads the same quantized file
-twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
-only check on the *wiring*: that the ggml type maps to the right layout, that
-the rope permutation reaches the packed bytes as well as the f16 ones, and that
-the packed operand gets to every projection rather than most of them. It needs
-`XABE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
-comparison is the unpacked 16 GB.
-
-The two paths are close rather than identical, and the asymmetry has a reason:
-on the tiled kernel both stage the same f16 bits, while on the mat-vec the
-packed path quantizes the *activation* to int8 to feed its wide loads. Decode
-runs on the mat-vec, so that is where the difference shows, and it is now the
-larger of the two effects by two orders of magnitude.
-
-Measured, and the two crates land on opposite sides of exactly that:
-
-| | prompt | worst logit difference | logit span |
-| --- | --- | --- | --- |
-| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | **0.000000** | 28.655 |
-| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.167409 | 25.323 |
-
-The translator's prompt is past `GEMV_MAX_M`, so every projection takes the
-tiled kernel, no activation is quantized, and the two paths are bit-identical -
-its translation is character-identical as well. The chat prompt is not, so its
-projections run on the mat-vec, and 0.167 against a span of 25.3 is **0.66%**,
-which is what int8 activations cost. It was 0.004566 before that change.
-
-That number is a bound on the arithmetic, not on the output. What it costs in
-*tokens* is measured separately and is zero: greedy decoding against the
-`llama-server` capture picks the same token at every position it picked before,
-and the disagreement list below is byte-identical across the change.
-
 ### Where that disagreement lives, and where it does not
 
-The five above are the ones with a wide margin; the full count is **10 of 105
-teacher-forced decisions**. They are not a wiring bug and they are not spread
-across the engine. Four measurements place them:
+This is the analysis that was done while the **10 of 105 teacher-forced
+decisions** were still believed to be the engine's defect, kept because its
+placement of the disagreement is what eventually pointed at the capture. They
+were not a wiring bug and they were not spread across the engine. Four
+measurements place them:
 
 | | disagreements |
 | --- | ---: |

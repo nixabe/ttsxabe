@@ -2,12 +2,14 @@
 
 ## Current standing
 
-The one-line version: the synthesiser is 1.24x faster than PyTorch, both Llama
-stages' decode is level with llama.cpp (101.1 against 101.1 tok/s on the chat
-model, 61.0 against 61.4 on the translator), the ASR is 0.55x against
-`whisper-server`, and prefill on both Llama stages is about 1.6x behind - it was
-3.5x. Each of those has its own section; this paragraph is not the evidence for
-any of them.
+The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
+0.55x against `whisper-server`, and both Llama stages are now **level with or
+ahead of llama.cpp on every number measured** - the chat model ahead on all
+three of its rows (1.08x and 1.17x prefill, 1.06x decode), the translator
+ahead on decode, level on 512-token prefill, and at 0.94x of a 128-token
+llama.cpp median that swings 20% between its own runs, which the table below
+reads as inside llama.cpp's noise and no stronger claim. Each of those has its
+own section; this paragraph is not the evidence for any of them.
 
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
@@ -114,35 +116,68 @@ they are what makes the packed-weight work measurable at all - but nothing here
 should claim the pipeline is fastest with them in the reply path, because it is
 not.
 
-## Against llama.cpp: the chat model's decode is now ahead
+## Against llama.cpp: level or ahead on every row
 
 `llama-bench` on the same card and the same two files, `-ngl 99`, against
-`xabe-llm-bench` at the same shapes. The chat model's decode has passed it; the
-translator's has not, and prefill is untouched.
+`xabe-llm-bench` at the same shapes.
 
-`llama-bench -r 5`, medians of the tool's own repeats:
+The protocol got stricter than one sitting, because the llama.cpp column will
+not hold still across sittings - see below. **Three alternated rounds**, each
+round one `llama-bench -r 9` followed by one `xabe-llm-bench --rounds 9`, both
+models, both prompt lengths, on an otherwise idle card. Each cell is the
+median of its three rounds, and the spread beside a llama.cpp figure is
+`llama-bench`'s own, from the median round.
+
+**The repeat count is part of the measurement.** At five rounds this engine
+once reported 2760 tok/s on a cell where nine rounds said 2677, because the
+first rounds run on a boosted clock. Every engine figure below is a nine-round
+one.
 
 | Checkpoint | | llama.cpp | this engine | |
 | --- | --- | ---: | ---: | ---: |
-| Breeze2 8 B Q4_K_M | prefill, 128 tok | **2416 tok/s** | 1836 tok/s | 1.32x behind |
-| | decode, 64 tok | 101.1 tok/s | 101.1 tok/s | level |
-| Taigi 13 B Q4_K_M | prefill, 128 tok | **1400 tok/s** | 1025 tok/s | 1.37x behind |
-| | decode, 64 tok | **61.4 tok/s** | 61.0 tok/s | level |
+| Breeze2 8 B Q4_K_M | prefill, 128 tok | 2259 +/- 46 | **2447 tok/s** | 1.08x |
+| | prefill, 512 tok | 2513 +/- 91 | **2928 tok/s** | 1.17x |
+| | decode, 64 tok | 95.3 +/- 0.3 | **100.9 tok/s** | 1.06x |
+| Taigi 13 B Q4_K_M | prefill, 128 tok | **1428 +/- 34** | 1339 tok/s | 0.94x |
+| | prefill, 512 tok | 1647 +/- 7 | 1636 tok/s | level |
+| | decode, 64 tok | 60.0 +/- 1.4 | **61.4 tok/s** | 1.02x |
 
-The llama.cpp prefill figures are noisy - +/- 156 and +/- 79 tok/s across five
-repeats - and an earlier single run of the chat model recorded 1950, which is
-the number the rest of this file was written against. 2416 is the five-repeat
-figure and is the one to compare to.
+**The translator's 128-token row is the one cell not won, and it is also the
+one where llama.cpp cannot repeat its own number.** Its three nine-round
+medians were 1453, 1428 and 1161 - a 20% span between full `-r 9` runs minutes
+apart - while the engine's three were 1339.4, 1336.7 and 1341.6. The 0.94x is
+against the middle of a swing the engine's whole spread fits inside three
+times over. The claim this table makes for that cell is "inside llama.cpp's
+own noise", and nothing stronger; the claim it declines to make is that 1428
+is what llama.cpp reliably runs at.
 
-Both prefills were measured against `forward`, which projected all 128 rows
-through the output head, until that was changed to project the one row that
-predicts a token - which is what `llama-bench`'s pp128 does. The engine column
-is now the same measurement as the llama.cpp column.
+**Why alternated rounds, and why the llama.cpp column moved.** The previous
+version of this table, one sitting on the same card and the same files,
+recorded llama.cpp at 2263/2835 on the chat model, 1401/1560 on the
+translator, and 100.8/61.2 decode. Re-measured for this table its chat prefill
+is down 11% at 512 tokens, its translator prefill is up 6%, and both decodes
+are down 5% - every one of those a larger move than most rows' spread. The
+engine's own figures repeat across sittings to about 1%. So the only
+comparison this file trusts is the two tools interleaved in one sitting, and
+the verdicts above come from that and nothing older.
+
+Both prefill columns are the same measurement: the engine's `forward` projects
+one row through the output head, which is what `llama-bench`'s pp does. The
+engine's decode-64 is taken after a 128-token prompt where `llama-bench`'s
+tg64 generates from an empty context, a difference that can only flatter the
+llama.cpp side.
+
+What moved the engine column from 2341/2677/1306/1438 - level at one prompt
+length, 0.92x to 0.94x at the other three - to the numbers above is the round
+below: "The round that closed prefill".
 
 Decode was 60.8 and 35.8 when this table was first written, so the two stages
-are 1.67x and 1.71x faster than that. **Both decode margins are inside 1%,
-which is a tie rather than a lead** - each is reproducible across runs to
-within 0.2 tok/s, and neither is comfortable.
+are 1.66x and 1.71x faster than that. **Read the decode margins carefully:
+the engine did not get faster this round.** It reads 100.9 and 61.4 where the
+previous sitting said 101.3 and 61.7 - unchanged within noise, which is what
+the prefill round had to preserve and did. The 1.06x and 1.02x exist because
+llama.cpp's own decode came in 5% and 2% lower this sitting than last. A
+margin that appears when the other column moves is reported as what it is.
 
 The translator's last 10% was not a kernel. A warp of the wide mat-vec covers
 four super-blocks a trip, and the path was gated on `k` being a multiple of
@@ -167,12 +202,428 @@ actually closed the gap was widening each thread's load from 4 bytes to 16, whic
 needs the *activation* narrow enough to keep up. See "Sixteen bytes a lane"
 below.
 
-Prefill is arithmetic, and it is still the larger gap. It is not the unpacking:
-the f16 path, which does no unpacking at all, ran at 322 tok/s when this was
-written. The reading that the 128-row prefill was "a tiling problem" was half
-right - see "Prefill: what four changes bought and what two did not" below,
-which is what closed most of it. What remains is the staging, and the two
-standard ways of hiding it both measured worse on this card.
+Prefill is arithmetic, and it was the larger gap for most of this file's
+history - 3.5x behind at its worst. Three rounds of work closed it: the f16
+tiling round ("Prefill: what four changes bought"), the move to the integer
+tensor cores ("Prefill on the integer tensor cores"), and the round after
+that, which is the one that ended level-or-ahead and comes next.
+
+## The round that closed prefill
+
+Where the last section's table came from. The starting point is the previous
+table's engine column - 2341 and 2677 tok/s on the chat model at 128 and 512
+tokens, 1306 and 1438 on the translator - against a llama.cpp lead of 6% to
+8% everywhere but chat-128. Four changes closed it, and the widest cell moved
+14%. Single runs at each step, all four cells, taken with the same binary
+back to back; single runs read a few percent above the nine-round settled
+figures, so the rows compare to each other and the settled protocol table
+above is the claim:
+
+| | chat 128 | chat 512 | trans 128 | trans 512 |
+| --- | ---: | ---: | ---: | ---: |
+| session start, nine-round figures | 2341 | 2677 | 1306 | 1438 |
+| Q6_K device layout, scale fold, two-regime split | 2350 | 2741 | 1295 | 1490 |
+| the int8 twin fused into three more writers | 2362 | 2759 | 1307 | 1513 |
+| the memory pool told to keep its pages | 2379 | 2772 | 1328 | 1564 |
+| attention fused into one kernel | 2488 | 2989 | 1355 | 1697 |
+
+### A stale binary, and three changes measured as nothing
+
+The first row's gain was nearly written off, because the first three changes
+were each measured at zero effect - 1412.8, then 1401.6, 1403.5, 1401.9
+tok/s on the translator's 512-token cell. All three measurements were of an
+unchanged binary: `cargo build --release -p xabe-cuda` rebuilds the library,
+and `xabe-llm-bench` lives in `xabe-engine` and does not get relinked. The
+kernel source is a compile-time string, so nothing failed - the old string
+ran, correctly, at the old speed. Rebuilding the workspace surfaced all three
+changes at once, which is why the table's first row is one combined step: the
+per-change split was never validly measured, and this file does not invent
+it. The rule this buys: **measure with a binary the build just wrote, and if
+a kernel change measures as exactly nothing, suspect the link before the
+theory.**
+
+The three changes in that row, design in `docs/KERNELS.md`:
+
+- **Q6_K is restrided at upload** into a device layout whose low nibbles pair
+  32 elements apart, Q4_K-style, and whose high bits land one 16-element run
+  per word - one shift against the file layout's eight-way byte gather.
+- **Its two sub-scales fold into integer arithmetic** - `sc0*dot0 + sc1*dot1`
+  is exact in int32, bounded under 2^24 - so the kernel converts once per
+  sub-block pair instead of twice, on a card whose I2F runs at quarter rate.
+- **The split-k rule grew a second regime.** The old rule split only
+  projections too small to fill the card. The translator's wide projections
+  are the opposite shape: 160 or 216 blocks against 144 slots, one full wave
+  and a straggler tail that leaves most of the card idle for half the time.
+  The rule now measures that idle fraction and splits when it exceeds 0.3,
+  taking the largest split in 2..4 that keeps 2048 of contraction per slice.
+  The earlier sweep's conclusion that the old rule "was already at the
+  optimum" was true of the constants it swept and not of the rule shape; the
+  5% the sweep found and declined is taken here without a constant that hurts
+  the other cells. `nsys` puts the Q6_K projections at 47.2 ms of a
+  translator-512 prefill where they had been 65.2.
+
+### Three more writers for the int8 twin
+
+The second row is `quantize_q8` almost disappearing from the profile. It ran
+once per projection group when the activation was produced by a kernel with
+no quantizing tail. Three got one: `silu_mul` already quantized for decode
+and now does for prefill whenever the down projection is packed (the gate
+was a row-count check left over from before the tiled kernel read codes),
+`merge_heads` quantizes the merged context on its way out for the o
+projection, and growing the KV cache no longer copies at all when there is
+no past to copy. Each fused tail has a differential test against
+`quantize_activation` at exact equality - same codes, same sums.
+
+### The memory pool told to keep its pages
+
+The third row is not a kernel and was found with a standalone benchmark that
+refused to go below 0.9 ms however small the work got. CUDA's default async
+memory pool has a release threshold of zero: every synchronize returns the
+pool's free pages to the driver, so every buffer allocated after a
+synchronize is a real allocation, at real-allocation cost, on every token
+and every prefill forever. One attribute at device open -
+`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` to `u64::MAX` - lets the pool keep what
+it has been given, and is worth 0.5% to 3.3% depending on the cell, the
+translator's 512-token cell most. It also retroactively explained a phantom
+cliff at large split factors in the ksplit sweep - more slices means a bigger
+partial buffer, and the "kernel time" of every micro-benchmark that allocated
+after a synchronize was part allocator. The two-regime rule's in-model gains
+were re-confirmed with the pool fixed; the raw sweep numbers were not
+re-taken and are read with that caveat.
+
+### Attention fused into one kernel
+
+The last row is the largest single step and the only new kernel of the
+round: `flash_attn`, an online-softmax fused attention for prefill, design
+and constraints in `docs/KERNELS.md`. What it replaces, per layer per
+prefill: `split_heads`, the batched QK^T against every past position, the
+causal softmax materialising the full score matrix, the batched PV product,
+`merge_heads`, and on the chat model `repeat_kv` - six launches and two
+score-matrix round trips through global memory become one kernel that never
+writes a score anywhere. `nsys` had the unfused chain at 27 ms of a
+translator-512 prefill; the fused kernel reads the KV cache in place, takes
+Q straight from the projection buffer, and hands the merged context to the o
+projection. It refuses any head width but 128 rather than silently indexing
+across heads, and the model falls back to the unfused chain - which is why
+that chain is still here and still tested. Its differential test drives
+peaked and flat softmax rows against a scalar reference that rounds where
+the unfused chain rounds.
+
+What it does *not* change: decode. A single-token step attends one query
+row; the fused kernel's 32-row tile would run 31/32 empty, so decode keeps
+the mat-vec chain, and the decode rows above moved by nothing - 100.9 and
+61.4 against 101.3 and 61.7 the sitting before.
+
+### WHY NOT, again
+
+Implemented, measured, reverted, same as every entry in the older lists:
+
+**Stream-K, the way llama.cpp schedules the same tensor cores.** Fixed
+blocks, each walking a contiguous span of tile-trips, partial tiles reduced
+through a scratch buffer with a fixup pass - no wave quantization by
+construction, and llama.cpp's `mul_mat_q` does it this way on this card. Built,
+correct, and slower than the two-regime split rule at nearly every shape:
+0.308 against 0.233 ms on the translator's 128-token o/v shape, 0.582
+against 0.474 on the chat model's 512-token o shape (and before the pool
+fix it had measured 0.867 - the scratch buffer was being really allocated
+every launch, which is the pool finding above). The arithmetic of why: at
+these shapes a block's span is 56-60 trips while a whole tile is 64-216, so
+nearly every tile is split across blocks and takes the scratch-and-fixup
+path that stream-K is supposed to reserve for stragglers. llama.cpp's tiles
+are shaped so a span usually covers whole tiles; this kernel's are not, and
+reshaping them is the f16 sweep's conclusion again - 128x128 won for
+arithmetic-intensity reasons that have not changed.
+
+**A format-aware slice floor,** raising `KSLICE_MIN` to 4096 for Q6_K on the
+theory that its heavier staging amortises worse across slices: -1% on the
+model (1282 against 1294 on the translator's 128-token cell), inside noise
+everywhere else, reverted.
+
+## Prefill on the integer tensor cores
+
+The f16 kernel ran out of room. At 1836 tok/s it was measured at 86% of its own
+ceiling - 32 ms of `mma` against the 65.3 TFLOP/s the card does at
+`m16n8k8.f32.f16.f16.f32` - and llama.cpp was 1.32x ahead. No amount of work on
+the staging reaches that, because the staging would have to go to zero. The
+other shape this card assembles, `m8n8k16.s32.s8.s8.s32`, runs at four times the
+rate, and llama.cpp uses it. So `gemm_i8` does too.
+
+**This is the engine's second deliberate approximation and a larger one than the
+first.** The f16 path rounds a weight that was already four bits and keeps the
+arithmetic exact to f32 accumulation. This one quantizes the activation as well.
+What that costs is measured below rather than argued about.
+
+Chat model, `--prompt 512`, single runs at each step, prefill tok/s:
+
+| | chat prefill |
+| --- | ---: |
+| f16 tiled `gemm`, the previous best | 1926 |
+| `gemm_i8`, activation quantized inside the kernel | 640 |
+| reading `Gpu::quantize_activation`'s codes instead | 1634 |
+| `ldmatrix` for the fragments, a 2x4 warp grid, scales in pairs | 1657 |
+| the block header cached per staging thread | 1869 |
+| both `mma` steps of a Q4_K sub-block into one accumulator | 1980 |
+| the row tile on `blockIdx.x`, so weight-sharing blocks co-reside | 1993 |
+| 64 of contraction a trip, using both nibbles of every byte read | 2292 |
+| the int8 twin shared across a block's five projections | 2305 |
+| one kernel per block format instead of a runtime branch | 2666 |
+| back to a 128x128 tile at two blocks an SM | 2766 |
+| the split-k partial buffer left uninitialised | 2702-2766 |
+
+The last two rows are inside the run-to-run spread of this benchmark, which is
+about 2% at 512 tokens; the settled figures are the three-repeat ones in the
+table above. Everything before them is larger than that spread.
+
+### The two that mattered most were not the tensor cores
+
+**Quantizing the activation inside the kernel cost 3x.** The first version
+computed the maximum, the reciprocal and the rounding for its own 128 rows on
+every trip - which is once per column tile, 32 times over on a 4096-wide
+projection, and the same numbers every time. `Gpu::quantize_activation` already
+existed for the mat-vec's fast path. Reading its output instead turned the
+activation staging into a copy: 640 to 1634 tok/s.
+
+**One kernel per block format was worth 20%.** Q4_K and Q6_K stage completely
+differently, and a Q4_K sub-block holds one scale across all 32 elements where
+Q6_K changes scale every 16 - so one merges its two `mma` steps into a single
+integer accumulator and the other cannot. As a runtime branch on a kernel
+argument, ptxas allocated registers for the union of both and scheduled for
+neither, and spilled eight bytes doing it. As a template parameter with two
+`extern "C"` entry points: 2305 to 2666, no spills.
+
+### Where the time was, and what it is not
+
+The A/B is the same one the f16 work used: delete a piece, accept wrong results,
+time it. Taken at 222.2 ms per 512-token prefill, after the 64-element trip and
+before the format split:
+
+| piece | ms | share |
+| --- | ---: | ---: |
+| staging, all of it | 68.5 | 31% |
+| - the weight's global read and scale decode | 28 | 13% |
+| - the activation's global read | 25.3 | 11% |
+| - the code sums, `dp4a` against ones | 2.1 | 1% |
+| converting int32 sums to f32 and scaling them | 29 | 13% |
+| `mma` | ~42 | 19% |
+| everything else, including the other kernels | ~50 | 22% |
+
+Re-taken later on the **13 B translator** at 512 tokens, where the gap was then
+widest, against a 352.6 ms baseline - the shares are not the same model's:
+
+| piece | ms | share |
+| --- | ---: | ---: |
+| staging, all of it | 110.9 | 31% |
+| - the activation's global read | 55.8 | 16% |
+| - the weight's global read and scale decode | 40.7 | 12% |
+| - the shared stores | 17.5 | 5% |
+| converting int32 sums to f32 and scaling them | 73.4 | 21% |
+| the two `__syncthreads()` a trip | 64.2 | 18% |
+
+The conversion is a fifth of this kernel here against an eighth on the chat
+model, and the reason is Q6_K: it changes scale every sixteen weights where
+Q4_K changes every thirty-two, so it converts twice a sub-block where Q4_K
+converts once, and it is 15.3% of these weights. The barrier row is measured by
+replacing both with `__syncwarp` - wrong results, timing only - and the entry
+above explains why that number is not headroom.
+
+The conversion is the floor this design has. Per output per 32-element
+sub-block it is one `I2F` and three multiply-adds against one `mma`, and that
+ratio does not change with the tile: it is set by how often the scales change,
+which is a property of Q4_K and not of the kernel. Making it cheaper means
+quantizing the activation in groups of 256 rather than 32 so the scale factors
+out of the contraction, which is a real accuracy loss for about 3%, and it was
+not taken.
+
+### WHY NOT, this round
+
+Every one of these was implemented, measured against the run beside it, and
+reverted.
+
+| | measured | against |
+| --- | ---: | ---: |
+| `__launch_bounds__(256, 2)` to force two blocks an SM at 152 registers | 1624 | 1634 |
+| a 256-row tile, 16 warps, one block an SM | 2568 | 2766 |
+| a 256-column tile, 16 warps, one block an SM | 2666 | 2766 |
+| a 64-column tile at three blocks an SM (512 tok) | 2188 | 2766 |
+| a 64-column tile at three blocks an SM (128 tok) | 1823 | 2261 |
+| a 4x2 warp grid - 4 rows, 8 columns a warp | 2068 | 2766 |
+| `SM_TARGET` 288 for the split (128 tok) | 1953 | 2261 |
+| `SM_TARGET` 216 with 256-element slices (128 tok) | 2159 | 2261 |
+| `SM_TARGET` 108 / 72 / 36 (128 tok) | 1875 / 2251 / 1796 | 2261 |
+| rounding the split up rather than down (128 tok) | 1986 | 2261 |
+| software-pipelined loads, 2 blocks an SM (translator 512) | 1213 | 1438 |
+| the same at 1 block an SM, 214 registers, no spills | 1273 | 1438 |
+| the packed blocks transposed to `[k-block][n]` (chat 512) | 2597 | 2677 |
+| the same (translator 512) | 1389 | 1438 |
+| the same (chat 128) | 2370 | 2341 |
+| the same (translator 128) | 1341 | 1306 |
+
+The occupancy one is worth stating plainly because it was the first guess and
+it was wrong. The kernel used 152 registers, which is one block an SM, and
+forcing 128 to get two changed nothing - 1624 against 1634. It was never
+occupancy-bound. The tile sweeps say the same thing the f16 sweep did: 128x128
+wins, and it wins for the arithmetic-intensity reason rather than by accident.
+
+**The pipelining result is the one that changed how to read the profile.** A
+fresh decomposition of the translator's 512-token prefill said the two
+`__syncthreads()` a trip were worth 64 ms of 353 - 18% - and the two global
+reads another 96 ms. The standard answer is to issue the next trip's loads
+right after the barrier and let them land in registers while the tensor cores
+work on the trip already staged. That was built, and it is 16% *slower*.
+
+Twenty-one registers of staging is what it costs, and at two blocks an SM there
+is no room for them: 80 bytes of spill, 1213 tok/s against 1438. Given the room
+- one block an SM, 214 registers, no spill at all - it is still slower, 1273.
+Which answers the question the profile could not: **the second resident block
+was already covering those barriers.** Eight warps pipelined by hand beat
+nothing; sixteen warps interleaved by the scheduler beat both. The 64 ms is
+what a barrier costs when you delete it and keep everything else, not headroom
+sitting there to be recovered.
+
+The block transpose is the interesting one because it is a *split* result, and
+the reason is locality in two directions at once. A staging thread reads sixteen
+bytes of one output channel's super-block, and consecutive threads are
+consecutive channels - which in the file's own layout are `k/256 * 144` bytes
+apart, 2880 on the translator. Transposing to `[k-block][n]` puts them 144
+apart, which is why both 128-token figures improve. But it also puts the *next*
+trip's bytes for the same channel `n * 144` away instead of adjacent, and a
+512-token prefill runs four times as many trips per weight read. The trips win.
+Neither layout is right for both, and a layout that is right for both means
+reordering inside the blocks as well - the shuffle llama.cpp's MMQ does at load,
+which is a larger change than this file has measured.
+
+The split-k rule was swept in both directions, at both prompt lengths and on
+both models, and the existing one was at the optimum *of its own shape* - no
+constant beat its constants, which was not obvious, since it was tuned for the
+f16 kernel and the integer one only happens to share its tile. A later round
+changed the rule's shape rather than its constants and won - the two-regime
+rule in "The round that closed prefill" above.
+
+The sweep did find one thing worth writing down, because it is a real 5% that
+was deliberately not taken. At 512 tokens the two models want *opposite*
+things:
+
+| | chat 128 | trans 128 | chat 512 | trans 512 |
+| --- | ---: | ---: | ---: | ---: |
+| `SM_TARGET` 144, `KSLICE_MIN` 512 | **2360** | **1294** | **2760** | 1395 |
+| `SM_TARGET` 432, `KSLICE_MIN` 2048 | 2032 | 1197 | 2665 | **1471** |
+| `SM_TARGET` 432, `KSLICE_MIN` 1024 | 2145 | 1201 | 2637 | 1459 |
+| `SM_TARGET` 288, `KSLICE_MIN` 2048 | 2028 | 1197 | 2668 | 1407 |
+
+The translator's 512-token prefill gains 5.4% from splitting more, and every
+other column loses - up to 14%. The cause is wave quantization and it is
+visible in the block counts: the translator's 5120-wide projections are
+40 x 4 = 160 blocks against 144 concurrent slots, which is one full wave plus
+sixteen stragglers, while the chat model's 4096-wide ones are 128 blocks and
+already under one wave. A constant that splits the first also splits the
+second, and the second does not want it.
+
+**Fitting a rule to two models is fitting a rule to two points.** The gain is
+real and shape-dependent, and the way to take it is to stop the shape from
+arising rather than to tune a constant around it. That is the next section, and
+it recovers the same 5% without a constant at all.
+
+### The projections, grouped
+
+q, k and v multiply the same normalised activation, so they can be one batched
+product instead of three launches - and then the shape that wanted more
+splitting does not arise. The translator's 5120-wide projections go from three
+lots of 160 blocks to one lot of 480: 3.3 waves instead of three times 1.11,
+with no partial buffer and no reduction pass.
+
+Batching needs identical `(in_dim, out_dim, block format)`, and which of the
+three qualify is a property of the checkpoint rather than a choice:
+
+- Q4_K_M stores `attn_v` as **Q6_K in half the layers** of both models, so
+  half of them fuse all three and half fuse what they can.
+- A grouped-query model gives `attn_q` a different width from `attn_k`, so the
+  8 B chat model fuses k with v and leaves q alone, where the multi-head 13 B
+  translator fuses q with k.
+
+So the grouping is computed per layer from the shapes and formats, and a layer
+whose three disagree runs three products, exactly as before.
+
+Nothing is copied to take the three apart afterwards. Each element of a batched
+product writes a contiguous block of one output, so `q` is that output's prefix
+and `k` and `v` are located by an offset - which is why `rope` and
+`cache_append` grew one, and why `gemv` and `gemm_i8` grew a row stride for the
+activation. A zero left-operand stride now means *shared*, and the activation is
+quantized once for the group instead of once a projection.
+
+Measured against the same build with the grouping disabled, three runs of nine
+rounds each:
+
+| | grouping off | grouping on | |
+| --- | ---: | ---: | ---: |
+| chat, 128 tok | 2345 | 2341 | level |
+| chat, 512 tok | 2665 | 2677 | +0.5% |
+| translator, 128 tok | 1286 | 1306 | +1.6% |
+| translator, 512 tok | 1384 | **1438** | **+3.9%** |
+| translator, decode | 60.9 | **61.7** | +1.3% |
+
+The translator gets what the split-k sweep found and the chat model does not,
+and both are what the block counts predict: the translator's three projections
+are the same width so all three fuse, while the chat model's q is four times
+its k and only k and v can go together - which are its two *small* projections
+and were never the ones leaving the machine idle.
+
+The decode row is the one that was not predicted. A single-token step is
+launch-bound, and grouping removes two launches a layer.
+
+### What it costs in accuracy
+
+Every number here is measured, and the comparison that matters is at the end.
+
+| | |
+| --- | --- |
+| kernel against a CPU twin of the same approximation | passes at 1e-5 relative |
+| chat, packed against f16 in this engine | 0.175 of a 25.32 logit span (0.69%) |
+| translator, packed against f16 | 0.121 of a 28.66 span (0.42%) |
+| chat against llama-server on f16 | 1 of 125 decisions, margin 0.056 |
+| | 7 of 8 replies identical |
+| chat block sums against llama.cpp on the same Q4_K file | worst 0.099 of the layer magnitude |
+
+**The llama-server agreement did not move.** It was 1 of 125 at margin 0.056
+and 7 of 8 replies before this work and it is the same after, which is the
+result that mattered: the integer path is a different arithmetic, not a worse
+model.
+
+### Whose integer path is closer
+
+"Different from llama.cpp" is not the same as "worse than llama.cpp", and the
+difference is measurable. `llama-eval-callback` prints a scalar sum per graph
+node, so both engines can be read at every block output on the *same* Q4_K file,
+and both can be compared against that file's weights computed more precisely -
+dequantized and run through this engine's f16 path, which rounds operands but
+quantizes no activation.
+
+Mean absolute difference from that reference over 31 block outputs, prompt
+`hi`:
+
+| | mean \|block sum - the same weights at f16\| |
+| --- | ---: |
+| this engine, `gemm_i8` | **0.234** |
+| llama.cpp CUDA, MMQ | 0.337 |
+| llama.cpp CPU, `-ngl 0` | 2.048 |
+
+So on this file the engine's integer matmul sits closer to the exact
+computation than llama.cpp's does, and both sit far closer than llama.cpp's own
+CPU backend - which quantizes activations in groups of 256 where the two CUDA
+paths use 32. That last row is the useful calibration: the spread between
+llama.cpp's own two backends is six times the spread between the two CUDA
+implementations.
+
+One caveat, stated rather than buried: the reference is this engine's f16 path,
+so it shares an implementation with the row being judged. It is a different
+computation - f16 tensor cores, f32 accumulation, no activation quantization -
+but it is not a neutral third party. The ordering it produces is independently
+sensible, which is the only reason it is quoted.
+
+Against `llama.cpp`'s f16 build the picture is different and it is not an
+arithmetic result: this engine is 9.402 from it, llama.cpp CUDA on Q4_K is
+9.298, and llama.cpp CPU on Q4_K is 7.618. All three are dominated by the same
+thing - the weights really are four bits - and the 0.1 between the first two is
+the whole arithmetic disagreement.
 
 ## Prefill: what four changes bought, and what two did not
 
@@ -422,9 +873,15 @@ roughly 480, and the GPU-idle gap went from 1.9 ms to 0.15.
 
 ### What it cost in accuracy, which is more than it first looked
 
-The int8 activation is the one deliberate approximation. Against the same model
-with f16 weights, worst logit difference **0.167 against a span of 25.3**, or
-0.66%.
+The int8 activation was, when this section was written, the engine's one
+deliberate approximation. Against the same model with f16 weights, worst logit
+difference **0.167 against a span of 25.3**, or 0.66%.
+
+It is not the only one any more - `gemm_i8` quantizes activations in prefill
+too, and the figure for both together is 0.69% on this model and 0.42% on the
+translator. The numbers below are the ones measured when only the mat-vec read
+int8; the agreement with llama-server they report is unchanged by the second
+kernel, which is the point of quoting them here rather than restating them.
 
 That number understated it, and the sentence that used to follow it - that
 greedy decoding picks the same token at every position - was measured against a
@@ -1191,7 +1648,7 @@ everything else.
 llama.cpp multiplies a packed weight as integers against an int8 activation and
 never forms the dequantized value. This engine's tiled matmul dequantizes to
 f16 first. That difference was the leading theory for why the chat model
-disagrees with llama-server, and for why its prefill is 3.5x behind - int8
+disagreed with llama-server, and for why its prefill was then 3.5x behind - int8
 tensor cores run at twice the f16 rate on this card, and
 `m8n8k16.s32.s8.s8.s32` is one of only two mma shapes that assemble on sm_75.
 

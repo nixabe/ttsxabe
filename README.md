@@ -55,13 +55,19 @@ engine is absorbing the rest of it.
 
 This paragraph used to end by saying the chat LLM stayed in llama.cpp
 permanently because rewriting it would buy nothing. Both halves are retracted.
-It is written here, and on decode it is now marginally *faster* than llama.cpp
-on this card — 101.5 tokens per second against 101.2, which is a tie rather than
-a lead, and it took a wide packed mat-vec, an int8 activation and the removal of
-40% of a token that was never arithmetic to get there. Prefill is still about
-3.5x behind and the translator's decode is 1.11x behind.
-`docs/BENCHMARKS.md` has all four numbers and does not round any of them
-kindly.
+It is written here, and both models are now **level with or ahead of
+llama.cpp on every measured row** on this card. The chat model leads on all
+three of its rows — 2447 against 2259 tokens per second of prefill at 128
+tokens, 2928 against 2513 at 512, 100.9 against 95.3 decoding — and the
+translator leads on decode, is level at 512-token prefill, and sits at 0.94x
+of a 128-token llama.cpp median that swings 20% between its own runs. Prefill
+was 3.5x behind once, then 1.6x, then 0.92x; the last stretch was the integer
+tensor cores, a fused attention kernel, and a memory-pool attribute.
+`docs/BENCHMARKS.md` has every one of those numbers with llama.cpp's own
+repeat spread beside them, and does not round any of them kindly — the
+translator's 128-token cell is recorded as inside llama.cpp's noise, not as
+won, and the decode leads are noted to have appeared partly because
+llama.cpp's own column moved between sittings.
 
 ## Target hardware and model
 
@@ -122,7 +128,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 51 CUDA kernels, each diffed against its scalar twin |
+| `xabe-cuda` | 59 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
 | `xabe-taco` | Tacotron2 + WaveGlow, POJ to Tâi-lô, converted weights |
@@ -134,6 +140,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
 | `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
+| `xabe-chat` | the chat model's forward pass, sampling and stop handling |
 | `xabe-engine` | the binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:

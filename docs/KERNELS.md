@@ -38,6 +38,11 @@ exists.
 | rotary position embedding | translator attention | `xabe_dsp::rope` | `rope` | `xabe-cuda` kernels |
 | scaled rotary embedding | chat-model attention | `xabe_dsp::rope_scaled` | `rope` | `xabe-cuda` kernels |
 | key-value head expansion | chat-model attention | — | `repeat_kv` | `xabe-cuda` kernels |
+| int8 quantization of an activation | both Llama stages | `xabe_dsp::quantize_q8` | `quantize_q8` | `xabe-cuda` quant |
+| tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `xabe_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k` | `xabe-cuda` quant |
+| split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
+| KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
+| fused causal attention | both Llama stages, prefill | (scalar softmax-attention, in the test) | `flash_attn` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -215,13 +220,16 @@ about it are deliberate:
 - **The scale is `max|a| / 127`,** symmetric, so zero maps to zero and there is
   no zero point to carry a second term for. An all-zero group gets scale zero
   and quantizes exactly rather than dividing by it.
-- **It is the engine's one approximation, and it is measured, not assumed.**
-  0.66% of the logit span against the same model at f16, and zero tokens of
-  difference in greedy decoding. `xabe_dsp::quantize_q8` is the CPU twin and the
-  differential test compares at *exact equality* - the thing worth checking is
-  that the two implementations approximate identically, and a tolerance there
-  would hide exactly the group-boundary or rounding-mode disagreement it exists
-  to catch.
+- **It is measured, not assumed.** 0.69% of the chat model's logit span and
+  0.42% of the translator's, against the same weights at f16.
+  `xabe_dsp::quantize_q8` is the CPU twin and the differential test compares at
+  *exact equality* - the thing worth checking is that the two implementations
+  approximate identically, and a tolerance there would hide exactly the
+  group-boundary or rounding-mode disagreement it exists to catch.
+- **It is no longer the engine's *one* approximation.** It was, while only the
+  mat-vec read int8. `gemm_i8` reads the same codes, so prefill quantizes its
+  activations too - see "The integer matmul" below. The two are the same
+  approximation in two kernels, and the figures above cover both.
 - **The caller takes it, not the matmul.** A transformer layer feeds one normed
   activation to three projections and another to two, so quantizing per
   projection is four fifths of a launch and an allocation wasted.
@@ -361,6 +369,17 @@ shared footprints allow. Raising it measured worse (288 gives chat prefill 1224
 against 1350), because the extra slices are short and a slice reads the whole
 tile footprint however little of `k` it covers.
 
+The rule has a second regime for the opposite shape: a launch already *over*
+one wave but with a straggler tail - the translator's wide projections are 160
+or 216 blocks against 144 slots, so most of the card idles while the last few
+blocks finish. Splitting there is not about making blocks, it is about
+levelling waves, so the rule computes the idle fraction of the last wave and
+splits only when it exceeds 0.3, taking the largest factor in 2..4 that keeps
+2048 elements of contraction a slice - a deeper floor than the fill regime's
+512, because these slices come from projections that were never short of
+work. Both constants were fitted to a per-shape sweep on this card, not
+derived.
+
 ### WHY NOT
 
 - **Do not time a GPU kernel by downloading its result.** The first version of
@@ -404,6 +423,197 @@ with constant-input error growing monotonically 3.2e-2 at 8K to 7.3e-1 at 131K.
 Rescale cadence does not help. So `m16n8k8.f32...f32` is the shape used, and the
 operand rounding it does cost is measured rather than assumed: 6.5e-5 of full
 scale on a k=1280 contraction.
+
+## The integer matmul, `gemm_i8`
+
+Two entry points, `gemm_i8_q4k` and `gemm_i8_q6k`, over one templated body. It
+replaces the f16 tiled `gemm` wherever the weight is a K-quant and the shape is
+past `GEMV_MAX_M` - which is prefill on both Llama stages, and nothing else.
+
+### Why there is a second matmul at all
+
+The f16 kernel was measured at 86% of the card's `m16n8k8.f32.f16.f16.f32` peak.
+Its remaining 14% is not enough to catch llama.cpp, so the only way up is the
+other reachable shape: `m8n8k16.s32.s8.s8.s32`, which runs at four times the
+rate. That is the whole reason, and it costs an approximation - both operands
+quantized rather than one rounded. `docs/BENCHMARKS.md` has what the
+approximation is worth, including the comparison against llama.cpp's own
+integer path on the same file.
+
+### The trip is 64 elements, and that number is not a tuning constant
+
+Two Q4_K sub-blocks. Every part of the kernel's shape follows from it:
+
+- A Q4_K sub-block is 32 elements with one `(d*sc, dmin*mn)` pair, and
+  `xabe_dsp::quantize_q8` quantizes activations in groups of 32. So a
+  *sub-block* is the span over which every scale is constant, and it is the span
+  the integer accumulator may run before anything is converted.
+- Q4_K stores the low nibble of a byte at element `j` and the high nibble at
+  `j + 32`. A trip of 32 reads sixteen bytes and uses half of each. A trip of 64
+  uses both, which halves what the kernel reads from global memory for four
+  fifths of the weights in a Q4_K_M file. Worth 1993 to 2292 tok/s.
+- 64 elements is also 32 bytes of int8 activation per row, which is one thread's
+  worth for a 128-row tile across 256 threads. At 32 the activation staging ran
+  on half the block and measured 15% of the kernel.
+
+Q6_K gets the same trip because its *device* layout is built for it.
+`Gpu::upload_quant` re-packs every Q6_K block on the way to the card: the low
+nibbles are paired 32 elements apart - exactly Q4_K's shape, elements `j` and
+`j + 32` in one byte - and the 2-bit high fields are packed one 16-element run
+to a word, element `e` at bits `8*(e%4) + 2*(e/4)`. A staged run is then one
+aligned sixteen-byte read plus eight bytes of highs, every fetched byte used,
+where the file's own grouping - low halves 64 apart, high fields four to a
+byte across 128 elements - cost 48 bytes a step and used half of each. The
+same 224 bytes as the padded stride, so it costs no VRAM; every device-side
+reader decodes this layout and only this layout, and nothing downloads a block
+back. It is the one place the engine's copy of a checkpoint is not
+byte-for-byte the file's.
+
+Q6_K still converts twice a sub-block where Q4_K converts once - its scale
+changes every sixteen elements - but the two conversions fold: the sub-scales
+are 8-bit integers, so `sc0*dot0 + sc1*dot1` runs on the integer pipe and one
+exact `I2F` replaces two quarter-rate ones. The folded sum stays under 2^24,
+which is what keeps the conversion exact.
+
+### `ldmatrix` is a 16-bit instruction and this is an 8-bit matmul
+
+They fit exactly. An 8x8 tile of `b16` is eight rows of sixteen bytes, and after
+the load lane `l` holds bytes `4*(l&3) .. +3` of row `l>>2` - which is the
+`m8n8k16` fragment layout for both operands, to the byte. So one
+`ldmatrix.sync.aligned.m8n8.x4.shared.b16` fetches four int8 fragments, and the
+alternative is 32 scalar shared loads a trip.
+
+That constrains the shared stride twice over. It must be a multiple of four
+words, so every 16-byte fragment row is 16-byte aligned, which `ldmatrix`
+requires. And eight consecutive rows must cover all 32 banks, which needs
+`STRIDE mod 32` to be an odd multiple of four: at `WORDS = 16` the choice is 20,
+where `20r mod 32` runs 0, 20, 8, 28, 16, 4, 24, 12 and repeats.
+
+### The minimum is a rank-one correction
+
+Q4_K is `w = ds*q - dm`, so
+
+    sum_k a_k w_k  =  ds * sum_k(a_k q_k)  -  dm * sum_k(a_k)
+
+The first term is what the integer `mma` computes. The second needs only the
+sum of the activation's codes over the sub-block, which depends on the row and
+not on the column - so it is one `dp4a` against a word of ones while staging,
+and one multiply-add per output. Q6_K is `d * sc * (q - 32)` and has no minimum
+at all; only the `-32` folds into the code.
+
+**`sc` does not fold into the code, and trying was a bug caught before it ran.**
+Q6_K's scale reaches 127 and `q - 32` reaches 32, and the product does not fit
+in the int8 the tensor core reads. It is applied after the `mma` instead - but
+in *int32*, where `sc * dot` does fit, which is the scale fold above: the two
+sub-scales multiply their dots on the integer pipe and one conversion covers
+both.
+
+### A square-ish warp grid
+
+A warp's shared traffic is `(MS + NPW) * KS` words a trip while `MS * NPW` is
+fixed by the `mma` count, so the sum wants the two factors close. Eight warps as
+one column strip made that 18 words; as two by four it is 12. As four by two it
+is 12 again and measured much worse, because that shape gives each warp eight
+columns and four rows, and the column scales are the ones that have to be
+re-read.
+
+### The weight header is read once a super-block
+
+A staging thread reads the same weight row on every trip, so it crosses a
+super-block only once in four - and everything it needs from the header is
+sixteen bytes, at the front for Q4_K and at byte 192 for Q6_K. Caching those in
+registers, keyed on the super-block index, was worth 1657 to 1869 tok/s. It is
+the same trick `gemm` uses.
+
+The Q6_K scale is one of sixteen cached bytes chosen by a loop variable, and it
+is extracted with selects rather than a subscript: indexing a register array by
+a runtime value puts the whole array in local memory, which is the thing the
+cache exists to avoid.
+
+### Blocks are ordered by row tile, not column tile
+
+`blockIdx.x` is the row tile. The blocks that share a weight tile are the ones
+that differ in `m`, so making them consecutive puts them on the machine together
+and lets L2 serve the weight to all but the first. Worth about 1%, and free.
+
+### A batch may share its left operand
+
+`Batch::a == 0` with a count above one means every matrix of the batch
+multiplies the *same* activation. The attention projections are issued that way
+- q, k and v against one normalised input - and it changes two things in the
+packed paths, both of which were bugs before they were features.
+
+Both `gemv` and `gemm_i8` address the int8 codes densely as `[batch, m, k]`,
+derived from a row count rather than from `Batch::a`, because `quantize_q8`
+writes them that way. A shared activation is quantized *once*, so that row
+count has to be zero rather than `m` - otherwise the second matrix of the group
+reads past the end of the codes and the third reads further. `gemv` was the one
+that found this: the tiled kernel was fixed first, and a two-token prompt runs
+on the mat-vec, so the chat model's block outputs diverged at layer 7 - the
+first layer whose `attn_v` is Q4_K and therefore fuses with `attn_k`.
+
+The other thing is the quantiser itself: `q_rows` is `m` and not `count * m`,
+which is the same numbers two or three times over.
+
+### The split-k partial is not zeroed
+
+Every slice assigns every element of the tile it owns - a slice with no
+contraction left assigns the zero it started with - so the memset was one pass
+over `ksplit * m * n` floats that nothing ever read. Both tiled kernels have
+this property and the test `every_output_element_is_written_exactly_once` is
+what it rests on.
+
+## Fused causal attention, `flash_attn`
+
+Scores, mask, softmax and the value product for a whole prompt, in one kernel,
+with nothing materialised. Both Llama stages take it for any multi-token pass;
+a single decode step keeps the unfused chain, whose score row is one `gemv`
+and has nothing to fuse.
+
+### What it replaces, and why that was worth a kernel
+
+The unfused chain wrote the score matrix, read it back to softmax it, wrote
+the probabilities, and read them again for the value product -
+`heads * tq * tk` floats three times over - plus a head split before and a
+merge after, and the chat model's `repeat_kv` expanding the grouped cache
+four-for-one on top. At 512 tokens on the 13 B that chain measured about 27 ms
+of a 320 ms prefill, and the score tensor exists only so the softmax can find
+its row maximum. The running-maximum trick removes that need: fold each tile's
+maximum into a running one, rescale the output accumulator by
+`exp(m_old - m_new)`, and no tile's scores outlive the iteration that made
+them.
+
+### Shape
+
+One block owns 32 query rows of one head and walks the keys 32 at a time.
+Scores by `m16n8k8` into f32, probabilities rounded to f16 on their way into
+the value product, one more `m16n8k8` against the values, the output
+accumulator in registers throughout. The loop's upper bound is the last key
+its rows may see, so the upper triangle is never computed at all - the fusion
+gets the triangle skip that would have been a special case in the tiled gemm
+for free.
+
+The layouts are the caches' own. K is `[kv_head][pos][hd]`, which is the
+`[n][k]` shape the score product's B fragment wants; V is `[kv_head][hd][cap]`,
+which is the same shape for the value product; the queries are read straight
+out of the projection buffer and the merged context written straight back in
+`[tq, heads * hd]`. So `split_heads`, `merge_heads` and `repeat_kv` all
+disappear from the prompt path rather than getting faster. A grouped-query
+model maps `head / (heads / kv_heads)` and reads the one cached copy.
+
+`hd` is fixed at 128 - both Llama stages' - and the wrapper refuses anything
+else by construction rather than by tolerance: another width would index
+another head's values, in bounds, and return plausible context.
+
+### The arithmetic is the chain's, deliberately
+
+Operands round to f16 where the tiled `gemm` rounded them, scores accumulate
+in f32, `__expf` because that is what `softmax_causal` uses, probabilities
+round to f16 exactly where the chain rounded them - on their way into the
+value product - and the normaliser sums unrounded f32. The differential test
+compares against a scalar reference with the same roundings, on a *peaked*
+softmax: near-uniform scores would let a permuted position hide inside the
+tolerance, and a permuted position is precisely what the test exists to catch.
 
 ## The three kernels the translator added
 
