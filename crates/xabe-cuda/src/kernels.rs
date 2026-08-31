@@ -46,9 +46,9 @@ pub const SOURCE: &str = r#"
 // cost is what the differential test against `xabe_dsp::linear` measures.
 
 #define GEMM_WARPS 8
-#define GEMM_MT    128     // rows of `a` per block
-#define GEMM_NT    128     // rows of `w` per block
-#define GEMM_KC    32      // contraction staged per trip
+#define GEMM_MT    128
+#define GEMM_NT    128
+#define GEMM_KC    32
 #define GEMM_MSTEPS (GEMM_MT / 16)
 #define GEMM_KSTEPS (GEMM_KC / 8)
 #define GEMM_NPW   (GEMM_NT / (GEMM_WARPS * 8))   // 8-wide n tiles per warp
@@ -830,21 +830,41 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     int w_quant, int q_bs, int q_ts,
     // Elements between consecutive rows of `w`, when that is not `k`. See the
     // note in `gemv`; f32 only.
-    int w_rs)
+    int w_rs,
+    // How many ways the contraction is split across `blockIdx.z`. One is the
+    // ordinary matmul and the only case that writes `out` directly; above one,
+    // each slice writes its own partial into `partial` and `gemm_reduce` sums
+    // them. See the note above `partial`.
+    int ksplit,
+    // `[ksplit, batch, m, n]`, written instead of `out` when `ksplit > 1`.
+    float* __restrict__ partial)
 {
     __shared__ unsigned as[GEMM_MT * GEMM_WSTRIDE];
     __shared__ unsigned bs[GEMM_NT * GEMM_WSTRIDE];
 
-    // See the note in `gemv`: blockIdx.z selects one product of a batch.
-    out += (size_t)blockIdx.z * so;
-    const float*    af = (const float*)a    + (size_t)blockIdx.z * sa;
-    const unsigned* ah = (const unsigned*)a + (size_t)blockIdx.z * (sa >> 1);
-    const float*    wf = (const float*)w    + (size_t)blockIdx.z * sw;
-    const unsigned* wh = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1);
+    // See the note in `gemv`: blockIdx.z selects one product of a batch, and
+    // above it one slice of the contraction. Slice is the slower axis so that
+    // a batch's blocks stay adjacent, as they were before the split existed.
+    const int slice = (int)(blockIdx.z / (gridDim.z / ksplit));
+    const int bat   = (int)(blockIdx.z % (gridDim.z / ksplit));
+
+    out += (size_t)bat * so;
+    const float*    af = (const float*)a    + (size_t)bat * sa;
+    const unsigned* ah = (const unsigned*)a + (size_t)bat * (sa >> 1);
+    const float*    wf = (const float*)w    + (size_t)bat * sw;
+    const unsigned* wh = (const unsigned*)w + (size_t)bat * (sw >> 1);
     // Guarded because `q_bs` is zero on the unquantized paths, where this
     // pointer is never read.
     const unsigned char* wq = (const unsigned char*)w
-        + (size_t)blockIdx.z * (size_t)(q_bs ? (sw / q_bs) * (long)q_ts : 0);
+        + (size_t)bat * (size_t)(q_bs ? (sw / q_bs) * (long)q_ts : 0);
+
+    // Each slice takes a whole number of staged trips, so no slice boundary
+    // falls inside a `GEMM_KC` tile and the staging loop is unchanged. The last
+    // slice is short, or empty when `k` does not divide evenly - an empty slice
+    // still writes its zeroed accumulator, which the reduction needs.
+    const int kstep = ((k + ksplit - 1) / ksplit + GEMM_KC - 1) / GEMM_KC * GEMM_KC;
+    const int kbeg  = slice * kstep;
+    const int kend  = min(k, kbeg + kstep);
 
     const int lane = threadIdx.x;          // 0..31
     const int warp = threadIdx.y;          // 0..GEMM_WARPS-1
@@ -864,7 +884,7 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         }
     }
 
-    for (int kc = 0; kc < k; kc += GEMM_KC) {
+    for (int kc = kbeg; kc < kend; kc += GEMM_KC) {
         // Stage both tiles as f16. Out-of-range rows and columns are zeroed
         // rather than clamped: a zero contributes nothing to the dot product,
         // where a clamped duplicate would contribute the wrong thing.
@@ -882,7 +902,7 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
         // after the first. Taking the scalar path for the whole trip costs
         // nothing that can be measured - every contraction big enough to care
         // about (1280, 5120, 1500, 240, 3840) is even.
-        const bool whole = (kc + GEMM_KC <= k) && ((k & 1) == 0);
+        const bool whole = (kc + GEMM_KC <= kend) && ((k & 1) == 0);
         for (int i = tid; i < GEMM_MT * (GEMM_KC / 2); i += GEMM_WARPS * 32) {
             int row = i / (GEMM_KC / 2);
             int j   = i % (GEMM_KC / 2);
@@ -1029,11 +1049,16 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     // D is 16x8: d0 is row `g` column `2*tg`, d2 is row `g+8`. The lane's `g`
     // means the N index when loading B and the M index when storing D; that is
     // the instruction redistributing, not a mistake.
+    // A split writes its raw partial sum: the bias is a constant, so adding it
+    // in every slice would add it `ksplit` times. `gemm_reduce` adds it once.
+    if (ksplit > 1) {
+        out = partial + ((size_t)slice * (gridDim.z / ksplit) + bat) * (size_t)m * n;
+    }
     #pragma unroll
     for (int nt = 0; nt < GEMM_NPW; ++nt) {
         const int col0 = n0 + (warp * GEMM_NPW + nt) * 8 + 2 * tg;
-        const float bias0 = (bias && col0     < n) ? bias[col0]     : 0.0f;
-        const float bias1 = (bias && col0 + 1 < n) ? bias[col0 + 1] : 0.0f;
+        const float bias0 = (bias && ksplit == 1 && col0     < n) ? bias[col0]     : 0.0f;
+        const float bias1 = (bias && ksplit == 1 && col0 + 1 < n) ? bias[col0 + 1] : 0.0f;
         #pragma unroll
         for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
             int row0 = m0 + 16 * ms + g;
@@ -1048,6 +1073,25 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
             }
         }
     }
+}
+
+// Sums the slices a split-k `gemm` produced and adds the bias.
+//
+// The sum is ordered - slice 0 first - rather than an `atomicAdd` race, so the
+// result does not depend on how the blocks happened to be scheduled. A matmul
+// that returns slightly different numbers from one run to the next would make
+// every differential threshold in the workspace a coin toss.
+extern "C" __global__ void gemm_reduce(
+    const float* __restrict__ partial, const float* __restrict__ bias,
+    float* __restrict__ out, int mn, int n, int batch, int ksplit)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= mn * batch) return;
+    float acc = 0.0f;
+    for (int s = 0; s < ksplit; ++s) {
+        acc += partial[(size_t)s * mn * batch + i];
+    }
+    out[i] = acc + (bias ? bias[i % n] : 0.0f);
 }
 // ---------------------------------------------------------------- convolution
 
@@ -2424,3 +2468,63 @@ extern "C" __global__ void coupling_inverse(
 }
 
 "#;
+
+/// The integer a `#define` in [`SOURCE`] binds to, read at compile time.
+///
+/// The launch geometry and the kernel's block tile are the same three numbers,
+/// and writing them twice is how they drift: the grid stayed at `div_ceil(128)`
+/// through a tile change once, which under-covers the output rather than
+/// failing, so the matmul silently returns whatever the buffer already held.
+/// Reading them out of the source makes the `#define` the only copy.
+///
+/// Panics at compile time if the name is not defined, so a rename is a build
+/// error rather than a wrong grid.
+const fn define(key: &str) -> u32 {
+    let (s, k, tag) = (SOURCE.as_bytes(), key.as_bytes(), b"#define ");
+    let mut i = 0;
+    while i + tag.len() + k.len() < s.len() {
+        let mut hit = true;
+        let mut j = 0;
+        while j < tag.len() {
+            if s[i + j] != tag[j] {
+                hit = false;
+                break;
+            }
+            j += 1;
+        }
+        j = 0;
+        while hit && j < k.len() {
+            if s[i + tag.len() + j] != k[j] {
+                hit = false;
+                break;
+            }
+            j += 1;
+        }
+        // The name has to end here, or `GEMM_KC` would match `GEMM_KSTEPS`.
+        let mut p = i + tag.len() + k.len();
+        if hit && (s[p] == b' ' || s[p] == b'\t') {
+            while s[p] == b' ' || s[p] == b'\t' {
+                p += 1;
+            }
+            let mut v = 0;
+            let mut any = false;
+            while p < s.len() && s[p] >= b'0' && s[p] <= b'9' {
+                v = v * 10 + (s[p] - b'0') as u32;
+                p += 1;
+                any = true;
+            }
+            if any {
+                return v;
+            }
+        }
+        i += 1;
+    }
+    panic!("no such #define in the CUDA source")
+}
+
+/// Warps per `gemm` block; the launch's `block_dim.y`.
+pub const GEMM_WARPS: u32 = define("GEMM_WARPS");
+/// Rows of the activation one `gemm` block covers; the grid's `y` step.
+pub const GEMM_MT: u32 = define("GEMM_MT");
+/// Rows of the weight one `gemm` block covers; the grid's `x` step.
+pub const GEMM_NT: u32 = define("GEMM_NT");

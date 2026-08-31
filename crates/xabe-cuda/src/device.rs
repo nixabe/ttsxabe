@@ -6,7 +6,7 @@
 //! crate is behind a feature flag.
 
 use crate::error::CudaError;
-use crate::kernels::SOURCE;
+use crate::kernels::{self, SOURCE};
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
 use std::collections::HashMap;
@@ -25,6 +25,37 @@ const REDUCE_BLOCK: u32 = 256;
 
 /// Output positions per block in the tiled convolution.
 const CONV_BLOCK: u32 = 128;
+
+/// Blocks a `gemm` aims to put on the card before it stops splitting `k`.
+///
+/// The card has 72 SMs and the tile is register-heavy enough that one resident
+/// block an SM is what it gets, so this is "fill the machine twice over" -
+/// enough to cover the tail of a wave without making the slices so short that
+/// the staging stops paying for itself.
+const SM_TARGET: usize = 144;
+
+/// The shortest contraction a split slice is allowed.
+///
+/// A slice reads the whole `GEMM_MT x GEMM_NT` tile footprint however little of
+/// `k` it covers, so a short slice is nearly all staging.
+const KSLICE_MIN: usize = 512;
+
+/// The most ways `k` is ever split, capping the reduction pass and the
+/// `ksplit * batch * m * n` scratch it reads.
+const KSPLIT_MAX: usize = 8;
+
+/// How many ways `gemm` splits the contraction at this shape. One is no split.
+///
+/// A function rather than an expression at the call site so the geometry can be
+/// asserted without a device: what it returns decides whether a launch writes
+/// `out` or a scratch buffer, and getting it wrong is silent.
+pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
+    let blocks =
+        n.div_ceil(kernels::GEMM_NT as usize) * m.div_ceil(kernels::GEMM_MT as usize) * batch;
+    (SM_TARGET / blocks.max(1))
+        .min(k / KSLICE_MIN)
+        .clamp(1, KSPLIT_MAX)
+}
 
 /// Output channels each convolution thread accumulates. Must match `OC_TILE`
 /// in the device source.
@@ -370,6 +401,7 @@ const NAMES: &[&str] = &[
     "transposed_conv1d",
     "linear",
     "gemm",
+    "gemm_reduce",
     "gemv",
     "quantize_q8",
     "cache_append",
@@ -1143,11 +1175,10 @@ impl Gpu {
         };
         let null: u64 = 0;
 
-        // 128 rows of `a` and 128 of `w` per block, across 8 warps, or one warp
-        // per output channel when there are too few rows to fill a tile. The
-        // tile is chosen by global traffic rather than by shared capacity - see
-        // the derivation in kernels.rs, which is also why those three numbers
-        // must move together with GEMM_MT, GEMM_NT and GEMM_WARPS.
+        // `GEMM_MT` rows of `a` and `GEMM_NT` of `w` per block, across
+        // `GEMM_WARPS` warps, or one warp per output channel when there are too
+        // few rows to fill a tile. Those three are read out of the kernel's own
+        // `#define`s rather than written again here - see `kernels::define`.
         let small = m <= GEMV_MAX_M;
 
         // The wide packed mat-vec reads the activation as int8, because a lane
@@ -1186,6 +1217,31 @@ impl Gpu {
             _ => taken.as_ref(),
         };
 
+        // Split the contraction when the tile leaves the machine idle.
+        //
+        // A 128-token prefill is one tile of `m`, so a 1024-wide projection is
+        // eight blocks on 72 SMs and the tile size cannot fix it: shrinking
+        // `GEMM_MT` to make more blocks makes each weight dequantized once per
+        // block instead of once. Splitting `k` adds blocks without adding that
+        // redundancy - every weight is still read exactly once, by whichever
+        // slice owns its part of the contraction - at the cost of one pass over
+        // `ksplit * batch * m * n` floats to sum the slices.
+        //
+        // Kept to a whole number of staged trips each, and only while a slice
+        // still has enough contraction to amortise its staging; below that the
+        // split costs more than the idle SMs do.
+        let ksplit = if small {
+            1
+        } else {
+            ksplit_for(m, k, n, batch.count)
+        };
+        let mut partial = if ksplit > 1 {
+            Some(self.zeros(ksplit * batch.count * m * n)?)
+        } else {
+            None
+        };
+        let ks = ksplit as i32;
+
         let f = self.func(if small { "gemv" } else { "gemm" });
         let mut lb = self.stream.launch_builder(f);
         match a {
@@ -1217,6 +1273,12 @@ impl Gpu {
             .arg(&q_bs)
             .arg(&q_ts)
             .arg(&w_rs);
+        if !small {
+            match &mut partial {
+                Some(p) => lb.arg(&ks).arg(p),
+                None => lb.arg(&ks).arg(&null),
+            };
+        }
         let asc_off = q8.map_or(0, |q| q.scale_offset() as i32);
         if small {
             match q8 {
@@ -1230,12 +1292,12 @@ impl Gpu {
                 (n.div_ceil(8) as u32, m as u32, batch.count as u32)
             } else {
                 (
-                    n.div_ceil(128) as u32,
-                    m.div_ceil(128) as u32,
-                    batch.count as u32,
+                    (n as u32).div_ceil(kernels::GEMM_NT),
+                    (m as u32).div_ceil(kernels::GEMM_MT),
+                    (batch.count * ksplit) as u32,
                 )
             },
-            block_dim: (32, 8, 1),
+            block_dim: (32, kernels::GEMM_WARPS, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the grid covers every (batch, m, n) exactly once, `out` is
@@ -1244,6 +1306,23 @@ impl Gpu {
         launched(if small { "gemv" } else { "gemm" }, unsafe {
             lb.launch(cfg)
         })?;
+
+        if let Some(p) = &partial {
+            let total = batch.count * m * n;
+            let (mn, ni, bi) = ((m * n) as i32, n as i32, batch.count as i32);
+            let mut lb = self.stream.launch_builder(self.func("gemm_reduce"));
+            lb.arg(p);
+            match bias {
+                Some(v) => lb.arg(v),
+                None => lb.arg(&null),
+            };
+            lb.arg(&mut out).arg(&mn).arg(&ni).arg(&bi).arg(&ks);
+            // SAFETY: one thread per output element, bounds checked in the
+            // kernel, and `partial` holds exactly `ksplit * batch * m * n`.
+            launched("gemm_reduce", unsafe {
+                lb.launch(cudarc::driver::LaunchConfig::for_num_elems(total as u32))
+            })?;
+        }
         Ok(out)
     }
 

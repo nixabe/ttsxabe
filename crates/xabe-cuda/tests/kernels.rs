@@ -1418,3 +1418,79 @@ fn coupling_inverse_matches() {
     let out = g.coupling_inverse(&dx, &dst, half, t).unwrap();
     assert_close("coupling_inverse", &want, &g.download(&out).unwrap());
 }
+
+#[test]
+fn the_split_contraction_agrees_with_the_whole_one() {
+    let Some(g) = gpu() else { return };
+
+    // Shapes chosen so `ksplit_for` returns more than one: a narrow output on a
+    // long contraction is exactly the prefill projection that left the card
+    // idle, and it is the only shape the split path ever runs on. A shape it
+    // declines is included so a heuristic that stopped splitting anything would
+    // not pass this test by accident.
+    let shapes: &[(usize, usize, usize)] = &[
+        (128, 4096, 1024),  // the grouped-attention k/v projection: 8 blocks
+        (128, 4096, 4096),  // the query and output projections
+        (128, 14336, 4096), // the mlp down projection, the longest contraction
+        (256, 2048, 128),   // two m tiles, one n tile
+    ];
+    let mut split_seen = 0;
+
+    for &(m, k, n) in shapes {
+        let ks = xabe_cuda::ksplit_for(m, k, n, 1);
+        if ks > 1 {
+            split_seen += 1;
+        }
+        let (a, w) = (seq(m * k, 5), seq(n * k, 6));
+        let want = reference_gemm(&a, m, k, &w, n);
+        let got = g
+            .download(
+                &g.gemm(
+                    &g.upload(&a).expect("upload"),
+                    &g.upload(&w).expect("upload"),
+                    None,
+                    m,
+                    k,
+                    n,
+                )
+                .expect("gemm"),
+            )
+            .expect("download");
+        assert_close_gemm(&format!("split {m}x{k}x{n} ksplit={ks}"), &want, &got);
+    }
+
+    // The point of the test is the split path, so a run where nothing split is
+    // a pass that proved nothing.
+    assert!(
+        split_seen >= 3,
+        "no shape here reached the split path: ksplit_for never returned > 1"
+    );
+}
+
+#[test]
+fn a_split_contraction_is_bit_identical_from_run_to_run() {
+    let Some(g) = gpu() else { return };
+
+    // Summing the slices in index order rather than by `atomicAdd` is what
+    // makes this hold. It is asserted rather than assumed because an atomic
+    // reduction is the obvious way to write `gemm_reduce`, it is faster, and
+    // it would pass every tolerance-based test in this file while making the
+    // differential thresholds elsewhere depend on block scheduling.
+    let (m, k, n) = (128usize, 4096usize, 1024usize);
+    assert!(
+        xabe_cuda::ksplit_for(m, k, n, 1) > 1,
+        "shape does not split"
+    );
+    let (a, w) = (seq(m * k, 7), seq(n * k, 8));
+    let (da, dw) = (g.upload(&a).expect("upload"), g.upload(&w).expect("upload"));
+
+    let first = g
+        .download(&g.gemm(&da, &dw, None, m, k, n).expect("gemm"))
+        .expect("download");
+    for round in 1..4 {
+        let again = g
+            .download(&g.gemm(&da, &dw, None, m, k, n).expect("gemm"))
+            .expect("download");
+        assert_eq!(first, again, "round {round} differs from the first");
+    }
+}
