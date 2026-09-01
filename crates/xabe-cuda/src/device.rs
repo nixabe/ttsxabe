@@ -456,6 +456,10 @@ const NAMES: &[&str] = &[
     "flash_attn_64",
     "gemv",
     "gemv_rows",
+    "cache_append_f16",
+    "cache_append_t_f16",
+    "cache_grow_f16",
+    "flash_attn_h",
     "quantize_q8",
     "cache_append",
     "cache_append_t",
@@ -692,6 +696,21 @@ impl Gpu {
     pub fn zeros(&self, n: usize) -> Result<CudaSlice<f32>, CudaError> {
         self.stream
             .alloc_zeros::<f32>(n)
+            .map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })
+    }
+
+    /// Allocates a zeroed f16 device buffer, of `n` *elements* rather than
+    /// words.
+    ///
+    /// A cache is the caller: it is written a token at a time and read in
+    /// full, so the positions past the live length are read before anything
+    /// writes them and must be zero rather than whatever was there.
+    pub fn zeros_f16(&self, n: usize) -> Result<CudaSlice<u16>, CudaError> {
+        self.stream
+            .alloc_zeros::<u16>(n)
             .map_err(|source| CudaError::Driver {
                 what: "allocating",
                 source,
@@ -1265,7 +1284,20 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        if (a.half() == 1 || w.half() == 1) && !k.is_multiple_of(2) {
+        // The f16 paths that take an odd contraction are the two mat-vecs, and
+        // they take it because they have to: between them they contract an f16
+        // value cache over however many positions have been decoded, and half
+        // of those are odd. A grouped-query model arrives with `group` rows and
+        // a multi-head one with a single row, so both shapes occur. Each reads
+        // the last element as a lone half rather than as part of a pair - see
+        // `gemv_rows` and the tail of `gemv`'s f16 branch. The tiled kernel
+        // addresses whole words throughout and an odd `k` has no layout in it
+        // at all, so it keeps the refusal.
+        let odd_ok = matches!(w, Operand::F16(_))
+            && a.half() == 0
+            && m <= GEMV_MAX_M
+            && matches!(a, Operand::F32(_) | Operand::F32Q { .. });
+        if (a.half() == 1 || w.half() == 1) && !k.is_multiple_of(2) && !odd_ok {
             return Err(CudaError::RaggedContraction { k });
         }
         // Only a weight is ever stored packed. An activation is produced by the
@@ -1293,13 +1325,19 @@ impl Gpu {
         // in the tests, which is the check this relies on.
         let mut out = unsafe { self.uninit(batch.count * m * n) }?;
         // A row stride is meaningful only where a row is read as a row. The
-        // packed and f16 paths derive it from the block or word layout, so a
-        // caller asking for one there is asking for something that would be
-        // silently ignored.
-        if batch.w_row != 0 && !matches!(w, Operand::F32(_)) {
+        // packed paths derive it from the block layout, so a caller asking for
+        // one there is asking for something that would be silently ignored.
+        // The f16 path reads words of two elements and honours it halved,
+        // which is what an f16 value cache needs and why it must be even.
+        if batch.w_row != 0 && !matches!(w, Operand::F32(_) | Operand::F16(_)) {
             return Err(CudaError::StridedNonF32Weight {
                 stride: batch.w_row,
             });
+        }
+        if let Operand::F16(_) = w
+            && !batch.w_row.is_multiple_of(2)
+        {
+            return Err(CudaError::OddCacheCapacity { cap: batch.w_row });
         }
         let (mi, ki, ni) = (m as i32, k as i32, n as i32);
         let w_rs = batch.w_row as i32;
@@ -1539,21 +1577,24 @@ impl Gpu {
         // row, where there is something to share. See `gemv_rows`.
         if small
             && m > 1
-            && matches!(w, Operand::F32(_))
+            && matches!(w, Operand::F32(_) | Operand::F16(_))
             && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
         {
             debug_assert!(m <= kernels::GEMV_ROWS_MAX as usize, "gemv_rows is bounded");
             let (Operand::F32(av) | Operand::F32Q { data: av, .. }) = a else {
                 unreachable!("matched above")
             };
-            let Operand::F32(wv) = w else {
-                unreachable!("matched above")
-            };
             let f = self.func("gemv_rows");
             let mut lb = self.stream.launch_builder(f);
+            lb.arg(av);
+            match w {
+                Operand::F32(v) => lb.arg(v),
+                Operand::F16(v) => lb.arg(v),
+                _ => unreachable!("matched above"),
+            };
             match bias {
-                Some(v) => lb.arg(av).arg(wv).arg(v),
-                None => lb.arg(av).arg(wv).arg(&null),
+                Some(v) => lb.arg(v),
+                None => lb.arg(&null),
             };
             lb.arg(&mut out)
                 .arg(&mi)
@@ -1562,7 +1603,8 @@ impl Gpu {
                 .arg(&sa)
                 .arg(&sw)
                 .arg(&so)
-                .arg(&w_rs);
+                .arg(&w_rs)
+                .arg(&w_half);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (n.div_ceil(8) as u32, 1, batch.count as u32),
                 block_dim: (32, kernels::GEMV_WARPS, 1),
@@ -1677,6 +1719,72 @@ impl Gpu {
         launched("gemm_reduce", unsafe {
             lb.launch(cudarc::driver::LaunchConfig::for_num_elems(total as u32))
         })?;
+        Ok(())
+    }
+
+    /// [`Self::cache_append`] into an f16 cache.
+    ///
+    /// A twin rather than a type parameter: the two differ only in the width
+    /// they store and in nothing a caller has to reason about, and one of them
+    /// has to name a kernel either way.
+    ///
+    /// `cap` must be even. Everything that reads this cache reads it as pairs
+    /// of halves in a word - the value layout puts a head's row `cap` apart,
+    /// and an odd `cap` would put every other row's pairs across a word
+    /// boundary. It is a constructor's job to guarantee, not a reader's to
+    /// survive, so it is refused here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_append_f16(
+        &self,
+        src: &CudaSlice<f32>,
+        src_off: usize,
+        dst: &mut CudaSlice<u16>,
+        n: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cap: usize,
+        past: usize,
+        transposed: bool,
+    ) -> Result<(), CudaError> {
+        if past + n > cap {
+            return Err(CudaError::CacheOverrun { at: past + n, cap });
+        }
+        if !cap.is_multiple_of(2) {
+            return Err(CudaError::OddCacheCapacity { cap });
+        }
+        let total = n * kv_heads * head_dim;
+        if src_off + total > src.len() {
+            return Err(CudaError::SliceOverrun {
+                at: src_off + total,
+                len: src.len(),
+            });
+        }
+        let name = if transposed {
+            "cache_append_t_f16"
+        } else {
+            "cache_append_f16"
+        };
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        let (ni, kh, hd, ca, pa) = (
+            n as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            cap as i32,
+            past as i32,
+        );
+        let so = src_off as i64;
+        lb.arg(src)
+            .arg(&so)
+            .arg(dst)
+            .arg(&ni)
+            .arg(&kh)
+            .arg(&hd)
+            .arg(&ca)
+            .arg(&pa);
+        // SAFETY: as `cache_append`, with a half-width destination whose
+        // element count is the same.
+        launched(name, unsafe { lb.launch(Self::flat(total)) })?;
         Ok(())
     }
 
@@ -1823,6 +1931,72 @@ impl Gpu {
         // against `rows * len`, and both allocations are checked above to hold
         // `rows` runs at their own stride.
         launched("cache_grow", unsafe { lb.launch(Self::flat(total)) })?;
+        Ok(())
+    }
+
+    /// [`Self::cache_grow`] for an f16 cache. Same runs, same strides,
+    /// half the width - and the same reason it is a kernel and not a
+    /// memcpy, which the note on that one gives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_grow_f16(
+        &self,
+        src: &CudaSlice<u16>,
+        dst: &mut CudaSlice<u16>,
+        kv_heads: usize,
+        head_dim: usize,
+        old_cap: usize,
+        new_cap: usize,
+        live: usize,
+        transposed: bool,
+    ) -> Result<(), CudaError> {
+        if live > old_cap || new_cap < old_cap {
+            return Err(CudaError::CacheOverrun {
+                at: live.max(old_cap),
+                cap: new_cap.min(old_cap),
+            });
+        }
+        // Both layouts are `rows` runs of `len` contiguous halves, a source
+        // capacity apart and a destination capacity apart. Only what a run is
+        // differs: a whole head's positions for the keys, one head's single
+        // dimension across positions for the values.
+        let (rows, len, src_stride, dst_stride) = match transposed {
+            false => (
+                kv_heads,
+                live * head_dim,
+                old_cap * head_dim,
+                new_cap * head_dim,
+            ),
+            true => (kv_heads * head_dim, live, old_cap, new_cap),
+        };
+        if rows * src_stride > src.len() {
+            return Err(CudaError::SliceOverrun {
+                at: rows * src_stride,
+                len: src.len(),
+            });
+        }
+        if rows * dst_stride > dst.len() {
+            return Err(CudaError::SliceOverrun {
+                at: rows * dst_stride,
+                len: dst.len(),
+            });
+        }
+        let total = rows * len;
+        if total == 0 {
+            return Ok(());
+        }
+        let (r, l, ss, ds) = (
+            rows as i32,
+            len as i32,
+            src_stride as i32,
+            dst_stride as i32,
+        );
+        let f = self.func("cache_grow_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(src).arg(dst).arg(&r).arg(&l).arg(&ss).arg(&ds);
+        // SAFETY: one thread per copied element, bounds checked in the kernel
+        // against `rows * len`, and both allocations are checked above to hold
+        // `rows` runs at their own stride.
+        launched("cache_grow_f16", unsafe { lb.launch(Self::flat(total)) })?;
         Ok(())
     }
 
@@ -3171,6 +3345,87 @@ impl Gpu {
                 });
             }
         };
+        if !heads.is_multiple_of(kv_heads.max(1)) {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim,
+                heads,
+                kv_heads,
+            });
+        }
+        // SAFETY: every (row, column) of the output is written by exactly one
+        // lane of the store loop below; rows past `tq` are predicated off.
+        let mut out = unsafe { self.uninit(tq * heads * head_dim) }?;
+        let (tqi, pi, hi, kvi, ci) = (
+            tq as i32,
+            past as i32,
+            heads as i32,
+            kv_heads as i32,
+            cap as i32,
+        );
+        let causal_i = i32::from(causal);
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(&mut out)
+            .arg(&tqi)
+            .arg(&pi)
+            .arg(&hi)
+            .arg(&kvi)
+            .arg(&ci)
+            .arg(&scale)
+            .arg(&causal_i);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((tq as u32).div_ceil(qt), heads as u32, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        launched(name, unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
+    /// [`Self::flash_attn`] against an f16 cache.
+    ///
+    /// Only at a head width of 128, which is the only width any stage holds a
+    /// cache that way at, and only with an even `cap` - the value layout is
+    /// read as words of two positions, so an odd capacity would straddle them.
+    /// Both are refused by name rather than producing plausible context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_f16(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        tq: usize,
+        past: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cap: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        // Only the widths the kernel is instantiated at. A width it is not
+        // instantiated at would index across heads *in bounds* and return
+        // plausible context, so it is refused by name and the caller falls
+        // back to the unfused chain.
+        // The query rows a block owns, which is the kernel's own `QT` and
+        // therefore its grid stride. It is not the same at both widths: see
+        // the kernel's header for why the encoder's instantiation takes 64.
+        let (name, qt) = match head_dim {
+            128 => ("flash_attn_h", 32),
+            _ => {
+                return Err(CudaError::UnsupportedAttention {
+                    head_dim,
+                    heads,
+                    kv_heads,
+                });
+            }
+        };
+        if !cap.is_multiple_of(2) {
+            return Err(CudaError::OddCacheCapacity { cap });
+        }
         if !heads.is_multiple_of(kv_heads.max(1)) {
             return Err(CudaError::UnsupportedAttention {
                 head_dim,

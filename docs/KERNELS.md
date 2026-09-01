@@ -785,10 +785,12 @@ pay, because the four products then issue back to back off one register.
 `GEMV_ROWS_MAX` is 4 and `GEMV_MAX_M` must not exceed it; a `debug_assert` at
 the launch says so.
 
-**f32 both sides, and no packed path.** A packed weight is a checkpoint tensor
-and has no case here. The KV cache is the only unpacked `f32` operand that ever
-appears on the right of a mat-vec in these models, which is why this kernel is
-narrow enough to be worth having rather than a second copy of `gemv`.
+**f32 or f16 on the right, and no packed path.** A packed weight is a
+checkpoint tensor and has no case here. The KV cache is the only *unpacked*
+operand that ever appears on the right of a mat-vec in these models, which is
+why this kernel is narrow enough to be worth having rather than a second copy
+of `gemv`. It is f16 now, so the loop has both widths - and the f16 one carries
+the odd tail, below.
 
 Two things it deliberately is not:
 
@@ -801,6 +803,47 @@ Two things it deliberately is not:
   test asks for **bit equality** against the same rows computed one at a time -
   a tolerance there would be hiding the only thing worth checking - and gets it
   on five shapes, including the strided `w_row` layout the value cache uses.
+
+## The f16 KV cache, and the odd contraction it brings
+
+Both Llama stages hold their caches at f16. That is five kernels with twins -
+the two appends, the growth re-stride, both mat-vecs and the fused prefill
+attention - and one thing that had never come up before.
+
+**An f16 *weight* is never an odd length. An f16 *cache* is, half the time.**
+Every f16 path here addresses 32-bit words of two elements, and
+`RaggedContraction` refuses an odd `k` because a weight is a checkpoint tensor
+whose contraction is a model dimension and always even. A value cache is not a
+weight: the context product contracts over however many positions have been
+decoded, which is 1, then 2, then 3. So the two mat-vecs read the last element
+as a lone half - `wv[kh]`'s low half against `af[k - 1]`, by one lane, after
+the pair loop - and only they are let through the refusal. The tiled kernel
+keeps it, because it stages whole words throughout and an odd `k` has no layout
+in it at all.
+
+Two invariants make the addressing work, and both are refused rather than
+assumed:
+
+- **An even capacity.** The value layout puts a head's row a capacity apart, so
+  an odd capacity lands every other row's pairs across a word boundary. That
+  reads *in bounds* and returns the wrong two numbers - fluent text off a cache
+  that is quietly wrong - so `OddCacheCapacity` rejects it where the buffer is
+  made. Capacities double from 256 and are never odd; the check costs nothing
+  and says what it depends on.
+- **An even row stride.** `w_row` used to be refused on anything but f32.
+  An f16 value cache is exactly that case, so the f16 paths honour it halved.
+
+**`flash_attn` reading an f16 cache is simpler, not harder.** Both of its
+staging loops already round what they read to f16 on the way into shared
+memory, so an f16 source removes a conversion rather than adding one: the key
+loop becomes a word copy. It is a template argument (`KVH`) and not a flag,
+because those loops run once a key tile.
+
+What this is worth, and where it is not, is in docs/BENCHMARKS.md: 4 GiB on the
+translator and 512 MiB on the chat model, 6.6% of the translator's decode at a
+1024 context, and **nothing on the chat model's** - whose score product
+contracts over one head width and is latency bound rather than bandwidth bound
+at four rows.
 
 ## Fused attention, `flash_attn`
 

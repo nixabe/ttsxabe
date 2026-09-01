@@ -8,8 +8,13 @@ pub enum CudaError {
     /// The F32 path takes any length - see the history in
     /// `gemm_accepts_every_contraction_length`. This one cannot: an f16 weight
     /// is addressed as 32-bit words, so an odd `k` would put the boundary in
-    /// the middle of one. Every contraction in a transformer is even, so this
-    /// is a check rather than a limitation.
+    /// the middle of one. Every contraction against a *weight* is even, so for
+    /// those this is a check rather than a limitation.
+    ///
+    /// The exception is the several-row mat-vec against an f16 value cache,
+    /// which contracts over however many positions have been decoded - half of
+    /// them odd. It reads the last element as a lone half and is allowed
+    /// through; nothing else is.
     #[error("contraction length {k} is odd, and an f16 weight packs two to a word")]
     RaggedContraction {
         /// The length asked for.
@@ -92,11 +97,27 @@ pub enum CudaError {
         cap: usize,
     },
 
+    /// An f16 cache whose capacity is odd.
+    ///
+    /// Every reader of an f16 cache reads two positions to a 32-bit word, and
+    /// the value layout puts a head's row a capacity apart. An odd capacity
+    /// therefore lands every other row's pairs across a word boundary, which
+    /// reads in bounds and returns the wrong two numbers - the shape of bug
+    /// that produces fluent text off a cache that is quietly wrong. Rejected
+    /// where the buffer is made, not where it is read.
+    #[error("an f16 cache with an odd capacity of {cap}")]
+    OddCacheCapacity {
+        /// Positions the buffer has room for.
+        cap: usize,
+    },
+
     /// A row stride asked for on an operand that has no rows to stride.
     ///
-    /// The packed and f16 paths derive addressing from the block or word
-    /// layout, so a stride handed to them would be ignored without a word.
-    #[error("a row stride of {stride} on a weight that is not f32")]
+    /// The packed paths derive addressing from the block layout, so a stride
+    /// handed to them would be ignored without a word. The f16 path *does*
+    /// honour one - an f16 value cache is exactly that case - so long as it is
+    /// even, which a capacity always is.
+    #[error("a row stride of {stride} on a packed weight")]
     StridedNonF32Weight {
         /// The stride asked for.
         stride: usize,

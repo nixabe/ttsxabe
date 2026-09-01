@@ -159,8 +159,17 @@ pub struct ChatModel {
 /// heads in a group read the same key-value head, so what is saved is
 /// 3/4 of 32 layers' worth of context, which at 8k tokens is 6 GB against 1.5.
 pub struct Cache {
-    k: Vec<CudaSlice<f32>>,
-    v: Vec<CudaSlice<f32>>,
+    /// f16, and that is the whole point of it.
+    ///
+    /// The weights a token reads are a fixed 4.6 GB; the cache is the term
+    /// that *grows*, and at 2048 positions it is 537 MB re-read for every
+    /// token on top of them. Halving its width halves that, and halves what a
+    /// long conversation costs to hold. llama.cpp's cache is f16 by default,
+    /// so this moves the arithmetic toward the reference rather than away from
+    /// it - `layer_taps` compares against that reference and its bound did not
+    /// move. See docs/BENCHMARKS.md.
+    k: Vec<CudaSlice<u16>>,
+    v: Vec<CudaSlice<u16>>,
     /// Tokens the buffers have room for, which is not how many they hold.
     ///
     /// The first version of this grew by exactly the tokens being added, which
@@ -605,12 +614,13 @@ impl ChatModel {
             let keys = cache.k.iter_mut().map(|s| (s, false));
             let values = cache.v.iter_mut().map(|s| (s, true));
             for (slot, transposed) in keys.chain(values) {
-                let mut grown = self.gpu.zeros(want * kv_dim)?;
+                let mut grown = self.gpu.zeros_f16(want * kv_dim)?;
                 // A fresh conversation grows from empty, and sixty-four
                 // zero-byte copies are still sixty-four launches.
                 if past > 0 {
-                    self.gpu
-                        .cache_grow(slot, &mut grown, kv_heads, hd, was, want, past, transposed)?;
+                    self.gpu.cache_grow_f16(
+                        slot, &mut grown, kv_heads, hd, was, want, past, transposed,
+                    )?;
                 }
                 *slot = grown;
             }
@@ -696,11 +706,11 @@ impl ChatModel {
             // Scattered straight into the layout attention reads, rather than
             // appended and rearranged. See `Gpu::cache_append`.
             if first {
-                cache.k.push(self.gpu.zeros(cache.cap * kv_dim)?);
-                cache.v.push(self.gpu.zeros(cache.cap * kv_dim)?);
+                cache.k.push(self.gpu.zeros_f16(cache.cap * kv_dim)?);
+                cache.v.push(self.gpu.zeros_f16(cache.cap * kv_dim)?);
             }
             let cap = cache.cap;
-            self.gpu.cache_append(
+            self.gpu.cache_append_f16(
                 &proj[kg],
                 k_off,
                 &mut cache.k[i],
@@ -711,7 +721,7 @@ impl ChatModel {
                 past,
                 false,
             )?;
-            self.gpu.cache_append(
+            self.gpu.cache_append_f16(
                 &proj[vg],
                 v_off,
                 &mut cache.v[i],
@@ -747,7 +757,7 @@ impl ChatModel {
             // single step keeps the chain below: its score row is one gemv
             // and there is nothing to fuse.
             if n > 1 && hd == 128 {
-                let ctx = self.gpu.flash_attn(
+                let ctx = self.gpu.flash_attn_f16(
                     q,
                     &cache.k[i],
                     &cache.v[i],
@@ -770,7 +780,7 @@ impl ChatModel {
                 };
                 let mut scores = self.gpu.gemm_batched(
                     Operand::F32(qh.as_ref().unwrap_or(q)),
-                    Operand::F32(&cache.k[i]),
+                    Operand::F16(&cache.k[i]),
                     None,
                     Batch {
                         count: kv_heads,
@@ -800,7 +810,7 @@ impl ChatModel {
                 // untouched tail of the cache irrelevant rather than wrong.
                 let ctx = self.gpu.gemm_batched(
                     Operand::F32(&scores),
-                    Operand::F32(&cache.v[i]),
+                    Operand::F16(&cache.v[i]),
                     None,
                     Batch {
                         count: kv_heads,

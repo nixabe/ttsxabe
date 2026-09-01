@@ -287,8 +287,16 @@ pub struct Cache {
     /// `[heads, capacity, head_dim]` and values `[heads, head_dim, capacity]`,
     /// which are the two shapes attention reads. Rearranging them per step was
     /// four kernels and four allocations a layer.
-    k: Vec<CudaSlice<f32>>,
-    v: Vec<CudaSlice<f32>>,
+    /// f16, which on this model is the larger of the two savings it makes.
+    ///
+    /// The translator has no grouped-query attention - 40 key heads for 40
+    /// query heads - so its cache is five times the chat model's per token and
+    /// 6.25 GiB at a doubled 4 096 capacity. Halving that was named in
+    /// docs/BENCHMARKS.md as the first thing to try if the card ever got
+    /// tight, and it also decodes with a *single* row, which is the shape the
+    /// f16 mat-vec is fastest at. See docs/BENCHMARKS.md for both numbers.
+    k: Vec<CudaSlice<u16>>,
+    v: Vec<CudaSlice<u16>>,
     /// Tokens the buffers have room for, which is not how many they hold.
     ///
     /// Doubled on growth. Growing by exactly the tokens added meant an
@@ -659,12 +667,12 @@ impl Translator {
             let keys = cache.k.iter_mut().map(|s| (s, false));
             let values = cache.v.iter_mut().map(|s| (s, true));
             for (slot, transposed) in keys.chain(values) {
-                let mut grown = self.gpu.zeros(want * h_dim)?;
+                let mut grown = self.gpu.zeros_f16(want * h_dim)?;
                 // A fresh conversation grows from empty, and eighty zero-byte
                 // copies are still eighty launches.
                 if past > 0 {
                     self.gpu
-                        .cache_grow(slot, &mut grown, heads, hd, was, want, past, transposed)?;
+                        .cache_grow_f16(slot, &mut grown, heads, hd, was, want, past, transposed)?;
                 }
                 *slot = grown;
             }
@@ -734,11 +742,11 @@ impl Translator {
 
             // Scattered straight into the layout attention reads.
             if first {
-                cache.k.push(self.gpu.zeros(cache.cap * h_dim)?);
-                cache.v.push(self.gpu.zeros(cache.cap * h_dim)?);
+                cache.k.push(self.gpu.zeros_f16(cache.cap * h_dim)?);
+                cache.v.push(self.gpu.zeros_f16(cache.cap * h_dim)?);
             }
             let cap = cache.cap;
-            self.gpu.cache_append(
+            self.gpu.cache_append_f16(
                 &proj[kg],
                 k_off,
                 &mut cache.k[i],
@@ -749,7 +757,7 @@ impl Translator {
                 past,
                 false,
             )?;
-            self.gpu.cache_append(
+            self.gpu.cache_append_f16(
                 &proj[vg],
                 v_off,
                 &mut cache.v[i],
@@ -775,7 +783,7 @@ impl Translator {
             // and there is nothing to fuse. So does any geometry the fused
             // kernel's tiles do not cover, which this checkpoint's never is.
             if n > 1 && hd == 128 {
-                let ctx = self.gpu.flash_attn(
+                let ctx = self.gpu.flash_attn_f16(
                     q,
                     &cache.k[i],
                     &cache.v[i],
@@ -798,7 +806,7 @@ impl Translator {
 
                 let mut scores = self.gpu.gemm_batched(
                     Operand::F32(qh.as_ref().unwrap_or(q)),
-                    Operand::F32(&cache.k[i]),
+                    Operand::F16(&cache.k[i]),
                     None,
                     Batch {
                         count: heads,
@@ -825,7 +833,7 @@ impl Translator {
 
                 let ctx = self.gpu.gemm_batched(
                     Operand::F32(&scores),
-                    Operand::F32(&cache.v[i]),
+                    Operand::F16(&cache.v[i]),
                     None,
                     // `w_row` is `cap`, not `tk`: the values sit in a buffer with
                     // room for more positions than are in it.

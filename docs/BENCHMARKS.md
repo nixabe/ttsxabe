@@ -1497,6 +1497,66 @@ The CPU finishes queueing the step less than halfway through it and then waits,
 so the launches are already hidden behind the GPU and a graph would remove a
 cost that is not being paid. `cudarc` has `CudaGraph` and it was not used.
 
+## An f16 KV cache: 4 GiB, and a speed result that depends on the row count
+
+The cache is the one buffer whose size is the *context* rather than the
+checkpoint. Halving its width was named in the residency section above as the
+first thing to try if the card got tight, and the machinery is the same for
+both Llama stages: two append kernels, a growth kernel, both mat-vecs and the
+fused prefill attention, each with an f16 twin.
+
+**What it bought in memory,** peak resident during a 2048-token prefill and 32
+decodes, polled from `nvidia-smi`:
+
+| | f32 cache | f16 cache | saved |
+| --- | ---: | ---: | ---: |
+| chat 8 B | 8 070 MiB | 7 558 MiB | 512 MiB |
+| translator 13 B | 17 190 MiB | **13 126 MiB** | **4 064 MiB** |
+
+The chat saving is exactly the 512 MiB the arithmetic predicts. The
+translator's is a quarter more than the 3.1 GiB predicted, because the prefill
+also stages from the cache and its working set narrows with it.
+
+**What it bought in speed depends on which model,** and the split is the whole
+finding. Nine-round medians, alternated:
+
+| | 128 | 512 | 1024 | 2048 |
+| --- | ---: | ---: | ---: | ---: |
+| chat, f32 cache | 9.66 | 9.96 | 10.28 | 10.94 |
+| chat, f16 cache | 9.68 | 9.95 | 10.25 | **10.84** |
+| translator, f32 cache | 15.98 | 17.35 | 19.00 | — |
+| translator, f16 cache | 15.89 | **16.67** | **17.75** | — |
+
+ms a token. **The chat model is a wash and the translator gains 3.9% at 512 and
+6.6% at 1024.** Prefill moved once, on the chat model at 2048: 719.0 ms to
+708.5.
+
+### Why the same change wins on one model and not the other
+
+Timed standalone across 32 layers at a 2048 cache, the two decode products
+separately:
+
+| | scores, f32 | scores, f16 | context, f32 | context, f16 |
+| --- | ---: | ---: | ---: | ---: |
+| four rows (chat) | 0.736 ms | **0.811** | 0.654 ms | 0.583 |
+| one row (translator) | 0.601 ms | 0.483 | 0.592 ms | 0.357 |
+
+At one row both products gain, 20% and 40%. At four rows the *score* product
+gets **slower**, and it cancels what the value product gains.
+
+The reason is the contraction, not the traffic. A score product contracts over
+one head width - 128 - so at f32 a warp makes four trips and at f16 it makes
+**two**, and two loads is not enough outstanding work to cover their latency;
+the reduction and the four predicated row products are then most of what the
+warp does. The value product contracts over the whole context, which at 2048 is
+sixty-four trips either way, and there halving the bytes halves the time.
+
+A grouped-query model reaches the score product with four rows and a multi-head
+one with one, so the same kernel is latency bound on the first and bandwidth
+bound on the second. Nothing here is a *loss* on the chat model, and it keeps
+512 MiB, so both stages hold their caches at f16 - but the speed claim is the
+translator's alone.
+
 ## Sixteen bytes a lane, and the token that was 40% not-matmul
 
 Two separate problems, found in that order, and the second was the larger.
@@ -1837,9 +1897,11 @@ not the context; dropping CosyVoice is what saves the 3 266 MiB.
 
 ### The caches are the part that grows, and the translator has no GQA
 
-Weights are what the table measures. The KV cache is f32 and its capacity
-doubles from 256, so a 2 100-token conversation has allocated 4 096 slots and
-pays the 4k column.
+Weights are what the table measures. The KV cache's capacity doubles from 256,
+so a 2 100-token conversation has allocated 4 096 slots and pays the 4k column.
+**The cache was f32 when this was written and is f16 now** - see "An f16 KV
+cache" below - so the figures here are the f32 ones the rest of this section
+reasons about, and each is now half what it says:
 
 | | kv heads | per token | 1k ctx | 4k ctx |
 | --- | ---: | ---: | ---: | ---: |
@@ -1852,10 +1914,12 @@ otherwise empty card, peaks at **18 031 MiB** - about 8.9 GiB of weights and
 context, 6.25 GiB of KV at the doubled 4 096 capacity, and the rest prefill
 activations.
 
-So the four stages at a 4k context on both models come to roughly 26 GiB of
+So the four stages at a 4k context on both models came to roughly 26 GiB of
 the 48. The headroom is real, and the translator's cache spends it four times
-faster than the chat model's: an f16 KV cache there is worth 3.1 GiB and is the
-first thing to try if it ever gets tight.
+faster than the chat model's: this entry ended by saying an f16 KV cache there
+was worth 3.1 GiB and was the first thing to try if it ever got tight. **It has
+since been done**, and measured at more than that - 4.0 GiB - because the
+prefill's own working set narrows with it.
 
 The context is charged to the TTS row because it is created by whichever stage
 opens the device first, and 36 M parameters is where it is obviously the

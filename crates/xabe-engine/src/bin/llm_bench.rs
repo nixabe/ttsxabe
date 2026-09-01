@@ -127,10 +127,8 @@ fn main() -> ExitCode {
 
                 let t0 = Instant::now();
                 for i in 0..args.decode {
-                    if m.forward_last(&[1500 + i as u32 % 100], &mut cache)
-                        .is_err()
-                    {
-                        eprintln!("decode failed");
+                    if let Err(why) = m.forward_last(&[1500 + i as u32 % 100], &mut cache) {
+                        eprintln!("decode failed: {why}");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -177,10 +175,8 @@ fn main() -> ExitCode {
 
                 let t0 = Instant::now();
                 for i in 0..args.decode {
-                    if m.forward_last(&[1500 + i as u32 % 100], &mut cache)
-                        .is_err()
-                    {
-                        eprintln!("decode failed");
+                    if let Err(why) = m.forward_last(&[1500 + i as u32 % 100], &mut cache) {
+                        eprintln!("decode failed: {why}");
                         return ExitCode::FAILURE;
                     }
                 }

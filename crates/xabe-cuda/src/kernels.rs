@@ -952,8 +952,12 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         // Two halves to a word, and `k` is even whenever a weight is stored
         // this way - every contraction in the model is.
         const int kh = k >> 1;
+        // `w_rs` is honoured here as well as on the f32 path: an f16 value
+        // cache is a row of `capacity` halves and the contraction is `tk` of
+        // them. Both are even, so the word stride is the element stride
+        // halved.
         const unsigned* wv = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1)
-                           + (size_t)col * kh;
+                           + (size_t)col * (size_t)(w_rs ? (w_rs >> 1) : kh);
         for (int i = lane; i < kh; i += 32) {
             float lo, hi, alo, ahi;
             gemm_unpack(wv[i], lo, hi);
@@ -964,6 +968,16 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
                 ahi = af[2 * i + 1];
             }
             acc += alo * lo + ahi * hi;
+        }
+        // The odd tail, for the same reason `gemv_rows` has one: a multi-head
+        // model decodes with one row, and its value cache is contracted over
+        // however many positions exist. An f16 *weight* is never odd; an f16
+        // cache is, half the time. Refused when the activation is also f16,
+        // which has no layout for it either way.
+        if ((k & 1) && !a_half && lane == 0) {
+            float lo, hi;
+            gemm_unpack(wv[kh], lo, hi);
+            acc += af[k - 1] * lo;
         }
     } else {
         const float* wv =
@@ -1010,14 +1024,17 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
 #define GEMV_ROWS_MAX 4
 extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
     const float* __restrict__ a,
-    const float* __restrict__ w,
+    const void* __restrict__ w,
     const float* __restrict__ bias,
     float* __restrict__ out,
     int m, int k, int n,
     long sa, long sw, long so,
     // Elements between consecutive rows of `w`. See the note in `gemv`: the
     // value cache is why it exists.
-    int w_rs)
+    int w_rs,
+    // Whether `w` is f16, two halves to a word. `k` and `w_rs` are then both
+    // even - a cache is head_dim wide or capacity apart and both are.
+    int w_half)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -1026,7 +1043,6 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
     }
     out += (size_t)blockIdx.z * so;
     const float* af = a + (size_t)blockIdx.z * sa;
-    const float* wv = w + (size_t)blockIdx.z * sw + (size_t)col * (w_rs ? w_rs : k);
 
     float acc[GEMV_ROWS_MAX];
     #pragma unroll
@@ -1035,14 +1051,52 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
     }
     // `m` is a runtime count but never above GEMV_ROWS_MAX, so the row loop is
     // unrolled against the bound and predicated on the count. An unrolled body
-    // is what makes the single `wv[i]` load pay: the four products issue back
+    // is what makes the single weight load pay: the four products issue back
     // to back off one register.
-    for (int i = lane; i < k; i += 32) {
-        const float wi = wv[i];
-        #pragma unroll
-        for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
-            if (r < m) {
-                acc[r] += af[(size_t)r * k + i] * wi;
+    if (w_half) {
+        // A word is two consecutive elements of the contraction, so a lane
+        // covers 64 of them a trip rather than 32 - which is the point, and
+        // why this is not the f32 loop with a conversion in it.
+        const int kh = k >> 1;
+        const unsigned* wv = (const unsigned*)w + (size_t)blockIdx.z * (sw >> 1)
+                           + (size_t)col * (size_t)(w_rs ? (w_rs >> 1) : kh);
+        for (int i = lane; i < kh; i += 32) {
+            float lo, hi;
+            gemm_unpack(wv[i], lo, hi);
+            #pragma unroll
+            for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+                if (r < m) {
+                    const float* ar = af + (size_t)r * k + 2 * i;
+                    acc[r] += ar[0] * lo + ar[1] * hi;
+                }
+            }
+        }
+        // An odd contraction, which the other f16 paths refuse and this one
+        // has to take: decoding contracts the value cache over the 1, 2, 3...
+        // positions emitted so far and half of those are odd. The last
+        // element is the low half of a word whose high half is a position the
+        // activation does not have, so it is read alone rather than as a pair.
+        // In bounds because a capacity is even and `k` never exceeds it.
+        if ((k & 1) && lane == 0) {
+            float lo, hi;
+            gemm_unpack(wv[kh], lo, hi);
+            #pragma unroll
+            for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+                if (r < m) {
+                    acc[r] += af[(size_t)r * k + k - 1] * lo;
+                }
+            }
+        }
+    } else {
+        const float* wv = (const float*)w + (size_t)blockIdx.z * sw
+                        + (size_t)col * (size_t)(w_rs ? w_rs : k);
+        for (int i = lane; i < k; i += 32) {
+            const float wi = wv[i];
+            #pragma unroll
+            for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+                if (r < m) {
+                    acc[r] += af[(size_t)r * k + i] * wi;
+                }
             }
         }
     }
@@ -1980,11 +2034,16 @@ GEMM_I8_ENTRY(gemm_i8_q6k_narrow, QT_Q6_K, GEMM_I8_MT_NARROW)
 // FA_WARPS / QG warps spread across the key fragments of the score product and
 // the column fragments of the value product. Every count below is derived, so
 // a new (QT, KT, HD) is a template argument rather than an edit.
-template <int HD, int KT, int QT>
+// `KVH` says the caches are f16. Both staging loops already round what they
+// read to f16 on the way into shared memory, so an f16 cache does not cost a
+// conversion here - it removes one, and halves what the loop fetches. It is a
+// template argument and not a flag because these two loops run once a key tile
+// and a branch inside them is a branch in the hot path.
+template <int HD, int KT, int QT, bool KVH>
 __device__ __forceinline__ void flash_attn_impl(
     const float* __restrict__ q,
-    const float* __restrict__ kc,
-    const float* __restrict__ vc,
+    const void* __restrict__ kc,
+    const void* __restrict__ vc,
     float* __restrict__ out,
     int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
@@ -2039,8 +2098,14 @@ __device__ __forceinline__ void flash_attn_impl(
     const int kh = h / (heads / kv_heads);
     const int dq = heads * HD;
 
-    const float* kb = kc + (size_t)kh * cap * HD;
-    const float* vb = vc + (size_t)kh * HD * cap;
+    // Elements either way; the f16 pointers are words, so a head's offset is
+    // halved with it. `cap` is even for exactly this reason - see `Cache`.
+    const float* kb = KVH ? (const float*)0 : (const float*)kc + (size_t)kh * cap * HD;
+    const float* vb = KVH ? (const float*)0 : (const float*)vc + (size_t)kh * HD * cap;
+    const unsigned* kbh =
+        KVH ? (const unsigned*)kc + (size_t)kh * cap * (HD / 2) : (const unsigned*)0;
+    const unsigned* vbh =
+        KVH ? (const unsigned*)vc + (size_t)kh * HD * (cap / 2) : (const unsigned*)0;
 
     // Queries once, rounded to f16 - the same rounding the tiled gemm applied
     // to its operands. A row past `tq` stages zeros and is never stored.
@@ -2086,9 +2151,14 @@ __device__ __forceinline__ void flash_attn_impl(
             const int r = i / (HD / 2), j = i % (HD / 2);
             unsigned w = 0u;
             if (kv0 + r < kend) {
-                const float2 v = *reinterpret_cast<const float2*>(
-                    kb + (size_t)(kv0 + r) * HD + 2 * j);
-                w = gemm_pack(v.x, v.y);
+                if (KVH) {
+                    // Already the packed pair this wants.
+                    w = kbh[(size_t)(kv0 + r) * (HD / 2) + j];
+                } else {
+                    const float2 v = *reinterpret_cast<const float2*>(
+                        kb + (size_t)(kv0 + r) * HD + 2 * j);
+                    w = gemm_pack(v.x, v.y);
+                }
             }
             kvs[r * KSTR + j] = w;
         }
@@ -2232,11 +2302,24 @@ __device__ __forceinline__ void flash_attn_impl(
             const int r = i / (KT / 2), j = i % (KT / 2);
             unsigned w = 0u;
             if (kv0 + 2 * j + 1 < kend) {
-                const float2 v = *reinterpret_cast<const float2*>(
-                    vb + (size_t)r * cap + kv0 + 2 * j);
-                w = gemm_pack(v.x, v.y);
+                if (KVH) {
+                    // `cap` and `kv0` are both even, so the pair this word
+                    // wants is one word of the cache and not two halves of
+                    // neighbouring ones.
+                    w = vbh[((size_t)r * cap + kv0) / 2 + j];
+                } else {
+                    const float2 v = *reinterpret_cast<const float2*>(
+                        vb + (size_t)r * cap + kv0 + 2 * j);
+                    w = gemm_pack(v.x, v.y);
+                }
             } else if (kv0 + 2 * j < kend) {
-                w = gemm_pack(vb[(size_t)r * cap + kv0 + 2 * j], 0.0f);
+                if (KVH) {
+                    // The odd tail: keep the low half, zero the one the mask
+                    // would have discarded anyway.
+                    w = vbh[((size_t)r * cap + kv0) / 2 + j] & 0x0000ffffu;
+                } else {
+                    w = gemm_pack(vb[(size_t)r * cap + kv0 + 2 * j], 0.0f);
+                }
             }
             kvs[r * VSTR + j] = w;
         }
@@ -2329,8 +2412,23 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
     float* __restrict__ out,
     int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
-    flash_attn_impl<128, 32, 32>(q, kc, vc, out, tq, past, heads, kv_heads,
-                                 cap, scale, causal);
+    flash_attn_impl<128, 32, 32, false>(q, kc, vc, out, tq, past, heads,
+                                        kv_heads, cap, scale, causal);
+}
+
+// The same at 128, reading an f16 cache. Only this width, because the chat
+// model is the only stage that holds its cache that way - the ASR's is a
+// 64-wide encoder cache it re-reads inside L2, where an f16 copy was measured
+// and bought nothing. See docs/BENCHMARKS.md.
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_h(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ kc,
+    const unsigned short* __restrict__ vc,
+    float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+{
+    flash_attn_impl<128, 32, 32, true>(q, kc, vc, out, tq, past, heads,
+                                       kv_heads, cap, scale, causal);
 }
 
 extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
@@ -2340,8 +2438,8 @@ extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
     float* __restrict__ out,
     int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
 {
-    flash_attn_impl<64, 64, 64>(q, kc, vc, out, tq, past, heads, kv_heads,
-                                cap, scale, causal);
+    flash_attn_impl<64, 64, 64, false>(q, kc, vc, out, tq, past, heads,
+                                       kv_heads, cap, scale, causal);
 }
 
 // ---------------------------------------------------------------- convolution
@@ -3744,6 +3842,46 @@ extern "C" __global__ void cache_append_t(
     dst[((size_t)h * head_dim + j) * cap + past + ti] = src[(size_t)src_off + i];
 }
 
+// The same two appends, writing an f16 cache.
+//
+// The cache is the one buffer in a decode whose size is the *context* rather
+// than the checkpoint, so it is the one place where halving a width halves
+// something that grows. Attention re-reads all of it for every token, and at
+// 2048 positions that is 537 MB against the weights' 4.6 GB - see
+// docs/BENCHMARKS.md. Rounding is `f32_to_f16`'s, which is round-to-nearest-
+// even and the same rounding the tiled kernels do when they stage.
+extern "C" __global__ void cache_append_f16(
+    const float* __restrict__ src, long src_off, unsigned short* __restrict__ dst,
+    int n, int kv_heads, int head_dim, int cap, int past)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int d = kv_heads * head_dim;
+    if (i >= (size_t)n * d) {
+        return;
+    }
+    const int ti = (int)(i / d);
+    const int h = (int)((i % d) / head_dim);
+    const int j = (int)(i % head_dim);
+    dst[((size_t)h * cap + past + ti) * head_dim + j] =
+        f32_to_f16(src[(size_t)src_off + i]);
+}
+
+extern "C" __global__ void cache_append_t_f16(
+    const float* __restrict__ src, long src_off, unsigned short* __restrict__ dst,
+    int n, int kv_heads, int head_dim, int cap, int past)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int d = kv_heads * head_dim;
+    if (i >= (size_t)n * d) {
+        return;
+    }
+    const int ti = (int)(i / d);
+    const int h = (int)((i % d) / head_dim);
+    const int j = (int)(i % head_dim);
+    dst[((size_t)h * head_dim + j) * cap + past + ti] =
+        f32_to_f16(src[(size_t)src_off + i]);
+}
+
 // Re-strides a head-major cache into a larger one.
 //
 // `cap` is a *stride* in both cache layouts, not only a length: keys are
@@ -3763,6 +3901,21 @@ extern "C" __global__ void cache_append_t(
 // `len` contiguous floats, a source stride and a destination stride.
 extern "C" __global__ void cache_grow(
     const float* __restrict__ src, float* __restrict__ dst,
+    int rows, int len, int src_stride, int dst_stride)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * len) {
+        return;
+    }
+    const int r = (int)(i / len);
+    const int j = (int)(i % len);
+    dst[(size_t)r * dst_stride + j] = src[(size_t)r * src_stride + j];
+}
+
+// `cache_grow` for an f16 cache. Same run-and-stride argument, half the width;
+// see the note above it for why a memcpy is not what this is.
+extern "C" __global__ void cache_grow_f16(
+    const unsigned short* __restrict__ src, unsigned short* __restrict__ dst,
     int rows, int len, int src_stride, int dst_stride)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

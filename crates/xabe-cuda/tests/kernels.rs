@@ -2059,3 +2059,184 @@ fn several_rows_of_a_mat_vec_agree_with_one_row_at_a_time() {
         }
     }
 }
+
+/// An f16 KV cache holds and serves what an f32 one does.
+///
+/// The cache is written by one pair of kernels and read by three - the two
+/// mat-vec products of a decode step and the fused attention of a prefill -
+/// and the f16 copies of all five are separate code. What makes that worth a
+/// test of its own rather than trusting the model's is the failure mode: a
+/// width or a stride wrong by a factor of two reads *in bounds*, off a
+/// neighbouring head, and returns numbers that look like context. So both
+/// caches are filled from the same source and every reader is run against
+/// both.
+///
+/// The tolerance is f16's and nothing looser. `cap` deliberately exceeds the
+/// live length so the value layout's row stride is exercised, and the live
+/// length is odd, which is the case the value product's contraction actually
+/// hits - it contracts over however many positions have been decoded.
+#[test]
+fn an_f16_cache_serves_the_same_attention_as_an_f32_one() {
+    let Some(g) = gpu() else { return };
+    let (kv, hd, cap, n) = (4usize, 128usize, 64usize, 37usize);
+    let group = 4usize;
+    let kvd = kv * hd;
+    let src = seq(n * kvd, 11);
+    let dsrc = g.upload(&src).unwrap();
+    // Scores read a row of the query per group member; the value product reads
+    // a row of the scores. Both are the four rows one key head serves.
+    let q = seq(kv * group * hd, 12);
+    let dq = g.upload(&q).unwrap();
+
+    let mut k32 = g.zeros(cap * kvd).unwrap();
+    let mut v32 = g.zeros(cap * kvd).unwrap();
+    let mut k16 = g.zeros_f16(cap * kvd).unwrap();
+    let mut v16 = g.zeros_f16(cap * kvd).unwrap();
+    // Keys as they come, values transposed - the two layouts the pair of
+    // append kernels exists for.
+    for (tr, d32, d16) in [(false, &mut k32, &mut k16), (true, &mut v32, &mut v16)] {
+        g.cache_append(&dsrc, 0, d32, n, kv, hd, cap, 0, tr)
+            .unwrap();
+        g.cache_append_f16(&dsrc, 0, d16, n, kv, hd, cap, 0, tr)
+            .unwrap();
+    }
+
+    // The score product: contraction is the head width, weight rows are tight.
+    let sb = Batch {
+        count: kv,
+        a: group * hd,
+        w: cap * hd,
+        out: group * n,
+        w_row: 0,
+    };
+    let s32 = g
+        .gemm_batched(
+            Operand::F32(&dq),
+            Operand::F32(&k32),
+            None,
+            sb,
+            group,
+            hd,
+            n,
+        )
+        .unwrap();
+    let s16 = g
+        .gemm_batched(
+            Operand::F32(&dq),
+            Operand::F16(&k16),
+            None,
+            sb,
+            group,
+            hd,
+            n,
+        )
+        .unwrap();
+    assert_close_to(
+        "scores off an f16 key cache",
+        &g.download(&s32).unwrap(),
+        &g.download(&s16).unwrap(),
+        2e-3,
+    );
+
+    // The value product: contraction is the live length - odd here, which the
+    // f16 path has to take as a lone trailing half - and the weight's rows are
+    // a whole capacity apart.
+    let cb = Batch {
+        count: kv,
+        a: group * n,
+        w: hd * cap,
+        out: group * hd,
+        w_row: cap,
+    };
+    let c32 = g
+        .gemm_batched(
+            Operand::F32(&s32),
+            Operand::F32(&v32),
+            None,
+            cb,
+            group,
+            n,
+            hd,
+        )
+        .unwrap();
+    let c16 = g
+        .gemm_batched(
+            Operand::F32(&s32),
+            Operand::F16(&v16),
+            None,
+            cb,
+            group,
+            n,
+            hd,
+        )
+        .unwrap();
+    assert_close_to(
+        "context off an f16 value cache",
+        &g.download(&c32).unwrap(),
+        &g.download(&c16).unwrap(),
+        2e-3,
+    );
+
+    // And the prefill's fused kernel, which stages both caches itself.
+    let heads = kv * group;
+    let fq = seq(n * heads * hd, 13);
+    let dfq = g.upload(&fq).unwrap();
+    let f32o = g
+        .flash_attn(&dfq, &k32, &v32, n, 0, heads, kv, hd, cap, 0.1, true)
+        .unwrap();
+    let f16o = g
+        .flash_attn_f16(&dfq, &k16, &v16, n, 0, heads, kv, hd, cap, 0.1, true)
+        .unwrap();
+    assert_close_to(
+        "fused attention off an f16 cache",
+        &g.download(&f32o).unwrap(),
+        &g.download(&f16o).unwrap(),
+        2e-3,
+    );
+
+    // Growth re-strides both widths the same way. A flat copy would leave head
+    // zero right and bury the rest, so the check is against the f32 kernel
+    // that already has a test of its own.
+    let big = cap * 2;
+    let mut gk32 = g.zeros(big * kvd).unwrap();
+    let mut gk16 = g.zeros_f16(big * kvd).unwrap();
+    g.cache_grow(&k32, &mut gk32, kv, hd, cap, big, n, false)
+        .unwrap();
+    g.cache_grow_f16(&k16, &mut gk16, kv, hd, cap, big, n, false)
+        .unwrap();
+    let gb = Batch {
+        count: kv,
+        a: group * hd,
+        w: big * hd,
+        out: group * n,
+        w_row: 0,
+    };
+    let g32 = g
+        .gemm_batched(
+            Operand::F32(&dq),
+            Operand::F32(&gk32),
+            None,
+            gb,
+            group,
+            hd,
+            n,
+        )
+        .unwrap();
+    let g16 = g
+        .gemm_batched(
+            Operand::F32(&dq),
+            Operand::F16(&gk16),
+            None,
+            gb,
+            group,
+            hd,
+            n,
+        )
+        .unwrap();
+    assert_close_to(
+        "scores off a grown f16 key cache",
+        &g.download(&g32).unwrap(),
+        &g.download(&g16).unwrap(),
+        2e-3,
+    );
+}

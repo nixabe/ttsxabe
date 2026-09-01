@@ -148,6 +148,11 @@ nine-round median, because five-round runs read about 3% high off the boost
 clock; and the decode lead appeared because llama.cpp's own decode came in
 lower that sitting — the engine's decode did not move, which was the
 constraint the prefill work was under.
+Both stages hold their KV cache at **f16**, which is worth 4.0 GiB on the
+translator and 512 MiB on the chat model, and 6.6% of the translator's decode
+at a 1024-token context but nothing at all of the chat model's - the reason is
+grouped-query attention and it is in `docs/BENCHMARKS.md`.
+
 A fourth caution has since been added: every decode figure in that table is
 taken at a 128-token prompt, and decode is **context-sensitive** - it costs
 0.42 ms more per 1024 tokens of context, because the KV cache is re-read in
