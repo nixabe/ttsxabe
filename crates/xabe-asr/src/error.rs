@@ -29,4 +29,21 @@ pub enum AsrError {
         /// The last one that exists.
         max: usize,
     },
+
+    /// A cross-attention projection whose bias is not where the batched
+    /// cache build expects it.
+    ///
+    /// Every layer's key and value projections go out as one product each,
+    /// which carries one bias for the whole batch - so the value biases are
+    /// added in the head split, and the key projection is assumed to have
+    /// none, as Whisper's does. A checkpoint that broke either assumption
+    /// would bind cleanly and build a cache that is quietly off by a bias, so
+    /// it is refused here by layer instead.
+    #[error("decoder layer {layer}: {what}, which the batched cross-attention cache does not add")]
+    CrossBias {
+        /// Which layer.
+        layer: usize,
+        /// What was found.
+        what: &'static str,
+    },
 }

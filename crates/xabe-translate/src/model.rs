@@ -685,7 +685,9 @@ impl Translator {
         let dids = self.gpu.upload_i64(&ids64)?;
         let mut h = match &self.embed {
             GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
-            GEmbed::Packed { data, ty } => self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?,
+            GEmbed::Packed { data, ty } => {
+                self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?
+            }
         };
 
         // The block output the next normalisation still has to add; see where

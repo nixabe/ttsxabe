@@ -26,3 +26,7 @@ xabe-gguf.workspace = true
 [[bin]]
 name = "bench-gemm"
 path = "src/bin/bench_gemm.rs"
+
+[[bin]]
+name = "bench-attn"
+path = "src/bin/bench_attn.rs"

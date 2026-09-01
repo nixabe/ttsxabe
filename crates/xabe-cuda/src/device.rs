@@ -108,7 +108,6 @@ const CONV_OC_TILE: u32 = 8;
 /// Time positions each convolution thread accumulates. Must match `T_REG`.
 const CONV_T_REG: u32 = 4;
 
-
 /// What the fused decode attention keeps between calls.
 ///
 /// A block per chunk of keys writes its partial - a running maximum, a sum and
@@ -147,6 +146,32 @@ impl Default for DecodeScratch {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where [`Gpu::gemv_into`] puts each column of its one output row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutLayout {
+    /// `out[col]`, the plain row.
+    Row,
+    /// Column `h * head_dim + j` at `(h * cap + pos) * head_dim + j` - one
+    /// position of a head-major `[heads, cap, head_dim]` key cache, which is
+    /// what `cache_append` scatters a projected row into.
+    KeyCache {
+        /// Elements a head.
+        head_dim: usize,
+        /// Positions the cache has room for.
+        cap: usize,
+        /// The position being written.
+        pos: usize,
+    },
+    /// Column `c` at `c * cap + pos` - one position of a transposed
+    /// `[heads, head_dim, cap]` value cache, `cache_append_t`'s layout.
+    ValueCache {
+        /// Positions the cache has room for.
+        cap: usize,
+        /// The position being written.
+        pos: usize,
+    },
 }
 
 /// Which cache the fused decode attention reads.
@@ -1707,11 +1732,18 @@ impl Gpu {
             };
         }
         let asc_off = q8.map_or(0, |q| q.scale_offset() as i32);
+        // The plain epilogue: no activation, a fresh `[batch, m, n]` output.
+        let (epi_act, o_cs, o_hs, o_hd, o_off) = (0i32, 1i32, 0i32, 0i32, 0i64);
         if small {
             match q8 {
                 Some(q) => lb.arg(&q.buf).arg(&asc_off).arg(&a_rows),
                 None => lb.arg(&null).arg(&asc_off).arg(&a_rows),
             };
+            lb.arg(&epi_act)
+                .arg(&o_cs)
+                .arg(&o_hs)
+                .arg(&o_hd)
+                .arg(&o_off);
         }
 
         let cfg = cudarc::driver::LaunchConfig {
@@ -2061,7 +2093,8 @@ impl Gpu {
         bias: &CudaSlice<f32>,
         eps: f32,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(rows * cols)?;
+        // SAFETY: one block a row writes every element of its row.
+        let mut out = unsafe { self.uninit(rows * cols) }?;
         let c = cols as i32;
         let f = self.func("layer_norm");
         let mut lb = self.stream.launch_builder(f);
@@ -2097,7 +2130,8 @@ impl Gpu {
         bias: &CudaSlice<f32>,
         eps: f32,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(rows * cols)?;
+        // SAFETY: one block a row writes every element of its row.
+        let mut out = unsafe { self.uninit(rows * cols) }?;
         let c = cols as i32;
         let f = self.func("layer_norm_add");
         let mut lb = self.stream.launch_builder(f);
@@ -2508,6 +2542,137 @@ impl Gpu {
             .arg(&scale);
         launched("embed_scaled", unsafe { lb.launch(Self::flat(t * ch)) })?;
         Ok(out)
+    }
+
+    /// One row through a mat-vec, with the result placed and finished by the
+    /// kernel rather than by two more launches.
+    ///
+    /// `x` is one row of `k`, `w` an f32 or f16 `[n, k]` weight, and the
+    /// output row is written into `out` at the positions `layout` names, with
+    /// the exact GELU applied first when `gelu` is set. The arithmetic is
+    /// `gemm_batched`'s mat-vec to the bit - same kernel, same order - so a
+    /// projection followed by `cache_append` and one followed by `gelu` each
+    /// become this and produce the same numbers. What is saved is a launch or
+    /// two a layer, which at one decoded row is what a layer costs; see
+    /// docs/BENCHMARKS.md.
+    ///
+    /// Refuses a layout that does not fit `out` - the failure it guards is a
+    /// scatter into the next head's positions, in bounds and wrong.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_into(
+        &self,
+        x: &CudaSlice<f32>,
+        w: Operand<'_>,
+        bias: Option<&CudaSlice<f32>>,
+        k: usize,
+        n: usize,
+        gelu: bool,
+        layout: OutLayout,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
+        let w_half = match w {
+            Operand::F32(_) => 0i32,
+            Operand::F16(_) => 1i32,
+            Operand::F32Q { .. } | Operand::Q { .. } => {
+                return Err(CudaError::QuantizedActivation);
+            }
+        };
+        if x.len() < k {
+            return Err(CudaError::SliceOverrun {
+                at: k,
+                len: x.len(),
+            });
+        }
+        let wlen = match w {
+            Operand::F32(v) | Operand::F32Q { data: v, .. } => v.len(),
+            Operand::F16(v) => v.len(),
+            Operand::Q { data, .. } => data.len(),
+        };
+        if wlen < n * k {
+            return Err(CudaError::SliceOverrun {
+                at: n * k,
+                len: wlen,
+            });
+        }
+        if w_half == 1 && !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        let (o_cs, o_hs, o_hd, o_off, last) = match layout {
+            OutLayout::Row => (1usize, 0usize, 0usize, 0usize, n - 1),
+            OutLayout::KeyCache { head_dim, cap, pos } => {
+                if head_dim == 0 || !n.is_multiple_of(head_dim) || pos >= cap {
+                    return Err(CudaError::CacheOverrun { at: pos + 1, cap });
+                }
+                let heads = n / head_dim;
+                (
+                    1,
+                    (cap - 1) * head_dim,
+                    head_dim,
+                    pos * head_dim,
+                    ((heads - 1) * cap + pos) * head_dim + head_dim - 1,
+                )
+            }
+            OutLayout::ValueCache { cap, pos } => {
+                if pos >= cap {
+                    return Err(CudaError::CacheOverrun { at: pos + 1, cap });
+                }
+                (cap, 0, 0, pos, (n - 1) * cap + pos)
+            }
+        };
+        if last >= out.len() {
+            return Err(CudaError::SliceOverrun {
+                at: last + 1,
+                len: out.len(),
+            });
+        }
+        let null: u64 = 0;
+        let (mi, ki, ni) = (1i32, k as i32, n as i32);
+        let (sa, sw, so) = (0i64, 0i64, 0i64);
+        let (a_half, w_quant, q_bs, q_ts, w_rs) = (0i32, 0i32, 0i32, 0i32, 0i32);
+        let (asc_off, a_rows) = (0i32, 1i32);
+        let epi_act = i32::from(gelu);
+        let (cs, hs, hd, off) = (o_cs as i32, o_hs as i32, o_hd as i32, o_off as i64);
+        let f = self.func("gemv");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x);
+        match w {
+            Operand::F32(v) | Operand::F32Q { data: v, .. } => lb.arg(v),
+            Operand::F16(v) => lb.arg(v),
+            Operand::Q { data, .. } => lb.arg(data),
+        };
+        match bias {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(out)
+            .arg(&mi)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&sa)
+            .arg(&sw)
+            .arg(&so)
+            .arg(&a_half)
+            .arg(&w_half)
+            .arg(&w_quant)
+            .arg(&q_bs)
+            .arg(&q_ts)
+            .arg(&w_rs)
+            .arg(&null)
+            .arg(&asc_off)
+            .arg(&a_rows)
+            .arg(&epi_act)
+            .arg(&cs)
+            .arg(&hs)
+            .arg(&hd)
+            .arg(&off);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n.div_ceil(8) as u32, 1, 1),
+            block_dim: (32, kernels::GEMV_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one warp a column, columns past `n` return; every store
+        // lands at or before `last`, which is checked against `out` above.
+        launched("gemv", unsafe { lb.launch(cfg) })
     }
 
     /// [`Self::embed_scaled`] off a table that stays in its checkpoint's
@@ -3370,7 +3535,7 @@ impl Gpu {
         heads: usize,
         head_dim: usize,
     ) -> Result<CudaSlice<u16>, CudaError> {
-        self.reshape_heads_f16("split_heads_f16", x, t, heads, head_dim)
+        self.reshape_heads_f16("split_heads_f16", x, 0, None, t, heads, head_dim)
     }
 
     /// [`Self::split_heads_t`], writing f16.
@@ -3381,7 +3546,44 @@ impl Gpu {
         heads: usize,
         head_dim: usize,
     ) -> Result<CudaSlice<u16>, CudaError> {
-        self.reshape_heads_f16("split_heads_t_f16", x, t, heads, head_dim)
+        self.reshape_heads_f16("split_heads_t_f16", x, 0, None, t, heads, head_dim)
+    }
+
+    /// [`Self::split_heads_f16`] of the `[t, heads * head_dim]` block that
+    /// starts `x_off` elements into `x`, adding the row `bias` - given as a
+    /// buffer and an offset into it - before rounding.
+    ///
+    /// For a cache built from one batched projection over every layer: the
+    /// batch carries a single bias where each layer has its own, so the bias
+    /// moves here. It is the same f32 add the matmul's epilogue makes, so the
+    /// cache holds the same bits it did when the layers were projected one at
+    /// a time - `the_packed_head_splits_are_the_f32_ones_converted` says so.
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_heads_f16_at(
+        &self,
+        x: &CudaSlice<f32>,
+        x_off: usize,
+        bias: Option<(&CudaSlice<f32>, usize)>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        self.reshape_heads_f16("split_heads_f16", x, x_off, bias, t, heads, head_dim)
+    }
+
+    /// [`Self::split_heads_t_f16`] with an offset and a bias, as
+    /// [`Self::split_heads_f16_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_heads_t_f16_at(
+        &self,
+        x: &CudaSlice<f32>,
+        x_off: usize,
+        bias: Option<(&CudaSlice<f32>, usize)>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        self.reshape_heads_f16("split_heads_t_f16", x, x_off, bias, t, heads, head_dim)
     }
 
     /// `[heads, t, head_dim]` back to `[t, heads*head_dim]`.
@@ -3706,6 +3908,16 @@ impl Gpu {
         if tk == 0 || tk > cap {
             return Err(CudaError::CacheOverrun { at: tk, cap });
         }
+        // A value row is `cap` elements, and the kernel loads it eight bytes
+        // at a time at least - so the capacity must keep every row at that
+        // alignment. Every capacity here is a multiple of 64 or 1500.
+        let esz = match &kv {
+            KvCache::F32(..) => 4,
+            KvCache::F16(..) => 2,
+        };
+        if !(cap * esz).is_multiple_of(8) {
+            return Err(CudaError::OddCacheCapacity { cap });
+        }
         let (klen, vlen) = match &kv {
             KvCache::F32(k, v) => (k.len(), v.len()),
             KvCache::F16(k, v) => (k.len(), v.len()),
@@ -3738,12 +3950,12 @@ impl Gpu {
             scratch.head_dim = head_dim;
         }
         if scratch.ctr.is_none() {
-            scratch.ctr = Some(self.stream.alloc_zeros::<u32>(kv_heads).map_err(
-                |source| CudaError::Driver {
+            scratch.ctr = Some(self.stream.alloc_zeros::<u32>(kv_heads).map_err(|source| {
+                CudaError::Driver {
                     what: "allocating",
                     source,
-                },
-            )?);
+                }
+            })?);
         }
         if scratch.chunks < chunks || scratch.part.is_none() {
             let want = chunks.next_power_of_two().max(4);
@@ -3899,15 +4111,32 @@ impl Gpu {
     }
 
     /// [`Self::reshape_heads`] for the kernels that write f16.
+    #[allow(clippy::too_many_arguments)]
     fn reshape_heads_f16(
         &self,
         name: &'static str,
         x: &CudaSlice<f32>,
+        x_off: usize,
+        bias: Option<(&CudaSlice<f32>, usize)>,
         t: usize,
         heads: usize,
         head_dim: usize,
     ) -> Result<CudaSlice<u16>, CudaError> {
         let n = t * heads * head_dim;
+        if x_off + n > x.len() {
+            return Err(CudaError::SliceOverrun {
+                at: x_off + n,
+                len: x.len(),
+            });
+        }
+        if let Some((b, off)) = bias
+            && off + heads * head_dim > b.len()
+        {
+            return Err(CudaError::SliceOverrun {
+                at: off + heads * head_dim,
+                len: b.len(),
+            });
+        }
         let mut out = self
             .stream
             .alloc_zeros::<u16>(n)
@@ -3916,9 +4145,17 @@ impl Gpu {
                 source,
             })?;
         let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
+        let null: u64 = 0;
+        let xv = x.slice(x_off..);
+        let bv = bias.map(|(b, off)| b.slice(off..));
         let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(x).arg(&mut out).arg(&a).arg(&b_).arg(&c);
+        lb.arg(&xv);
+        match &bv {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(&mut out).arg(&a).arg(&b_).arg(&c);
         launched(name, unsafe {
             lb.launch(Self::reshape_cfg(name, t, heads * head_dim))
         })?;

@@ -2,7 +2,7 @@
 
 use crate::AsrError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, Operand, OutLayout};
 use xabe_st::StSet;
 use xabe_whisper::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, Frontend, GenerationConfig, LayerNorm, Linear,
@@ -43,6 +43,18 @@ struct GAttention {
     out: GLinear,
 }
 
+/// A decoder block's cross-attention: the two projections that run per step.
+///
+/// The key and value projections are not here. They read the encoder's
+/// output and nothing else, so they run once an utterance, and all thirty-two
+/// layers' worth go out as one batched product each - see [`AsrModel::cache`]
+/// - which wants the weights of every layer in one allocation rather than one
+/// a layer. Those live on the model as `cross_k` and `cross_v`.
+struct GCrossAttention {
+    q: GLinear,
+    out: GLinear,
+}
+
 /// One encoder block, on the device.
 struct GEncoderLayer {
     attn_ln: GNorm,
@@ -57,7 +69,7 @@ struct GDecoderLayer {
     attn_ln: GNorm,
     attn: GAttention,
     cross_ln: GNorm,
-    cross: GAttention,
+    cross: GCrossAttention,
     ffn_ln: GNorm,
     fc1: GLinear,
     fc2: GLinear,
@@ -111,6 +123,19 @@ pub struct AsrModel {
     dec_pos: CudaSlice<f32>,
     dec_layers: Vec<GDecoderLayer>,
     dec_ln: GNorm,
+    /// Every decoder layer's cross-attention key projection, `[layers, d, d]`
+    /// at f16, so the cache is built with one launch rather than thirty-two.
+    ///
+    /// A launch of 120 blocks is one wave on this card whether it is issued
+    /// alone or as one of thirty-two; issued alone each pays a wave, and
+    /// together they pay 27 - docs/BENCHMARKS.md has the arithmetic. The key
+    /// projection has no bias in Whisper.
+    cross_k: CudaSlice<u16>,
+    /// The same for the values, whose biases ride beside them as
+    /// `[layers, d]` and are added in the head split, since a batched product
+    /// carries one bias for the whole batch.
+    cross_v: CudaSlice<u16>,
+    cross_v_bias: CudaSlice<f32>,
 }
 
 /// The keys and values a decode step reuses.
@@ -229,6 +254,10 @@ impl AsrModel {
             });
         }
         let mut dec_layers = Vec::with_capacity(w.dec_layers.len());
+        let d = cfg.d_model;
+        let mut cross_k_all: Vec<f32> = Vec::with_capacity(w.dec_layers.len() * d * d);
+        let mut cross_v_all: Vec<f32> = Vec::with_capacity(w.dec_layers.len() * d * d);
+        let mut cross_v_bias_all: Vec<f32> = Vec::with_capacity(w.dec_layers.len() * d);
         for l in &w.dec_layers {
             let DecoderLayer {
                 attn_ln,
@@ -239,16 +268,42 @@ impl AsrModel {
                 fc1,
                 fc2,
             } = l;
+            // The schema has already checked the shapes; what is checked here
+            // is the one thing the batched product assumes and the schema does
+            // not say: a key projection with no bias. A checkpoint with one
+            // would need the bias in the split too.
+            if cross.k.bias.is_some() {
+                return Err(AsrError::CrossBias {
+                    layer: dec_layers.len(),
+                    what: "k_proj carries a bias",
+                });
+            }
+            let Some(vb) = cross.v.bias else {
+                return Err(AsrError::CrossBias {
+                    layer: dec_layers.len(),
+                    what: "v_proj has no bias",
+                });
+            };
+            cross_k_all.extend_from_slice(cross.k.weight);
+            cross_v_all.extend_from_slice(cross.v.weight);
+            cross_v_bias_all.extend_from_slice(vb);
             dec_layers.push(GDecoderLayer {
                 attn_ln: nrm(attn_ln)?,
                 attn: att(attn)?,
                 cross_ln: nrm(cross_ln)?,
-                cross: att(cross)?,
+                cross: GCrossAttention {
+                    q: lin(&cross.q)?,
+                    out: lin(&cross.out)?,
+                },
                 ffn_ln: nrm(ffn_ln)?,
                 fc1: lin(fc1)?,
                 fc2: lin(fc2)?,
             });
         }
+        let cross_k = up16(&cross_k_all)?;
+        let cross_v = up16(&cross_v_all)?;
+        let cross_v_bias = up(&cross_v_bias_all)?;
+        drop((cross_k_all, cross_v_all, cross_v_bias_all));
 
         let model = Self {
             conv1: cnv(&w.conv1)?,
@@ -261,6 +316,9 @@ impl AsrModel {
             dec_pos: up(w.dec_pos)?,
             dec_layers,
             dec_ln: nrm(&w.dec_ln)?,
+            cross_k,
+            cross_v,
+            cross_v_bias,
             cfg,
             decoding,
             frontend,
@@ -487,12 +545,12 @@ impl AsrModel {
     fn queries(
         &self,
         x: Operand<'_>,
-        a: &GAttention,
+        q_proj: &GLinear,
         t: usize,
         heads: usize,
     ) -> Result<CudaSlice<f32>, AsrError> {
         let hd = self.cfg.d_model / heads;
-        let mut q = self.project(x, &a.q, t)?;
+        let mut q = self.project(x, q_proj, t)?;
         self.gpu
             .scale_inplace(&mut q, t * self.cfg.d_model, (hd as f32).powf(-0.5))?;
         // One row is already `[head][1][hd]`, so the split has nothing to do.
@@ -532,6 +590,22 @@ impl AsrModel {
             return self.project(Operand::F16(&inner), fc2, t);
         }
         let x = self.norm_add(h, res, ln, t)?;
+        if t == 1 {
+            // The activation in the projection's epilogue: one launch, not two.
+            // SAFETY: `gemv_into` writes every one of the `out_dim` columns.
+            let mut inner = unsafe { self.gpu.uninit(fc1.out_dim) }?;
+            self.gpu.gemv_into(
+                &x,
+                Operand::F16(&fc1.w),
+                fc1.b.as_ref(),
+                fc1.in_dim,
+                fc1.out_dim,
+                true,
+                OutLayout::Row,
+                &mut inner,
+            )?;
+            return self.project(Operand::F32(&inner), fc2, t);
+        }
         let mut inner = self.project(Operand::F32(&x), fc1, t)?;
         self.gpu.gelu(&mut inner, t * fc1.out_dim)?;
         self.project(Operand::F32(&inner), fc2, t)
@@ -627,7 +701,7 @@ impl AsrModel {
                 self.gpu
                     .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)?
             } else {
-                let q = self.queries(Operand::F16(&x), &l.attn, t, heads)?;
+                let q = self.queries(Operand::F16(&x), &l.attn.q, t, heads)?;
                 self.attend(
                     Operand::F32(&q),
                     Operand::F32(&k),
@@ -679,20 +753,49 @@ impl AsrModel {
         // narrowing is fused into the kernels that produce the activation
         // rather than done in a pass of its own.
         let narrow = self.gpu.to_f16(encoded, t * d)?;
-        for l in &self.dec_layers {
-            // Stored packed: every decode step reads all 32 layers of both, so
-            // this is 160 MB of traffic a token rather than 320. The split
-            // writes f16 directly - it is already touching every element, and
-            // a `to_f16` pass after it read and wrote the same 7.7 MB tensor
-            // again to change nothing but its width.
-            cross_k.push(self.gpu.split_heads_f16(
-                &self.project(Operand::F16(&narrow), &l.cross.k, t)?,
+        // All thirty-two layers' keys in one launch, then all their values:
+        // 3840 blocks is 27 waves where thirty-two launches of 120 are 32,
+        // because a launch that under-fills the card still pays a whole wave.
+        // The activation stride is zero - every layer projects the same
+        // encoder output.
+        let layers = self.dec_layers.len();
+        let all = |w: &CudaSlice<u16>| -> Result<CudaSlice<f32>, AsrError> {
+            Ok(self.gpu.gemm_batched(
+                Operand::F16(&narrow),
+                Operand::F16(w),
+                None,
+                Batch {
+                    count: layers,
+                    a: 0,
+                    w: d * d,
+                    out: t * d,
+                    w_row: 0,
+                },
                 t,
-                heads,
-                hd,
-            )?);
-            cross_v.push(self.gpu.split_heads_t_f16(
-                &self.project(Operand::F16(&narrow), &l.cross.v, t)?,
+                d,
+                d,
+            )?)
+        };
+        // Stored packed: every decode step reads all 32 layers of both, so
+        // this is 160 MB of traffic a token rather than 320. The split writes
+        // f16 directly - it is already touching every element, and a `to_f16`
+        // pass after it read and wrote the same 7.7 MB tensor again to change
+        // nothing but its width. The value bias is added there too, for the
+        // reason `cross_v_bias` gives.
+        let k_all = all(&self.cross_k)?;
+        for i in 0..layers {
+            cross_k.push(
+                self.gpu
+                    .split_heads_f16_at(&k_all, i * t * d, None, t, heads, hd)?,
+            );
+        }
+        drop(k_all);
+        let v_all = all(&self.cross_v)?;
+        for i in 0..layers {
+            cross_v.push(self.gpu.split_heads_t_f16_at(
+                &v_all,
+                i * t * d,
+                Some((&self.cross_v_bias, i * d)),
                 t,
                 heads,
                 hd,
@@ -773,11 +876,8 @@ impl AsrModel {
             let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, n)?;
             let q = match fused {
                 true => self.project(Operand::F32(&x), &l.attn.q, n)?,
-                false => self.queries(Operand::F32(&x), &l.attn, n, heads)?,
+                false => self.queries(Operand::F32(&x), &l.attn.q, n, heads)?,
             };
-            let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
-            let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
-
             // Scattered straight into the layout attention reads, in a buffer
             // that already has room for the whole utterance. This used to
             // allocate a larger pair, copy the whole cache into it and then
@@ -785,30 +885,61 @@ impl AsrModel {
             // here argued the permutation was cheaper than a scattered append,
             // and it was measuring the wrong thing - the append and the
             // permutation are the same kernel, so keeping the cache in the
-            // read layout costs nothing and saves all of it.
+            // read layout costs nothing and saves all of it. At one row the
+            // projection itself does the scattering - `Gpu::gemv_into` - so
+            // the append is not a launch at all.
             let cap = cache.cap;
-            self.gpu.cache_append(
-                &k_new,
-                0,
-                &mut cache.self_k[i],
-                n,
-                heads,
-                hd,
-                cap,
-                past,
-                false,
-            )?;
-            self.gpu.cache_append(
-                &v_new,
-                0,
-                &mut cache.self_v[i],
-                n,
-                heads,
-                hd,
-                cap,
-                past,
-                true,
-            )?;
+            if fused {
+                self.gpu.gemv_into(
+                    &x,
+                    Operand::F16(&l.attn.k.w),
+                    l.attn.k.b.as_ref(),
+                    d,
+                    d,
+                    false,
+                    OutLayout::KeyCache {
+                        head_dim: hd,
+                        cap,
+                        pos: past,
+                    },
+                    &mut cache.self_k[i],
+                )?;
+                self.gpu.gemv_into(
+                    &x,
+                    Operand::F16(&l.attn.v.w),
+                    l.attn.v.b.as_ref(),
+                    d,
+                    d,
+                    false,
+                    OutLayout::ValueCache { cap, pos: past },
+                    &mut cache.self_v[i],
+                )?;
+            } else {
+                let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
+                let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
+                self.gpu.cache_append(
+                    &k_new,
+                    0,
+                    &mut cache.self_k[i],
+                    n,
+                    heads,
+                    hd,
+                    cap,
+                    past,
+                    false,
+                )?;
+                self.gpu.cache_append(
+                    &v_new,
+                    0,
+                    &mut cache.self_v[i],
+                    n,
+                    heads,
+                    hd,
+                    cap,
+                    past,
+                    true,
+                )?;
+            }
             let tk = past + n;
             let ctx = match fused {
                 true => self.gpu.attn_decode(
@@ -859,7 +990,7 @@ impl AsrModel {
                     )?
                 }
                 false => {
-                    let q = self.queries(Operand::F32(&x), &l.cross, n, heads)?;
+                    let q = self.queries(Operand::F32(&x), &l.cross.q, n, heads)?;
                     self.attend(
                         Operand::F32(&q),
                         Operand::F16(&cache.cross_k[i]),

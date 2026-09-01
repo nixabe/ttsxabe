@@ -255,13 +255,28 @@ fn linear_matches() {
     assert_close("linear", &want, &g.download(&out).unwrap());
 }
 
+/// The shared tolerance up to the widest row any model here normalises, and
+/// a relative-to-full-scale one past it: a 9000-term mean summed in a
+/// different order than the scalar twin's lands about 1e-5 off, which the
+/// absolute floor cannot absorb at the elements the normalisation sends near
+/// zero. Nothing in the engine has a row that wide; the case exists to run
+/// the path that re-reads the row rather than to gate its last bits.
+fn close_for_width(name: &str, cols: usize, want: &[f32], got: &[f32]) {
+    if cols > 8192 {
+        assert_close_to(name, want, got, 1e-4);
+    } else {
+        assert_close(name, want, got);
+    }
+}
+
 #[test]
 fn layer_norm_matches() {
     let Some(g) = gpu() else { return };
-    // Column counts above and below the block size, and one that is not a
+    // Column counts above and below the block size, one that is not a
     // multiple of it - the reduction strides by blockDim and the tail is where
-    // a shared-memory reduction goes wrong.
-    for &(rows, cols) in &[(11usize, 192usize), (5, 700), (3, 257), (2, 1)] {
+    // a reduction goes wrong - and one too wide for the row to stay in
+    // registers, which is the path that re-reads it.
+    for &(rows, cols) in &[(11usize, 192usize), (5, 700), (3, 257), (2, 1), (2, 9000)] {
         let x = seq(rows * cols, 13);
         let w = seq(cols, 14);
         let b = seq(cols, 15);
@@ -271,8 +286,9 @@ fn layer_norm_matches() {
         let dw = g.upload(&w).unwrap();
         let db = g.upload(&b).unwrap();
         let out = g.layer_norm(&dx, rows, cols, &dw, &db, 1e-5).unwrap();
-        assert_close(
+        close_for_width(
             &format!("layer_norm {rows}x{cols}"),
+            cols,
             &want,
             &g.download(&out).unwrap(),
         );
@@ -290,7 +306,7 @@ fn layer_norm_matches() {
 #[test]
 fn layer_norm_add_matches_the_sum_and_the_normalisation() {
     let Some(g) = gpu() else { return };
-    for &(rows, cols) in &[(11usize, 192usize), (5, 700), (3, 257), (2, 1)] {
+    for &(rows, cols) in &[(11usize, 192usize), (5, 700), (3, 257), (2, 1), (2, 9000)] {
         let h = seq(rows * cols, 41);
         let res = seq(rows * cols, 42);
         let w = seq(cols, 43);
@@ -306,8 +322,9 @@ fn layer_norm_add_matches_the_sum_and_the_normalisation() {
         let out = g
             .layer_norm_add(&mut dh, &dres, rows, cols, &dw, &db, 1e-5)
             .unwrap();
-        assert_close(
+        close_for_width(
             &format!("layer_norm_add {rows}x{cols}"),
+            cols,
             &want,
             &g.download(&out).unwrap(),
         );
@@ -347,6 +364,50 @@ fn the_packed_head_splits_are_the_f32_ones_converted() {
             let got = g.download_u16(&packed).unwrap();
             assert_eq!(want, got, "split {t}x{heads}x{hd} disagrees packed");
         }
+
+        // The offset-and-bias form: the block that starts `off` into a larger
+        // buffer, with a row added first, is the plain split of that block
+        // with the bias added by `add_strided` - the same f32 add, so the
+        // same bits.
+        let (off, d) = (3 * t * heads * hd, heads * hd);
+        let big = seq(off + 2 * t * d, 62);
+        let bias = seq(2 * d, 63);
+        let dbig = g.upload(&big).unwrap();
+        let dbias = g.upload(&bias).unwrap();
+        let block: Vec<f32> = big[off..off + t * d]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + bias[d + i % d])
+            .collect();
+        let dblock = g.upload(&block).unwrap();
+        let want_k = g
+            .download_u16(&g.split_heads_f16(&dblock, t, heads, hd).unwrap())
+            .unwrap();
+        let got_k = g
+            .download_u16(
+                &g.split_heads_f16_at(&dbig, off, Some((&dbias, d)), t, heads, hd)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(want_k, got_k, "offset split {t}x{heads}x{hd} with a bias");
+        let want_v = g
+            .download_u16(&g.split_heads_t_f16(&dblock, t, heads, hd).unwrap())
+            .unwrap();
+        let got_v = g
+            .download_u16(
+                &g.split_heads_t_f16_at(&dbig, off, Some((&dbias, d)), t, heads, hd)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            want_v, got_v,
+            "offset transposed split {t}x{heads}x{hd} with a bias"
+        );
+        assert!(
+            g.split_heads_f16_at(&dbig, off + t * d + 1, None, t, heads, hd)
+                .is_err(),
+            "a block past the end of its buffer"
+        );
     }
 }
 
@@ -2314,6 +2375,8 @@ fn the_fused_decode_attention_matches_the_chain() {
         (6, 6, 64, 37, 448, false, true),
         (6, 6, 64, 129, 448, false, true),
         (6, 6, 64, 448, 448, false, true),
+        // Past the merge's shared arrays: 258 chunks take the serial form.
+        (4, 2, 128, 16500, 16512, true, false),
     ];
     for (i, &(heads, kv, hd, tk, cap, half, scale_q)) in cases.iter().enumerate() {
         let salt = 300 + 3 * i as u64;
@@ -2333,13 +2396,37 @@ fn the_fused_decode_attention_matches_the_chain() {
             let dk = g.upload_f16(&k0).unwrap();
             let dv = g.upload_f16(&v0).unwrap();
             let first = g
-                .attn_decode_f16(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .attn_decode_f16(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    kv,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    scale_q,
+                    &mut scratch,
+                )
                 .unwrap();
             // Twice through the same scratch: the merging block resets the
             // head's counter, and a counter left dirty would make the second
             // call merge too early or never.
             let again = g
-                .attn_decode_f16(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .attn_decode_f16(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    kv,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    scale_q,
+                    &mut scratch,
+                )
                 .unwrap();
             let (a, b) = (g.download(&first).unwrap(), g.download(&again).unwrap());
             assert_eq!(a, b, "{name}: not reproducible through one scratch");
@@ -2348,10 +2435,34 @@ fn the_fused_decode_attention_matches_the_chain() {
             let dk = g.upload(&k).unwrap();
             let dv = g.upload(&v).unwrap();
             let first = g
-                .attn_decode(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .attn_decode(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    kv,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    scale_q,
+                    &mut scratch,
+                )
                 .unwrap();
             let again = g
-                .attn_decode(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .attn_decode(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    kv,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    scale_q,
+                    &mut scratch,
+                )
                 .unwrap();
             let (a, b) = (g.download(&first).unwrap(), g.download(&again).unwrap());
             assert_eq!(a, b, "{name}: not reproducible through one scratch");
@@ -2382,5 +2493,164 @@ fn the_fused_decode_attention_matches_the_chain() {
         g.attn_decode_f16(&dq, &dk, &dk, 10, 2, 128, 10, 256, 1.0, false, &mut scratch)
             .is_err(),
         "a group wider than the kernel carries"
+    );
+}
+
+/// `gemv_into` is the mat-vec with its result placed by the kernel: the same
+/// numbers as the mat-vec followed by `cache_append`, `cache_append_t` or
+/// `gelu`, to the bit, since it is the same kernel storing to a different
+/// address and the activation is the same expression.
+#[test]
+fn a_placed_matvec_is_the_matvec_and_the_placement_it_replaces() {
+    use xabe_cuda::OutLayout;
+    let Some(g) = gpu() else { return };
+    let (k, heads, hd, cap, pos) = (96usize, 3usize, 16usize, 10usize, 7usize);
+    let n = heads * hd;
+    let x = seq(k, 61);
+    let w = seq(n * k, 62);
+    let b = seq(n, 63);
+    let dx = g.upload(&x).unwrap();
+    let dw16 = g.upload_f16(&w).unwrap();
+    let dw32 = g.upload(&w).unwrap();
+    let db = g.upload(&b).unwrap();
+
+    for half in [true, false] {
+        let wop = if half {
+            Operand::F16(&dw16)
+        } else {
+            Operand::F32(&dw32)
+        };
+        let plain = g
+            .gemm_batched(Operand::F32(&dx), wop, Some(&db), Batch::single(n), 1, k, n)
+            .unwrap();
+
+        // Into a key cache, against the append that used to follow.
+        let mut want_k = g.zeros(heads * cap * hd).unwrap();
+        g.cache_append(&plain, 0, &mut want_k, 1, heads, hd, cap, pos, false)
+            .unwrap();
+        let mut got_k = g.zeros(heads * cap * hd).unwrap();
+        g.gemv_into(
+            &dx,
+            wop,
+            Some(&db),
+            k,
+            n,
+            false,
+            OutLayout::KeyCache {
+                head_dim: hd,
+                cap,
+                pos,
+            },
+            &mut got_k,
+        )
+        .unwrap();
+        assert_eq!(
+            g.download(&want_k).unwrap(),
+            g.download(&got_k).unwrap(),
+            "key cache, f16 {half}"
+        );
+
+        // Into a value cache.
+        let mut want_v = g.zeros(heads * hd * cap).unwrap();
+        g.cache_append(&plain, 0, &mut want_v, 1, heads, hd, cap, pos, true)
+            .unwrap();
+        let mut got_v = g.zeros(heads * hd * cap).unwrap();
+        g.gemv_into(
+            &dx,
+            wop,
+            Some(&db),
+            k,
+            n,
+            false,
+            OutLayout::ValueCache { cap, pos },
+            &mut got_v,
+        )
+        .unwrap();
+        assert_eq!(
+            g.download(&want_v).unwrap(),
+            g.download(&got_v).unwrap(),
+            "value cache, f16 {half}"
+        );
+
+        // A row with the GELU applied, against the activation pass.
+        let mut want_g = g
+            .gemm_batched(Operand::F32(&dx), wop, Some(&db), Batch::single(n), 1, k, n)
+            .unwrap();
+        g.gelu(&mut want_g, n).unwrap();
+        let mut got_g = g.zeros(n).unwrap();
+        g.gemv_into(&dx, wop, Some(&db), k, n, true, OutLayout::Row, &mut got_g)
+            .unwrap();
+        assert_eq!(
+            g.download(&want_g).unwrap(),
+            g.download(&got_g).unwrap(),
+            "gelu row, f16 {half}"
+        );
+        // And without a bias, which is the key projection's case.
+        let want_nb = g
+            .gemm_batched(Operand::F32(&dx), wop, None, Batch::single(n), 1, k, n)
+            .unwrap();
+        let mut got_nb = g.zeros(n).unwrap();
+        g.gemv_into(&dx, wop, None, k, n, false, OutLayout::Row, &mut got_nb)
+            .unwrap();
+        assert_eq!(
+            g.download(&want_nb).unwrap(),
+            g.download(&got_nb).unwrap(),
+            "row without bias, f16 {half}"
+        );
+    }
+
+    // What it refuses: a position past the capacity, a cache too small for
+    // the layout, and a row that is not whole heads.
+    let mut small = g.zeros(heads * cap * hd - 1).unwrap();
+    assert!(
+        g.gemv_into(
+            &dx,
+            Operand::F16(&dw16),
+            None,
+            k,
+            n,
+            false,
+            OutLayout::KeyCache {
+                head_dim: hd,
+                cap,
+                pos: cap - 1
+            },
+            &mut small
+        )
+        .is_err(),
+        "a key cache one element short of its last head"
+    );
+    let mut ok = g.zeros(heads * cap * hd).unwrap();
+    assert!(
+        g.gemv_into(
+            &dx,
+            Operand::F16(&dw16),
+            None,
+            k,
+            n,
+            false,
+            OutLayout::ValueCache { cap, pos: cap },
+            &mut ok
+        )
+        .is_err(),
+        "a position past the capacity"
+    );
+    assert!(
+        g.gemv_into(
+            &dx,
+            Operand::F16(&dw16),
+            None,
+            k,
+            n,
+            false,
+            OutLayout::KeyCache {
+                head_dim: 7,
+                cap,
+                pos
+            },
+            &mut ok
+        )
+        .is_err(),
+        "a head width that does not divide the row"
     );
 }

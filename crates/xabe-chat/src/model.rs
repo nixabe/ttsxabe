@@ -635,7 +635,9 @@ impl ChatModel {
         let dids = self.gpu.upload_i64(&ids64)?;
         let mut h = match &self.embed {
             GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
-            GEmbed::Packed { data, ty } => self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?,
+            GEmbed::Packed { data, ty } => {
+                self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?
+            }
         };
 
         // Room for `past + n` before any layer touches it, so the loop below

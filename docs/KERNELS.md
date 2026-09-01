@@ -45,6 +45,7 @@ exists.
 | fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
 | single-row decode attention | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test) | `attn_decode_h128`, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
 | packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
+| mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -1049,33 +1050,61 @@ around traffic and launch count, not around the tensor cores.
 
 ### Shape
 
-Grid `(chunks, kv_heads)`, a block per 64 keys of one key-value head, `HD`
-threads to a block. The block stages its 64 key rows through a shared tile,
-takes the `group` query heads' scores against them with two threads a key at
-`HD` 128 and one at 64, softmaxes the chunk in one warp, then stages the same
-64 positions of the value rows into the *same* tile and has each thread
-contract one output element over them. Both stagings read global memory along
-the contiguous axis - a key row, or a value row's run of positions - and both
-tiles carry a stride chosen so that the warp's 32 lanes land on 32 banks:
-`W + TPK` words for the keys, where `TPK` threads share a key and interleave
-their words, and an odd stride for the values. Without the staging, a lane
-walking its own cache row a stride apart is the pattern `split_heads_t` was
-measured at 141 GB/s for.
+Grid `(chunks, kv_heads)`, a block per 64 keys of one head, `HD` threads to
+a block. Nothing is staged. A lane reads 16 bytes of a key row - eight halves
+at `HD` 128 - and the sixteen lanes that share a key reduce their partial dot
+products with four shuffles; a thread owns one value row and reads its
+chunk's 64 positions straight out of the transposed cache, whose rows are
+contiguous along exactly that axis. Every load a thread makes is issued
+before anything waits on one: eight key loads, then eight value loads that
+go out *before* the softmax they do not depend on, so the block's critical
+path is three round trips to memory - the keys, the values, and the merge.
+
+**That is the kernel's third shape, and the first two were measured slower
+than the chain they replaced.** The first staged the keys and then the values
+through a padded shared tile, a row of loads and a barrier at a time, which
+made a block a chain of a dozen dependent round trips; the second kept the
+staging and fixed the merge. Neither moved the chat model's token, and the
+microbenchmark (`bench-attn`, thirty-two layers of one step, medians of
+twenty) said why: at a 128-token context the fused kernel took 0.51 ms where
+the three launches took 0.40. What a single-query kernel is short of is
+neither bandwidth nor launches but the length of its critical path, and no
+amount of coalescing shortens a chain of barriers.
 
 **The chunks are merged by the last block to finish**, so it stays one launch.
 Each block writes its running maximum, its sum and its unnormalised context to
 a scratch buffer, bumps the head's counter behind a fence, and the block that
-sees the count reach `chunks - 1` merges every chunk with the usual
-`exp(m_c - m)` rescaling and puts the counter back to zero. `DecodeScratch`
-owns that buffer and those counters; it is held by the caller's cache rather
-than by `Gpu`, because two sequences decoding by turns must not share a
-counter, and the Whisper decoder keeps one for each of its two attentions for
-the same reason. At one chunk the block writes the output directly.
+sees the count reach `chunks - 1` merges every chunk: one pass loading every
+chunk's maximum and sum, a warp a group reducing them out of shared memory,
+one pass of independent `ld.global.cg` loads for the context. The merge's
+first version reduced each group in turn through block-wide barriers -
+twelve dependent round trips for a grouped-query head - and that alone was a
+third of the kernel at a short context. `DecodeScratch` owns the buffer and
+the counters; it is held by the caller's cache rather than by `Gpu`, because
+two sequences decoding by turns must not share a counter, and the Whisper
+decoder keeps one for each of its two attentions for the same reason. At one
+chunk the block writes the output directly.
 
 **The grouped-query rows share every read.** The four query heads of a chat
-model group are four score rows against one staged key tile and four
-accumulators against one staged value tile, which is what `gemv_rows` bought
+model group are four score accumulators against one key load and four
+context accumulators against one value load, which is what `gemv_rows` bought
 by being a separate kernel and this gets for free.
+
+Measured against the chain at every decoded shape, `bench-attn`, same card:
+
+| shape, x32 layers | chain | fused |
+| --- | ---: | ---: |
+| chat 8 B, 128 ctx | 0.40 ms | 0.42 |
+| chat 8 B, 512 ctx | 0.64 | **0.45** |
+| chat 8 B, 1024 ctx | 0.91 | **0.60** |
+| chat 8 B, 2048 ctx | 1.51 | **1.17** |
+| translator 13 B, 128 ctx | 0.51 | **0.44** |
+| translator 13 B, 1024 ctx | 1.62 | 1.61 |
+| Whisper self, 40 of 448 | 0.47 | **0.18** |
+| Whisper cross, 1500 | 0.91 | **0.76** |
+
+Level at the short end and ahead everywhere the cache is worth reading
+faster; what a token gains from it is in `docs/BENCHMARKS.md`.
 
 ### The arithmetic is the chain's
 
@@ -1090,6 +1119,56 @@ context lengths of one chunk, an exact chunk, a chunk and one key, several
 chunks and an odd tail - the odd tail being the case where a packed value row's
 last word holds a position the softmax must have zeroed - and runs each twice
 through one scratch, because a counter left dirty merges too early or never.
+
+## The mat-vec's epilogue, `gemv_into`
+
+A decode step's projections used to be followed by launches that did nothing
+but move or finish what the projection had just written: `cache_append`
+scattering a new key row into the head-major cache, `cache_append_t` doing
+the same for the values, `gelu` over the MLP's inner activation. At one row
+each of those is a few kilobytes and a launch, and the launch is the whole
+cost. `gemv` now takes an epilogue: an activation flag, and a placement
+`o_off + col * o_cs + (col / o_hd) * o_hs` that puts column `col` where the
+append would have put it - a key cache when `o_hs` is a head's stride less
+one position, a transposed value cache when `o_cs` is the capacity. The
+defaults are the plain store and every other caller passes them.
+
+`Gpu::gemv_into` is the entry that sets them, from an `OutLayout` it checks
+against the destination's length before launching: the failure it guards is a
+scatter into the next head's positions, in bounds and wrong. The arithmetic
+is the mat-vec's to the bit - same kernel, same reduction, and `act_gelu`'s
+expression character for character - so the test demands equality with the
+two-launch form rather than closeness. The Whisper decoder takes it for its
+self-attention keys and values and its `fc1`, which with the fused attention
+above is eight launches a layer that used to be sixteen.
+
+## Layer normalisation, on shuffles
+
+`layer_norm` and `layer_norm_add` reduced through a shared-memory tree with a
+barrier at every level - sixteen barriers for the two reductions - and read
+the row from memory three times. At one decoded row of 1280 that block is all
+the parallelism there is, and the kernel measured 11 us beyond the launch
+floor for 10 KB of traffic: it was the length of its dependency chain. Both
+now reduce through warp shuffles with one barrier each, load four floats at a
+time, and keep the row in registers between the passes when it fits - up to
+8192 columns at 256 threads, which is every row in the engine; past that the
+later passes re-read it. The two-pass form is unchanged, the mean and then
+the variance about it, so what differs from the tree is the association of
+the sum and nothing else, and the oracle tests hold layer by layer.
+
+## The cross-attention cache, batched over the layers
+
+Building the ASR's cross-attention cache is sixty-four projections of the
+same 1500x1280 encoder output, one per decoder layer per half. Each is 120
+blocks of the tiled `gemm`, which on 144 resident slots is one wave whether
+the launch has 120 blocks or 144 - so sixty-four launches pay sixty-four
+waves for fifty-three and a third waves of work. The key weights of every
+layer are one `[32, d, d]` allocation now, the values another, and each half
+is one batched product over a shared activation: 3840 blocks, 27 waves. The
+biases go with the split into head order, since a batched product carries one
+bias for the whole batch and each layer has its own; the add is the same f32
+add the matmul's epilogue would have made, so the cache holds the same bits.
+15.3 ms to 13.5 on this card, which is the arithmetic's 16% within noise.
 
 ## Packed embeddings, `embed_q`
 

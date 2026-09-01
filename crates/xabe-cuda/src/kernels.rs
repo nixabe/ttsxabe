@@ -51,6 +51,7 @@ pub const SOURCE: &str = r#"
 // far end of it costs more constant evaluation than rustc allows.
 #define AD_CH 64
 #define AD_GMAX 4
+#define AD_CMAX 256
 
 #define GEMM_WARPS 8
 #define GEMM_MT    128
@@ -837,7 +838,16 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     // `asc_off` bytes - one allocation rather than two, because at 225 of these
     // a token the allocation is a cost worth counting. Only the two K-quant
     // paths read either.
-    const signed char* __restrict__ qa, int asc_off, int a_rows)
+    const signed char* __restrict__ qa, int asc_off, int a_rows,
+    // The epilogue, for a single-row product whose result goes somewhere
+    // other than a fresh `[m, n]` buffer. `epi_act` 1 applies the exact GELU
+    // to the sum; the rest place column `col` at
+    // `o_off + col * o_cs + (col / o_hd) * o_hs` when `o_hd` is nonzero, which
+    // is a head-major key cache when `o_hs` is a head's stride less one
+    // position, and at `o_off + col * o_cs` otherwise, which is a transposed
+    // value cache when `o_cs` is the capacity. The defaults `0, 1, 0, 0, 0`
+    // are the plain store. See `Gpu::gemv_into`.
+    int epi_act, int o_cs, int o_hs, int o_hd, long o_off)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -1004,7 +1014,20 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (lane == 0) {
-        out[(size_t)row * n + col] = acc + (bias ? bias[col] : 0.0f);
+        float v = acc + (bias ? bias[col] : 0.0f);
+        if (epi_act == 1) {
+            // `act_gelu`'s expression, character for character.
+            v = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+        }
+        size_t idx;
+        if (o_hd) {
+            idx = (size_t)o_off + (size_t)col * o_cs + (size_t)(col / o_hd) * o_hs;
+        } else if (o_cs != 1) {
+            idx = (size_t)o_off + (size_t)col * o_cs;
+        } else {
+            idx = (size_t)o_off + (size_t)row * n + col;
+        }
+        out[idx] = v;
     }
 }
 
@@ -2643,44 +2666,156 @@ __global__ void linear(
 // -------------------------------------------------------------- normalisation
 
 // One block per row. Two shared reductions: sum, then sum of squares.
+// One block a row. The two reductions - the mean, then the variance about it,
+// which is the two-pass form `torch.nn.LayerNorm` computes - go through warp
+// shuffles and one barrier each rather than a shared-memory tree with a
+// barrier at every level, and the row stays in registers between the passes
+// when it fits. That is the same shape `rms_norm` has, and for the same
+// reason: at one decoded row this block is all the parallelism there is, and
+// what it costs is the length of its dependency chain rather than what it
+// reads. A whole row of 1280 was 11 us beyond the launch floor on the old
+// tree; docs/BENCHMARKS.md has what this one measures.
+//
+// Four floats a thread when the row is a whole number of them, which every
+// row here is; the scalar path is the general contract. The register cache
+// holds `LN_REG` float4 a thread, so rows up to `4 * LN_REG * blockDim.x` are
+// read once - past that the later passes re-read the row, which is a
+// correctness-neutral slow path rather than a refusal.
+#define LN_REG 8
+
+__device__ __forceinline__ float ln_block_sum(float v, float* red) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, o);
+    }
+    if (lane == 0) {
+        red[warp] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float t = (lane < warps) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            t += __shfl_xor_sync(0xffffffff, t, o);
+        }
+        if (lane == 0) {
+            red[0] = t;
+        }
+    }
+    __syncthreads();
+    const float r = red[0];
+    // The next reduction writes `red` again; nobody may still be reading it.
+    __syncthreads();
+    return r;
+}
+
+} // extern "C" - an overload set and a template cannot have C linkage.
+
+__device__ __forceinline__ void norm_store(float* p, int i, float v) {
+    p[i] = v;
+}
+__device__ __forceinline__ void norm_store(unsigned short* p, int i, float v) {
+    p[i] = f32_to_f16(v);
+}
+
+// `ADD` folds the residual sum in: `h += res` on the way through the first
+// pass, so `h` holds the sum for every pass below and for whatever adds to the
+// residual stream next. Without it `h` is read and never written.
+template <typename OUT, bool ADD>
+__device__ __forceinline__ void layer_norm_impl(
+    float* __restrict__ h, const float* __restrict__ res,
+    const float* __restrict__ weight, const float* __restrict__ bias,
+    OUT* __restrict__ out, int cols, float eps)
+{
+    __shared__ float red[32];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const size_t base = (size_t)row * cols;
+    float* hr = h + base;
+    const float* rr = res + base;
+    OUT* outr = out + base;
+    const bool wide = (cols & 3) == 0;
+    const int n4 = cols >> 2;
+
+    float4 keep[LN_REG];
+    float sum = 0.0f;
+    if (wide) {
+        float4* h4 = (float4*)hr;
+        const float4* r4 = (const float4*)rr;
+        int slot = 0;
+        for (int i = tid; i < n4; i += nt, ++slot) {
+            float4 v = h4[i];
+            if (ADD) {
+                const float4 r = r4[i];
+                v.x += r.x; v.y += r.y; v.z += r.z; v.w += r.w;
+                h4[i] = v;
+            }
+            if (slot < LN_REG) {
+                keep[slot] = v;
+            }
+            sum += (v.x + v.y) + (v.z + v.w);
+        }
+    } else {
+        for (int i = tid; i < cols; i += nt) {
+            float v = hr[i];
+            if (ADD) {
+                v += rr[i];
+                hr[i] = v;
+            }
+            sum += v;
+        }
+    }
+    const float mean = ln_block_sum(sum, red) / (float)cols;
+
+    float sq = 0.0f;
+    if (wide) {
+        const float4* h4 = (const float4*)hr;
+        int slot = 0;
+        for (int i = tid; i < n4; i += nt, ++slot) {
+            const float4 v = (slot < LN_REG) ? keep[slot] : h4[i];
+            const float a = v.x - mean, b = v.y - mean, c = v.z - mean, d = v.w - mean;
+            sq += (a * a + b * b) + (c * c + d * d);
+        }
+    } else {
+        for (int i = tid; i < cols; i += nt) {
+            const float d = hr[i] - mean;
+            sq += d * d;
+        }
+    }
+    // The biased variance, matching torch.nn.LayerNorm.
+    const float inv = rsqrtf(ln_block_sum(sq, red) / (float)cols + eps);
+
+    if (wide) {
+        const float4* h4 = (const float4*)hr;
+        const float4* w4 = (const float4*)weight;
+        const float4* b4 = (const float4*)bias;
+        int slot = 0;
+        for (int i = tid; i < n4; i += nt, ++slot) {
+            const float4 v = (slot < LN_REG) ? keep[slot] : h4[i];
+            const float4 w = w4[i], b = b4[i];
+            norm_store(outr, 4 * i + 0, (v.x - mean) * inv * w.x + b.x);
+            norm_store(outr, 4 * i + 1, (v.y - mean) * inv * w.y + b.y);
+            norm_store(outr, 4 * i + 2, (v.z - mean) * inv * w.z + b.z);
+            norm_store(outr, 4 * i + 3, (v.w - mean) * inv * w.w + b.w);
+        }
+    } else {
+        for (int i = tid; i < cols; i += nt) {
+            norm_store(outr, i, (hr[i] - mean) * inv * weight[i] + bias[i]);
+        }
+    }
+}
+
+extern "C" {
+
 __global__ void layer_norm(
     const float* __restrict__ x, const float* __restrict__ weight,
     const float* __restrict__ bias, float* __restrict__ out,
     int cols, float eps)
 {
-    extern __shared__ float sdata[];
-    int row = blockIdx.x;
-    const float* xr = x + (size_t)row * cols;
-    float* outr = out + (size_t)row * cols;
-
-    float partial = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) partial += xr[i];
-    sdata[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float mean = sdata[0] / (float)cols;
-    __syncthreads();
-
-    partial = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float d = xr[i] - mean;
-        partial += d * d;
-    }
-    sdata[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    // The biased variance, matching torch.nn.LayerNorm.
-    float inv = rsqrtf(sdata[0] / (float)cols + eps);
-
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        outr[i] = (xr[i] - mean) * inv * weight[i] + bias[i];
-    }
+    // `x` is not written: `ADD` is off, and the only store to `h` is under it.
+    layer_norm_impl<float, false>((float*)x, x, weight, bias, out, cols, eps);
 }
 
 // The same, taking the residual sum on the way in.
@@ -2706,71 +2841,14 @@ __global__ void layer_norm(
 //
 // `h` stays f32 throughout: it is the residual stream, it is added to rather
 // than multiplied by, and narrowing it would be a real approximation.
-} // extern "C" - an overload set and a template cannot have C linkage.
-
-__device__ __forceinline__ void norm_store(float* p, int i, float v) {
-    p[i] = v;
-}
-__device__ __forceinline__ void norm_store(unsigned short* p, int i, float v) {
-    p[i] = f32_to_f16(v);
-}
-
-template <typename OUT>
-__device__ __forceinline__ void layer_norm_add_impl(
-    float* __restrict__ h, const float* __restrict__ res,
-    const float* __restrict__ weight, const float* __restrict__ bias,
-    OUT* __restrict__ out, int cols, float eps)
-{
-    extern __shared__ float sdata[];
-    int row = blockIdx.x;
-    float* hr = h + (size_t)row * cols;
-    const float* rr = res + (size_t)row * cols;
-    OUT* outr = out + (size_t)row * cols;
-
-    // The sum is folded in here, so `hr` holds it for every pass below and for
-    // whatever adds to the residual stream next.
-    float partial = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        const float v = hr[i] + rr[i];
-        hr[i] = v;
-        partial += v;
-    }
-    sdata[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float mean = sdata[0] / (float)cols;
-    __syncthreads();
-
-    partial = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float d = hr[i] - mean;
-        partial += d * d;
-    }
-    sdata[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    // The biased variance, matching torch.nn.LayerNorm.
-    float inv = rsqrtf(sdata[0] / (float)cols + eps);
-
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        norm_store(outr, i, (hr[i] - mean) * inv * weight[i] + bias[i]);
-    }
-}
-
-extern "C" {
+// The implementation is `layer_norm_impl<OUT, true>` above.
 
 __global__ void layer_norm_add(
     float* __restrict__ h, const float* __restrict__ res,
     const float* __restrict__ weight, const float* __restrict__ bias,
     float* __restrict__ out, int cols, float eps)
 {
-    layer_norm_add_impl<float>(h, res, weight, bias, out, cols, eps);
+    layer_norm_impl<float, true>(h, res, weight, bias, out, cols, eps);
 }
 
 __global__ void layer_norm_add_f16(
@@ -2778,7 +2856,7 @@ __global__ void layer_norm_add_f16(
     const float* __restrict__ weight, const float* __restrict__ bias,
     unsigned short* __restrict__ out, int cols, float eps)
 {
-    layer_norm_add_impl<unsigned short>(h, res, weight, bias, out, cols, eps);
+    layer_norm_impl<unsigned short, true>(h, res, weight, bias, out, cols, eps);
 }
 
 // One block per row; subtracts the row max before exponentiating.
@@ -3662,8 +3740,15 @@ extern "C" __global__ void split_heads_t(
 // MB tensor twice to change nothing but its width. The split is already
 // touching every element and `f32_to_f16` rounds the way `gemm_pack` does, so
 // the conversion is free where the element is already in a register.
+//
+// `bias`, when not null, is a `[heads * head_dim]` row added before the
+// rounding. It is there so the cross-attention projections of every layer can
+// go out as one batched matmul, which carries one bias for the whole batch,
+// while each layer keeps its own: the add is the same f32 add the matmul's
+// epilogue would have made, so the bits do not change.
 extern "C" __global__ void split_heads_f16(
     const float* __restrict__ x,
+    const float* __restrict__ bias,
     unsigned short* __restrict__ out,
     int t, int heads, int head_dim)
 {
@@ -3675,11 +3760,13 @@ extern "C" __global__ void split_heads_f16(
     int ti = i / d;
     int h  = (i % d) / head_dim;
     int j  = i % head_dim;
-    out[((size_t)h * t + ti) * head_dim + j] = f32_to_f16(x[i]);
+    const float v = x[i] + (bias ? bias[i % d] : 0.0f);
+    out[((size_t)h * t + ti) * head_dim + j] = f32_to_f16(v);
 }
 
 extern "C" __global__ void split_heads_t_f16(
     const float* __restrict__ x,
+    const float* __restrict__ bias,
     unsigned short* __restrict__ out,
     int t, int heads, int head_dim)
 {
@@ -3696,7 +3783,7 @@ extern "C" __global__ void split_heads_t_f16(
     for (int o = 0; o < TR_TILE; o += TR_ROWS) {
         const int r = r0 + (int)threadIdx.y + o;
         if (r < t && c < d) {
-            tile[threadIdx.y + o][threadIdx.x] = x[(size_t)r * d + c];
+            tile[threadIdx.y + o][threadIdx.x] = x[(size_t)r * d + c] + (bias ? bias[c] : 0.0f);
         }
     }
     __syncthreads();
@@ -4214,18 +4301,21 @@ extern "C" __global__ void coupling_inverse(
 // HD]` and values `[kv_heads, HD, cap]`, f16 or f32 by instantiation.
 //
 // Grid `(chunks, kv_heads)`, a block per `AD_CH` keys of one head, `HD`
-// threads a block. A block stages its 64 keys through shared memory *twice* -
-// the key rows, then the value rows into the same tile - because that is what
-// makes both halves of the product read global memory along the contiguous
-// axis and shared memory without a bank conflict. Reading the cache directly
-// would have each lane walking its own row a stride apart, which is the
-// pattern `split_heads_t` was measured at 141 GB/s for.
+// threads a block. Nothing is staged: a lane reads 16 bytes of a key row and
+// the lanes that share a key reduce their partial dot products with shuffles,
+// and a thread reads one value row's run of positions straight from the
+// transposed cache, whose rows are contiguous along exactly that axis. Every
+// load a thread makes is issued before anything waits on one - eight key
+// loads, then eight value loads before the softmax they do not depend on.
 //
-// The tile's row stride is `W + TPK` words: with `TPK` threads to a key, a
-// warp's 32 lanes are 32 / TPK keys times TPK interleaved word offsets, and
-// the stride being congruent to TPK modulo 32 is what spreads them over 32
-// banks. The value tile is `[HD][AD_CH]` at an odd stride for the same reason
-// with one thread a row.
+// That is the second shape this kernel had. The first staged the keys and
+// then the values through a padded shared tile, and measured *slower* than
+// the three launches it replaced at short contexts and barely ahead at long
+// ones: a block was a chain of a dozen dependent round trips - a row of
+// loads, a barrier, a phase, a barrier, another row of loads - and with a
+// few dozen blocks in flight nothing hid the chain. What a single-query
+// kernel is short of is not bandwidth or launches but the length of its
+// critical path, and this shape has three round trips on it.
 //
 // Chunks are combined by the last block to finish, which is the standard
 // fenced-counter pattern: each block writes its running maximum, its sum and
@@ -4243,6 +4333,13 @@ extern "C" __global__ void coupling_inverse(
 // replaces did, or on the scores after it, as Llama does. Algebraically
 // identical, not the same rounding, and each model keeps its own.
 
+// A global load that bypasses L1 - for a value another SM wrote.
+__device__ __forceinline__ float ld_cg(const float* p) {
+    float v;
+    asm volatile("ld.global.cg.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+
 template <int HD, bool KVH>
 __device__ __forceinline__ void attn_decode_impl(
     const float* __restrict__ q,
@@ -4253,92 +4350,104 @@ __device__ __forceinline__ void attn_decode_impl(
     unsigned* __restrict__ ctr,
     int tk, int group, int cap, float scale, int scale_q, int chunks)
 {
-    constexpr int T   = HD;                  // threads a block
-    constexpr int W   = KVH ? HD / 2 : HD;   // words in a key row
-    constexpr int TPK = T / AD_CH;           // threads a key in the score pass
-    constexpr int KSTR = W + TPK;            // key tile stride, words
-    constexpr int VW  = KVH ? AD_CH / 2 : AD_CH; // words in a value row
-    constexpr int VSTR = VW + 1;             // value tile stride, words
-    constexpr int KWORDS = AD_CH * KSTR;
-    constexpr int VWORDS = HD * VSTR;
-    constexpr int TILE = KWORDS > VWORDS ? KWORDS : VWORDS;
-    static_assert(T % AD_CH == 0, "a chunk's keys are shared out over the block");
-    static_assert(W % 32 == 0, "the stride argument needs a row of whole warps of words");
+    constexpr int T    = HD;                    // threads a block
+    constexpr int W    = KVH ? HD / 2 : HD;     // words in a key row
+    constexpr int LPK  = W / 4;                 // lanes a key, 16 bytes each
+    constexpr int KPW  = 32 / LPK;              // keys a warp a trip
+    constexpr int WARPS = T / 32;
+    constexpr int KPWARP = AD_CH / WARPS;       // keys a warp covers
+    constexpr int KTRIPS = KPWARP / KPW;
+    constexpr int EPL  = KVH ? 8 : 4;           // elements a lane a trip
+    constexpr int VW   = KVH ? AD_CH / 2 : AD_CH; // words in a value row's chunk
+    static_assert(LPK * KPW == 32, "a key is a whole number of lanes and a warp of keys");
+    static_assert(KPWARP % KPW == 0, "a warp's keys are whole trips");
+    static_assert(W % 4 == 0, "a key row is whole 16-byte loads");
 
-    __shared__ unsigned tile[TILE];
     __shared__ float qs[AD_GMAX * HD];
     __shared__ float sc[AD_GMAX * AD_CH];
     __shared__ float m_s[AD_GMAX], l_s[AD_GMAX];
     __shared__ int last;
 
-    const int tid = threadIdx.x, lane = tid & 31;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int h = blockIdx.y;
     const int c = blockIdx.x;
     const int kv0 = c * AD_CH;
     const int nk = min(AD_CH, tk - kv0);
     const float ninf = __int_as_float(0xff800000);
 
+    // Every key load a lane will make, issued before anything waits on one.
+    // A lane owns 16 bytes of `KPW` keys a trip, `KTRIPS` trips - eight
+    // independent loads in flight rather than a chain of round trips, which
+    // is what the first version of this kernel paid for staging the chunk
+    // through shared memory a row at a time.
+    const int ks = lane / LPK, wo = (lane - ks * LPK) * 4;
+    const unsigned* kb = kc + ((size_t)h * cap + kv0) * W;
+    uint4 kr[KTRIPS];
+    #pragma unroll
+    for (int t = 0; t < KTRIPS; ++t) {
+        const int r = warp * KPWARP + t * KPW + ks;
+        kr[t] = make_uint4(0u, 0u, 0u, 0u);
+        if (r < nk) {
+            kr[t] = *reinterpret_cast<const uint4*>(kb + (size_t)r * W + wo);
+        }
+    }
+
     // The group's queries, scaled here when the scale belongs on the query.
     const float qf = scale_q ? scale : 1.0f;
     for (int i = tid; i < group * HD; i += T) {
         qs[i] = q[(size_t)h * group * HD + i] * qf;
     }
-
-    // Key rows kv0..kv0+nk into the tile, a row of W words each, read as
-    // 16-byte loads along the row. `cap` is even and so is kv0, so an f16
-    // row's word offset is exact.
-    {
-        const unsigned* kb = kc + ((size_t)h * cap + kv0) * W;
-        for (int i = tid; i < nk * (W / 4); i += T) {
-            const int r = i / (W / 4), j4 = i - r * (W / 4);
-            const uint4 w = *reinterpret_cast<const uint4*>(kb + (size_t)r * W + 4 * j4);
-            unsigned* d = tile + r * KSTR + 4 * j4;
-            d[0] = w.x; d[1] = w.y; d[2] = w.z; d[3] = w.w;
-        }
-    }
     __syncthreads();
 
-    // Scores: TPK threads a key, interleaved over the row's words.
-    {
-        const int r = tid / TPK, p = tid - r * TPK;
+    // The lane's slice of each query, in registers: the elements its 16
+    // bytes of key cover.
+    float qr[AD_GMAX][EPL];
+    #pragma unroll
+    for (int g = 0; g < AD_GMAX; ++g) {
+        #pragma unroll
+        for (int e = 0; e < EPL; ++e) {
+            qr[g][e] = (g < group) ? qs[g * HD + (KVH ? 2 * wo : wo) + e] : 0.0f;
+        }
+    }
+
+    // Scores: the lane's partial dot products, then a reduction across the
+    // LPK lanes that share a key. The lane with the key's first word writes
+    // the score; a key past `nk` gets minus infinity so the softmax drops it.
+    const float sf = scale_q ? 1.0f : scale;
+    #pragma unroll
+    for (int t = 0; t < KTRIPS; ++t) {
         float acc[AD_GMAX];
         #pragma unroll
         for (int g = 0; g < AD_GMAX; ++g) {
             acc[g] = 0.0f;
         }
-        if (r < nk) {
-            const unsigned* krow = tile + r * KSTR;
-            for (int jj = 0; jj < W / TPK; ++jj) {
-                const int j = jj * TPK + p;
-                const unsigned w = krow[j];
-                if (KVH) {
-                    float lo, hi;
-                    gemm_unpack(w, lo, hi);
-                    #pragma unroll
-                    for (int g = 0; g < AD_GMAX; ++g) {
-                        if (g < group) {
-                            acc[g] += qs[g * HD + 2 * j] * lo + qs[g * HD + 2 * j + 1] * hi;
-                        }
-                    }
-                } else {
-                    const float v = __uint_as_float(w);
-                    #pragma unroll
-                    for (int g = 0; g < AD_GMAX; ++g) {
-                        if (g < group) {
-                            acc[g] += qs[g * HD + j] * v;
-                        }
-                    }
+        const unsigned wv[4] = {kr[t].x, kr[t].y, kr[t].z, kr[t].w};
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (KVH) {
+                float lo, hi;
+                gemm_unpack(wv[w], lo, hi);
+                #pragma unroll
+                for (int g = 0; g < AD_GMAX; ++g) {
+                    acc[g] += qr[g][2 * w] * lo + qr[g][2 * w + 1] * hi;
+                }
+            } else {
+                const float v = __uint_as_float(wv[w]);
+                #pragma unroll
+                for (int g = 0; g < AD_GMAX; ++g) {
+                    acc[g] += qr[g][w] * v;
                 }
             }
         }
-        if (TPK == 2) {
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
             #pragma unroll
-            for (int g = 0; g < AD_GMAX; ++g) {
-                acc[g] += __shfl_xor_sync(0xffffffff, acc[g], 1);
+            for (int o = LPK / 2; o > 0; o >>= 1) {
+                acc[g] += __shfl_xor_sync(0xffffffff, acc[g], o);
             }
         }
-        if (p == 0 && r < AD_CH) {
-            const float sf = scale_q ? 1.0f : scale;
+        if (lane == ks * LPK) {
+            const int r = warp * KPWARP + t * KPW + ks;
             #pragma unroll
             for (int g = 0; g < AD_GMAX; ++g) {
                 if (g < group) {
@@ -4347,10 +4456,47 @@ __device__ __forceinline__ void attn_decode_impl(
             }
         }
     }
+
+    // The value loads go out now, before the softmax, because they do not
+    // depend on it: thread `d` owns value row `d` and reads its chunk of
+    // positions as a run of 16-byte loads - 8 bytes when the capacity keeps
+    // rows only so aligned, which the ASR's 1500 encoder positions do. A
+    // vector that would run past the live positions is taken a word at a
+    // time, so the tail of a chunk never reads past `tk`; the words past it
+    // are zero and so are their probabilities.
+    const unsigned* vb = vc + ((size_t)h * HD * cap + kv0) / (KVH ? 2 : 1);
+    const int nw = KVH ? (nk + 1) / 2 : nk;
+    const int rs = KVH ? cap / 2 : cap;
+    const bool v16 = ((cap * (KVH ? 2 : 4)) & 15) == 0;
+    unsigned vr[VW];
+    {
+        const unsigned* src = vb + (size_t)tid * rs;
+        #pragma unroll
+        for (int w0 = 0; w0 < VW; w0 += 4) {
+            vr[w0] = vr[w0 + 1] = vr[w0 + 2] = vr[w0 + 3] = 0u;
+            if (w0 >= nw) {
+                continue;
+            }
+            if (w0 + 4 <= nw && v16) {
+                const uint4 x = *reinterpret_cast<const uint4*>(src + w0);
+                vr[w0] = x.x; vr[w0 + 1] = x.y; vr[w0 + 2] = x.z; vr[w0 + 3] = x.w;
+            } else if (w0 + 4 <= nw) {
+                const uint2 x0 = *reinterpret_cast<const uint2*>(src + w0);
+                const uint2 x1 = *reinterpret_cast<const uint2*>(src + w0 + 2);
+                vr[w0] = x0.x; vr[w0 + 1] = x0.y; vr[w0 + 2] = x1.x; vr[w0 + 3] = x1.y;
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    if (w0 + e < nw) {
+                        vr[w0 + e] = src[w0 + e];
+                    }
+                }
+            }
+        }
+    }
     __syncthreads();
 
-    // The softmax over the chunk, by warp 0, while the rest of the block
-    // stages the value rows into the same tile the scores have finished with.
+    // The softmax over the chunk, by warp 0.
     if (tid < 32) {
         #pragma unroll
         for (int g = 0; g < AD_GMAX; ++g) {
@@ -4378,49 +4524,32 @@ __device__ __forceinline__ void attn_decode_impl(
             }
         }
     }
-    {
-        // Value rows: HD rows of VW words, each row's chunk contiguous in the
-        // cache. The word past an odd `nk` holds a key the softmax gave a
-        // probability of zero, and is in bounds because `cap` is even.
-        const unsigned* vb = vc + ((size_t)h * HD * cap + kv0) * (KVH ? 1 : 2) / (KVH ? 2 : 2);
-        // (element offset (h*HD*cap + kv0), in words: /2 for f16, x1 for f32)
-        const int nw = KVH ? (nk + 1) / 2 : nk;
-        for (int i = tid; i < HD * nw; i += T) {
-            const int d = i / nw, j = i - d * nw;
-            tile[d * VSTR + j] = vb[(size_t)d * (KVH ? cap / 2 : cap) + j];
-        }
-    }
     __syncthreads();
 
     // The context: one thread an output element, the probabilities read as a
-    // broadcast and the value row from the tile at a conflict-free stride.
+    // broadcast and the value row already in registers.
     float o[AD_GMAX];
     #pragma unroll
     for (int g = 0; g < AD_GMAX; ++g) {
         o[g] = 0.0f;
     }
-    {
-        const int d = tid;
-        const unsigned* vrow = tile + d * VSTR;
-        const int nw = KVH ? (nk + 1) / 2 : nk;
-        for (int j = 0; j < nw; ++j) {
-            const unsigned w = vrow[j];
-            if (KVH) {
-                float lo, hi;
-                gemm_unpack(w, lo, hi);
-                #pragma unroll
-                for (int g = 0; g < AD_GMAX; ++g) {
-                    if (g < group) {
-                        o[g] += sc[g * AD_CH + 2 * j] * lo + sc[g * AD_CH + 2 * j + 1] * hi;
-                    }
+    #pragma unroll
+    for (int w = 0; w < VW; ++w) {
+        if (KVH) {
+            float lo, hi;
+            gemm_unpack(vr[w], lo, hi);
+            #pragma unroll
+            for (int g = 0; g < AD_GMAX; ++g) {
+                if (g < group) {
+                    o[g] += sc[g * AD_CH + 2 * w] * lo + sc[g * AD_CH + 2 * w + 1] * hi;
                 }
-            } else {
-                const float v = __uint_as_float(w);
-                #pragma unroll
-                for (int g = 0; g < AD_GMAX; ++g) {
-                    if (g < group) {
-                        o[g] += sc[g * AD_CH + j] * v;
-                    }
+            }
+        } else {
+            const float v = __uint_as_float(vr[w]);
+            #pragma unroll
+            for (int g = 0; g < AD_GMAX; ++g) {
+                if (g < group) {
+                    o[g] += sc[g * AD_CH + w] * v;
                 }
             }
         }
@@ -4459,22 +4588,91 @@ __device__ __forceinline__ void attn_decode_impl(
         return;
     }
     __threadfence();
-    const volatile float* all = part + ((size_t)h * chunks * AD_GMAX) * (HD + 2);
-    #pragma unroll
-    for (int g = 0; g < AD_GMAX; ++g) {
-        if (g < group) {
+    // The merge, for every group at once and with as few round trips as it
+    // can be given: one pass loading every chunk's maximum and sum, a warp a
+    // group reducing them out of shared memory, one pass of independent
+    // loads for the context. The first version of this was one thread's
+    // serial loop of volatile loads, and the second reduced each group in
+    // turn through block-wide barriers - twelve dependent round trips for a
+    // grouped-query head, which was most of what the kernel cost at a short
+    // context. `.cg` loads because the partials were written by other SMs
+    // and must not be served from this one's L1. Past `AD_CMAX` chunks the
+    // shared arrays are too small and the serial form takes over; that is a
+    // context of sixteen thousand and more, and correct rather than fast.
+    const float* all = part + ((size_t)h * chunks * AD_GMAX) * (HD + 2);
+    if (chunks <= AD_CMAX) {
+        __shared__ float mf[AD_GMAX * AD_CMAX];
+        __shared__ float ls[AD_GMAX * AD_CMAX];
+        __shared__ float L_s[AD_GMAX];
+        for (int i = tid; i < group * chunks; i += T) {
+            const int g = i / chunks, cc = i - g * chunks;
+            const float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
+            mf[g * AD_CMAX + cc] = ld_cg(pc + HD);
+            ls[g * AD_CMAX + cc] = ld_cg(pc + HD + 1);
+        }
+        __syncthreads();
+        for (int g = warp; g < group; g += WARPS) {
             float m = ninf;
-            for (int cc = 0; cc < chunks; ++cc) {
-                m = fmaxf(m, all[((size_t)cc * AD_GMAX + g) * (HD + 2) + HD]);
+            for (int cc = lane; cc < chunks; cc += 32) {
+                m = fmaxf(m, mf[g * AD_CMAX + cc]);
             }
-            float l = 0.0f, acc = 0.0f;
-            for (int cc = 0; cc < chunks; ++cc) {
-                const volatile float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
-                const float f = __expf(pc[HD] - m);
-                l += pc[HD + 1] * f;
-                acc += pc[tid] * f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
             }
-            out[((size_t)h * group + g) * HD + tid] = acc / l;
+            float l = 0.0f;
+            for (int cc = lane; cc < chunks; cc += 32) {
+                const float f = __expf(mf[g * AD_CMAX + cc] - m);
+                mf[g * AD_CMAX + cc] = f;
+                l += ls[g * AD_CMAX + cc] * f;
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                l += __shfl_xor_sync(0xffffffff, l, o);
+            }
+            if (lane == 0) {
+                L_s[g] = l;
+            }
+        }
+        __syncthreads();
+        float acc[AD_GMAX];
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            acc[g] = 0.0f;
+        }
+        #pragma unroll 4
+        for (int cc = 0; cc < chunks; ++cc) {
+            const float* pc = all + (size_t)cc * AD_GMAX * (HD + 2) + tid;
+            #pragma unroll
+            for (int g = 0; g < AD_GMAX; ++g) {
+                if (g < group) {
+                    acc[g] += ld_cg(pc + g * (HD + 2)) * mf[g * AD_CMAX + cc];
+                }
+            }
+        }
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            if (g < group) {
+                out[((size_t)h * group + g) * HD + tid] = acc[g] / L_s[g];
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            if (g < group) {
+                float m = ninf;
+                for (int cc = 0; cc < chunks; ++cc) {
+                    m = fmaxf(m, ld_cg(all + ((size_t)cc * AD_GMAX + g) * (HD + 2) + HD));
+                }
+                float l = 0.0f, acc = 0.0f;
+                for (int cc = 0; cc < chunks; ++cc) {
+                    const float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
+                    const float f = __expf(ld_cg(pc + HD) - m);
+                    l += ld_cg(pc + HD + 1) * f;
+                    acc += ld_cg(pc + tid) * f;
+                }
+                out[((size_t)h * group + g) * HD + tid] = acc / l;
+            }
         }
     }
     if (tid == 0) {
@@ -4482,7 +4680,7 @@ __device__ __forceinline__ void attn_decode_impl(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void attn_decode_h128(
+extern "C" __global__ __launch_bounds__(128, 4) void attn_decode_h128(
     const float* __restrict__ q,
     const unsigned short* __restrict__ kc,
     const unsigned short* __restrict__ vc,
@@ -4493,7 +4691,7 @@ extern "C" __global__ __launch_bounds__(128) void attn_decode_h128(
                                 part, ctr, tk, group, cap, scale, scale_q, chunks);
 }
 
-extern "C" __global__ __launch_bounds__(64) void attn_decode_h64(
+extern "C" __global__ __launch_bounds__(64, 8) void attn_decode_h64(
     const float* __restrict__ q,
     const unsigned short* __restrict__ kc,
     const unsigned short* __restrict__ vc,
@@ -4504,7 +4702,7 @@ extern "C" __global__ __launch_bounds__(64) void attn_decode_h64(
                                part, ctr, tk, group, cap, scale, scale_q, chunks);
 }
 
-extern "C" __global__ __launch_bounds__(64) void attn_decode_f64(
+extern "C" __global__ __launch_bounds__(64, 8) void attn_decode_f64(
     const float* __restrict__ q,
     const float* __restrict__ kc,
     const float* __restrict__ vc,

@@ -720,7 +720,10 @@ fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
         let ids: Vec<i64> = vec![8, 0, 3, 3, 8];
         let dids = g.upload_i64(&ids).unwrap();
         let got = g
-            .download(&g.embed_packed(&table, q, &dids, ids.len(), ch, 1.0).unwrap())
+            .download(
+                &g.embed_packed(&table, q, &dids, ids.len(), ch, 1.0)
+                    .unwrap(),
+            )
             .unwrap();
         for (r, &id) in ids.iter().enumerate() {
             let w = &want[id as usize * ch..(id as usize + 1) * ch];
@@ -746,5 +749,8 @@ fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
     let raw = blocks(Quant::Q4K, 4, 12);
     let table = g.upload_quant(Quant::Q4K, &raw).unwrap();
     let dids = g.upload_i64(&[0]).unwrap();
-    assert!(g.embed_packed(&table, Quant::Q4K, &dids, 1, 300, 1.0).is_err());
+    assert!(
+        g.embed_packed(&table, Quant::Q4K, &dids, 1, 300, 1.0)
+            .is_err()
+    );
 }
