@@ -128,7 +128,19 @@ prompt lengths (2447 against 2259 at 128 tokens, 2928 against 2513 at 512) and
 on decode (100.9 against 95.3), the translator ahead on decode (61.4 against
 60.0), level on 512-token prefill (1636 against 1647), and at 0.94x on
 128-token prefill against a llama.cpp median that swings 20% between its own
-runs — recorded as inside its noise, not as a win. Prefill was 0.29x once,
+runs — recorded as inside its noise, not as a win.
+
+The translator's *latency* is a separate question from its throughput and has
+its own section in `docs/BENCHMARKS.md`. What is worth knowing here: a
+translation is 99.1% `forward_last` — the logits download, the repeat penalty,
+the CPU argmax and the stop-string check are 0.8% between them, so the decode
+loop is not where to look. The step itself streams 8.0 GB a token at 579 GB/s
+against 602 for the same weights at f16, so unpacking costs 4% and the weight
+stream is close to done. What is left is a seventh of the step in fifteen small
+kernels a layer that cost what a launch costs, and a prefill that used to
+compute 128 rows for a twenty-four-token prompt.
+
+Prefill was 0.29x once,
 then 0.75x, and has now been worked on four times. Three cautions: the
 llama.cpp column does not hold still across sittings, so the only comparison
 trusted is both tools alternated in one sitting; every engine figure is a
