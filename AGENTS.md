@@ -85,10 +85,12 @@ computed at f16, this engine's integer matmul sits closer to exact than
 llama.cpp's own does. `docs/BENCHMARKS.md` has every one of those numbers and
 `docs/KERNELS.md` has the design.
 
-The limits that remain are narrower. Only the **matmul** reads packed blocks -
-the embedding table is still gathered at f32, because a gather is not a matmul
-and it has its own kernel. And a *weight* still may not arrive packed as the
-left operand of a matmul; that refusal stands.
+The limit that remains is narrower still. This paragraph used to say only the
+matmul read packed blocks and the embedding table was still gathered at f32;
+the gather has its own packed kernel now, `embed_q`, so a quantized checkpoint
+occupies its file's size on the card and nothing more - `docs/BENCHMARKS.md`
+has the residency table. What still holds is that a *weight* may not arrive
+packed as the left operand of a matmul; that refusal stands.
 
 ## Current standing
 

@@ -2240,3 +2240,147 @@ fn an_f16_cache_serves_the_same_attention_as_an_f32_one() {
         2e-3,
     );
 }
+
+/// The three-kernel decode chain, on the CPU, for one query position.
+///
+/// `k` is `[kv_heads][cap][hd]` and `v` is `[kv_heads][hd][cap]` - the
+/// layouts the append kernels write - already rounded to whatever width the
+/// device copy holds. Query head `h * group + g` reads key-value head `h`.
+#[allow(clippy::too_many_arguments)]
+fn decode_attention_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    tk: usize,
+    cap: usize,
+    scale: f32,
+    scale_q: bool,
+) -> Vec<f32> {
+    let group = heads / kv_heads;
+    let mut out = vec![0.0f32; heads * hd];
+    for qh in 0..heads {
+        let h = qh / group;
+        let qr = &q[qh * hd..(qh + 1) * hd];
+        let mut s: Vec<f32> = (0..tk)
+            .map(|t| {
+                let kr = &k[(h * cap + t) * hd..(h * cap + t + 1) * hd];
+                let dot: f32 = qr
+                    .iter()
+                    .zip(kr)
+                    .map(|(a, b)| if scale_q { a * scale * b } else { a * b })
+                    .sum();
+                if scale_q { dot } else { dot * scale }
+            })
+            .collect();
+        let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut l = 0.0f32;
+        for x in s.iter_mut() {
+            *x = (*x - m).exp();
+            l += *x;
+        }
+        for d in 0..hd {
+            let vr = &v[(h * hd + d) * cap..(h * hd + d) * cap + tk];
+            let acc: f32 = s.iter().zip(vr).map(|(p, x)| p * x).sum();
+            out[qh * hd + d] = acc / l;
+        }
+    }
+    out
+}
+
+/// The fused single-query attention against the chain it replaces, at every
+/// shape the engine decodes: the chat model's grouped 128-wide f16 cache,
+/// the ASR's 64-wide f16 cross cache and its 64-wide f32 self cache, at
+/// context lengths that are one chunk, an exact chunk, a chunk and one key,
+/// several chunks and an odd tail - the odd tail being the case where a
+/// packed value row's last word holds a key the softmax must have zeroed.
+#[test]
+fn the_fused_decode_attention_matches_the_chain() {
+    let Some(g) = gpu() else { return };
+    let mut scratch = xabe_cuda::DecodeScratch::new();
+    // (heads, kv_heads, hd, tk, cap, f16 cache, scale on the query)
+    let cases = [
+        (8usize, 2usize, 128usize, 1usize, 256usize, true, false),
+        (8, 2, 128, 63, 256, true, false),
+        (8, 2, 128, 64, 256, true, false),
+        (8, 2, 128, 65, 256, true, false),
+        (8, 2, 128, 200, 256, true, false),
+        (8, 2, 128, 256, 256, true, false),
+        (4, 4, 128, 130, 512, true, false),
+        (6, 6, 64, 1500, 1500, true, true),
+        (6, 6, 64, 1499, 1500, true, true),
+        (6, 6, 64, 37, 448, false, true),
+        (6, 6, 64, 129, 448, false, true),
+        (6, 6, 64, 448, 448, false, true),
+    ];
+    for (i, &(heads, kv, hd, tk, cap, half, scale_q)) in cases.iter().enumerate() {
+        let salt = 300 + 3 * i as u64;
+        let q = seq(heads * hd, salt);
+        let k0 = seq(kv * cap * hd, salt + 1);
+        let v0 = seq(kv * hd * cap, salt + 2);
+        let (k, v) = if half {
+            (through_f16(&k0), through_f16(&v0))
+        } else {
+            (k0.clone(), v0.clone())
+        };
+        let scale = 0.11f32;
+        let want = decode_attention_ref(&q, &k, &v, heads, kv, hd, tk, cap, scale, scale_q);
+        let dq = g.upload(&q).unwrap();
+        let name = format!("attn_decode heads {heads} kv {kv} hd {hd} tk {tk} f16 {half}");
+        let got = if half {
+            let dk = g.upload_f16(&k0).unwrap();
+            let dv = g.upload_f16(&v0).unwrap();
+            let first = g
+                .attn_decode_f16(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .unwrap();
+            // Twice through the same scratch: the merging block resets the
+            // head's counter, and a counter left dirty would make the second
+            // call merge too early or never.
+            let again = g
+                .attn_decode_f16(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .unwrap();
+            let (a, b) = (g.download(&first).unwrap(), g.download(&again).unwrap());
+            assert_eq!(a, b, "{name}: not reproducible through one scratch");
+            a
+        } else {
+            let dk = g.upload(&k).unwrap();
+            let dv = g.upload(&v).unwrap();
+            let first = g
+                .attn_decode(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .unwrap();
+            let again = g
+                .attn_decode(&dq, &dk, &dv, heads, kv, hd, tk, cap, scale, scale_q, &mut scratch)
+                .unwrap();
+            let (a, b) = (g.download(&first).unwrap(), g.download(&again).unwrap());
+            assert_eq!(a, b, "{name}: not reproducible through one scratch");
+            a
+        };
+        assert_close_to(&name, &want, &got, 2e-5);
+    }
+
+    // The shapes it refuses, by name rather than by wrong answer.
+    let dq = g.upload(&seq(8 * 128, 1)).unwrap();
+    let dk = g.upload_f16(&seq(2 * 256 * 128, 2)).unwrap();
+    assert!(
+        g.attn_decode_f16(&dq, &dk, &dk, 8, 2, 96, 10, 256, 1.0, false, &mut scratch)
+            .is_err(),
+        "a head width it is not instantiated at"
+    );
+    assert!(
+        g.attn_decode_f16(&dq, &dk, &dk, 8, 2, 128, 257, 256, 1.0, false, &mut scratch)
+            .is_err(),
+        "more keys than the cache holds"
+    );
+    assert!(
+        g.attn_decode_f16(&dq, &dk, &dk, 8, 2, 128, 0, 256, 1.0, false, &mut scratch)
+            .is_err(),
+        "no keys at all"
+    );
+    assert!(
+        g.attn_decode_f16(&dq, &dk, &dk, 10, 2, 128, 10, 256, 1.0, false, &mut scratch)
+            .is_err(),
+        "a group wider than the kernel carries"
+    );
+}

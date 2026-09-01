@@ -108,6 +108,53 @@ const CONV_OC_TILE: u32 = 8;
 /// Time positions each convolution thread accumulates. Must match `T_REG`.
 const CONV_T_REG: u32 = 4;
 
+
+/// What the fused decode attention keeps between calls.
+///
+/// A block per chunk of keys writes its partial - a running maximum, a sum and
+/// an unnormalised context - here, and the last block to finish for a head
+/// merges them. The counters that decide which block is last start at zero
+/// and are reset by the block that reads them, so this is allocated once and
+/// never zeroed again; the partials are never read before they are written.
+///
+/// Held by the caller rather than by [`Gpu`] because the device handle is
+/// shared by every stage, and two stages decoding by turns must not share a
+/// counter. It grows when a longer context needs more chunks, which is a
+/// logarithmic number of allocations over a conversation and none in steady
+/// state - the same reasoning the KV caches follow.
+pub struct DecodeScratch {
+    part: Option<CudaSlice<f32>>,
+    ctr: Option<CudaSlice<u32>>,
+    kv_heads: usize,
+    head_dim: usize,
+    chunks: usize,
+}
+
+impl DecodeScratch {
+    /// Empty; the first call allocates.
+    pub fn new() -> Self {
+        Self {
+            part: None,
+            ctr: None,
+            kv_heads: 0,
+            head_dim: 0,
+            chunks: 0,
+        }
+    }
+}
+
+impl Default for DecodeScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Which cache the fused decode attention reads.
+enum KvCache<'a> {
+    F32(&'a CudaSlice<f32>, &'a CudaSlice<f32>),
+    F16(&'a CudaSlice<u16>, &'a CudaSlice<u16>),
+}
+
 /// An open CUDA device with the kernels compiled and loaded.
 pub struct Gpu {
     stream: Arc<CudaStream>,
@@ -516,6 +563,10 @@ const NAMES: &[&str] = &[
     "causal_mask",
     "lstm_gates",
     "coupling_inverse",
+    "attn_decode_h128",
+    "attn_decode_h64",
+    "attn_decode_f64",
+    "embed_q",
 ];
 
 impl Gpu {
@@ -2459,6 +2510,65 @@ impl Gpu {
         Ok(out)
     }
 
+    /// [`Self::embed_scaled`] off a table that stays in its checkpoint's
+    /// blocks.
+    ///
+    /// `table` is `vocab` rows of `ch` elements in `ty`'s blocks, as
+    /// [`Self::upload_quant`] laid them out; each gathered row is unpacked on
+    /// the way out. Refuses a row that is not a whole number of blocks, since
+    /// a row that started mid-block would decode plausibly and wrongly.
+    pub fn embed_packed(
+        &self,
+        table: &CudaSlice<u8>,
+        ty: Quant,
+        ids: &CudaSlice<i64>,
+        t: usize,
+        ch: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let bs = ty.block_size();
+        if !ch.is_multiple_of(bs) {
+            return Err(CudaError::RaggedBlock { k: ch, block: bs });
+        }
+        if ids.len() < t {
+            return Err(CudaError::SliceOverrun {
+                at: t,
+                len: ids.len(),
+            });
+        }
+        // SAFETY: one block a row writes every one of the row's `ch`
+        // elements, and the grid has `t` blocks.
+        let mut out = unsafe { self.uninit(t * ch) }?;
+        if t == 0 {
+            return Ok(out);
+        }
+        let (tyi, bsi, tsi, ti, chi) = (
+            ty.id(),
+            bs as i32,
+            ty.device_stride() as i32,
+            t as i32,
+            ch as i32,
+        );
+        let f = self.func("embed_q");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(table)
+            .arg(&tyi)
+            .arg(&bsi)
+            .arg(&tsi)
+            .arg(ids)
+            .arg(&mut out)
+            .arg(&ti)
+            .arg(&chi)
+            .arg(&scale);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (t as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launched("embed_q", unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
     /// Fuses weight normalisation. Mirrors `xabe_dsp::fuse_weight_norm`.
     /// SiLU in place, unfused.
     pub fn silu(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
@@ -3462,6 +3572,228 @@ impl Gpu {
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };
+        launched(name, unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
+    /// Attention for one query position, in one launch, off an f16 cache.
+    ///
+    /// `q` is `[heads, head_dim]` with the query heads of a grouped-query
+    /// group adjacent, which is the layout one decode row already has. The
+    /// caches are the append kernels' layouts: keys `[kv_heads, cap,
+    /// head_dim]`, values `[kv_heads, head_dim, cap]`, `tk` positions of each
+    /// live. Returns `[heads, head_dim]`, which for one row is `[heads *
+    /// head_dim]` and needs no merge.
+    ///
+    /// Replaces the score product, the softmax and the value product - three
+    /// launches and a score row written and read back twice - with one kernel
+    /// that keeps the scores in shared memory. `scale_q` puts the scale on
+    /// the query before the product, as Whisper does; otherwise it goes on
+    /// the scores, as Llama does. See the kernel for the arithmetic.
+    ///
+    /// Only the widths the kernel is instantiated at: 64 and 128.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_f16(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+        scale: f32,
+        scale_q: bool,
+        scratch: &mut DecodeScratch,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if !cap.is_multiple_of(2) {
+            return Err(CudaError::OddCacheCapacity { cap });
+        }
+        let name = match head_dim {
+            128 => "attn_decode_h128",
+            64 => "attn_decode_h64",
+            _ => {
+                return Err(CudaError::UnsupportedAttention {
+                    head_dim,
+                    heads,
+                    kv_heads,
+                });
+            }
+        };
+        self.attn_decode_inner(
+            name,
+            q,
+            KvCache::F16(k, v),
+            heads,
+            kv_heads,
+            head_dim,
+            tk,
+            cap,
+            scale,
+            scale_q,
+            scratch,
+        )
+    }
+
+    /// [`Self::attn_decode_f16`] off an f32 cache, at head width 64 - the
+    /// ASR's self-attention cache, which is the one f32 cache still decoded
+    /// against.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+        scale: f32,
+        scale_q: bool,
+        scratch: &mut DecodeScratch,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if head_dim != 64 {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim,
+                heads,
+                kv_heads,
+            });
+        }
+        self.attn_decode_inner(
+            "attn_decode_f64",
+            q,
+            KvCache::F32(k, v),
+            heads,
+            kv_heads,
+            head_dim,
+            tk,
+            cap,
+            scale,
+            scale_q,
+            scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn_decode_inner(
+        &self,
+        name: &'static str,
+        q: &CudaSlice<f32>,
+        kv: KvCache<'_>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+        scale: f32,
+        scale_q: bool,
+        scratch: &mut DecodeScratch,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        // The kernel carries at most `AD_GMAX` query rows a key-value head,
+        // and a group of zero is a division by it.
+        if kv_heads == 0
+            || !heads.is_multiple_of(kv_heads)
+            || heads / kv_heads > kernels::AD_GMAX as usize
+        {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim,
+                heads,
+                kv_heads,
+            });
+        }
+        if tk == 0 || tk > cap {
+            return Err(CudaError::CacheOverrun { at: tk, cap });
+        }
+        let (klen, vlen) = match &kv {
+            KvCache::F32(k, v) => (k.len(), v.len()),
+            KvCache::F16(k, v) => (k.len(), v.len()),
+        };
+        let need = kv_heads * cap * head_dim;
+        if klen < need || vlen < need {
+            return Err(CudaError::SliceOverrun {
+                at: need,
+                len: klen.min(vlen),
+            });
+        }
+        if q.len() < heads * head_dim {
+            return Err(CudaError::SliceOverrun {
+                at: heads * head_dim,
+                len: q.len(),
+            });
+        }
+        let group = heads / kv_heads;
+        let chunks = tk.div_ceil(kernels::AD_CH as usize);
+
+        // Grow the scratch to this call's shape. Doubling the chunk count
+        // keeps the allocations logarithmic in the context; a change of head
+        // geometry, which no stage ever makes, starts over.
+        let stride = kernels::AD_GMAX as usize * (head_dim + 2);
+        if scratch.kv_heads != kv_heads || scratch.head_dim != head_dim {
+            scratch.part = None;
+            scratch.ctr = None;
+            scratch.chunks = 0;
+            scratch.kv_heads = kv_heads;
+            scratch.head_dim = head_dim;
+        }
+        if scratch.ctr.is_none() {
+            scratch.ctr = Some(self.stream.alloc_zeros::<u32>(kv_heads).map_err(
+                |source| CudaError::Driver {
+                    what: "allocating",
+                    source,
+                },
+            )?);
+        }
+        if scratch.chunks < chunks || scratch.part.is_none() {
+            let want = chunks.next_power_of_two().max(4);
+            // SAFETY: a partial is read only by the block that merges a head,
+            // and only for the chunks and rows that this same launch wrote.
+            scratch.part = Some(unsafe { self.uninit(kv_heads * want * stride) }?);
+            scratch.chunks = want;
+        }
+        let part = scratch.part.as_mut().expect("allocated above");
+        let ctr = scratch.ctr.as_mut().expect("allocated above");
+
+        // SAFETY: every element is written by exactly one thread - of the only
+        // block when there is one chunk, of the merging block otherwise.
+        let mut out = unsafe { self.uninit(heads * head_dim) }?;
+        let (tki, gi, ci, sqi, chi) = (
+            tk as i32,
+            group as i32,
+            cap as i32,
+            i32::from(scale_q),
+            chunks as i32,
+        );
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(q);
+        match kv {
+            KvCache::F32(k, v) => {
+                lb.arg(k).arg(v);
+            }
+            KvCache::F16(k, v) => {
+                lb.arg(k).arg(v);
+            }
+        }
+        lb.arg(&mut out)
+            .arg(part)
+            .arg(ctr)
+            .arg(&tki)
+            .arg(&gi)
+            .arg(&ci)
+            .arg(&scale)
+            .arg(&sqi)
+            .arg(&chi);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (chunks as u32, kv_heads as u32, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the grid covers every (chunk, head) once; the caches are
+        // checked above to hold `kv_heads * cap * head_dim`, the chunk's keys
+        // are bounded by `tk <= cap` inside the kernel, and the scratch holds
+        // `chunks` partials a head.
         launched(name, unsafe { lb.launch(cfg) })?;
         Ok(out)
     }

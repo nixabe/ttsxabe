@@ -43,6 +43,8 @@ exists.
 | split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
 | KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
 | fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
+| single-row decode attention | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test) | `attn_decode_h128`, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
+| packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
 
 ## Also implemented
 
@@ -850,8 +852,8 @@ at four rows.
 Scores, mask, softmax and the value product for a whole prompt - or a whole
 encoder window - in one kernel, with nothing materialised. Both Llama stages
 take it for any multi-token pass and the Whisper encoder takes it for every
-layer; a single decode step keeps the unfused chain, whose score row is one
-`gemv` and has nothing to fuse.
+layer; a single decode step takes `attn_decode` below, which is organised
+around a different constraint.
 
 ### What it replaces, and why that was worth a kernel
 
@@ -1025,6 +1027,82 @@ A permuted position substitutes one averaged value for another - a whole
 spread, and many multiples of the tolerance - so the margin is still the thing
 the test measures. It is reported as the worst error's fraction of its own
 tolerance, so drift shows up before any single point crosses.
+
+## Decode attention, `attn_decode`
+
+The single-row twin of `flash_attn`: scores, softmax and the value product
+for **one** query position, in one launch, off the caches in place. Both Llama
+stages take it for every decoded token and the Whisper decoder takes it twice a
+layer, for its self-attention over an f32 cache and its cross-attention over
+the packed f16 encoder cache. `flash_attn` keeps the prompt.
+
+### Why a second kernel and not the first one at `tq = 1`
+
+`flash_attn` is built around `m16n8k8`, which wants sixteen query rows to fill
+an instruction; at one row it would compute fifteen sixteenths of nothing.
+And the single-row chain it replaces was not slow for the reason a prefill's
+chain was. A prefill materialised a score matrix that was real traffic. A decode
+step's score row is a few kilobytes - what it paid was **three launches a
+layer** and a value product whose one-row shape ran the cache at 200 to
+400 GB/s, on a card that streams at 585. So the single-row kernel is organised
+around traffic and launch count, not around the tensor cores.
+
+### Shape
+
+Grid `(chunks, kv_heads)`, a block per 64 keys of one key-value head, `HD`
+threads to a block. The block stages its 64 key rows through a shared tile,
+takes the `group` query heads' scores against them with two threads a key at
+`HD` 128 and one at 64, softmaxes the chunk in one warp, then stages the same
+64 positions of the value rows into the *same* tile and has each thread
+contract one output element over them. Both stagings read global memory along
+the contiguous axis - a key row, or a value row's run of positions - and both
+tiles carry a stride chosen so that the warp's 32 lanes land on 32 banks:
+`W + TPK` words for the keys, where `TPK` threads share a key and interleave
+their words, and an odd stride for the values. Without the staging, a lane
+walking its own cache row a stride apart is the pattern `split_heads_t` was
+measured at 141 GB/s for.
+
+**The chunks are merged by the last block to finish**, so it stays one launch.
+Each block writes its running maximum, its sum and its unnormalised context to
+a scratch buffer, bumps the head's counter behind a fence, and the block that
+sees the count reach `chunks - 1` merges every chunk with the usual
+`exp(m_c - m)` rescaling and puts the counter back to zero. `DecodeScratch`
+owns that buffer and those counters; it is held by the caller's cache rather
+than by `Gpu`, because two sequences decoding by turns must not share a
+counter, and the Whisper decoder keeps one for each of its two attentions for
+the same reason. At one chunk the block writes the output directly.
+
+**The grouped-query rows share every read.** The four query heads of a chat
+model group are four score rows against one staged key tile and four
+accumulators against one staged value tile, which is what `gemv_rows` bought
+by being a separate kernel and this gets for free.
+
+### The arithmetic is the chain's
+
+Scores are f32 sums of f16-or-f32 cache elements against f32 queries, the
+softmax is `__expf` as in `softmax_causal`, the context is an f32 sum. The
+association differs and nothing else. `scale_q` puts the scale on the query
+before the product, which is where Whisper puts it - and where the
+`scale_inplace` launch this also replaces put it - or on the scores after,
+where Llama does. Same algebra, not the same rounding, and each model keeps
+its own. The differential test runs every shape the engine decodes at, at
+context lengths of one chunk, an exact chunk, a chunk and one key, several
+chunks and an odd tail - the odd tail being the case where a packed value row's
+last word holds a position the softmax must have zeroed - and runs each twice
+through one scratch, because a counter left dirty merges too early or never.
+
+## Packed embeddings, `embed_q`
+
+The one packed tensor a matmul never sees. `docs/MILESTONES.md` recorded that
+the embedding table was still widened to f32 at load - 2.0 GB at the chat
+model's 128 256-row vocabulary, 1.1 GB at the translator's - because a gather
+is not a matmul and had no kernel that read blocks. It has one now: a block a
+row, each thread unpacking its elements with `q_elem`, the general per-element
+decoder the matmuls could not afford to call. A decode step gathers one row of
+a few thousand elements, so the per-element header decode costs nothing that
+can be measured and buys every block format at once. The numbers are the same
+as before to the bit: the blocks decode to exactly the f32 that used to be
+uploaded, and the test says so against the container crate's own decoder.
 
 ## `silu_mul_pair`, and why a launch is the unit that matters
 

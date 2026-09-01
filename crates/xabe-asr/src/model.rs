@@ -2,7 +2,7 @@
 
 use crate::AsrError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, Operand};
 use xabe_st::StSet;
 use xabe_whisper::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, Frontend, GenerationConfig, LayerNorm, Linear,
@@ -145,6 +145,12 @@ pub struct Cache {
     /// 73 MB across the stack, which is small enough that growing it would be
     /// machinery bought with nothing.
     cap: usize,
+    /// The fused decode attention's partials and counters, one set for the
+    /// self-attention and one for the cross-attention: the two run back to
+    /// back in a layer, and a counter must not be shared between launches
+    /// that may overlap. See `Gpu::attn_decode`.
+    self_scratch: DecodeScratch,
+    cross_scratch: DecodeScratch,
 }
 
 impl Cache {
@@ -708,6 +714,8 @@ impl AsrModel {
             cross_v,
             len: 0,
             cap,
+            self_scratch: DecodeScratch::new(),
+            cross_scratch: DecodeScratch::new(),
         })
     }
 
@@ -753,9 +761,20 @@ impl AsrModel {
         // normalisation to add it, so a decode step spends three launches a
         // layer rather than six on what is one pass either way.
         let mut res: Option<CudaSlice<f32>> = None;
+        // One row takes the fused single-query attention for both halves of
+        // a layer: the query is projected and handed over unscaled, because
+        // the kernel scales it on the way in exactly as `scale_inplace` did,
+        // and the scores, the softmax and the context are one launch rather
+        // than three. Eight launches a layer became two. A prefix of several
+        // rows keeps the chain, which is what `attend` is.
+        let fused = n == 1 && hd == 64;
+        let scale = (hd as f32).powf(-0.5);
         for (i, l) in self.dec_layers.iter().enumerate() {
             let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, n)?;
-            let q = self.queries(Operand::F32(&x), &l.attn, n, heads)?;
+            let q = match fused {
+                true => self.project(Operand::F32(&x), &l.attn.q, n)?,
+                false => self.queries(Operand::F32(&x), &l.attn, n, heads)?,
+            };
             let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
             let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
 
@@ -791,33 +810,68 @@ impl AsrModel {
                 true,
             )?;
             let tk = past + n;
-            let ctx = self.attend(
-                Operand::F32(&q),
-                Operand::F32(&cache.self_k[i]),
-                Operand::F32(&cache.self_v[i]),
-                n,
-                tk,
-                cap,
-                heads,
-                true,
-            )?;
+            let ctx = match fused {
+                true => self.gpu.attn_decode(
+                    &q,
+                    &cache.self_k[i],
+                    &cache.self_v[i],
+                    heads,
+                    heads,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    true,
+                    &mut cache.self_scratch,
+                )?,
+                false => self.attend(
+                    Operand::F32(&q),
+                    Operand::F32(&cache.self_k[i]),
+                    Operand::F32(&cache.self_v[i]),
+                    n,
+                    tk,
+                    cap,
+                    heads,
+                    true,
+                )?,
+            };
             let out = self.project(Operand::F32(&ctx), &l.attn.out, n)?;
 
             // Cross-attention. Only the queries come from the decoder; the
             // keys and values were built once from the encoder's output, which
             // is what makes a decode step cheap.
             let x = self.norm_add(&mut h, &out, &l.cross_ln, n)?;
-            let q = self.queries(Operand::F32(&x), &l.cross, n, heads)?;
-            let ctx = self.attend(
-                Operand::F32(&q),
-                Operand::F16(&cache.cross_k[i]),
-                Operand::F16(&cache.cross_v[i]),
-                n,
-                enc_t,
-                enc_t,
-                heads,
-                false,
-            )?;
+            let ctx = match fused {
+                true => {
+                    let q = self.project(Operand::F32(&x), &l.cross.q, n)?;
+                    self.gpu.attn_decode_f16(
+                        &q,
+                        &cache.cross_k[i],
+                        &cache.cross_v[i],
+                        heads,
+                        heads,
+                        hd,
+                        enc_t,
+                        enc_t,
+                        scale,
+                        true,
+                        &mut cache.cross_scratch,
+                    )?
+                }
+                false => {
+                    let q = self.queries(Operand::F32(&x), &l.cross, n, heads)?;
+                    self.attend(
+                        Operand::F32(&q),
+                        Operand::F16(&cache.cross_k[i]),
+                        Operand::F16(&cache.cross_v[i]),
+                        n,
+                        enc_t,
+                        enc_t,
+                        heads,
+                        false,
+                    )?
+                }
+            };
             let out = self.project(Operand::F32(&ctx), &l.cross.out, n)?;
             res = Some(self.feed_forward(&mut h, &out, &l.ffn_ln, &l.fc1, &l.fc2, n)?);
             if i < taps {

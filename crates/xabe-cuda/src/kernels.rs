@@ -45,6 +45,13 @@ pub const SOURCE: &str = r#"
 // monotonically with the contraction length. The operand rounding this does
 // cost is what the differential test against `xabe_dsp::linear` measures.
 
+// Keys one `attn_decode` block covers, and the query heads a key-value head
+// may serve there. Defined up here, beside the matmul's, because the Rust side
+// finds a `#define` by scanning this string at compile time and a name at the
+// far end of it costs more constant evaluation than rustc allows.
+#define AD_CH 64
+#define AD_GMAX 4
+
 #define GEMM_WARPS 8
 #define GEMM_MT    128
 #define GEMM_NT    128
@@ -4189,6 +4196,350 @@ extern "C" __global__ void coupling_inverse(
     out[i] = (x[i] - b) / expf(s);
 }
 
+// ------------------------------------------------------- decode attention
+//
+// One query position against a head-major cache, in one launch.
+//
+// A decode step used to reach attention as three kernels a layer - a score
+// mat-vec, a softmax and a value mat-vec - with the score row written to
+// global memory between them and re-read twice. At one query the score row is
+// tiny and the launches are what cost: three launches, three tails, and a
+// kernel whose whole job is fifty microseconds of exponentials. This kernel
+// does the chain in one pass and never materialises the scores at all.
+//
+// Shape. `q` is `[heads, HD]`, the query heads grouped so that query head
+// `h * group + g` reads key-value head `h` - which is how `split_heads` lays a
+// grouped-query model out, and how a multi-head one arrives with `group` 1.
+// The caches are the layouts the append kernels write: keys `[kv_heads, cap,
+// HD]` and values `[kv_heads, HD, cap]`, f16 or f32 by instantiation.
+//
+// Grid `(chunks, kv_heads)`, a block per `AD_CH` keys of one head, `HD`
+// threads a block. A block stages its 64 keys through shared memory *twice* -
+// the key rows, then the value rows into the same tile - because that is what
+// makes both halves of the product read global memory along the contiguous
+// axis and shared memory without a bank conflict. Reading the cache directly
+// would have each lane walking its own row a stride apart, which is the
+// pattern `split_heads_t` was measured at 141 GB/s for.
+//
+// The tile's row stride is `W + TPK` words: with `TPK` threads to a key, a
+// warp's 32 lanes are 32 / TPK keys times TPK interleaved word offsets, and
+// the stride being congruent to TPK modulo 32 is what spreads them over 32
+// banks. The value tile is `[HD][AD_CH]` at an odd stride for the same reason
+// with one thread a row.
+//
+// Chunks are combined by the last block to finish, which is the standard
+// fenced-counter pattern: each block writes its running maximum, its sum and
+// its unnormalised context to `part`, bumps the head's counter, and the block
+// that sees the count reach `chunks - 1` merges them with the usual
+// `exp(m_c - m)` rescaling and resets the counter for the next call. So the
+// counters must start at zero and are left at zero - `Gpu::attn_decode` owns
+// that. At one chunk the block writes the output directly.
+//
+// Arithmetic. Scores are f32 sums of f16-or-f32 cache elements against f32
+// queries, the softmax is `__expf` as in `softmax_causal`, and the context is
+// an f32 sum - the same operations the three-kernel chain performs, in a
+// different association. `scale_q` says where the scale goes: on the query
+// before the product, as Whisper does and as the `scale_inplace` launch this
+// replaces did, or on the scores after it, as Llama does. Algebraically
+// identical, not the same rounding, and each model keeps its own.
+
+template <int HD, bool KVH>
+__device__ __forceinline__ void attn_decode_impl(
+    const float* __restrict__ q,
+    const unsigned* __restrict__ kc,
+    const unsigned* __restrict__ vc,
+    float* __restrict__ out,
+    float* __restrict__ part,
+    unsigned* __restrict__ ctr,
+    int tk, int group, int cap, float scale, int scale_q, int chunks)
+{
+    constexpr int T   = HD;                  // threads a block
+    constexpr int W   = KVH ? HD / 2 : HD;   // words in a key row
+    constexpr int TPK = T / AD_CH;           // threads a key in the score pass
+    constexpr int KSTR = W + TPK;            // key tile stride, words
+    constexpr int VW  = KVH ? AD_CH / 2 : AD_CH; // words in a value row
+    constexpr int VSTR = VW + 1;             // value tile stride, words
+    constexpr int KWORDS = AD_CH * KSTR;
+    constexpr int VWORDS = HD * VSTR;
+    constexpr int TILE = KWORDS > VWORDS ? KWORDS : VWORDS;
+    static_assert(T % AD_CH == 0, "a chunk's keys are shared out over the block");
+    static_assert(W % 32 == 0, "the stride argument needs a row of whole warps of words");
+
+    __shared__ unsigned tile[TILE];
+    __shared__ float qs[AD_GMAX * HD];
+    __shared__ float sc[AD_GMAX * AD_CH];
+    __shared__ float m_s[AD_GMAX], l_s[AD_GMAX];
+    __shared__ int last;
+
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int h = blockIdx.y;
+    const int c = blockIdx.x;
+    const int kv0 = c * AD_CH;
+    const int nk = min(AD_CH, tk - kv0);
+    const float ninf = __int_as_float(0xff800000);
+
+    // The group's queries, scaled here when the scale belongs on the query.
+    const float qf = scale_q ? scale : 1.0f;
+    for (int i = tid; i < group * HD; i += T) {
+        qs[i] = q[(size_t)h * group * HD + i] * qf;
+    }
+
+    // Key rows kv0..kv0+nk into the tile, a row of W words each, read as
+    // 16-byte loads along the row. `cap` is even and so is kv0, so an f16
+    // row's word offset is exact.
+    {
+        const unsigned* kb = kc + ((size_t)h * cap + kv0) * W;
+        for (int i = tid; i < nk * (W / 4); i += T) {
+            const int r = i / (W / 4), j4 = i - r * (W / 4);
+            const uint4 w = *reinterpret_cast<const uint4*>(kb + (size_t)r * W + 4 * j4);
+            unsigned* d = tile + r * KSTR + 4 * j4;
+            d[0] = w.x; d[1] = w.y; d[2] = w.z; d[3] = w.w;
+        }
+    }
+    __syncthreads();
+
+    // Scores: TPK threads a key, interleaved over the row's words.
+    {
+        const int r = tid / TPK, p = tid - r * TPK;
+        float acc[AD_GMAX];
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            acc[g] = 0.0f;
+        }
+        if (r < nk) {
+            const unsigned* krow = tile + r * KSTR;
+            for (int jj = 0; jj < W / TPK; ++jj) {
+                const int j = jj * TPK + p;
+                const unsigned w = krow[j];
+                if (KVH) {
+                    float lo, hi;
+                    gemm_unpack(w, lo, hi);
+                    #pragma unroll
+                    for (int g = 0; g < AD_GMAX; ++g) {
+                        if (g < group) {
+                            acc[g] += qs[g * HD + 2 * j] * lo + qs[g * HD + 2 * j + 1] * hi;
+                        }
+                    }
+                } else {
+                    const float v = __uint_as_float(w);
+                    #pragma unroll
+                    for (int g = 0; g < AD_GMAX; ++g) {
+                        if (g < group) {
+                            acc[g] += qs[g * HD + j] * v;
+                        }
+                    }
+                }
+            }
+        }
+        if (TPK == 2) {
+            #pragma unroll
+            for (int g = 0; g < AD_GMAX; ++g) {
+                acc[g] += __shfl_xor_sync(0xffffffff, acc[g], 1);
+            }
+        }
+        if (p == 0 && r < AD_CH) {
+            const float sf = scale_q ? 1.0f : scale;
+            #pragma unroll
+            for (int g = 0; g < AD_GMAX; ++g) {
+                if (g < group) {
+                    sc[g * AD_CH + r] = (r < nk) ? acc[g] * sf : ninf;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // The softmax over the chunk, by warp 0, while the rest of the block
+    // stages the value rows into the same tile the scores have finished with.
+    if (tid < 32) {
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            if (g < group) {
+                float* row = sc + g * AD_CH;
+                float v0 = row[lane], v1 = row[lane + 32];
+                float m = fmaxf(v0, v1);
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+                }
+                const float p0 = (lane < nk) ? __expf(v0 - m) : 0.0f;
+                const float p1 = (lane + 32 < nk) ? __expf(v1 - m) : 0.0f;
+                float l = p0 + p1;
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    l += __shfl_xor_sync(0xffffffff, l, o);
+                }
+                row[lane] = p0;
+                row[lane + 32] = p1;
+                if (lane == 0) {
+                    m_s[g] = m;
+                    l_s[g] = l;
+                }
+            }
+        }
+    }
+    {
+        // Value rows: HD rows of VW words, each row's chunk contiguous in the
+        // cache. The word past an odd `nk` holds a key the softmax gave a
+        // probability of zero, and is in bounds because `cap` is even.
+        const unsigned* vb = vc + ((size_t)h * HD * cap + kv0) * (KVH ? 1 : 2) / (KVH ? 2 : 2);
+        // (element offset (h*HD*cap + kv0), in words: /2 for f16, x1 for f32)
+        const int nw = KVH ? (nk + 1) / 2 : nk;
+        for (int i = tid; i < HD * nw; i += T) {
+            const int d = i / nw, j = i - d * nw;
+            tile[d * VSTR + j] = vb[(size_t)d * (KVH ? cap / 2 : cap) + j];
+        }
+    }
+    __syncthreads();
+
+    // The context: one thread an output element, the probabilities read as a
+    // broadcast and the value row from the tile at a conflict-free stride.
+    float o[AD_GMAX];
+    #pragma unroll
+    for (int g = 0; g < AD_GMAX; ++g) {
+        o[g] = 0.0f;
+    }
+    {
+        const int d = tid;
+        const unsigned* vrow = tile + d * VSTR;
+        const int nw = KVH ? (nk + 1) / 2 : nk;
+        for (int j = 0; j < nw; ++j) {
+            const unsigned w = vrow[j];
+            if (KVH) {
+                float lo, hi;
+                gemm_unpack(w, lo, hi);
+                #pragma unroll
+                for (int g = 0; g < AD_GMAX; ++g) {
+                    if (g < group) {
+                        o[g] += sc[g * AD_CH + 2 * j] * lo + sc[g * AD_CH + 2 * j + 1] * hi;
+                    }
+                }
+            } else {
+                const float v = __uint_as_float(w);
+                #pragma unroll
+                for (int g = 0; g < AD_GMAX; ++g) {
+                    if (g < group) {
+                        o[g] += sc[g * AD_CH + j] * v;
+                    }
+                }
+            }
+        }
+    }
+
+    if (chunks == 1) {
+        #pragma unroll
+        for (int g = 0; g < AD_GMAX; ++g) {
+            if (g < group) {
+                out[((size_t)h * group + g) * HD + tid] = o[g] / l_s[g];
+            }
+        }
+        return;
+    }
+
+    // Several chunks: publish this one's partial and let the last block merge.
+    float* mine = part + ((size_t)(h * chunks + c) * AD_GMAX) * (HD + 2);
+    #pragma unroll
+    for (int g = 0; g < AD_GMAX; ++g) {
+        if (g < group) {
+            mine[g * (HD + 2) + tid] = o[g];
+            if (tid == 0) {
+                mine[g * (HD + 2) + HD] = m_s[g];
+                mine[g * (HD + 2) + HD + 1] = l_s[g];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned prev = atomicAdd(ctr + h, 1u);
+        last = (prev == (unsigned)(chunks - 1));
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    const volatile float* all = part + ((size_t)h * chunks * AD_GMAX) * (HD + 2);
+    #pragma unroll
+    for (int g = 0; g < AD_GMAX; ++g) {
+        if (g < group) {
+            float m = ninf;
+            for (int cc = 0; cc < chunks; ++cc) {
+                m = fmaxf(m, all[((size_t)cc * AD_GMAX + g) * (HD + 2) + HD]);
+            }
+            float l = 0.0f, acc = 0.0f;
+            for (int cc = 0; cc < chunks; ++cc) {
+                const volatile float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
+                const float f = __expf(pc[HD] - m);
+                l += pc[HD + 1] * f;
+                acc += pc[tid] * f;
+            }
+            out[((size_t)h * group + g) * HD + tid] = acc / l;
+        }
+    }
+    if (tid == 0) {
+        ctr[h] = 0u;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128) void attn_decode_h128(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ kc,
+    const unsigned short* __restrict__ vc,
+    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
+    int tk, int group, int cap, float scale, int scale_q, int chunks)
+{
+    attn_decode_impl<128, true>(q, (const unsigned*)kc, (const unsigned*)vc, out,
+                                part, ctr, tk, group, cap, scale, scale_q, chunks);
+}
+
+extern "C" __global__ __launch_bounds__(64) void attn_decode_h64(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ kc,
+    const unsigned short* __restrict__ vc,
+    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
+    int tk, int group, int cap, float scale, int scale_q, int chunks)
+{
+    attn_decode_impl<64, true>(q, (const unsigned*)kc, (const unsigned*)vc, out,
+                               part, ctr, tk, group, cap, scale, scale_q, chunks);
+}
+
+extern "C" __global__ __launch_bounds__(64) void attn_decode_f64(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
+    int tk, int group, int cap, float scale, int scale_q, int chunks)
+{
+    attn_decode_impl<64, false>(q, (const unsigned*)kc, (const unsigned*)vc, out,
+                                part, ctr, tk, group, cap, scale, scale_q, chunks);
+}
+
+// Gathers rows of a block-quantized embedding table, unpacking as it goes.
+//
+// The one tensor of a packed checkpoint that is not a matmul operand. It was
+// widened to f32 at load for want of this kernel, which at the 8 B chat
+// model's 128 256-row vocabulary was 2 GB on the card for a table the decode
+// reads one row of - see docs/BENCHMARKS.md. The unpacking is `q_elem`'s,
+// element by element: a step gathers a handful of rows of a few thousand
+// elements, so the per-element header decode the matmuls could not afford
+// costs nothing measurable here and buys every format at once.
+//
+// One block a row; `table` holds `ch / bs` blocks of `ts` bytes a row, in the
+// device layout `Gpu::upload_quant` wrote.
+extern "C" __global__ void embed_q(
+    const unsigned char* __restrict__ table, int ty, int bs, int ts,
+    const long long* __restrict__ ids, float* __restrict__ out,
+    int t, int ch, float scale)
+{
+    const int pos = blockIdx.x;
+    if (pos >= t) return;
+    const unsigned char* row = table + (size_t)ids[pos] * (size_t)(ch / bs) * (size_t)ts;
+    for (int c = threadIdx.x; c < ch; c += blockDim.x) {
+        out[(size_t)pos * ch + c] = q_elem(ty, row + (size_t)(c / bs) * ts, c % bs) * scale;
+    }
+}
+
 "#;
 
 /// The integer a `#define` in [`SOURCE`] binds to, read at compile time.
@@ -4265,3 +4616,7 @@ pub const GEMM_I8_MT_NARROW: u32 = define("GEMM_I8_MT_NARROW");
 pub const GEMV_ROWS_MAX: u32 = define("GEMV_ROWS_MAX");
 /// Rows of the weight one `gemm_i8` block covers.
 pub const GEMM_I8_NT: u32 = define("GEMM_I8_NT");
+/// Keys one `attn_decode` block covers; the grid's `x` step.
+pub const AD_CH: u32 = define("AD_CH");
+/// Query heads a key-value head may serve in `attn_decode`.
+pub const AD_GMAX: u32 = define("AD_GMAX");

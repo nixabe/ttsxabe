@@ -2,7 +2,7 @@
 
 use crate::ChatError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Q8, Quant};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, Bpe, LlamaConfig, LlamaWeights};
 
@@ -34,6 +34,25 @@ enum GWeight {
     /// Rounded to f16 at load. What an f16 or f32 checkpoint gives.
     F16(CudaSlice<u16>),
     /// The checkpoint's blocks, byte for byte, unpacked inside the matmul.
+    Packed {
+        /// The packed bytes.
+        data: CudaSlice<u8>,
+        /// Which layout reads them.
+        ty: Quant,
+    },
+}
+
+/// The token table on the device.
+///
+/// Gathered rather than multiplied, so it is the one packed tensor the
+/// matmuls never see. It used to be widened to f32 at load regardless of the
+/// file - 2 GB at this vocabulary for a table a decode step reads one row of -
+/// and now stays in its blocks when the file has them; `Gpu::embed_packed`
+/// unpacks the rows it gathers. See docs/BENCHMARKS.md.
+enum GEmbed {
+    /// Full width, what an f16 or f32 checkpoint gives.
+    F32(CudaSlice<f32>),
+    /// The checkpoint's blocks, unpacked a row at a time on lookup.
     Packed {
         /// The packed bytes.
         data: CudaSlice<u8>,
@@ -143,7 +162,7 @@ pub struct ChatModel {
     cfg: LlamaConfig,
     tokenizer: Bpe,
     gpu: Gpu,
-    embed: CudaSlice<f32>,
+    embed: GEmbed,
     layers: Vec<GLayer>,
     norm: CudaSlice<f32>,
     /// The output projection. Llama-3 does not tie it to the embedding.
@@ -180,6 +199,10 @@ pub struct Cache {
     /// logarithmic number of times and appends in place the rest.
     cap: usize,
     len: usize,
+    /// The fused decode attention's partials and counters; see
+    /// `Gpu::attn_decode_f16`. Per cache rather than per model because two
+    /// conversations decoding by turns must not share a counter.
+    scratch: DecodeScratch,
 }
 
 impl Cache {
@@ -194,6 +217,9 @@ impl Cache {
     }
 
     /// Drops everything, so the next forward pass starts from position zero.
+    ///
+    /// The attention scratch is kept: it holds nothing about the sequence,
+    /// and its counters are already at rest.
     pub fn clear(&mut self) {
         self.k.clear();
         self.v.clear();
@@ -364,8 +390,20 @@ impl ChatModel {
             tracing::warn!("no rope_freqs.weight; rope runs unscaled");
         }
 
+        // The table stays packed on the same condition a matrix does. It is
+        // never rope-permuted, so its bytes are the file's.
+        let embed = match (packing == Packing::Packed)
+            .then(|| w.embed_tokens.packed.and_then(|t| Quant::from_id(t as u32)))
+            .flatten()
+        {
+            Some(ty) => GEmbed::Packed {
+                data: gpu.upload_quant(ty, &Self::packed(&f, &w.embed_tokens, &cfg, ty)?)?,
+                ty,
+            },
+            None => GEmbed::F32(wide(&w.embed_tokens)?),
+        };
         let model = Self {
-            embed: wide(&w.embed_tokens)?,
+            embed,
             layers,
             norm: wide(&w.norm)?,
             lm_head: lin(&w.lm_head)?,
@@ -453,6 +491,7 @@ impl ChatModel {
             v: Vec::new(),
             cap: 0,
             len: 0,
+            scratch: DecodeScratch::new(),
         }
     }
 
@@ -593,9 +632,11 @@ impl ChatModel {
 
         let ids64: Vec<i64> = ids.iter().map(|&i| i64::from(i)).collect();
         // Llama does not scale its embeddings, unlike the models that do.
-        let mut h =
-            self.gpu
-                .embed_scaled(&self.embed, &self.gpu.upload_i64(&ids64)?, n, h_dim, 1.0)?;
+        let dids = self.gpu.upload_i64(&ids64)?;
+        let mut h = match &self.embed {
+            GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
+            GEmbed::Packed { data, ty } => self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?,
+        };
 
         // Room for `past + n` before any layer touches it, so the loop below
         // never allocates. Doubling from a floor of 256 means a 64-token decode
@@ -757,9 +798,29 @@ impl ChatModel {
             // the value product in one kernel, reading the query buffer and
             // the caches in place - no head split, no score matrix, no merge,
             // and the grouped heads read the one cached copy directly. A
-            // single step keeps the chain below: its score row is one gemv
-            // and there is nothing to fuse.
-            if n > 1 && hd == 128 {
+            // single step takes its own fused kernel, which does the same
+            // three things for one row without ever writing the score row -
+            // three launches a layer became one, and the grouped rows share
+            // every cache read. The chain below is what is left for a width
+            // neither kernel is instantiated at, which this checkpoint's
+            // never is.
+            if n == 1 && (hd == 128 || hd == 64) {
+                let ctx = self.gpu.attn_decode_f16(
+                    q,
+                    &cache.k[i],
+                    &cache.v[i],
+                    heads,
+                    kv_heads,
+                    hd,
+                    tk,
+                    cap,
+                    (hd as f32).powf(-0.5),
+                    false,
+                    &mut cache.scratch,
+                )?;
+                let out = self.project(Operand::F32(&ctx), &l.o, 1)?;
+                residual = Some(out);
+            } else if n > 1 && hd == 128 {
                 let ctx = self.gpu.flash_attn_f16(
                     q,
                     &cache.k[i],

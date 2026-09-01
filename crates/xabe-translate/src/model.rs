@@ -2,7 +2,7 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand, Q8, Quant};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -184,6 +184,21 @@ enum GWeight {
     },
 }
 
+/// The token table on the device, full width or in the file's blocks.
+///
+/// The chat model has the same pair for the same reason; see `xabe-chat`.
+enum GEmbed {
+    /// Full width, what a safetensors or unquantized GGUF gives.
+    F32(CudaSlice<f32>),
+    /// The checkpoint's blocks, unpacked a row at a time on lookup.
+    Packed {
+        /// The packed bytes.
+        data: CudaSlice<u8>,
+        /// Which layout reads them.
+        ty: Quant,
+    },
+}
+
 /// A projection, on the device.
 struct GLinear {
     w: GWeight,
@@ -268,12 +283,15 @@ pub struct Translator {
     gpu: Gpu,
     cfg: LlamaConfig,
     tokenizer: Tokenizer,
-    /// `[vocab, hidden]` at full width, for the lookup.
+    /// `[vocab, hidden]`, for the lookup.
     ///
     /// Read rather than multiplied: a token's vector goes straight into the
-    /// residual stream, where rounding it perturbs the input rather than the
-    /// arithmetic. 1.1 GB, against a model that is already 26.5.
-    embed: CudaSlice<f32>,
+    /// residual stream. Full width from a safetensors or f16 file; from a
+    /// quantized GGUF it stays in its blocks and the gather unpacks the rows
+    /// it reads - which is 1.1 GB against 160 MB at this vocabulary, and the
+    /// same numbers either way, since the blocks decode to exactly the f32
+    /// that used to be uploaded. See docs/BENCHMARKS.md.
+    embed: GEmbed,
     layers: Vec<GLayer>,
     norm: CudaSlice<f32>,
     /// The output projection, which this checkpoint does *not* tie to the
@@ -304,6 +322,10 @@ pub struct Cache {
     /// every token - quadratic in the context.
     cap: usize,
     len: usize,
+    /// The fused decode attention's partials and counters; see
+    /// `Gpu::attn_decode_f16`. Per cache, so two sequences decoding by turns
+    /// never share a counter.
+    scratch: DecodeScratch,
 }
 
 impl Cache {
@@ -468,7 +490,17 @@ impl Translator {
         }
 
         let model = Self {
-            embed: wide(&w.embed_tokens)?,
+            embed: match if packing == Packing::Packed {
+                src.packed(&w.embed_tokens, &cfg)?
+            } else {
+                None
+            } {
+                Some((bytes, ty)) => GEmbed::Packed {
+                    data: gpu.upload_quant(ty, &bytes)?,
+                    ty,
+                },
+                None => GEmbed::F32(wide(&w.embed_tokens)?),
+            },
             layers,
             norm: wide(&w.norm)?,
             lm_head: lin(&w.lm_head)?,
@@ -510,6 +542,7 @@ impl Translator {
             v: Vec::new(),
             cap: 0,
             len: 0,
+            scratch: DecodeScratch::new(),
         }
     }
 
@@ -649,9 +682,11 @@ impl Translator {
 
         let ids64: Vec<i64> = ids.iter().map(|&i| i64::from(i)).collect();
         // Llama does not scale its embeddings, unlike the models that do.
-        let mut h =
-            self.gpu
-                .embed_scaled(&self.embed, &self.gpu.upload_i64(&ids64)?, n, h_dim, 1.0)?;
+        let dids = self.gpu.upload_i64(&ids64)?;
+        let mut h = match &self.embed {
+            GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
+            GEmbed::Packed { data, ty } => self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?,
+        };
 
         // The block output the next normalisation still has to add; see where
         // it is set. The residual add and the normalisation read the same row,
@@ -779,10 +814,28 @@ impl Translator {
             // A prompt takes the fused attention: scores, mask, softmax and
             // the value product in one kernel, reading the query buffer and
             // the caches in place - no head split, no score matrix, no merge.
-            // A single step keeps the chain below: its score row is one gemv
-            // and there is nothing to fuse. So does any geometry the fused
-            // kernel's tiles do not cover, which this checkpoint's never is.
-            if n > 1 && hd == 128 {
+            // A single step takes its own fused kernel, which does the same
+            // for one row without writing the score row: three launches a
+            // layer became one. The chain below is what is left for a
+            // geometry neither kernel covers, which this checkpoint's never
+            // is.
+            if n == 1 && (hd == 128 || hd == 64) {
+                let ctx = self.gpu.attn_decode_f16(
+                    q,
+                    &cache.k[i],
+                    &cache.v[i],
+                    heads,
+                    heads,
+                    hd,
+                    tk,
+                    cap,
+                    (hd as f32).powf(-0.5),
+                    false,
+                    &mut cache.scratch,
+                )?;
+                let out = self.project(Operand::F32(&ctx), &l.o, 1)?;
+                residual = Some(out);
+            } else if n > 1 && hd == 128 {
                 let ctx = self.gpu.flash_attn_f16(
                     q,
                     &cache.k[i],

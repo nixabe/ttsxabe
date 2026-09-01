@@ -706,3 +706,45 @@ fn the_merged_context_twin_matches_a_separate_quantise() {
     assert_eq!(got_c, want_c, "codes");
     assert_eq!(got_s, want_s, "scales");
 }
+
+/// The packed embedding gather returns the rows the CPU decoder returns, in
+/// every format, including the two whose device layout is not the file's.
+#[test]
+fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
+    let Some(g) = gpu() else { return };
+    let (vocab, ch) = (9usize, 512usize);
+    for &(q, gt) in FORMATS {
+        let raw = blocks(q, vocab * ch / q.block_size(), 11);
+        let want = xabe_gguf::dequantize_blocks(gt, &raw, vocab * ch).expect("the CPU decoder");
+        let table = g.upload_quant(q, &raw).unwrap();
+        let ids: Vec<i64> = vec![8, 0, 3, 3, 8];
+        let dids = g.upload_i64(&ids).unwrap();
+        let got = g
+            .download(&g.embed_packed(&table, q, &dids, ids.len(), ch, 1.0).unwrap())
+            .unwrap();
+        for (r, &id) in ids.iter().enumerate() {
+            let w = &want[id as usize * ch..(id as usize + 1) * ch];
+            let e = &got[r * ch..(r + 1) * ch];
+            assert!(
+                w.iter().zip(e).all(|(a, b)| a == b),
+                "{q:?}: row {id} gathered wrong"
+            );
+        }
+        // A scale rides along, as the models that scale their embeddings want.
+        let scaled = g
+            .download(&g.embed_packed(&table, q, &dids, 1, ch, 0.5).unwrap())
+            .unwrap();
+        assert!(
+            scaled
+                .iter()
+                .zip(&want[8 * ch..9 * ch])
+                .all(|(a, b)| *a == b * 0.5),
+            "{q:?}: the scale was not applied"
+        );
+    }
+    // A row that is not a whole number of blocks is refused, not decoded.
+    let raw = blocks(Quant::Q4K, 4, 12);
+    let table = g.upload_quant(Quant::Q4K, &raw).unwrap();
+    let dids = g.upload_i64(&[0]).unwrap();
+    assert!(g.embed_packed(&table, Quant::Q4K, &dids, 1, 300, 1.0).is_err());
+}
