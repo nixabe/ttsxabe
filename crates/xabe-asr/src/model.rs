@@ -320,6 +320,41 @@ impl AsrModel {
             .layer_norm(x, rows, self.cfg.d_model, &n.w, &n.b, EPS)?)
     }
 
+    /// [`Self::norm`] or [`Self::norm_add`], depending on whether a sub-layer's
+    /// output is still waiting to be added.
+    ///
+    /// Only the first normalisation of a stack has nothing waiting.
+    fn normed(
+        &self,
+        h: &mut CudaSlice<f32>,
+        res: Option<&CudaSlice<f32>>,
+        n: &GNorm,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, AsrError> {
+        match res {
+            Some(r) => self.norm_add(h, r, n, rows),
+            None => self.norm(h, n, rows),
+        }
+    }
+
+    /// The residual sum and the normalisation that always follows it.
+    ///
+    /// Every normalisation in a block reads the residual stream immediately
+    /// after a sub-layer added to it, and nothing in between reads it - so the
+    /// sum is left for the pass that was going to be made anyway. `h` is
+    /// updated in place because it is what the next sub-layer adds to.
+    fn norm_add(
+        &self,
+        h: &mut CudaSlice<f32>,
+        res: &CudaSlice<f32>,
+        n: &GNorm,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, AsrError> {
+        Ok(self
+            .gpu
+            .layer_norm_add(h, res, rows, self.cfg.d_model, &n.w, &n.b, EPS)?)
+    }
+
     /// Attention, given queries already projected and split, and keys and
     /// values already split.
     ///
@@ -433,20 +468,26 @@ impl AsrModel {
     }
 
     /// A feed-forward block, applied in place on the residual stream.
+    ///
+    /// `res` is what the attention sub-layer produced and has not been added
+    /// yet: the normalisation takes it, for the reason [`Self::norm_add`]
+    /// gives. What this returns is this block's own output, unadded, for the
+    /// next normalisation to take the same way - so a residual add survives
+    /// only at the very end of a stack, where the last one is folded into the
+    /// final normalisation instead.
     fn feed_forward(
         &self,
         h: &mut CudaSlice<f32>,
+        res: &CudaSlice<f32>,
         ln: &GNorm,
         fc1: &GLinear,
         fc2: &GLinear,
         t: usize,
-    ) -> Result<(), AsrError> {
-        let x = self.norm(h, ln, t)?;
+    ) -> Result<CudaSlice<f32>, AsrError> {
+        let x = self.norm_add(h, res, ln, t)?;
         let mut inner = self.project(Operand::F32(&x), fc1, t)?;
         self.gpu.gelu(&mut inner, t * fc1.out_dim)?;
-        let out = self.project(Operand::F32(&inner), fc2, t)?;
-        self.gpu.add_inplace(h, &out, t * self.cfg.d_model)?;
-        Ok(())
+        self.project(Operand::F32(&inner), fc2, t)
     }
 
     /// The encoder, from log-mel features to `[1500, d_model]` on the device.
@@ -507,8 +548,13 @@ impl AsrModel {
         // arithmetic. `flash_attn` never writes a score anywhere; see
         // docs/BENCHMARKS.md for what it was worth here.
         let fused = self.gpu.supports_flash(hd, heads, heads);
+        // What the previous sub-layer produced and has not been added to the
+        // residual stream yet: the next normalisation takes it, for the reason
+        // `norm_add` gives. Only the first normalisation of the stack finds
+        // nothing here.
+        let mut res: Option<CudaSlice<f32>> = None;
         for (i, l) in self.enc_layers.iter().enumerate() {
-            let x = self.norm(&h, &l.attn_ln, t)?;
+            let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, t)?;
             let k = self.gpu.split_heads(
                 &self.project(Operand::F32(&x), &l.attn.k, t)?,
                 t,
@@ -547,15 +593,22 @@ impl AsrModel {
                 )?
             };
             let out = self.project(Operand::F32(&ctx), &l.attn.out, t)?;
-            self.gpu.add_inplace(&mut h, &out, t * d)?;
-
-            self.feed_forward(&mut h, &l.ffn_ln, &l.fc1, &l.fc2, t)?;
+            res = Some(self.feed_forward(&mut h, &out, &l.ffn_ln, &l.fc1, &l.fc2, t)?);
             if i < taps {
+                // A tap is the block's output, so the deferred sum is taken
+                // here. Same arithmetic as deferring it - the same two floats
+                // added in the same order - so a tapped run and a production
+                // one agree bit for bit, and the tap means what its name says.
+                let r = res.take().expect("the feed-forward always leaves one");
+                self.gpu.add_inplace(&mut h, &r, t * d)?;
                 tapped.push(self.gpu.download(&h)?);
             }
         }
 
-        Ok((self.norm(&h, &self.enc_ln, t)?, tapped))
+        Ok((
+            self.normed(&mut h, res.take().as_ref(), &self.enc_ln, t)?,
+            tapped,
+        ))
     }
 
     /// Builds the cache for one utterance from the encoder's output.
@@ -570,22 +623,23 @@ impl AsrModel {
         // `decode`; normalising the keys and values with it as well would be
         // an easy symmetry to assume and is not what the reference does.
         for l in &self.dec_layers {
-            let k = self.gpu.split_heads(
+            // Stored packed: every decode step reads all 32 layers of both, so
+            // this is 160 MB of traffic a token rather than 320. The split
+            // writes f16 directly - it is already touching every element, and
+            // a `to_f16` pass after it read and wrote the same 7.7 MB tensor
+            // again to change nothing but its width.
+            cross_k.push(self.gpu.split_heads_f16(
                 &self.project(Operand::F32(encoded), &l.cross.k, t)?,
                 t,
                 heads,
                 hd,
-            )?;
-            let v = self.gpu.split_heads_t(
+            )?);
+            cross_v.push(self.gpu.split_heads_t_f16(
                 &self.project(Operand::F32(encoded), &l.cross.v, t)?,
                 t,
                 heads,
                 hd,
-            )?;
-            // Stored packed: every decode step reads all 32 layers of both, so
-            // this is 160 MB of traffic a token rather than 320.
-            cross_k.push(self.gpu.to_f16(&k, t * d)?);
-            cross_v.push(self.gpu.to_f16(&v, t * d)?);
+            )?);
         }
         // The self-attention halves are allocated here rather than on the
         // first step, so a decode never allocates at all.
@@ -644,8 +698,12 @@ impl AsrModel {
         self.gpu.add_inplace(&mut h, &pos, n * d)?;
 
         let mut tapped = Vec::with_capacity(taps);
+        // As in the encoder: a sub-layer's output waits for the next
+        // normalisation to add it, so a decode step spends three launches a
+        // layer rather than six on what is one pass either way.
+        let mut res: Option<CudaSlice<f32>> = None;
         for (i, l) in self.dec_layers.iter().enumerate() {
-            let x = self.norm(&h, &l.attn_ln, n)?;
+            let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, n)?;
             let q = self.queries(Operand::F32(&x), &l.attn, n, heads)?;
             let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
             let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
@@ -693,12 +751,11 @@ impl AsrModel {
                 true,
             )?;
             let out = self.project(Operand::F32(&ctx), &l.attn.out, n)?;
-            self.gpu.add_inplace(&mut h, &out, n * d)?;
 
             // Cross-attention. Only the queries come from the decoder; the
             // keys and values were built once from the encoder's output, which
             // is what makes a decode step cheap.
-            let x = self.norm(&h, &l.cross_ln, n)?;
+            let x = self.norm_add(&mut h, &out, &l.cross_ln, n)?;
             let q = self.queries(Operand::F32(&x), &l.cross, n, heads)?;
             let ctx = self.attend(
                 Operand::F32(&q),
@@ -711,16 +768,18 @@ impl AsrModel {
                 false,
             )?;
             let out = self.project(Operand::F32(&ctx), &l.cross.out, n)?;
-            self.gpu.add_inplace(&mut h, &out, n * d)?;
-
-            self.feed_forward(&mut h, &l.ffn_ln, &l.fc1, &l.fc2, n)?;
+            res = Some(self.feed_forward(&mut h, &out, &l.ffn_ln, &l.fc1, &l.fc2, n)?);
             if i < taps {
+                // The deferred sum, taken here so the tap is the block's
+                // output. See the encoder for why this is the same arithmetic.
+                let r = res.take().expect("the feed-forward always leaves one");
+                self.gpu.add_inplace(&mut h, &r, n * d)?;
                 tapped.push(self.gpu.download(&h)?);
             }
         }
         cache.len = past + n;
 
-        let h = self.norm(&h, &self.dec_ln, n)?;
+        let h = self.normed(&mut h, res.take().as_ref(), &self.dec_ln, n)?;
         if taps > 0 {
             // The decoder's final normalisation, tapped under its own name so
             // a test can tell "the last block is wrong" from "the last norm

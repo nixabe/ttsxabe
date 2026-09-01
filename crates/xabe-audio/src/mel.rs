@@ -153,45 +153,99 @@ pub fn mel_power(samples: &[f32], cfg: &MelConfig, filters: &[f32]) -> Vec<f32> 
     let window = hann(cfg.n_fft);
     let fft = Fft::new(cfg.n_fft);
 
-    let mut out = vec![0.0f32; n_mels * frames];
-    let mut frame = vec![0.0f32; cfg.n_fft];
-    let mut bins = vec![0.0f32; 2 * n_freq];
-    let mut power = vec![0.0f32; n_freq];
-    // One frame's mel row, accumulated contiguously and then written out once.
-    // Accumulating straight into `out` reads and writes `n_mels` floats a
-    // *frames* apart for every one of `n_freq` bins - 16 thousand strided
-    // read-modify-writes a frame, over 940 KB, none of which stays in cache.
-    let mut row = vec![0.0f32; n_mels];
-    let mut scratch = fft.scratch();
+    // Frame-major while it is being filled, `[frames][n_mels]`, and transposed
+    // at the end. That is what lets the frames be split across threads without
+    // any of them touching another's memory: a frame owns one contiguous row
+    // here, where in the `[n_mels][frames]` output it owns one column and its
+    // writes are interleaved with everybody else's.
+    let mut rows = vec![0.0f32; frames * n_mels];
 
-    for t in 0..frames {
-        let start = t * cfg.hop;
-        // A frame of digital silence has a zero spectrum, so its contribution
-        // to every mel bin is exactly zero and `out` already holds that. This
-        // is not an approximation, and it is not a micro-optimisation either:
-        // a model with a fixed 30-second window spends most of its frontend on
-        // padding, and on a 2.7-second clip 91% of the frames are zeros. It
-        // took the frontend from 171 ms to a rounding error.
-        let src = &padded[start.min(padded.len())..(start + cfg.n_fft).min(padded.len())];
-        if src.iter().all(|&v| v == 0.0) {
-            continue;
+    // Which frames have anything in them, before deciding who does what.
+    //
+    // Splitting all `frames` evenly across threads is the obvious thing and it
+    // is worthless here, measured: the window is a fixed 30 seconds, a clip is
+    // a few, and the silence is all at the end - so an even split hands the
+    // first thread every non-empty frame and the other seven a run of zeros.
+    // It came out slower than one thread by the cost of the spawns. What gets
+    // split is the range that has signal in it.
+    //
+    // Found from the samples rather than by testing each frame: frame `t`
+    // covers `padded[t*hop .. t*hop + n_fft)`, so the frames that can be
+    // non-empty are those whose window overlaps the first and last non-zero
+    // sample. Interior silence is still skipped per frame below.
+    let (lo, hi) = match padded.iter().position(|&v| v != 0.0) {
+        None => (0, 0),
+        Some(a) => {
+            let b = padded.iter().rposition(|&v| v != 0.0).unwrap_or(a);
+            let lo = a.saturating_sub(cfg.n_fft - 1).div_ceil(cfg.hop);
+            (lo.min(frames), (b / cfg.hop + 1).min(frames))
         }
-        for (i, s) in frame.iter_mut().enumerate() {
-            *s = padded.get(start + i).copied().unwrap_or(0.0) * window[i];
+    };
+    let live = hi.saturating_sub(lo);
+
+    // One thread a core, at most eight, and never so many that a thread gets
+    // fewer than 64 frames to earn its spawn. The frames are independent and
+    // each one's arithmetic is unchanged, so this is bit-for-bit the serial
+    // answer - the reduction that could reorder is the filter bank's, and that
+    // stays inside a frame.
+    let want = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let threads = want.min(live.div_ceil(64)).max(1);
+    let per = live.div_ceil(threads);
+
+    std::thread::scope(|scope| {
+        for (chunk, part) in rows[lo * n_mels..hi * n_mels]
+            .chunks_mut(per * n_mels)
+            .enumerate()
+        {
+            let (padded, window, fft, filters) = (&padded, &window, &fft, &filters);
+            scope.spawn(move || {
+                let mut frame = vec![0.0f32; cfg.n_fft];
+                let mut bins = vec![0.0f32; 2 * n_freq];
+                let mut power = vec![0.0f32; n_freq];
+                let mut scratch = fft.scratch();
+                for (i, row) in part.chunks_mut(n_mels).enumerate() {
+                    let t = lo + chunk * per + i;
+                    let start = t * cfg.hop;
+                    // A frame of digital silence has a zero spectrum, so its
+                    // contribution to every mel bin is exactly zero and `row`
+                    // already holds that. This is not an approximation, and it
+                    // is not a micro-optimisation either: a model with a fixed
+                    // 30-second window spends most of its frontend on padding,
+                    // and on a 2.7-second clip 91% of the frames are zeros. It
+                    // took the frontend from 171 ms to a rounding error.
+                    let src =
+                        &padded[start.min(padded.len())..(start + cfg.n_fft).min(padded.len())];
+                    if src.iter().all(|&v| v == 0.0) {
+                        continue;
+                    }
+                    for (j, s) in frame.iter_mut().enumerate() {
+                        *s = padded.get(start + j).copied().unwrap_or(0.0) * window[j];
+                    }
+                    fft.forward_real_with(&frame, &mut bins, &mut scratch);
+                    for (p, c) in power.iter_mut().zip(bins.as_chunks::<2>().0) {
+                        *p = c[0] * c[0] + c[1] * c[1];
+                    }
+                    // Accumulated across a contiguous row rather than into the
+                    // output's column: `out[m * frames + t] += w * p` is
+                    // sixteen thousand strided read-modify-writes a frame,
+                    // over 940 KB, none of which stays in cache.
+                    for (k, &p) in power.iter().enumerate() {
+                        let filt = &filters[k * n_mels..(k + 1) * n_mels];
+                        for (r, &w) in row.iter_mut().zip(filt) {
+                            *r += w * p;
+                        }
+                    }
+                }
+            });
         }
-        fft.forward_real_with(&frame, &mut bins, &mut scratch);
-        for (p, c) in power.iter_mut().zip(bins.as_chunks::<2>().0) {
-            *p = c[0] * c[0] + c[1] * c[1];
-        }
-        row.fill(0.0);
-        for (i, &p) in power.iter().enumerate() {
-            let filt = &filters[i * n_mels..(i + 1) * n_mels];
-            for (r, &w) in row.iter_mut().zip(filt) {
-                *r += w * p;
-            }
-        }
-        for (m, &r) in row.iter().enumerate() {
-            out[m * frames + t] = r;
+    });
+
+    let mut out = vec![0.0f32; n_mels * frames];
+    for (t, row) in rows.chunks(n_mels).enumerate() {
+        for (m, &v) in row.iter().enumerate() {
+            out[m * frames + t] = v;
         }
     }
     out

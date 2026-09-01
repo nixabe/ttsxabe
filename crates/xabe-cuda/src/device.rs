@@ -458,6 +458,7 @@ const NAMES: &[&str] = &[
     "cache_append_t",
     "softmax_causal",
     "layer_norm",
+    "layer_norm_add",
     "softmax_rows",
     "act_relu",
     "act_leaky_relu",
@@ -498,6 +499,8 @@ const NAMES: &[&str] = &[
     "grouped_conv1d",
     "split_heads",
     "split_heads_t",
+    "split_heads_f16",
+    "split_heads_t_f16",
     "merge_heads",
     "causal_mask",
     "lstm_gates",
@@ -1696,6 +1699,43 @@ impl Gpu {
         Ok(out)
     }
 
+    /// The residual sum and the normalisation of it, in one pass.
+    ///
+    /// `h` becomes `h + res` - which is what the next sub-layer adds to, so it
+    /// has to survive - and the return is the normalisation of that. Mirrors
+    /// `xabe_dsp::layer_norm_add`.
+    ///
+    /// Every normalisation in a transformer block reads the residual stream
+    /// just after something was added to it, and nothing between the two reads
+    /// it. As two kernels that is five passes and two launches where this is
+    /// four and one: on the encoder's 1500 rows the passes are what costs, and
+    /// on a single decode step the row is five kilobytes and the launch is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm_add(
+        &self,
+        h: &mut CudaSlice<f32>,
+        res: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        weight: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let mut out = self.zeros(rows * cols)?;
+        let c = cols as i32;
+        let f = self.func("layer_norm_add");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(h)
+            .arg(res)
+            .arg(weight)
+            .arg(bias)
+            .arg(&mut out)
+            .arg(&c)
+            .arg(&eps);
+        launched("layer_norm_add", unsafe { lb.launch(Self::per_row(rows)) })?;
+        Ok(out)
+    }
+
     /// Softmax over each row, in place. Mirrors `xabe_dsp::softmax_rows`.
     pub fn softmax_rows(
         &self,
@@ -2748,6 +2788,35 @@ impl Gpu {
         self.reshape_heads("split_heads_t", x, t, heads, head_dim)
     }
 
+    /// [`Self::split_heads`], writing f16.
+    ///
+    /// For a tensor that is built once and then read whole many times - the
+    /// cross-attention cache is the case this exists for - where the split and
+    /// a `to_f16` pass after it read and write the same tensor twice to change
+    /// nothing but its width. The rounding is `f32_to_f16`'s, which is the
+    /// round-to-nearest-even the tiled matmul's own staging does, so an
+    /// operand converted here and one staged from f32 are the same bits.
+    pub fn split_heads_f16(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        self.reshape_heads_f16("split_heads_f16", x, t, heads, head_dim)
+    }
+
+    /// [`Self::split_heads_t`], writing f16.
+    pub fn split_heads_t_f16(
+        &self,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        self.reshape_heads_f16("split_heads_t_f16", x, t, heads, head_dim)
+    }
+
     /// `[heads, t, head_dim]` back to `[t, heads*head_dim]`.
     pub fn merge_heads(
         &self,
@@ -2927,6 +2996,31 @@ impl Gpu {
     ) -> Result<CudaSlice<f32>, CudaError> {
         let n = t * heads * head_dim;
         let mut out = self.zeros(n)?;
+        let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
+        let f = self.func(name);
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&a).arg(&b_).arg(&c);
+        launched(name, unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
+    }
+
+    /// [`Self::reshape_heads`] for the kernels that write f16.
+    fn reshape_heads_f16(
+        &self,
+        name: &'static str,
+        x: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        let n = t * heads * head_dim;
+        let mut out = self
+            .stream
+            .alloc_zeros::<u16>(n)
+            .map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
         let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
         let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);

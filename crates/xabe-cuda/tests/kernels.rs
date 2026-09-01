@@ -279,6 +279,77 @@ fn layer_norm_matches() {
     }
 }
 
+/// The fused residual-and-normalise, on both of the things it writes.
+///
+/// It updates the residual stream in place *and* returns the normalisation of
+/// it, and the in-place half is the one that is easy to get wrong quietly: a
+/// kernel that normalised the sum correctly but left `h` unsummed would pass
+/// any test that only looked at the return, and the next sub-layer would add
+/// to a stale stream. Both are checked, at the same column counts the
+/// unfused kernel is checked at.
+#[test]
+fn layer_norm_add_matches_the_sum_and_the_normalisation() {
+    let Some(g) = gpu() else { return };
+    for &(rows, cols) in &[(11usize, 192usize), (5, 700), (3, 257), (2, 1)] {
+        let h = seq(rows * cols, 41);
+        let res = seq(rows * cols, 42);
+        let w = seq(cols, 43);
+        let b = seq(cols, 44);
+
+        let mut want_h = h.clone();
+        let want = xabe_dsp::layer_norm_add(&mut want_h, &res, rows, cols, &w, &b, 1e-5);
+
+        let mut dh = g.upload(&h).unwrap();
+        let dres = g.upload(&res).unwrap();
+        let dw = g.upload(&w).unwrap();
+        let db = g.upload(&b).unwrap();
+        let out = g
+            .layer_norm_add(&mut dh, &dres, rows, cols, &dw, &db, 1e-5)
+            .unwrap();
+        assert_close(
+            &format!("layer_norm_add {rows}x{cols}"),
+            &want,
+            &g.download(&out).unwrap(),
+        );
+        assert_close(
+            &format!("layer_norm_add residual {rows}x{cols}"),
+            &want_h,
+            &g.download(&dh).unwrap(),
+        );
+    }
+}
+
+/// The packed head splits are the f32 ones with `to_f16` applied, exactly.
+///
+/// They exist to save a pass, not to round differently, so the claim is
+/// equality of every bit against the two-kernel chain they replace - anything
+/// looser would mean the cross-attention cache is a second approximation
+/// rather than the same one, and it is read by every decode step.
+#[test]
+fn the_packed_head_splits_are_the_f32_ones_converted() {
+    let Some(g) = gpu() else { return };
+    for &(t, heads, hd) in &[(7usize, 3usize, 4usize), (1500, 20, 64), (1, 2, 8)] {
+        let x = seq(t * heads * hd, 61);
+        let dx = g.upload(&x).unwrap();
+        for (plain, packed) in [
+            (
+                g.split_heads(&dx, t, heads, hd).unwrap(),
+                g.split_heads_f16(&dx, t, heads, hd).unwrap(),
+            ),
+            (
+                g.split_heads_t(&dx, t, heads, hd).unwrap(),
+                g.split_heads_t_f16(&dx, t, heads, hd).unwrap(),
+            ),
+        ] {
+            let want = g
+                .download_u16(&g.to_f16(&plain, t * heads * hd).unwrap())
+                .unwrap();
+            let got = g.download_u16(&packed).unwrap();
+            assert_eq!(want, got, "split {t}x{heads}x{hd} disagrees packed");
+        }
+    }
+}
+
 #[test]
 fn softmax_matches() {
     let Some(g) = gpu() else { return };

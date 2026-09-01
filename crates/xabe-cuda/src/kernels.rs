@@ -2478,6 +2478,64 @@ __global__ void layer_norm(
     }
 }
 
+// The same, taking the residual sum on the way in.
+//
+// Every normalisation in a transformer block reads `h + out` where `out` is
+// what the previous sub-layer produced, and nothing between the two reads `h`.
+// Done as two kernels that is a pass to add, a pass to write `h`, and then the
+// normalisation reading `h` again - five passes and two launches where this is
+// four and one. On a decode step the passes are five kilobytes and it is the
+// launch that costs; on the encoder's 1500 rows it is the passes.
+//
+// `h` is updated in place because the residual stream is what the next
+// sub-layer adds to, so the sum has to survive; `out` is dead afterwards.
+__global__ void layer_norm_add(
+    float* __restrict__ h, const float* __restrict__ res,
+    const float* __restrict__ weight, const float* __restrict__ bias,
+    float* __restrict__ out, int cols, float eps)
+{
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    float* hr = h + (size_t)row * cols;
+    const float* rr = res + (size_t)row * cols;
+    float* outr = out + (size_t)row * cols;
+
+    // The sum is folded in here, so `hr` holds it for every pass below and for
+    // whatever adds to the residual stream next.
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = hr[i] + rr[i];
+        hr[i] = v;
+        partial += v;
+    }
+    sdata[threadIdx.x] = partial;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / (float)cols;
+    __syncthreads();
+
+    partial = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float d = hr[i] - mean;
+        partial += d * d;
+    }
+    sdata[threadIdx.x] = partial;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    // The biased variance, matching torch.nn.LayerNorm.
+    float inv = rsqrtf(sdata[0] / (float)cols + eps);
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        outr[i] = (hr[i] - mean) * inv * weight[i] + bias[i];
+    }
+}
+
 // One block per row; subtracts the row max before exponentiating.
 __global__ void softmax_rows(float* __restrict__ x, int cols)
 {
@@ -3250,6 +3308,46 @@ extern "C" __global__ void split_heads_t(
     int h  = (i % d) / head_dim;
     int j  = i % head_dim;
     out[((size_t)h * head_dim + j) * t + ti] = x[i];
+}
+
+// The two above, writing f16 instead of f32.
+//
+// The cross-attention cache is built once an utterance and then read whole by
+// every decode step, so it is held packed - which used to mean a `split_heads`
+// pass at f32 and a `pack_f16` pass after it, reading and writing the same 7.7
+// MB tensor twice to change nothing but its width. The split is already
+// touching every element and `f32_to_f16` rounds the way `gemm_pack` does, so
+// the conversion is free where the element is already in a register.
+extern "C" __global__ void split_heads_f16(
+    const float* __restrict__ x,
+    unsigned short* __restrict__ out,
+    int t, int heads, int head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = heads * head_dim;
+    if (i >= t * d) {
+        return;
+    }
+    int ti = i / d;
+    int h  = (i % d) / head_dim;
+    int j  = i % head_dim;
+    out[((size_t)h * t + ti) * head_dim + j] = f32_to_f16(x[i]);
+}
+
+extern "C" __global__ void split_heads_t_f16(
+    const float* __restrict__ x,
+    unsigned short* __restrict__ out,
+    int t, int heads, int head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = heads * head_dim;
+    if (i >= t * d) {
+        return;
+    }
+    int ti = i / d;
+    int h  = (i % d) / head_dim;
+    int j  = i % head_dim;
+    out[((size_t)h * head_dim + j) * t + ti] = f32_to_f16(x[i]);
 }
 
 // [heads, t, head_dim] -> [t, heads * head_dim]. The inverse of `split_heads`.

@@ -38,7 +38,7 @@ pub use erf::{erf, gelu};
 pub use fft::{Fft, Scratch, dft, hann_periodic, istft, stft};
 pub use flow::coupling_inverse;
 pub use linear::linear;
-pub use norm::layer_norm;
+pub use norm::{layer_norm, layer_norm_add};
 pub use quantize::{GROUP, quantize_q8};
 pub use recurrent::lstm_gates;
 pub use rope::{rms_norm, rope, rope_scaled, silu, silu_mul};
