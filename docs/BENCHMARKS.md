@@ -3,8 +3,8 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.89x and 0.95x against `whisper-server` on two clips - a milestone still
-missed, now alternated in one sitting against a `whisper-server` built here
+0.89x to 0.95x against `whisper-server` from three to seven seconds of
+speech and 1.04x at ten, a milestone met only at the long end and missed, now alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
 stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
@@ -57,13 +57,39 @@ reading the same checkpoint converted by that tree's own
 was arithmetic across two sittings and said so; it is superseded rather than
 appended to.
 
-| clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
-| --- | --- | --- | --- |
-| 2.93 s | 211.9 ms | 188.4 ms | 0.89x |
-| 4.98 s | 250.8 ms | 237.7 ms | 0.95x |
+| clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
+| --- | --- | --- | --- | --- |
+| 2.93 s | 211.4 ms | 188.3 ms | 0.89x | identical |
+| 4.98 s | 251.3 ms | 237.1 ms | 0.94x | identical |
+| 7.28 s | 278.2 ms | 265.2 ms | 0.95x | differ |
+| 9.95 s | 338.7 ms | 352.7 ms | **1.04x** | differ |
 
-**This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
-for an ASR faster than `whisper-server`; it is 1.05x to 1.12x slower.
+`whisper-server` is started `-nf -bo 1 -bs -1` as well as without `--vad`, so
+both sides are strictly single-pass greedy with no temperature fallback -
+which is what this engine does and all it does. That turned out not to matter
+(the fallback was not firing and the numbers are unchanged either way) but it
+is the difference between a matched comparison and one that happened to be
+matched.
+
+**The milestone's target is met above about nine seconds of speech and missed
+below it, and the shape of that is the useful result.** The two engines have
+opposite cost structures. The encoder is a fixed 30-second window for both and
+ours is 28 ms slower at it, so every transcription starts 28 ms behind; the
+decode is cheaper here, by about 1.8 ms a token. From 2.93 s to 9.95 s our
+total grows 127 ms against their 164 for the same twenty-odd extra tokens, and
+the fixed deficit is paid off at roughly fifteen tokens.
+
+**The workload this engine exists for is the short end.** The pipeline runs
+greedy over VAD-gated utterances of a few seconds, which is 0.89x to 0.94x -
+so the honest reading is that the item is not met for the case that matters,
+and the 1.04x is a fact about where the curve crosses rather than a win to
+quote.
+
+The two longer clips are also weaker evidence for a second reason: the
+transcripts diverge. Both engines are single-pass greedy on the same weights,
+so the paths separate as they lengthen and neither is wrong relative to the
+other - but they are no longer doing quite the same work, and the two rows
+where the transcripts are identical are the ones to trust.
 
 The clips are synthesised rather than recorded, so the row is reproducible on
 any box that has the checkpoints - `bench/` is gitignored and the two lines are
@@ -1897,6 +1923,36 @@ What both rejections did establish is that the constraint was the instruction
 mix, and the round above acts on that. Both experiments themselves were
 reverted whole; neither entry point is carried unused, and the f16 cache is not
 in the shipped kernel.
+
+### The decode `gemv` does not want sixteen-byte weight loads either
+
+"Sixteen bytes a lane" is the finding the packed mat-vec was rebuilt around,
+and the f16 path - which is the one the ASR decoder runs, and the only stage
+that runs it at scale - still read four. Widening it to a `uint4` of weight
+against two `float4` of activation, guarded on the row dividing into whole
+16-byte loads, left the ASR decode loop at 78.7 ms against 77.5. Reverted.
+
+The reason is in "Sixteen bytes a lane" itself and was written down before this
+was tried: a wide weight load only pays with an activation narrow enough to
+keep up, which there meant int8. Here the activation is f32 and stays f32 -
+narrowing it to f16 is available and worth 5% on the tiled path, which is not
+enough to change the answer. The six attempts already recorded below were all
+on the packed path at the chat model's shapes; this is the same conclusion
+reached again on the other path and the other model's shapes.
+
+### The tiled `gemm` cannot buy a third resident block
+
+The move that worked for the fused attention - shrink the footprint, get a
+third block an SM, take the latency hiding - does not transfer. `gemm` ships
+with `__launch_bounds__(GEMM_WARPS * 32)` and no minimum, and ptxas already
+chooses two blocks' worth of registers: pinning 2 explicitly measures 110.5 ms
+against the unpinned 110.9, inside the noise. Pinning 3 measures **281.7 ms**
+and pinning 4 **747.8**. The accumulator alone is 64 floats a thread and
+capping registers at the 85 a third block needs spills it to local memory.
+
+Shared memory is not the constraint here - the two staged tiles are 20 KB and
+three would fit in the SM's 64 - which is what makes this different from the
+attention kernel, where shared was binding and register pressure was not.
 
 ### Stopping the translator at its stop string saved nothing measurable
 

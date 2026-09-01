@@ -81,12 +81,19 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.89x and 0.95x** against `whisper-server` on
-two clips — a stated milestone that is not met, recorded as a miss. That
-comparison used to be the one in the repository whose two halves were not
+medians. The ASR is **0.89x to 0.95x** against `whisper-server` from three to
+seven seconds of speech and **1.04x** at ten — a stated milestone met only at
+the long end, and recorded as a miss because the short end is what the pipeline
+runs on. The two engines have opposite cost structures: the encoder is a fixed
+30-second window for both and ours is 28 ms slower at it, so every
+transcription starts that far behind, while the decode is about 1.8 ms a token
+cheaper here and pays it off at roughly fifteen tokens.
+
+That comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
-with CUDA against the same checkpoint, converted by its own script, and the two
-are alternated in pairs in one run. What is left of the gap is the **encoder**
+with CUDA against the same checkpoint, converted by its own script, both sides
+are strictly single-pass greedy, and the two are alternated in pairs in one
+run. What is left of the gap is the **encoder**
 and nothing else: 111 ms against `whisper.cpp`'s 83, which is 28 of the 33 ms
 between the columns, and 86 of those 111 ms are a tiled `gemm` running at 22.4
 TFLOP/s. **What that is short of is not the arithmetic.** The instruction is

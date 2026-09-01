@@ -97,10 +97,18 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 **Item 17 is not met, and it is now measured the way the item asks for.**
 Against a `whisper-server` built here with CUDA from the same checkpoint and
 started without `--vad` so both do the same job, alternated in pairs over
-twenty rounds in one sitting: 212 ms against 188 on a 2.93 s clip and 251
-against 238 on a 4.98 s one - 0.89x and 0.95x, with identical transcripts on
-both. The "measured and interleaved" half of this item is satisfied; the
-"faster" half is not.
+twenty rounds in one sitting, both sides strictly single-pass greedy: 211 ms
+against 188 on a 2.93 s clip, 251 against 237 at 4.98 s, 278 against 265 at
+7.28 s, and 339 against 353 at 9.95 s - 0.89x, 0.94x, 0.95x and **1.04x**.
+
+**So the item is met above about nine seconds of speech and missed below it.**
+The two engines have opposite cost structures: the encoder is a fixed
+30-second window for both and ours is 28 ms slower at it, so every
+transcription starts that far behind, while the decode is about 1.8 ms a token
+cheaper here and pays the deficit off at roughly fifteen tokens. The pipeline
+runs this stage on VAD-gated utterances of a few seconds, which is the 0.89x
+end - so this is recorded as **not met**, because the case it is not met for is
+the case the engine exists to serve.
 
 The remaining gap is the **encoder**, entirely. `whisper-bench` on the same
 build puts `whisper.cpp`'s encoder at 83 ms against this one's 111, which is 28

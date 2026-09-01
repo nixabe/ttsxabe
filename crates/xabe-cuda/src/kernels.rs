@@ -1344,7 +1344,9 @@ extern "C" __global__ void gemm_reduce(
 // does not have. Twice the arithmetic rate is still the largest lever on this
 // card and llama.cpp takes it, which is why this path exists; what the old
 // numbers also implied - that the f16 kernel had nothing left - does not
-// follow. See docs/KERNELS.md. It is **the engine's second deliberate approximation**, and a
+// follow. See docs/KERNELS.md.
+//
+// This is **the engine's second deliberate approximation**, and a
 // larger one than the mat-vec's: both operands are quantized, where the f16
 // kernel rounded a weight that was already 4-bit and left the arithmetic exact
 // to f32 accumulation.
