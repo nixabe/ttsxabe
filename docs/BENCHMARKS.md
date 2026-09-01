@@ -244,6 +244,19 @@ Two rows are anomalies and both are recorded rather than fixed:
   mat-vecs of one row against 1500 columns, and the shape is the problem rather
   than the code.
 
+### Measured and rejected: caching the normalisation's row in registers
+
+A normalisation reads its row three times - to sum it, to accumulate the
+variance, and to scale it - and at 256 threads over 1280 columns that is five
+values a thread, which fit in registers. Holding them, with the summation order
+and the single accumulator untouched so the result is bit-identical, removes two
+reads of 7.7 MB a call.
+
+It measured **nothing**: encoder 101.8 ms to 101.9, decode 76.6 to 75.9, both
+inside their own spread. The kernel was already at 535 GB/s and the re-reads
+were being served out of L2, which the traffic arithmetic did not account for
+and the measurement did. Reverted.
+
 ### Measured and rejected: batching the gemv's loads
 
 `gemv` gives one warp an output column and walks the weight row lane-strided,
@@ -505,9 +518,32 @@ below the shipped one, tabulated in `docs/KERNELS.md`. The other standard
 escapes stand as recorded there: KC 64 loses to KC 32, and wider tiles lose to
 128x128.
 
-So the honest statement of the remaining 28 ms is that it is a tiled matmul
-competing with cuBLAS on an architecture with no `cp.async`, not an arithmetic
-or accuracy limit.
+So the honest statement of the remaining 13 ms on the shortest clip is that it
+is a tiled matmul competing with cuBLAS on an architecture with no `cp.async`,
+not an arithmetic or accuracy limit.
+
+**The gap is now bounded from both ends, and it does not close.** The encoder
+is 101.9 ms against `whisper.cpp`'s 83.3, and everything else in the engine is
+5.6 ms *ahead* of everything else in theirs - so the whole 13 ms is the
+encoder, and of the encoder's 102 ms about 74 are the tiled `gemm` and 18 are
+`flash_attn`. The `gemm` is register-file bound, which is measured above. The
+`flash_attn` is bounded by the same shared-memory budget its own tile sweep
+already explored, which found two and three resident blocks indistinguishable.
+What is left outside those two is nine milliseconds of small kernels, and three
+separate attempts to take time out of them - the gemv's loads, the
+normalisation's re-reads, and the software pipeline - each measured neutral or
+worse, for the same reason each time: the dominant kernels are not the ones
+being changed, and the caches were already covering the traffic being saved.
+
+The remaining candidates, all estimated and none spent, are a GPU mel frontend
+(the 5.3 ms of CPU time the card spends idle), overlapping the independent
+projections across streams so a 120-block launch stops leaving a sixth of the
+machine idle (about 5 ms across the encoder and the cross-attention cache), and
+folding the query scale into `flash_attn` (0.9 ms). Together they are about 11
+ms against the 13 needed, which is to say that even spending all of them lands
+at roughly 0.99x rather than at 1.0x. Reaching parity on a three-second clip
+needs a matmul that gets nearer cuBLAS's rate on sm_75, and that is the thing
+this architecture has been measured to refuse.
 
 ### Translator
 
