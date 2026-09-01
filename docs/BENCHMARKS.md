@@ -204,6 +204,57 @@ Measured on the 2.93 s clip, `xabe-asr-bench --stages`, medians of nine:
 | cross-attention KV | 17.0 ms | **14.8 ms** |
 | decode loop | 78.0 ms | 76.3 ms |
 
+### The decode step, kernel by kernel
+
+The same profile for the other half, at `n = 1`. Every row here was measured
+with a synchronise after the call, so every row carries the same **8.0 us**
+floor of a launch and a round trip - measured with a do-nothing kernel and
+printed as its own row, because without it every number below reads high:
+
+| kernel | measured | less the floor | per token | GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| `layer_norm_add` `[1,1280]`, x3 | 19.0 us | **11.0 us** | 1.06 ms | - |
+| `gemv` 1x1280x1280, x6 | 16.0 us | 8.0 us | 1.54 ms | 410 |
+| `gemv` fc1 1x1280x5120 | 35.0 us | 27.0 us | 0.86 ms | 485 |
+| `gemv` fc2 1x5120x1280 | 35.3 us | 27.3 us | 0.87 ms | 480 |
+| cross scores, 20x(1x64x1500) f16 | 26.6 us | **18.6 us** | 0.60 ms | 206 |
+| cross context, 20x(1x1500x64) f16 | 17.7 us | 9.7 us | 0.31 ms | 396 |
+| `split_heads` `[1,1280]`, x2 | 11.4 us | 3.4 us | 0.22 ms | - |
+| self-attention, three kernels | ~12 us | ~4 us | 0.30 ms | - |
+| `gelu` `[1,5120]` | 8.2 us | 0.2 us | 0.01 ms | - |
+
+Those sum to about 6.0 ms a token against a measured 7.6, and the difference is
+launch overhead in the real pipeline, which is **3.2 us a launch** on this
+machine (measured over 5000 back-to-back launches of a kernel that does
+nothing). A decode step is roughly 24 launches a layer and 775 a token, so
+about 2.5 ms of queueing against 7.6 ms of GPU work - the CPU stays ahead, and
+collapsing launches is not the lever it looks like.
+
+Two rows are anomalies and both are recorded rather than fixed:
+
+- **`layer_norm_add` at one row costs 11 us to move 10 KB.** It is launched one
+  block per row, so at `n = 1` it is a single block on a single SM running two
+  dependent tree reductions with `__syncthreads` at every level. It is 17% of
+  the decode's GPU time. Shortening the tree with warp shuffles would help, and
+  would change the order the mean and the variance are summed in - which is a
+  reassociation in a kernel every model here shares, including the chat model
+  whose agreement with llama-server is a documented 1 of 125 decisions. Not
+  worth 3 ms of one ASR clip.
+- **The cross-attention score product reads at 206 GB/s.** Twenty batched
+  mat-vecs of one row against 1500 columns, and the shape is the problem rather
+  than the code.
+
+### Measured and rejected: batching the gemv's loads
+
+`gemv` gives one warp an output column and walks the weight row lane-strided,
+one load and one multiply-add at a time, so a warp has a single memory request
+in flight. Fetching four words before using any of them - bit-identical, since
+the summation order and the single accumulator are unchanged - was worth 7% of
+the kernel in isolation (8.3 us to 7.7 us at 1x1280x1280) and **nothing at all
+end to end**: the decode loop measured 76.3 ms before and 76.6 after, which is
+inside its own spread. Reverted. The isolated kernel is not the critical path
+it looks like when the pipeline overlaps it with everything else.
+
 ### Wave quantisation is real here, and it is measurable
 
 Chasing the rest of the encoder turned up a ceiling worth writing down, because
