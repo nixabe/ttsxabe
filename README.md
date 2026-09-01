@@ -5,8 +5,8 @@
 A from-scratch Rust engine for a Taiwanese Hokkien (Taigi) voice assistant.
 
 > **NOTICE**: This project was created for experiment and was fully driven by
-> **AI Agent** in 24 hours. It is NOT fully optimized, tested on multiple
-> devices or production-ready. Issues and undercover bugs are expected.
+> **AI Agent**. It is NOT fully optimized, tested on multiple devices or
+> production-ready. Issues and undercover bugs are expected.
 
 No ML framework, no bindings. The container readers, the weight schemas and the
 kernels all live in this repository and are verified against captured
