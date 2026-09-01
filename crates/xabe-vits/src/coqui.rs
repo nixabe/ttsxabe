@@ -383,18 +383,21 @@ fn repair_non_json_numbers(text: &str) -> String {
 /// # This tokenizer does not phonemise, and the model needs phonemes
 ///
 /// The reference's pipeline is *clean the text, phonemise it, then look each
-/// phoneme up*. The middle step is `pygoruut`, which downloads a Go binary and
-/// asks it over HTTP; the language data - a 140 KB dictionary plus a learned
-/// fallback for words that are not in it - lives inside that binary. Porting it
-/// would be a second project with its own oracle, and half-porting it would be
-/// worse than not having it: an out-of-dictionary word would come out
-/// mispronounced rather than missing, which is exactly the failure this
-/// workspace is built to refuse.
+/// phoneme up*. The middle step is `pygoruut`, a Go binary whose language data
+/// is a Han-to-IPA dictionary plus a learned fallback for words not in it, and
+/// it is **not** ported here. Half-porting it would be worse than not having
+/// it: an out-of-dictionary word would come out mispronounced rather than
+/// missing, which is exactly the failure this workspace is built to refuse.
 ///
-/// So this takes the phonemes, and `tools/phonemize_pygoruut.py` produces them
-/// with the reference's own phonemiser. What the engine does with them is
-/// checked against the reference exactly; what produces them is not this
-/// engine's claim.
+/// Two things produce phonemes instead, and which one applies depends on what
+/// the caller has:
+///
+/// - **From romanisation**, which is what this pipeline produces:
+///   `xabe_taigi::poj_to_ipa`. That is a spelling table and not a guess - the
+///   translator upstream has already decided how each word is read, so nothing
+///   is left to choose. This is the path the engine takes.
+/// - **From Han**, which nothing here needs but a person with a corpus might:
+///   `tools/phonemize_pygoruut.py`, which runs the reference's own front end.
 ///
 /// # Dropping is silent, as it is on the other path
 ///

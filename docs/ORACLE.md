@@ -684,3 +684,92 @@ Maximum absolute difference against the capture, on the CPU path, at
 
 The CUDA path is held to `atol=2e-3`, `rtol=2e-2` for the reason
 `gpu_end_to_end.rs` gives, and reaches 6.2e-5 on the waveform.
+
+# The Tâi-lô to IPA oracle
+
+The odd one out: there is **no reference implementation of this conversion**.
+`xabe-taigi` turns romanisation into the IPA the Coqui checkpoint reads, and
+goruut — the only other thing that produces that IPA — starts from Han instead.
+There is nothing to run side by side.
+
+So the oracle is built sideways, out of two things that already exist.
+
+## Provenance
+
+| | |
+| --- | --- |
+| corpus | `ceciliayl/SuiSiann_raw_tone`, `SuiSiann.csv` — 3,467 rows |
+| phonemiser | goruut `MinnanHokkien2`, via `coqui-tts-pygoruut` 0.27.4 |
+| inventory | `neurlang/goruut` `dicts/minnan/hokkien2/language.json`, 4,608 entries |
+| capture | `tools/oracle/capture_tailo_ipa.py` |
+| default output | `.golden/coqui-tailo/correspondence.json` |
+
+SuiSiann is the corpus this checkpoint was trained on, and its metadata carries
+both columns: the Han text of every recorded sentence **and** its Tâi-lô
+transcription. Phonemise the Han with goruut and the two halves line up
+syllable by syllable, so each sentence yields a set of (Tâi-lô, IPA) pairs.
+Aggregated over the corpus that is a correspondence table nobody wrote down —
+1,516 distinct syllables over 28,489 tokens.
+
+```bash
+.venv-coqui/bin/python tools/oracle/capture_tailo_ipa.py --out .golden/coqui-tailo
+```
+
+Only sentences whose two halves have the same syllable count are used: 2,152 of
+3,467. A mismatch means goruut merged or split something, and guessing an
+alignment would invent correspondences rather than record them.
+
+## The two halves disagree, and that is the point
+
+goruut has to guess which reading a Han character takes; the transcription is
+what the speaker said. They differ on about a quarter of tokens — 我 as `ŋɔ˥˧`
+where the corpus says `ɡua˥˧`, 人 as `dzin˨˦` where it says `laŋ˨˦`. The
+transcription is right every time, because the audio is the ground truth.
+
+So `tests/correspondence.rs` asserts a **floor on agreement**, not equality.
+Exact equality would be a test that this crate reproduces goruut's mistakes,
+which is the opposite of what is wanted. Measured when it was written:
+
+| | |
+| --- | --- |
+| matches goruut's commonest reading | 71.5% of syllables |
+| attested among goruut's readings | 80.2% |
+| token-weighted | 71.3% |
+
+A real regression in the table moves those by tens of points. A different
+reading moves them by fractions.
+
+## The sharp half is structural, not statistical
+
+An agreement rate cannot catch a table that invents a phoneme — a wrong initial
+would just look like another reading disagreement. So the capture also records
+goruut's **inventory** from the dictionary: every initial, rime, tone letter and
+syllable body it can write. The test then requires that
+
+- every initial `xabe-taigi` can produce is one goruut writes — **18 of 18**,
+- every tone letter is one goruut writes — **7 of 7**, exactly the set,
+- at least 95% of syllable bodies are attested — **97.9%**, 1,476 of 1,508.
+
+The residue of that last one is not error. goruut's dictionary has 4,608
+entries and the language has more syllables than that has words, so `ɡun`,
+`tʰue`, `dzik` and about thirty others are perfectly ordinary Taiwanese that
+simply never came up, plus `russia` and `putin`, which are in the corpus and are
+not syllables at all.
+
+**This is what caught the two real bugs.** `ainn` was parsing as `ai` plus a
+stray `n`, losing the nasalisation while keeping a plausible shape; and `thng`,
+`hng`, `tshng` — syllables whose rime is a syllabic `ng` after an initial — were
+not parsing at all and were being dropped. Neither moved the agreement rate
+much. Both produced a body goruut has no word for, and the inventory check named
+them.
+
+## One quirk left in, deliberately
+
+goruut writes the rime `ai` + `-h` as `aih`, with a literal `h`, where every
+other checked rime gets `ʔ`. It does that in exactly two dictionary entries —
+`aih` and `haih` — and `aiʔ` appears nowhere in the file.
+
+`xabe-taigi` converts `-h` to `ʔ` uniformly and does not reproduce it. Two
+entries is not a rule, and inferring one from them would put an `h` into
+`saih`, `uaih` and every other `ai`-plus-stop syllable that goruut has never
+spelled and has no opinion about. It costs 13 tokens of 28,489.

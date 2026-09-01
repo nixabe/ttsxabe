@@ -526,7 +526,7 @@ fn spawn_synthesiser(
             // A blocking receive on a channel the async side writes to. The
             // thread exists only to keep a forward pass off the executor.
             while let Some(job) = rx.blocking_recv() {
-                synthesise(&model, &job, rate, seed);
+                synthesise(&model, &job, rate, seed, coqui);
             }
             tracing::debug!("synthesiser thread stopping");
         })
@@ -757,7 +757,7 @@ fn speak_cosy(cosy: &xabe_cosy::Cosy, job: &SynthesisJob, rate: u32) {
 }
 
 /// Speaks one job, sending each chunk as it is produced.
-fn synthesise(model: &Synth, job: &SynthesisJob, rate: u32, seed: u64) {
+fn synthesise(model: &Synth, job: &SynthesisJob, rate: u32, seed: u64, phonemes: bool) {
     // The same cleaning and chunking the Python daemon did, because VITS
     // degrades on long inputs and chunking also gets first audio out sooner.
     let text = xabe_serve::clean(&job.text);
@@ -770,7 +770,24 @@ fn synthesise(model: &Synth, job: &SynthesisJob, rate: u32, seed: u64) {
     let chunks = xabe_serve::split_poj(&poj, 120);
 
     for (i, chunk) in chunks.iter().enumerate() {
-        match model.speak(chunk, seed) {
+        // The two VITS checkpoints read different scripts. `mms-tts-nan` was
+        // trained on POJ and takes the chunk as it stands; the Coqui one was
+        // trained on IPA, so the chunk is transliterated here - which is
+        // spelling, not a pronunciation guess, because the translator upstream
+        // has already decided how every word is read. See `xabe-taigi`.
+        let spoken = if phonemes {
+            let p = xabe_taigi::poj_to_ipa(chunk);
+            if p.dropped > 0 {
+                tracing::debug!(
+                    dropped = p.dropped,
+                    "runs that are not Tâi-lô were discarded"
+                );
+            }
+            std::borrow::Cow::Owned(p.text)
+        } else {
+            std::borrow::Cow::Borrowed(chunk.as_str())
+        };
+        match model.speak(&spoken, seed) {
             Ok(audio) => {
                 let wav = xabe_audio::wav_bytes(&audio, rate);
                 let msg = xabe_serve::TtsChunk {

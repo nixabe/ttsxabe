@@ -151,27 +151,37 @@ of here, where the path is still in hand.
 `--tts-model` sniffs the same way, so it takes any of them. Which one it is, is
 a property of the directory rather than of a second flag.
 
-### A Coqui VITS engine speaks IPA, not text
+### A Coqui VITS engine reads IPA, and the engine transliterates for it
 
 The last two rows are both VITS and run the same forward pass, but they do not
-eat the same thing. `neurlang/coqui-vits-suisiann-minnan-hokkien` is trained on
-IPA phonemes produced by `pygoruut`, and nothing in this pipeline produces them
-— there is no `--tts-script` value that would, because the translator emits POJ,
-Han or both and never IPA. Opening one logs a warning saying so.
-
-Where it works is the one-shot path, with the phonemes made first:
+eat the same thing: `mms-tts-nan` was trained on POJ and
+`neurlang/coqui-vits-suisiann-minnan-hokkien` on IPA. The engine converts, with
+`xabe-taigi`, on both the one-shot path and the conversation path — so a Coqui
+engine wants `POJ`, the same as mms:
 
 ```sh
-PHONEMES=$(.venv-coqui/bin/python tools/phonemize_pygoruut.py \
-             --text "你好！我是蔡贏。我的人在台北。")
-
-xabe-engine --tts-model models/tts/coqui-vits-suisiann --tts-device 0 \
-            --text "$PHONEMES" --out hello.wav
+xabe-engine --serve 127.0.0.1:8000 \
+            --tts-model  models/tts/mms-tts-nan            --tts-device 2 \
+            --tts-engine suisiann=models/tts/coqui-vits-suisiann \
+            --tts-script suisiann=POJ
 ```
 
-Handing it the Han text instead is not silently wrong: every character is
-outside its symbol table, so it refuses with "contains no symbols this model can
-speak". `docs/MODEL.md` says why the phonemiser is a tool here rather than a
+and the one-shot path takes romanisation directly:
+
+```sh
+xabe-engine --tts-model models/tts/coqui-vits-suisiann --tts-device 0 \
+            --text "Lí hó, guá sī Tâi-oân-lâng." --out hello.wav
+```
+
+That is a transliteration and not a pronunciation guess: the translator has
+already decided how every word is read, so the conversion is a spelling table.
+`--text` also accepts IPA and passes it through unchanged, since the two are
+trivially distinguishable — Chao tone letters never occur in romanisation.
+
+Handing it **Han** is still not silently wrong: every character is outside both
+the symbol table and the transliterator, so it refuses with "contains no
+symbols this model can speak". `tools/phonemize_pygoruut.py` is what converts
+Han, and `docs/MODEL.md` says why that stayed a tool rather than becoming a
 crate.
 
 It also stands alone. `--tts-model` fills one unnamed slot and `--tts-engine`

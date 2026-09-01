@@ -862,39 +862,98 @@ with a padding token between every phoneme.
 Both are 1.0 here, which is exactly why it is written down - the bug would not
 have shown up in this checkpoint.
 
-## The input is phonemes, and this engine does not produce them
+## The input is IPA, and getting there is `xabe-taigi`
 
 `use_phonemes` is true, `phonemizer` is `pygoruut:v0.6.3` and
 `phoneme_language` is `MinnanHokkien2`. The model's embedding table is indexed
 by IPA, and the thing that turns 你好 into `li˥˧ho˥˧` is a Go binary with a
 140 KB Han-to-IPA dictionary and a learned fallback for what is not in it.
 
-That front end is **not** ported here, and the decision is deliberate rather
-than pending. Porting the dictionary would be an afternoon; porting the fallback
-would not, and a half-port is worse than none - a word outside the dictionary
-would come out *mispronounced* rather than missing, which is precisely the
-failure mode this workspace exists to refuse. So `tools/phonemize_pygoruut.py`
-runs the reference's own front end, and the engine takes what it produces:
+**Han to IPA is not ported, and cannot honestly be.** The dictionary is easy;
+the choice between readings is not. `的` has four entries — `e˨˦`, `e˨˦_`,
+`tik˨`, `tik˦_` — and goruut picks between them with a learned model, not a
+rule. Porting the dictionary and guessing the rest would mispronounce an
+out-of-dictionary word rather than drop it, which is the failure this whole
+workspace is built to catch.
+
+**Romanisation to IPA is a different problem, and it is a table.** The pipeline
+does not have Han at the point of synthesis; it has POJ, because the translator
+emits POJ and the two other synthesisers read it. And a romanisation has
+*already made every reading choice* — that is what a transcription is. So the
+conversion this engine needs has no guessing in it at all:
+
+```
+translator ──POJ──► xabe-taigi::poj_to_ipa ──IPA──► Coqui VITS
+```
+
+18 initials, 78 rimes, 7 Chao tones. `xabe-taigi` owns it, and
+[ORACLE.md](ORACLE.md) has how a conversion with no reference implementation
+was verified anyway: by lining up SuiSiann's own Han and Tâi-lô columns through
+goruut and reading the correspondence off 28,489 aligned syllables.
+
+For anyone who has Han and no romanisation, `tools/phonemize_pygoruut.py` runs
+the reference's own front end:
 
 ```
 .venv-coqui/bin/python tools/phonemize_pygoruut.py --text "你好！我是蔡贏。"
 li˥˧ho˥˧ɡua˥˧si˧˧ĩã˨˦
 ```
 
-Two consequences follow, and neither is an error anywhere:
+## This engine disagrees with goruut, on purpose
 
-- **Han text fed straight in synthesises nothing.** Every character is outside
-  the table, so tokenisation yields an empty sequence and the engine returns
-  "contains no symbols this model can speak". That is the good case.
-- **This engine cannot serve the conversation pipeline.** No stage upstream
-  produces IPA, and `--tts-script` has no setting that would. `--tts-model`
-  with a Coqui directory warns about that at load and then works, because the
-  one-shot `--text` path is where it is useful.
+Over the 2,152 alignable SuiSiann sentences, goruut picks a different *reading*
+from the corpus's own transcription for 28.7% of syllable tokens:
 
-The phonemiser also leaves characters it does not know alone - the capture in
-`.golden/coqui-base` contains a bare 蔡 and a full-width 。 for that reason -
-and the tokenizer then drops them. That is the reference's behaviour, reproduced
-rather than corrected.
+| Han | corpus says | goruut says | count |
+| --- | --- | --- | --- |
+| 我 | `ɡua˥˧` | `ŋɔ˥˧` | 385 |
+| 人 | `laŋ˨˦` | `dzin˨˦` | 283 |
+| 欲 | `beʔ˨` | `iok˨` | 198 |
+| 阮 | `ɡun˥˧` | `ɡuan˥˧` | 59 |
+
+On every one of those the transcription is right, because it is what the
+speaker actually said — the audio is the ground truth and the Han is not. So
+`xabe-taigi` following the romanisation is not an approximation of goruut, it
+is better than it, and the differential test asserts a floor on agreement
+rather than equality. Reproducing goruut exactly would mean reproducing its
+mistakes.
+
+It also means the checkpoint was trained on text that is wrong in those places:
+the waveform says *guá* and the phonemes said `ŋɔ`. That is a property of the
+model, not something this engine can fix.
+
+## The tokenizer throws away 7.56% of what the phonemiser writes
+
+This is the most surprising thing about the checkpoint, and it is not a defect
+in this engine. Its symbol table is Coqui's `IPAPhonemes`, and that set does not
+contain everything goruut emits. Measured over the whole SuiSiann corpus:
+
+| dropped | count | effect |
+| --- | --- | --- |
+| `ʰ` U+02B0 | 5,633 | **aspiration is lost**: `pʰ` and `p` reach the model identically |
+| `ã ĩ ũ ẽ õ` | 4,578+ | **nasal vowels are lost**: 49% of sentences lose at least one |
+| `，。？、「」` | 6,700+ | full-width punctuation |
+
+`sĩã˨˦` reaches the embedding table as `s` plus two tone letters — both vowels
+gone. The vocabulary *does* hold a combining tilde U+0303, but goruut writes
+NFC, so it never matches.
+
+Two consequences, and the second is a design decision:
+
+- The model's effective phoneme inventory is smaller than its nominal 137.
+  拍 `pʰaʔ` and 百 `paʔ` are the same input to it.
+- **`xabe-taigi` reproduces the losses rather than repairing them.** It emits
+  `ʰ` and precomposed nasals exactly as goruut does, and they are dropped
+  exactly as they were in training. Emitting the decomposed form would survive
+  tokenisation and hand the model a symbol it has essentially never seen, which
+  is worse than matching the reference's own defect. If the checkpoint is ever
+  retrained with a corrected character set, the front end is already right.
+
+The one deliberate divergence is punctuation, which `xabe-taigi` drops outright
+instead of passing it on to be dropped. What survives goruut's tokenizer is
+0.337% of the training characters — `,` appears four times in the entire corpus
+and `.` nine — so those embeddings are noise, and clause boundaries reach the
+listener as separate synthesis calls anyway.
 
 ## Where the parameters are
 

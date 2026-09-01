@@ -57,8 +57,8 @@ pub enum Symbols {
     /// input is romanised text.
     Huggingface(Tokenizer),
     /// Coqui `TTSTokenizer`: drop, intersperse a blank at id 3. The input is
-    /// **IPA phonemes**, not text - see [`CoquiTokenizer`] for why this crate
-    /// does not produce them.
+    /// **IPA phonemes**, not romanisation. `xabe-taigi` transliterates the
+    /// pipeline's POJ into them; this crate takes what it is given.
     Coqui(CoquiTokenizer),
 }
 
@@ -66,9 +66,12 @@ impl Symbols {
     /// Encodes an input into symbol ids.
     ///
     /// What "input" means differs between the two, and the difference is not
-    /// cosmetic: the 🤗 path takes Pe̍h-ōe-jī and the Coqui path takes the
-    /// phonemes a phonemiser has already produced. Handing either the other's
-    /// input produces a short sequence or an empty one rather than an error.
+    /// cosmetic: the 🤗 path takes Pe̍h-ōe-jī and the Coqui path takes IPA.
+    /// Handing either the other's input produces a short sequence or an empty
+    /// one rather than an error, so the conversion belongs to the caller and is
+    /// `xabe_taigi::poj_to_ipa`. This crate deliberately does not do it
+    /// itself: the differential tests feed captured phonemes straight in, and a
+    /// transliteration hidden inside `encode` would silently rewrite them.
     pub fn encode(&self, text: &str) -> Vec<i64> {
         match self {
             Self::Huggingface(t) => t.encode(text),

@@ -81,10 +81,22 @@ pub fn speak(
 
     // A Coqui VITS save and a 🤗 export are the same model in different
     // containers, so they share every line below the constructor. What they do
-    // not share is their input: this one takes **IPA phonemes**, which
-    // `tools/phonemize_pygoruut.py` produces and nothing in this workspace
-    // does. See `docs/MODEL.md`.
+    // not share is their input: `mms-tts-nan` reads POJ and this one reads IPA.
+    // The transliteration is `xabe-taigi`'s, and it passes through text that is
+    // already phonemes - so `--text` takes either romanisation or IPA and does
+    // the right thing with both. See `docs/MODEL.md`.
     let coqui = crate::serve::is_coqui(&ck.dir);
+    let text = if coqui {
+        let p = xabe_taigi::poj_to_ipa(&text);
+        tracing::info!(
+            syllables = p.syllables,
+            dropped = p.dropped,
+            "transliterated to IPA",
+        );
+        p.text
+    } else {
+        text
+    };
 
     let (rate, audio) = match (device, coqui) {
         (Device::Cpu, true) => {

@@ -758,13 +758,27 @@ and so reads this checkpoint as published while still being unable to read
 WaveGlow. The distinction is state dict against object graph, and the loader
 says which it found.
 
-**What is not done, and will not be by this phase.** The model's text front end
-is `pygoruut` - a Go binary carrying a Han-to-IPA dictionary and a learned
-fallback - and it is not ported. `tools/phonemize_pygoruut.py` runs the
-reference's own instead. A half-port would mispronounce an out-of-dictionary
-word rather than dropping it, which is the failure this project's whole
-differential harness exists to catch, so shipping one to make the flag surface
-tidier would be trading the thing that matters for the thing that looks
-finished. The consequence is stated where it bites: this engine is useful on the
-one-shot `--text` path and not in the conversation, because nothing upstream
-produces IPA.
+| 35 | Romanisation reaches the model: `xabe-taigi`, verified against goruut's inventory | ✅ |
+
+**Item 35 is the one that was first written as impossible.** The model's front
+end is `pygoruut`, a Go binary carrying a Han-to-IPA dictionary and a learned
+fallback, and porting it is not on: choosing which of `的`'s four readings
+applies is a model, not a table, and a half-port would mispronounce an
+out-of-dictionary word rather than dropping it.
+
+What that reasoning missed is that **the pipeline never has Han at that point**.
+It has POJ, because the translator emits POJ and two other synthesisers read it,
+and a romanisation has already made every reading choice - that is what a
+transcription *is*. So the conversion actually needed is romanisation to IPA,
+which has no guessing in it and is 18 initials, 78 rimes and 7 Chao tones.
+
+Verifying it was the interesting part, because there is no reference
+implementation to diff against - goruut goes from Han. The oracle was built
+sideways out of SuiSiann's own aligned Han and Tâi-lô columns, and the check
+that actually found the bugs was structural rather than statistical: every
+initial and tone letter the table can produce must be one goruut writes.
+`docs/ORACLE.md` has it.
+
+Han to IPA is still not ported and `tools/phonemize_pygoruut.py` still runs the
+reference's own. That limit is unchanged; what changed is that it stopped being
+on the path the pipeline takes.

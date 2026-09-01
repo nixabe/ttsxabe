@@ -1613,6 +1613,7 @@ dependencies = [
  "xabe-cuda",
  "xabe-serve",
  "xabe-taco",
+ "xabe-taigi",
  "xabe-translate",
  "xabe-tts",
  "xabe-vad",
@@ -1708,6 +1709,16 @@ dependencies = [
  "xabe-cuda",
  "xabe-dsp",
  "xabe-st",
+ "xabe-taigi",
+]
+
+[[package]]
+name = "xabe-taigi"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

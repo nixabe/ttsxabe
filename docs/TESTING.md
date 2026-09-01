@@ -104,6 +104,11 @@ same names from different checkpoints, and pointing one test suite at the
 other's capture would compare two real utterances and fail for a reason that is
 not a defect.
 
+`crates/xabe-taigi/tests/correspondence.rs` needs a third capture,
+`.golden/coqui-tailo` or `XABE_TAIGI_GOLDEN`, and no checkpoint at all — it
+checks a spelling table against goruut's own inventory. `tests/spelling.rs`
+beside it needs nothing and always runs.
+
 The CPU suite takes about three minutes. That is the scalar vocoder producing
 2.6 seconds of 22.05 kHz audio several times over, not a hang; the reproducibility
 test deliberately uses a short input for that reason, since what it checks does

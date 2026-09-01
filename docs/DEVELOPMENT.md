@@ -27,8 +27,8 @@ huggingface-cli download neurlang/coqui-vits-suisiann-minnan-hokkien \
 
 Its oracle needs Python 3.10 and a torch of its own, which do not coexist with
 the rest of the tooling here — [ORACLE.md](ORACLE.md) has the two commands, and
-`.venv-coqui/` is gitignored. Nothing but regenerating `.golden/coqui-base`
-needs it.
+`.venv-coqui/` is gitignored. Nothing but regenerating `.golden/coqui-base` and
+`.golden/coqui-tailo` needs it.
 
 `models/` is gitignored and is where every model in the pipeline lives, so
 populating it is the whole of provisioning a machine. Tests look there first,

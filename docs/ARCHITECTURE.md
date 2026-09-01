@@ -35,6 +35,7 @@ configuration of the same flags, not a different program.
       ├── xabe-llama    Llama geometry from either container, two tokenizers
       ├── xabe-tts      the VITS forward pass and synthesis API
       ├── xabe-cosy     CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voices
+      ├── xabe-taigi    POJ, Tâi-lô and IPA, and the conversions between them
       ├── xabe-audio    WAV, mel spectrogram, PCM framing
       ├── xabe-vits     config, weight schema, shape validation
       ├── xabe-dsp      scalar reference kernels
@@ -150,6 +151,7 @@ crates above it.
 | `xabe-dsp` | scalar f32 reference kernels | being fast |
 | `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
 | `xabe-golden` | reading captures, comparing tensors | producing them |
+| `xabe-taigi` | the spelling of Taiwanese in three orthographies | reading Han, which is a dictionary and not a table |
 | `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
 | `xabe-vad` | Silero geometry, weights and forward pass | audio capture |

@@ -26,8 +26,8 @@ A fourth reuses the first: `xabe-tts` also reads
 [coqui-vits-suisiann-minnan-hokkien](https://huggingface.co/neurlang/coqui-vits-suisiann-minnan-hokkien),
 which is the same VITS from a different trainer at 22.05 kHz, with no stage of
 the forward pass changed — a new container, a new naming scheme and an IPA
-vocabulary were all it needed. It speaks phonemes rather than text; see
-`docs/MODEL.md`.
+vocabulary were all it needed. It reads IPA rather than romanisation, and
+`xabe-taigi` transliterates the pipeline's POJ into it; see `docs/MODEL.md`.
 Remaining inside CosyVoice: deriving a **new** voice still runs two ONNX models
 once, through `tools/make_cosyvoice_voice.py`. `docs/MILESTONES.md` has the
 phases and `docs/CLI.md` the flag surface.
@@ -163,6 +163,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
 | `xabe-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
 | `xabe-pt` | torch `.pth` container: zip, a state-dict pickle, validated addressing |
+| `xabe-taigi` | POJ, Tâi-lô and IPA, and the conversions three checkpoints need |
 | `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
 | `xabe-chat` | the chat model's forward pass, sampling and stop handling |

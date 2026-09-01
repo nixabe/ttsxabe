@@ -106,6 +106,30 @@ the whole point is to map them; and tensors must be **contiguous**, because a
 saved view would keep a plausible shape while reading its elements in the wrong
 order.
 
+## `xabe-taigi`
+
+```rust
+use xabe_taigi::{poj_to_tailo, poj_to_ipa, tailo_to_ipa};
+
+poj_to_tailo("lí hó");            // "li2 ho2"       - what Tacotron2 reads
+poj_to_ipa("lí hó").text;         // "li˥˧ho˥˧"      - what the Coqui VITS reads
+tailo_to_ipa("tai5-uan5").text;   // "tai˨˦uan˨˦"
+```
+
+No dependencies but `tracing`, and no errors. [`Phonemes`] carries the text
+beside `syllables` and `dropped`, because a run that is not a syllable is
+discarded rather than passed on — a Latin letter *is* in the Coqui vocabulary,
+so passing one through would put a phoneme in the sequence rather than a gap,
+and the count is what lets a caller notice.
+
+Text that already contains a Chao tone letter is returned unchanged, so
+`poj_to_ipa` is safe to apply to something already phonemised.
+
+This is spelling, not grapheme-to-phoneme: nothing here reads Han. See
+`docs/MODEL.md` for why that line is where it is.
+
+[`Phonemes`]: ../../xabe_taigi/struct.Phonemes.html
+
 ## The geometry crates
 
 `xabe-vits`, `xabe-whisper` and `xabe-llama` all have the same shape: a config

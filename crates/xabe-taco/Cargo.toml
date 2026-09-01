@@ -10,6 +10,7 @@ authors.workspace = true
 xabe-cuda.workspace = true
 xabe-dsp.workspace = true
 xabe-st.workspace = true
+xabe-taigi.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

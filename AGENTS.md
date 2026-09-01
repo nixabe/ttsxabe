@@ -26,14 +26,23 @@ out of the reply path. The loader proved the geometry, the forward pass was
 built on the kernels that were already there, and it matches both references —
 so the plan's "optional" is spent rather than pending.
 
-That model takes **IPA phonemes**, not text, and this engine does not produce
-them: its phonemiser is a Go binary with a Han-to-IPA dictionary and a learned
-fallback for what is not in it, and `tools/phonemize_pygoruut.py` runs the
-reference's own rather than half-porting it. That is a limit, stated rather than
-worked around - a half-ported G2P would mispronounce an out-of-dictionary word
-instead of dropping it, which is the failure this workspace is built to catch.
-It also means a Coqui engine is useful on the one-shot `--text` path and not in
-the conversation, where nothing upstream produces phonemes.
+That model takes **IPA phonemes**, not romanisation, and it is wired into the
+conversation by `xabe-taigi` - a fifth thing that fell out of it. The reference
+gets its phonemes from Han by dictionary lookup with a learned fallback, and
+that is not portable: choosing which reading `的` takes is a model, not a table.
+But the pipeline does not have Han at that point, it has **POJ**, and the
+translator has already made every one of those choices. So the conversion this
+engine needs is romanisation to IPA, which *is* a table - 18 initials, 78 rimes,
+7 Chao tones - and it is verified against goruut's own inventory and against
+28,489 syllable tokens of the training corpus. `docs/MODEL.md` has the numbers
+and `docs/ORACLE.md` has how a correspondence was built for a conversion with
+no reference implementation to diff against.
+
+What is still not ported is Han to IPA. `tools/phonemize_pygoruut.py` runs the
+reference's own front end for anyone who has Han and no romanisation, and that
+limit is stated rather than worked around: a half-ported G2P would mispronounce
+an out-of-dictionary word instead of dropping it, which is the failure this
+workspace is built to catch.
 
 An earlier version of this file said porting Whisper or the LLM here was
 explicitly out of scope. That was the right rule while the synthesiser was
@@ -253,6 +262,7 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
 | `xabe-gguf` | GGUF container parsing, mmap, metadata, block-format unpacking | — |
 | `xabe-pt` | torch `.pth` container parsing: zip, a state-dict pickle, mmap, addressing | — |
+| `xabe-taigi` | Taiwanese orthography: POJ, Tâi-lô and IPA, and the conversions | — |
 | `xabe-dsp` | CPU reference kernels + differential compare harness | — |
 | `xabe-golden` | reading captures and comparing tensors | — |
 | `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |
@@ -266,9 +276,9 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | `xabe-llama`, `xabe-cuda`, `xabe-st` |
 | `xabe-chat` | the chat model's forward pass, sampling, stop strings | `xabe-llama`, `xabe-cuda`, `xabe-gguf` |
 | `xabe-cosy` | CosyVoice3: geometry and forward pass | `xabe-cuda`, `xabe-dsp`, `xabe-st` |
-| `xabe-taco` | Tacotron2 + WaveGlow: geometry, forward pass, POJ to Tâi-lô | `xabe-cuda`, `xabe-st` |
+| `xabe-taco` | Tacotron2 + WaveGlow: geometry and forward pass | `xabe-cuda`, `xabe-st`, `xabe-taigi` |
 | `xabe-serve` | HTTP, WebSocket, the page, the conversation | `xabe-audio` |
-| `xabe-engine` | flags, stage wiring, orchestration, the binary | every stage crate |
+| `xabe-engine` | flags, stage wiring, orchestration, script selection, the binary | every stage crate |
 
 The pattern to keep: each model is **two** crates, one that says what the
 tensors are and refuses to do arithmetic, and one that runs them. `xabe-vits` to
@@ -285,6 +295,14 @@ differs is the container, every tensor name, the symbol table, and whether the
 decoder's weight norm was fused before saving. `docs/MODEL.md` has all five
 differences. The second one takes IPA phonemes rather than romanisation, and
 producing those is `tools/phonemize_pygoruut.py` rather than this engine.
+
+`xabe-taigi` is not a model crate at all and is the only one of its kind: it
+owns *the language*, not a checkpoint. Three models here read Taiwanese and no
+two read the same script - POJ for `mms-tts-nan`, Tâi-lô for Tacotron2, IPA for
+the Coqui VITS - while the translator emits exactly one of them. The conversion
+lived inside `xabe-taco` while one model needed it; when a second did, the
+choice was a crate below both or an edge from `xabe-tts` to `xabe-taco`, and
+the rule at the top of this section says which of those is the bug.
 
 `xabe-cosy` and `xabe-taco` are one crate each, and that is a deviation rather
 than a second pattern. Neither model's geometry is read by anything but its own

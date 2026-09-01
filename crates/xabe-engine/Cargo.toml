@@ -16,6 +16,7 @@ xabe-serve.workspace = true
 xabe-vad.workspace = true
 xabe-translate.workspace = true
 xabe-taco.workspace = true
+xabe-taigi.workspace = true
 xabe-tts.workspace = true
 xabe-vits.workspace = true
 clap.workspace = true

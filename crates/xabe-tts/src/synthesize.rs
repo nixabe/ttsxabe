@@ -72,9 +72,10 @@ impl Prosody {
 impl Synthesizer {
     /// Loads a Coqui model directory: `best_model.pth` and `config.json`.
     ///
-    /// The input this model takes is **IPA phonemes**, not text; see
-    /// [`xabe_vits::CoquiTokenizer`] for why the phonemiser is not in this
-    /// workspace and what produces them instead.
+    /// The input this model takes is **IPA phonemes**, not romanisation.
+    /// `xabe_taigi::poj_to_ipa` produces them from the POJ the pipeline emits;
+    /// this method takes phonemes so that a differential test can feed the
+    /// reference's own captured string in without a transliteration in the way.
     pub fn open_coqui(dir: &Path) -> Result<Self, SynthesisError> {
         let (cfg, tok, source) = open_coqui(dir)?;
         Ok(Self { source, cfg, tok })
