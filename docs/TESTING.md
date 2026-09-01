@@ -93,6 +93,22 @@ times; a debug build turns a test run into a coffee break, which is why
 XABE_TEST_DEVICE=2 cargo test --workspace --release
 ```
 
+### The Coqui VITS tests need two things the others do not
+
+`crates/xabe-tts/tests/coqui_end_to_end.rs` and `coqui_gpu.rs` look for the
+checkpoint at `models/tts/coqui-vits-suisiann` or `XABE_COQUI_MODEL`, and for
+its capture at `.golden/coqui-base` or `XABE_COQUI_GOLDEN`. Both skip loudly
+when either is absent. The capture is a *different directory* from the 🤗 one
+and `XABE_GOLDEN` does not reach it, deliberately: the two hold tensors with the
+same names from different checkpoints, and pointing one test suite at the
+other's capture would compare two real utterances and fail for a reason that is
+not a defect.
+
+The CPU suite takes about three minutes. That is the scalar vocoder producing
+2.6 seconds of 22.05 kHz audio several times over, not a hang; the reproducibility
+test deliberately uses a short input for that reason, since what it checks does
+not need a long utterance to be true or false.
+
 `XABE_TEST_DEVICE` and not `XABE_TTS_DEVICE`. The second is the engine's
 `--tts-device` env twin, so exporting it to steer a test run also reaches into
 `xabe-engine`'s flag tests, which then assert their defaults against whichever

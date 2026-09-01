@@ -584,3 +584,103 @@ tokens are a literal list in CosyVoice's *source*, not in
 `<|endofprompt|>` is 151646 only because `<|im_start|>` and `<|im_end|>` were
 already in `added_tokens_decoder`. Read out once, written down, rather than
 re-derived by hand.
+
+# The Coqui VITS oracle
+
+A second oracle for the same architecture, because it is a different
+*checkpoint* and the loader between the file and the arithmetic is new. The
+forward pass it checks is the one the first oracle already validated; what it is
+really testing is whether 738 tensors under different names, half of them
+weight-normalised, land where the first checkpoint's did.
+
+## Provenance
+
+| | |
+| --- | --- |
+| reference | Coqui `TTS.tts.models.vits.Vits`, `coqui-tts-pygoruut` 0.27.4 |
+| checkpoint | `neurlang/coqui-vits-suisiann-minnan-hokkien`, `best_model.pth` |
+| device | CPU, float32, one thread |
+| capture | `tools/oracle/capture_coqui.py` |
+| default output | `.golden/coqui-base` |
+
+The reference needs Python 3.10 and does not coexist with the rest of the
+tooling here, so it lives in its own environment:
+
+```bash
+/usr/bin/python3.10 -m venv .venv-coqui
+.venv-coqui/bin/pip install coqui-tts-pygoruut==0.27.4 "transformers>=4.47,<4.50"
+```
+
+The `transformers` pin is not optional. `coqui-tts` imports XTTS at package
+import time, which imports `isin_mps_friendly` from `transformers.pytorch_utils`,
+which does not exist before 4.45 - so a default resolve installs a version that
+cannot be imported at all.
+
+## Capturing
+
+```bash
+.venv-coqui/bin/python tools/oracle/capture_coqui.py \
+    --out .golden/coqui-base --seed 0 --text "你好！我是蔡贏。我的人在台北。"
+```
+
+Same format as the first oracle - raw little-endian tensors, C order, a
+`manifest.json` with shapes, dtypes and SHA-256 - so `xabe-golden` reads both
+without a second parser. Same hooks in spirit, on a different module tree, and
+the same `TorchFunctionMode` for the two random draws and the alignment matrix.
+
+## The manifest records the phonemes, and that is load-bearing
+
+This checkpoint's text front end is `pygoruut`, and it is not in this engine
+(`docs/MODEL.md` says why). The capture therefore records **both** the text it
+was given and the IPA that text became, and every differential test reads
+`Manifest::input()` - the phonemes - rather than `text`.
+
+A test that read `text` would not fail loudly. It would tokenise Han characters
+to nothing, get an empty symbol sequence, and compare an empty utterance against
+a real one. `Manifest::input()` exists so that choosing correctly is the default
+rather than a thing to remember.
+
+## The two references disagree about tensor layout
+
+Coqui's text encoder carries its activations as `[B, C, T]`; 🤗's carries them
+as `[B, T, C]`, because its port transposes the projection's output back before
+splitting it. That applies to `embed`, every `enc_layer_*`, `enc_out`, `m_p` and
+`logs_p`. After the duration expansion both are `[B, C, T]`, so `z_p`, `z` and
+the waveform need nothing.
+
+`capture_coqui.py` transposes on the way out rather than leaving it to the
+tests, so one capture format means one convention per stage name and a test
+never has to ask which dialect it opened.
+
+This cost a round, and how it presented is the useful part: the **waveform
+matched end to end** while `enc_out` disagreed at 18,595 of 18,624 values with a
+maximum absolute error of 6.0. An arithmetic bug that large does not leave the
+output correct. A transposed comparison does exactly that, and looks like this
+every time.
+
+## The phonemiser has to be stopped, not dropped
+
+`pygoruut` starts the goruut binary with the parent's stdout inherited. Leaving
+it running holds the pipe open for anything that captures the script's output,
+so `PHONEMES=$(... phonemize_pygoruut.py ...)` waits forever on the daemon
+rather than on the script. Both `capture_coqui.py` and
+`tools/phonemize_pygoruut.py` terminate it explicitly; `__del__` at interpreter
+shutdown is not reliable enough to depend on.
+
+## What agreement looks like
+
+Maximum absolute difference against the capture, on the CPU path, at
+`atol=1e-4`, `rtol=1e-3`:
+
+| stage | max abs |
+| --- | --- |
+| `input_ids` | exact |
+| `embed` | 0 |
+| `enc_layer_0` .. `enc_layer_5` | 2.9e-6 .. 9.5e-6 |
+| `enc_out` | 3.3e-6 |
+| `m_p` | 2.9e-6 |
+| `logs_p` | 3.7e-7 |
+| `waveform` (57,088 samples) | 5.8e-5 |
+
+The CUDA path is held to `atol=2e-3`, `rtol=2e-2` for the reason
+`gpu_end_to_end.rs` gives, and reaches 6.2e-5 on the waveform.

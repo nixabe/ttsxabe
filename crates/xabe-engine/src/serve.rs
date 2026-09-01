@@ -494,9 +494,23 @@ fn spawn_synthesiser(
 
     // Opened here, on the calling thread, so a bad checkpoint fails preflight
     // rather than at the first turn - by which time a user is waiting.
-    let mut model = match device {
-        Device::Cuda(ordinal) => Synth::Gpu(Box::new(xabe_tts::GpuModel::open(&ck.dir, ordinal)?)),
-        Device::Cpu => Synth::Cpu(Box::new(xabe_tts::Synthesizer::open_files(
+    //
+    // Which of the two VITS dialects this is, is a property of the directory
+    // rather than of a flag, exactly as the choice between VITS, CosyVoice and
+    // Tacotron2 is.
+    let coqui = is_coqui(&ck.dir);
+    if coqui {
+        tracing::warn!("this engine speaks IPA phonemes; no stage in this pipeline produces them",);
+    }
+    let mut model = match (device, coqui) {
+        (Device::Cuda(ordinal), true) => {
+            Synth::Gpu(Box::new(xabe_tts::GpuModel::open_coqui(&ck.dir, ordinal)?))
+        }
+        (Device::Cuda(ordinal), false) => {
+            Synth::Gpu(Box::new(xabe_tts::GpuModel::open(&ck.dir, ordinal)?))
+        }
+        (Device::Cpu, true) => Synth::Cpu(Box::new(xabe_tts::Synthesizer::open_coqui(&ck.dir)?)),
+        (Device::Cpu, false) => Synth::Cpu(Box::new(xabe_tts::Synthesizer::open_files(
             &ck.dir.join("model.safetensors"),
             &ck.config,
             &ck.dir,
@@ -534,6 +548,21 @@ fn is_cosyvoice(dir: &std::path::Path) -> bool {
     ["llm.safetensors", "flow.safetensors", "hift.safetensors"]
         .iter()
         .all(|f| dir.join(f).is_file())
+}
+
+/// Whether a directory holds a Coqui VITS checkpoint rather than a 🤗 export.
+///
+/// Both files, for the reason the two checks above want all of theirs: a
+/// directory with `best_model.pth` and no `config.json` has nothing to read the
+/// geometry from, and saying so here beats failing inside a weight schema with
+/// the path already out of scope.
+///
+/// **A Coqui VITS engine is fed IPA phonemes, not text.** Nothing in this
+/// pipeline produces them, so serving one is only useful with a client that
+/// sends phonemes; the one-shot `--text` path is where it earns its keep. See
+/// `xabe_vits::CoquiTokenizer`.
+pub fn is_coqui(dir: &std::path::Path) -> bool {
+    dir.join("best_model.pth").is_file() && dir.join("config.json").is_file()
 }
 
 /// Whether a directory holds a converted Tacotron2 + WaveGlow pair.

@@ -16,6 +16,7 @@
 //! It is also what makes the differential tests possible: they feed the
 //! reference's captured draws in at exactly the two points it drew them.
 
+use crate::source::{Source, Symbols, open_coqui};
 use crate::{
     EncoderOutput, decoder, duration_predictor, expand_prior, flow_reverse, rng::Rng, text_encoder,
 };
@@ -24,11 +25,16 @@ use xabe_st::StFile;
 use xabe_vits::{Tokenizer, VitsConfig, VitsWeights};
 
 /// A loaded model, ready to synthesise.
+///
+/// Either published checkpoint of this architecture loads here - see
+/// [`Synthesizer::open`] for the 🤗 export and [`Synthesizer::open_coqui`] for
+/// a Coqui trainer's save. Everything below the constructor is shared: the two
+/// differ in what was read, not in what is computed.
 #[derive(Debug)]
 pub struct Synthesizer {
-    file: StFile,
+    source: Source,
     cfg: VitsConfig,
-    tok: Tokenizer,
+    tok: Symbols,
 }
 
 /// The deterministic half of the pipeline: tokenisation and the text encoder.
@@ -64,7 +70,17 @@ impl Prosody {
 }
 
 impl Synthesizer {
-    /// Loads a model directory: `model.safetensors`, `config.json`,
+    /// Loads a Coqui model directory: `best_model.pth` and `config.json`.
+    ///
+    /// The input this model takes is **IPA phonemes**, not text; see
+    /// [`xabe_vits::CoquiTokenizer`] for why the phonemiser is not in this
+    /// workspace and what produces them instead.
+    pub fn open_coqui(dir: &Path) -> Result<Self, SynthesisError> {
+        let (cfg, tok, source) = open_coqui(dir)?;
+        Ok(Self { source, cfg, tok })
+    }
+
+    /// Loads a 🤗 model directory: `model.safetensors`, `config.json`,
     /// `vocab.json` and `tokenizer_config.json`.
     pub fn open(dir: &Path) -> Result<Self, SynthesisError> {
         Self::open_files(
@@ -92,7 +108,11 @@ impl Synthesizer {
         // synthesis.
         VitsWeights::load(&file, &cfg)?;
         tracing::info!(model = %model.display(), "loaded model");
-        Ok(Self { file, cfg, tok })
+        Ok(Self {
+            source: Source::Huggingface(file),
+            cfg,
+            tok: Symbols::Huggingface(tok),
+        })
     }
 
     /// The model's geometry.
@@ -110,8 +130,8 @@ impl Synthesizer {
         &mut self.cfg
     }
 
-    /// The model's tokenizer.
-    pub fn tokenizer(&self) -> &Tokenizer {
+    /// The model's symbol table.
+    pub fn tokenizer(&self) -> &Symbols {
         &self.tok
     }
 
@@ -203,14 +223,9 @@ impl Synthesizer {
         Ok(audio)
     }
 
-    /// Re-binds the weight schema.
-    ///
-    /// Binding is 662 lookups into an already-parsed header and copies nothing,
-    /// so it is done per call rather than stored - which would make this a
-    /// self-referential struct for no measurable gain against a decoder that
-    /// takes seconds.
+    /// Re-binds the weight schema. See [`Source::weights`].
     fn weights(&self) -> Result<VitsWeights<'_>, SynthesisError> {
-        Ok(VitsWeights::load(&self.file, &self.cfg)?)
+        Ok(self.source.weights(&self.cfg)?)
     }
 }
 
@@ -228,6 +243,10 @@ pub enum SynthesisError {
     /// The tokenizer could not be loaded.
     #[error(transparent)]
     Tokenizer(#[from] xabe_vits::TokenizerError),
+
+    /// A Coqui checkpoint could not be opened or addressed.
+    #[error(transparent)]
+    TorchContainer(#[from] xabe_pt::PtError),
 
     /// The GPU path failed, or there is no device.
     #[error(transparent)]

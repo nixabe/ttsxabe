@@ -27,12 +27,37 @@
 //! division makes the waveform three times too loud, which `tanh` then clips
 //! into distortion rather than into an obvious error.
 
-use xabe_dsp::{conv1d, leaky_relu, transposed_conv1d};
-use xabe_vits::{Decoder, ResBlock, VitsConfig};
+use std::borrow::Cow;
+
+use xabe_dsp::{conv1d, fuse_weight_norm, leaky_relu, transposed_conv1d};
+use xabe_vits::{Decoder, MaybeWn, ResBlock, VitsConfig};
 
 /// PyTorch's default negative slope, which the final activation inherits by
 /// being called without an argument.
 const TORCH_DEFAULT_SLOPE: f32 = 0.01;
+
+/// The kernel to convolve with, fusing the weight norm if one is stored.
+///
+/// The 🤗 export of `mms-tts-nan` fused the decoder's parameterisation before
+/// saving and the Coqui checkpoint does not, so the same convolution arrives
+/// two ways. Fusing here rather than at load keeps `xabe-vits` free of
+/// arithmetic, and the borrowed case still copies nothing.
+///
+/// The row count comes from the magnitude's own length rather than from
+/// `out_ch`. That is not a shortcut: weight norm normalises over every axis but
+/// the first, and a *transposed* convolution stores `[in, out, k]` - so its
+/// magnitude has one entry per input channel, and reading `out_ch` here would
+/// divide 512 rows by 256 norms.
+fn kernel<'a>(c: &MaybeWn<'a>) -> Cow<'a, [f32]> {
+    match c {
+        MaybeWn::Fused(c) => Cow::Borrowed(c.weight),
+        MaybeWn::Normalised(w) => {
+            let rows = w.weight_g.len();
+            let cols = w.weight_v.len() / (rows * w.k);
+            Cow::Owned(fuse_weight_norm(w.weight_v, w.weight_g, rows, cols, w.k))
+        }
+    }
+}
 
 /// Synthesises a waveform from the flow's output.
 ///
@@ -61,10 +86,12 @@ pub fn decoder(z: &[f32], w: &Decoder<'_>, cfg: &VitsConfig) -> Vec<f32> {
         leaky_relu(&mut h, cfg.leaky_relu_slope);
 
         let stride = cfg.upsample_rates[stage];
-        let pad = (up.k - stride) / 2;
-        h = transposed_conv1d(&h, ch, t, up.weight, up.bias, up.out_ch, up.k, stride, pad);
-        t = (t - 1) * stride + up.k - 2 * pad;
-        ch = up.out_ch;
+        let k = up.k();
+        let pad = (k - stride) / 2;
+        let weight = kernel(up);
+        h = transposed_conv1d(&h, ch, t, &weight, up.bias(), up.out_ch(), k, stride, pad);
+        t = (t - 1) * stride + k - 2 * pad;
+        ch = up.out_ch();
 
         // Multi-receptive-field fusion: the same input through three different
         // kernel sizes, averaged.
@@ -117,15 +144,28 @@ fn resblock(
 
         let c1 = &block.convs1[i];
         leaky_relu(&mut h, cfg.leaky_relu_slope);
-        let pad = (c1.k * dilation - dilation) / 2;
-        h = conv1d(&h, ch, t, c1.weight, c1.bias, ch, c1.k, pad, pad, dilation);
+        let k1 = c1.k();
+        let pad = (k1 * dilation - dilation) / 2;
+        h = conv1d(
+            &h,
+            ch,
+            t,
+            &kernel(c1),
+            c1.bias(),
+            ch,
+            k1,
+            pad,
+            pad,
+            dilation,
+        );
 
         let c2 = &block.convs2[i];
         leaky_relu(&mut h, cfg.leaky_relu_slope);
         // The second convolution of each pair is never dilated, whatever the
         // first one's dilation was.
-        let pad = (c2.k - 1) / 2;
-        h = conv1d(&h, ch, t, c2.weight, c2.bias, ch, c2.k, pad, pad, 1);
+        let k2 = c2.k();
+        let pad = (k2 - 1) / 2;
+        h = conv1d(&h, ch, t, &kernel(c2), c2.bias(), ch, k2, pad, pad, 1);
 
         for (dst, src) in h.iter_mut().zip(&residual) {
             *dst += src;

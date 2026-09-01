@@ -1,5 +1,6 @@
 //! Errors raised while reading a VITS configuration or binding its weights.
 
+use xabe_pt::PtError;
 use xabe_st::StError;
 
 /// A configuration file could not be read, or describes a model this
@@ -79,6 +80,50 @@ pub enum ConfigError {
     /// which is what every MMS checkpoint uses.
     #[error("use_stochastic_duration_prediction=false is not supported")]
     DeterministicDuration,
+
+    /// A Coqui config describes a run that trained something other than VITS.
+    #[error("this config trained {model}, not vits")]
+    UnsupportedModel {
+        /// The model the run named.
+        model: String,
+    },
+
+    /// The decoder was built from `ResBlock2`, which has two convolutions per
+    /// dilation where `ResBlock1` has four. Checked rather than assumed: the
+    /// two share every channel count and differ only in how many tensors there
+    /// are, so a schema written for one binds a prefix of the other.
+    #[error("resblock_type_decoder is {kind}, but only type 1 is implemented")]
+    UnsupportedResblock {
+        /// The type the config named.
+        kind: String,
+    },
+
+    /// The run conditioned the model on something this forward pass does not
+    /// carry - a speaker embedding, a d-vector, a language embedding, or an
+    /// encoder running at its own sample rate. Each adds a tensor to the
+    /// arithmetic while breaking no shape.
+    #[error("{field} is set, and that conditioning is not implemented")]
+    UnsupportedConditioning {
+        /// The field that turned it on.
+        field: &'static str,
+    },
+
+    /// The symbol table built from `characters` is not the size the config
+    /// declares, so the embedding would be indexed with ids from a different
+    /// alphabet.
+    #[error("num_chars is {declared} but the characters block builds {built} symbols")]
+    VocabMismatch {
+        /// What the config declared.
+        declared: usize,
+        /// What its own character block builds.
+        built: usize,
+    },
+
+    /// The symbol table asks for deduplication without sorting, and the
+    /// reference does that with a Python `set`, whose order is not defined.
+    /// Reproducing it would be a guess at every id.
+    #[error("is_unique without is_sorted leaves the symbol order undefined")]
+    UnorderedVocab,
 }
 
 /// A checkpoint could not be bound to the configured geometry.
@@ -88,6 +133,11 @@ pub enum WeightError {
     /// wrapped [`StError`] names the tensor.
     #[error(transparent)]
     Container(#[from] StError),
+
+    /// The same, for a checkpoint that arrived as a torch `.pth`. The wrapped
+    /// [`PtError`] names the tensor.
+    #[error(transparent)]
+    Torch(#[from] PtError),
 }
 
 /// A tokenizer could not be loaded, or is configured in a way this
@@ -130,8 +180,29 @@ pub enum TokenizerError {
 
     /// No token has id 0. The blank inserted between symbols is defined as
     /// "whatever token id 0 is", so a vocabulary without one cannot be used.
+    ///
+    /// This is the 🤗 dialect's rule. A Coqui symbol table names its blank
+    /// explicitly and puts it at 3, so it fails through [`Self::NoSuchBlank`]
+    /// instead.
     #[error("no token has id 0, so there is no blank to intersperse")]
     NoBlank,
+
+    /// A Coqui config names a blank token its own symbol table does not hold,
+    /// so there is nothing to intersperse.
+    #[error("the symbol table has no {token:?} to intersperse")]
+    NoSuchBlank {
+        /// The token the config named.
+        token: String,
+    },
+
+    /// The symbol table could not be built from the config's `characters`
+    /// block. Only a Coqui config reaches this.
+    #[error("cannot build the symbol table: {source}")]
+    Vocabulary {
+        /// Why it could not be built.
+        #[source]
+        source: Box<ConfigError>,
+    },
 
     /// The tokenizer config asks for a preprocessing step this implementation
     /// does not have. Failing is deliberate: silently skipping phonemisation

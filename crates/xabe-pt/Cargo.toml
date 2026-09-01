@@ -1,5 +1,5 @@
 [package]
-name = "xabe-vits"
+name = "xabe-pt"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -7,13 +7,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-xabe-pt.workspace = true
-xabe-st.workspace = true
-rustc-hash.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+half.workspace = true
+memmap2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-xabe-golden.workspace = true

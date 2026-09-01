@@ -41,7 +41,8 @@ configuration of the same flags, not a different program.
       ├── xabe-cuda     CUDA kernels, tested against xabe-dsp
       ├── xabe-golden   reads the captured oracle
       ├── xabe-st       safetensors container, mmap, addressing
-      └── xabe-gguf     GGUF container, mmap, metadata, addressing
+      ├── xabe-gguf     GGUF container, mmap, metadata, addressing
+      └── xabe-pt       torch .pth container: zip, state-dict pickle, mmap
 ```
 
 Every crate in that tree exists and every stage flag reaches a built stage.
@@ -51,9 +52,10 @@ the stages behind it, so the topology could be settled first, and
 was waiting on. Nothing does that now; the only refusal left is `--vad-url`,
 which is a permanent limit rather than a pending one.
 
-**Two containers, one contract.** `xabe-st` reads safetensors and `xabe-gguf`
-reads GGUF, and they are siblings rather than one wrapping the other: same
-accessors, same errors, no shared trait. A model crate above them takes either.
+**Three containers, one contract.** `xabe-st` reads safetensors, `xabe-gguf`
+reads GGUF and `xabe-pt` reads a torch `.pth`, and they are siblings rather than
+one wrapping another: same accessors, same errors, no shared trait. A model
+crate above them takes any of them.
 The translator does exactly that - `Translator::open` accepts a 🤗 directory or
 a `.gguf` file - and the awkward part is not the dispatch but that a GGUF Llama
 stores `attn_q` and `attn_k` row-permuted. That is undone at load in
@@ -143,7 +145,8 @@ crates above it.
 | --- | --- | --- |
 | `xabe-st` | byte addressing inside a safetensors file | any idea what a tensor means |
 | `xabe-gguf` | byte addressing inside a GGUF file | any idea what a tensor means |
-| `xabe-vits` | model geometry, tensor names, shape contracts | doing arithmetic |
+| `xabe-pt` | byte addressing inside a torch `.pth`, and the slice of pickle a state dict needs | executing a pickle that is not a state dict |
+| `xabe-vits` | model geometry, tensor names and shape contracts, in both published dialects | doing arithmetic |
 | `xabe-dsp` | scalar f32 reference kernels | being fast |
 | `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
 | `xabe-golden` | reading captures, comparing tensors | producing them |

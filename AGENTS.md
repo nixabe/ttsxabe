@@ -26,6 +26,15 @@ out of the reply path. The loader proved the geometry, the forward pass was
 built on the kernels that were already there, and it matches both references —
 so the plan's "optional" is spent rather than pending.
 
+That model takes **IPA phonemes**, not text, and this engine does not produce
+them: its phonemiser is a Go binary with a Han-to-IPA dictionary and a learned
+fallback for what is not in it, and `tools/phonemize_pygoruut.py` runs the
+reference's own rather than half-porting it. That is a limit, stated rather than
+worked around - a half-ported G2P would mispronounce an out-of-dictionary word
+instead of dropping it, which is the failure this workspace is built to catch.
+It also means a Coqui engine is useful on the one-shot `--text` path and not in
+the conversation, where nothing upstream produces phonemes.
+
 An earlier version of this file said porting Whisper or the LLM here was
 explicitly out of scope. That was the right rule while the synthesiser was
 unfinished; it is retracted now that it is finished and measured. The chat LLM
@@ -76,7 +85,16 @@ left operand of a matmul; that refusal stands.
 
 Every stage is finished: the synthesiser, the serving layer, voice activity
 detection, speech recognition, Mandarin-to-Taigi translation, the chat model,
-CosyVoice3, and a third synthesiser in Tacotron2 + WaveGlow. This paragraph
+CosyVoice3, and a third synthesiser in Tacotron2 + WaveGlow. A **fourth
+synthesiser** has since landed and cost almost nothing, which is the interesting
+part: `neurlang/coqui-vits-suisiann-minnan-hokkien` is the same VITS as
+`mms-tts-nan` from a different trainer, so not one line of the forward pass
+changed. What it needed was a third container crate - `xabe-pt`, which reads a
+torch `.pth` directly rather than converting one - a second naming scheme, a
+decoder whose weight norm had not been fused before saving, and a 137-symbol IPA
+vocabulary whose blank is at id 3 rather than 0. It agrees with its own captured
+oracle to 5.8e-5 on the CPU and 6.2e-5 on the card. `docs/MODEL.md` has the five
+differences and the one that is a genuine trap. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.
@@ -186,6 +204,16 @@ class definitions. `tools/convert_tacotron2.py` does that once, offline. The
 claim at the top of this file holds everywhere except `xabe-taco`, and that
 exception is a property of how NVIDIA saved the file in 2019.
 
+That exception is now narrower than it reads, and the boundary is worth being
+precise about. A modern torch `.pth` **is** readable here: it is a zip holding a
+pickle that names tensors and one stored entry per storage, and a *state dict*
+pickle names exactly three things - `collections.OrderedDict`,
+`torch._utils._rebuild_tensor_v2` and a storage class. `xabe-pt` implements
+those three and refuses every other `GLOBAL` by name, which is why the Coqui
+VITS checkpoint is read as published while WaveGlow still is not. The difference
+is not the extension; it is whether the file is a state dict or an object graph,
+and `xabe-pt` says which it found rather than guessing.
+
 ## Non-negotiable design rules
 
 1. **Reject invalid state in the constructor, not at use.** A checkpoint of the
@@ -224,15 +252,16 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 | --- | --- | --- |
 | `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
 | `xabe-gguf` | GGUF container parsing, mmap, metadata, block-format unpacking | — |
+| `xabe-pt` | torch `.pth` container parsing: zip, a state-dict pickle, mmap, addressing | — |
 | `xabe-dsp` | CPU reference kernels + differential compare harness | — |
 | `xabe-golden` | reading captures and comparing tensors | — |
 | `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |
 | `xabe-cuda` | CUDA kernels and the device handle | `xabe-dsp` |
-| `xabe-vits` | VITS config, weight schema, shape validation | `xabe-st`, `xabe-golden` |
+| `xabe-vits` | VITS config, weight schema, shape validation, two checkpoint dialects | `xabe-st`, `xabe-pt`, `xabe-golden` |
 | `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | `xabe-st`, `xabe-dsp`, `xabe-audio` |
 | `xabe-llama` | Llama geometry, weight schema, SentencePiece | `xabe-st`, `xabe-gguf` |
 | `xabe-vad` | Silero geometry, weights and forward pass | `xabe-st`, `xabe-dsp`, `xabe-audio` |
-| `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-golden` |
+| `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-pt`, `xabe-golden` |
 | `xabe-asr` | the Whisper forward pass and greedy decoding | `xabe-whisper`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-audio` |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | `xabe-llama`, `xabe-cuda`, `xabe-st` |
 | `xabe-chat` | the chat model's forward pass, sampling, stop strings | `xabe-llama`, `xabe-cuda`, `xabe-gguf` |
@@ -247,6 +276,15 @@ tensors are and refuses to do arithmetic, and one that runs them. `xabe-vits` to
 and `xabe-chat` - one geometry crate serving two forward passes, which is the
 pattern working rather than an exception to it. A geometry crate that grows a
 matmul has broken the rule.
+
+`xabe-vits` now runs the same pattern the other way: **one geometry crate
+reading two published checkpoints of one architecture.** `facebook/mms-tts-nan`
+and `neurlang/coqui-vits-suisiann-minnan-hokkien` are the same VITS from
+different trainers, and `xabe-tts` runs both with no stage changed - what
+differs is the container, every tensor name, the symbol table, and whether the
+decoder's weight norm was fused before saving. `docs/MODEL.md` has all five
+differences. The second one takes IPA phonemes rather than romanisation, and
+producing those is `tools/phonemize_pygoruut.py` rather than this engine.
 
 `xabe-cosy` and `xabe-taco` are one crate each, and that is a deviation rather
 than a second pattern. Neither model's geometry is read by anything but its own

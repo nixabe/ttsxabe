@@ -22,6 +22,12 @@ Finished: the synthesiser, the serving layer, voice activity detection, speech
 recognition, Mandarin-to-Taigi translation, the chat model, CosyVoice3, and a
 third synthesiser, Tacotron2 + WaveGlow, from
 [taiwanese_tonal_tlpa_tacotron2](https://github.com/yfliao/taiwanese_tonal_tlpa_tacotron2).
+A fourth reuses the first: `xabe-tts` also reads
+[coqui-vits-suisiann-minnan-hokkien](https://huggingface.co/neurlang/coqui-vits-suisiann-minnan-hokkien),
+which is the same VITS from a different trainer at 22.05 kHz, with no stage of
+the forward pass changed — a new container, a new naming scheme and an IPA
+vocabulary were all it needed. It speaks phonemes rather than text; see
+`docs/MODEL.md`.
 Remaining inside CosyVoice: deriving a **new** voice still runs two ONNX models
 once, through `tools/make_cosyvoice_voice.py`. `docs/MILESTONES.md` has the
 phases and `docs/CLI.md` the flag surface.
@@ -144,7 +150,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | --- | --- |
 | `xabe-st` | safetensors container, validated addressing |
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
-| `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
+| `xabe-vits` | config, weight schema and tokenizer, in both published dialects |
 | `xabe-dsp` | scalar reference kernels |
 | `xabe-cuda` | 75 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
@@ -156,6 +162,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
 | `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
 | `xabe-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
+| `xabe-pt` | torch `.pth` container: zip, a state-dict pickle, validated addressing |
 | `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
 | `xabe-chat` | the chat model's forward pass, sampling and stop handling |
@@ -332,6 +339,7 @@ supply, and their terms are between you and whoever published them.
 | `Breeze-ASR-26` | Apache-2.0 |
 | `Fun-CosyVoice3-0.5B` | Apache-2.0 |
 | `taiwanese_tonal_tlpa_tacotron2` | BSD-3-Clause, from NVIDIA's Tacotron2 |
+| `coqui-vits-suisiann-minnan-hokkien` | CC-BY-SA 4.0 — **share-alike** |
 
 The chat model and the VAD carry their own terms too; check the card before you
 ship anything. The non-commercial pair is the part that surprises people, which

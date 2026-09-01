@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 xabe-cuda.workspace = true
 xabe-dsp.workspace = true
+xabe-pt.workspace = true
 xabe-st.workspace = true
 xabe-vits.workspace = true
 clap.workspace = true

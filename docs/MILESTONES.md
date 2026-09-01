@@ -722,3 +722,49 @@ Serving *was* on that list, on the grounds that the pipeline upstream already
 had an HTTP surface that worked. That is retracted in phase 2: the engine is
 becoming the pipeline, so the gateway is not a surface being duplicated but one
 being replaced. See `docs/CLI.md` for the full reasoning.
+
+## Phase 7 — a second VITS checkpoint
+
+| # | State | Done |
+| --- | --- | --- |
+| 31 | A torch `.pth` is read as published, at exact equality with `torch.load` | ✅ |
+| 32 | Coqui geometry, vocabulary and all 738 inference tensors bound and shape-checked | ✅ |
+| 33 | The Coqui oracle is captured and every stage matches it, CPU and CUDA | ✅ |
+| 34 | `--tts-model` opens either dialect, decided by the directory | ✅ |
+
+This phase is unusual in that item 33 - the whole forward pass agreeing with a
+reference - took no forward-pass work at all.
+`neurlang/coqui-vits-suisiann-minnan-hokkien` is the same VITS as
+`facebook/mms-tts-nan` from a different trainer, so the arithmetic was already
+written and already correct. The work was entirely in front of it: a third
+container crate, a second naming scheme, a decoder whose weight norm had not
+been fused before saving, and a 137-symbol IPA vocabulary whose blank sits at id
+3 rather than 0.
+
+That is worth recording as evidence rather than as a boast. The reason a second
+checkpoint of a known architecture is cheap is that the first one was verified
+stage by stage against a capture: there was never a question of *which* half was
+wrong when something disagreed, because the forward pass had a standing proof
+and the loader did not.
+
+**Item 31 narrows a claim rather than adding one.** `AGENTS.md` has said since
+`xabe-taco` landed that WaveGlow is the one stage reading converted weights,
+because it is a pickled `nn.Module` object graph. That is still true, and it is
+now clear that the extension was never the issue: a modern `.pth` is a zip
+holding a pickle, and a *state dict* pickle names exactly three things -
+`collections.OrderedDict`, `torch._utils._rebuild_tensor_v2` and a storage
+class. `xabe-pt` implements those three, refuses every other `GLOBAL` by name,
+and so reads this checkpoint as published while still being unable to read
+WaveGlow. The distinction is state dict against object graph, and the loader
+says which it found.
+
+**What is not done, and will not be by this phase.** The model's text front end
+is `pygoruut` - a Go binary carrying a Han-to-IPA dictionary and a learned
+fallback - and it is not ported. `tools/phonemize_pygoruut.py` runs the
+reference's own instead. A half-port would mispronounce an out-of-dictionary
+word rather than dropping it, which is the failure this project's whole
+differential harness exists to catch, so shipping one to make the flag surface
+tidier would be trading the thing that matters for the thing that looks
+finished. The consequence is stated where it bites: this engine is useful on the
+one-shot `--text` path and not in the conversation, because nothing upstream
+produces IPA.

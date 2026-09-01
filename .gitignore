@@ -14,3 +14,9 @@ prompts/
 # `docs/BENCHMARKS.md` says which lines, and the weights are not redistributed
 # here for the same reason `models/` is not.
 bench/
+
+# The Coqui reference's environment. Python 3.10 and a torch of its own, which
+# do not coexist with the rest of the tooling here - `docs/ORACLE.md` has the
+# two commands that build it, and nothing in the workspace needs it except
+# regenerating `.golden/coqui-base`.
+.venv-coqui/

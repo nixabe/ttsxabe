@@ -112,7 +112,7 @@ impl VitsConfig {
     ///
     /// Called by both constructors. Everything downstream indexes on the
     /// invariants established here, so this is the only place they are checked.
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         // A different activation would change every output while breaking no
         // shape, so it is checked rather than assumed.
         if self.hidden_act != "relu" {

@@ -17,6 +17,19 @@ huggingface-cli download facebook/mms-tts-nan --local-dir models/tts/mms-tts-nan
 cargo test --workspace --release
 ```
 
+The second VITS checkpoint is one more download and needs no conversion, since
+`xabe-pt` reads the `.pth` as published:
+
+```sh
+huggingface-cli download neurlang/coqui-vits-suisiann-minnan-hokkien \
+    --local-dir models/tts/coqui-vits-suisiann
+```
+
+Its oracle needs Python 3.10 and a torch of its own, which do not coexist with
+the rest of the tooling here — [ORACLE.md](ORACLE.md) has the two commands, and
+`.venv-coqui/` is gitignored. Nothing but regenerating `.golden/coqui-base`
+needs it.
+
 `models/` is gitignored and is where every model in the pipeline lives, so
 populating it is the whole of provisioning a machine. Tests look there first,
 fall back to `~/.cache/huggingface/hub/`, and take an environment variable over
@@ -64,7 +77,15 @@ tensor that disagrees rather than staring at a waveform.
 
 If everything matches but the audio is wrong, the bug is upstream of the model:
 tokenisation, or the orthography of the input text. See the POJ note in
-[MODEL.md](MODEL.md).
+[MODEL.md](MODEL.md), and — on the Coqui checkpoint — remember that its input is
+IPA rather than any romanisation, so Han text in gives silence out by design.
+
+One failure shape is worth recognising on sight. If a **late** stage matches and
+an **early** one does not, suspect the capture rather than the code: an
+arithmetic error large enough to wreck the text encoder cannot leave the
+waveform correct, but a transposed comparison looks exactly like that. The two
+references disagree about whether the encoder carries `[B, C, T]` or `[B, T, C]`
+— [ORACLE.md](ORACLE.md) has the round this cost.
 
 ## Adding a dependency
 

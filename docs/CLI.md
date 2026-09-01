@@ -141,14 +141,38 @@ filenames:
 | --- | --- |
 | `llm.safetensors`, `flow.safetensors`, `hift.safetensors` | CosyVoice3 |
 | `tacotron2.safetensors`, `waveglow.safetensors`, `tacotron2.json` | Tacotron2 + WaveGlow |
-| anything else | VITS |
+| `best_model.pth`, `config.json` | Coqui VITS |
+| anything else | 🤗 VITS |
 
 All of a set, not one of it — a half-converted directory would otherwise be
 opened as the model it is half of and fail deep inside a weight schema instead
 of here, where the path is still in hand.
 
-`--tts-model` sniffs the same way, so it takes either checkpoint. Which one it
-is, is a property of the directory rather than of a second flag.
+`--tts-model` sniffs the same way, so it takes any of them. Which one it is, is
+a property of the directory rather than of a second flag.
+
+### A Coqui VITS engine speaks IPA, not text
+
+The last two rows are both VITS and run the same forward pass, but they do not
+eat the same thing. `neurlang/coqui-vits-suisiann-minnan-hokkien` is trained on
+IPA phonemes produced by `pygoruut`, and nothing in this pipeline produces them
+— there is no `--tts-script` value that would, because the translator emits POJ,
+Han or both and never IPA. Opening one logs a warning saying so.
+
+Where it works is the one-shot path, with the phonemes made first:
+
+```sh
+PHONEMES=$(.venv-coqui/bin/python tools/phonemize_pygoruut.py \
+             --text "你好！我是蔡贏。我的人在台北。")
+
+xabe-engine --tts-model models/tts/coqui-vits-suisiann --tts-device 0 \
+            --text "$PHONEMES" --out hello.wav
+```
+
+Handing it the Han text instead is not silently wrong: every character is
+outside its symbol table, so it refuses with "contains no symbols this model can
+speak". `docs/MODEL.md` says why the phonemiser is a tool here rather than a
+crate.
 
 It also stands alone. `--tts-model` fills one unnamed slot and `--tts-engine`
 fills named ones, but both are a synthesiser running in this process, so a run

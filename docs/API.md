@@ -72,6 +72,40 @@ on it; `GgmlType::is_quantized` says so for anyone who needs to know, and
 read, at full width — see `docs/MODEL.md` for why that is a disk saving and not
 a memory one.
 
+## `xabe-pt`
+
+```rust
+use xabe_pt::PtFile;
+
+// A trainer's checkpoint keeps the weights beside the optimiser, so the
+// section is named rather than guessed.
+let f = PtFile::open_section("best_model.pth", "model")?;
+
+f.len();                                        // tensors bound: 949 here
+f.tensors();                                    // (&str, &TensorInfo), sorted
+f.info("text_encoder.emb.weight");              // Option<&TensorInfo>
+f.tensor("text_encoder.emb.weight")?;           // &[f32], borrowed
+f.tensor_shaped("text_encoder.emb.weight", &[137, 192])?;
+f.tensor_f32("some.f16.tensor")?;               // Vec<f32>, widened
+```
+
+`PtFile::open` is the same for a file whose root object is itself the state
+dict. Both borrow from the mapping, exactly as `xabe-st` does.
+
+**This is not "unpickling".** Unpickling in general executes what the stream
+names, which is why the WaveGlow checkpoint in `xabe-taco` has to be converted
+offline: it is an `nn.Module` object graph and rebuilding it needs the model's
+own class definitions. A *state dict* names exactly three things -
+`collections.OrderedDict`, `torch._utils._rebuild_tensor_v2` and a storage
+class - and this crate implements those three and refuses every other `GLOBAL`
+by name. So the difference between a `.pth` it can honestly read and one it
+cannot is an error message rather than a guess.
+
+Two limits are deliberate. Entries must be **stored**, not compressed, because
+the whole point is to map them; and tensors must be **contiguous**, because a
+saved view would keep a plausible shape while reading its elements in the wrong
+order.
+
 ## The geometry crates
 
 `xabe-vits`, `xabe-whisper` and `xabe-llama` all have the same shape: a config
@@ -82,6 +116,13 @@ tensors and a fixed architecture — so it appears below with its forward pass.
 ```rust
 let cfg = VitsConfig::from_json_path(path)?;     // rejects unsupported geometry
 let weights = VitsWeights::load(&file, &cfg)?;   // every tensor shape-checked
+
+// The same architecture from a Coqui trainer: a different config file, a
+// different container, different names for all 738 inference tensors.
+let raw = CoquiConfig::from_json_path(path)?;
+let cfg = raw.to_vits()?;                        // one geometry, two dialects
+let tok = CoquiTokenizer::new(&raw)?;            // 137 IPA symbols, blank at 3
+let weights = VitsWeights::load_coqui(&pt, &cfg)?;
 
 let cfg = WhisperConfig::from_dir(dir)?;
 let weights = WhisperWeights::load(&set, &cfg)?; // 1,259 tensors

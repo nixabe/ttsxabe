@@ -79,15 +79,34 @@ pub fn speak(
 
     let ck = Checkpoint::locate(path, args.config.as_deref());
 
-    let (rate, audio) = match device {
-        Device::Cpu => {
+    // A Coqui VITS save and a 🤗 export are the same model in different
+    // containers, so they share every line below the constructor. What they do
+    // not share is their input: this one takes **IPA phonemes**, which
+    // `tools/phonemize_pygoruut.py` produces and nothing in this workspace
+    // does. See `docs/MODEL.md`.
+    let coqui = crate::serve::is_coqui(&ck.dir);
+
+    let (rate, audio) = match (device, coqui) {
+        (Device::Cpu, true) => {
+            let mut synth = Synthesizer::open_coqui(&ck.dir)?;
+            apply_overrides(synth.config_mut(), args);
+            let rate = synth.config().sampling_rate;
+            (rate, synth.synthesize(&text, args.seed)?)
+        }
+        (Device::Cpu, false) => {
             let mut synth =
                 Synthesizer::open_files(&ck.dir.join("model.safetensors"), &ck.config, &ck.dir)?;
             apply_overrides(synth.config_mut(), args);
             let rate = synth.config().sampling_rate;
             (rate, synth.synthesize(&text, args.seed)?)
         }
-        Device::Cuda(ordinal) => {
+        (Device::Cuda(ordinal), true) => {
+            let mut model = GpuModel::open_coqui(&ck.dir, ordinal)?;
+            apply_overrides(model.config_mut(), args);
+            let rate = model.config().sampling_rate;
+            (rate, model.synthesize(&text, args.seed)?)
+        }
+        (Device::Cuda(ordinal), false) => {
             let mut model = GpuModel::open(&ck.dir, ordinal)?;
             apply_overrides(model.config_mut(), args);
             let rate = model.config().sampling_rate;

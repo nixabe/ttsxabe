@@ -19,6 +19,7 @@ members = [
     "crates/xabe-cosy",
     "crates/xabe-translate",
     "crates/xabe-taco",
+    "crates/xabe-pt",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ xabe-taco = { path = "crates/xabe-taco" }
 xabe-asr = { path = "crates/xabe-asr" }
 xabe-llama = { path = "crates/xabe-llama" }
 xabe-gguf = { path = "crates/xabe-gguf" }
+xabe-pt = { path = "crates/xabe-pt" }
 xabe-chat = { path = "crates/xabe-chat" }
 xabe-cosy = { path = "crates/xabe-cosy" }
 xabe-translate = { path = "crates/xabe-translate" }

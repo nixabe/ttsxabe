@@ -28,12 +28,15 @@
 //! noise.
 
 use crate::rng::Rng;
+use crate::source::Symbols;
 use crate::synthesize::SynthesisError;
 use std::path::Path;
 use xabe_cuda::{CudaError, CudaSlice, Gpu};
 use xabe_dsp::spline_inverse;
 use xabe_st::StFile;
-use xabe_vits::{Conv, DdsConv, DurationFlow, Norm, Tokenizer, VitsConfig, VitsWeights, WnConv};
+use xabe_vits::{
+    Conv, DdsConv, DurationFlow, MaybeWn, Norm, Tokenizer, VitsConfig, VitsWeights, WnConv,
+};
 
 /// A convolution or dense projection, on the device.
 struct GConv {
@@ -143,7 +146,7 @@ struct GpuWeights {
 pub struct GpuModel {
     gpu: Gpu,
     cfg: VitsConfig,
-    tok: Tokenizer,
+    tok: Symbols,
     w: GpuWeights,
 }
 
@@ -158,13 +161,31 @@ impl std::fmt::Debug for GpuModel {
 }
 
 impl GpuModel {
-    /// Loads a model directory onto CUDA device `ordinal`.
+    /// Loads a 🤗 model directory onto CUDA device `ordinal`.
     pub fn open(dir: &Path, ordinal: usize) -> Result<Self, SynthesisError> {
         let gpu = Gpu::open(ordinal)?;
         let cfg = VitsConfig::from_json_path(dir.join("config.json"))?;
         let tok = Tokenizer::load(dir)?;
         let file = StFile::open(dir.join("model.safetensors"))?;
         let host = VitsWeights::load(&file, &cfg)?;
+        let w = upload(&gpu, &host, &cfg)?;
+        tracing::info!(ordinal, "model resident on device");
+        Ok(Self {
+            gpu,
+            cfg,
+            tok: Symbols::Huggingface(tok),
+            w,
+        })
+    }
+
+    /// Loads a Coqui model directory onto CUDA device `ordinal`.
+    ///
+    /// The weights land on the device fused, so nothing downstream of `upload`
+    /// knows that this checkpoint stored its decoder weight-normalised.
+    pub fn open_coqui(dir: &Path, ordinal: usize) -> Result<Self, SynthesisError> {
+        let gpu = Gpu::open(ordinal)?;
+        let (cfg, tok, source) = crate::source::open_coqui(dir)?;
+        let host = source.weights(&cfg)?;
         let w = upload(&gpu, &host, &cfg)?;
         tracing::info!(ordinal, "model resident on device");
         Ok(Self { gpu, cfg, tok, w })
@@ -862,15 +883,29 @@ fn upload(g: &Gpu, w: &VitsWeights<'_>, cfg: &VitsConfig) -> Result<GpuWeights, 
     };
     // Weight normalisation is fused on the device, using the same kernel the
     // differential tests cover.
+    //
+    // The row count comes from the magnitude's own length, not from `out_ch`,
+    // for the reason the CPU twin gives: a transposed convolution stores
+    // `[in, out, k]`, so its magnitude has one entry per *input* channel.
     let wn = |c: &WnConv<'_>| -> Result<GConv, CudaError> {
+        let rows = c.weight_g.len();
+        let cols = c.weight_v.len() / (rows * c.k);
         let v = g.upload(c.weight_v)?;
         let gg = g.upload(c.weight_g)?;
         Ok(GConv {
-            w: g.fuse_weight_norm(&v, &gg, c.out_ch, c.in_ch, c.k)?,
+            w: g.fuse_weight_norm(&v, &gg, rows, cols, c.k)?,
             b: Some(g.upload(c.bias)?),
             out_ch: c.out_ch,
             k: c.k,
         })
+    };
+    // The decoder's convolutions arrive fused from the 🤗 export and unfused
+    // from a Coqui save; either way the device gets one kernel.
+    let maybe = |c: &MaybeWn<'_>| -> Result<GConv, CudaError> {
+        match c {
+            MaybeWn::Fused(c) => conv(c),
+            MaybeWn::Normalised(c) => wn(c),
+        }
     };
     let dds = |d: &DdsConv<'_>| -> Result<GDds, CudaError> {
         Ok(GDds {
@@ -935,8 +970,8 @@ fn upload(g: &Gpu, w: &VitsWeights<'_>, cfg: &VitsConfig) -> Result<GpuWeights, 
     let mut resblocks = Vec::with_capacity(w.decoder.resblocks.len());
     for r in &w.decoder.resblocks {
         resblocks.push(GResBlock {
-            convs1: r.convs1.iter().map(&conv).collect::<Result<_, _>>()?,
-            convs2: r.convs2.iter().map(&conv).collect::<Result<_, _>>()?,
+            convs1: r.convs1.iter().map(&maybe).collect::<Result<_, _>>()?,
+            convs2: r.convs2.iter().map(&maybe).collect::<Result<_, _>>()?,
         });
     }
 
@@ -955,7 +990,7 @@ fn upload(g: &Gpu, w: &VitsWeights<'_>, cfg: &VitsConfig) -> Result<GpuWeights, 
             .decoder
             .upsampler
             .iter()
-            .map(&conv)
+            .map(&maybe)
             .collect::<Result<_, _>>()?,
         resblocks,
         dec_post: conv(&w.decoder.conv_post)?,

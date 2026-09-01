@@ -782,3 +782,167 @@ fall out of that list's order: `<|endofprompt|>` is 151646 only because
 
 The pre-tokenization pattern differs from Llama-3's in exactly one alternative,
 `\p{N}` against `\p{N}{1,3}` — every digit is its own piece here.
+
+# Coqui VITS, `neurlang/coqui-vits-suisiann-minnan-hokkien`
+
+The same architecture as `facebook/mms-tts-nan`, trained by somebody else on
+somebody else's corpus. 29,075,184 inference parameters in 738 F32 tensors -
+83,060,332 in 949 if you count the trainer's discriminator and posterior
+encoder, which is what the file actually holds - 22.05 kHz output, trained on
+SuiSiann-0.2.1. Licence CC-BY-SA 4.0, and not redistributed here.
+
+It is not a variant of the model above. It is *the* model above, from a
+different trainer, and every stage of the forward pass in `xabe-tts` runs it
+without a line changed. What is different is entirely in the loading, and this
+section is about those five differences, because each one of them is a way to
+read the checkpoint wrongly and still produce speech.
+
+## Geometry
+
+Beside `mms-tts-nan`, so the two columns are the point:
+
+| | mms-tts-nan | this |
+| --- | --- | --- |
+| hidden size | 192 | 192 |
+| text encoder | 6 layers, 2 heads, FFN 768, kernel 3 | same |
+| relative attention window | 4 | 4 |
+| vocabulary | 48 POJ symbols | **137 IPA phonemes** |
+| flow | 4 blocks, 4 WaveNet layers, kernel 5 | same |
+| duration predictor | stochastic, 4 flows, kernel 3 | same |
+| decoder upsample rates | [8, 8, 2, 2] | [8, 8, 2, 2] |
+| decoder upsample kernels | [16, 16, 4, 4] | [16, 16, 4, 4] |
+| hop length | 256 → 16 kHz | 256 → **22.05 kHz** |
+| noise scale | 0.667 prior, 0.8 duration | 0.667 prior, **1.0** duration |
+| container | safetensors | **torch `.pth`** |
+| decoder weight norm | fused away on export | **still there** |
+
+The hop is 256 in both, so a frame is 16 ms there and 11.6 ms here. Nothing in
+the engine cares; the sample rate is metadata all the way to the WAV header.
+
+## Five differences, and what each one breaks
+
+**1. The container is a `.pth`.** A zip archive holding a pickle that names the
+tensors and one stored entry per storage. `xabe-pt` reads it directly - see
+below for why that is not the same as unpickling - so the claim at the top of
+`AGENTS.md` still holds: this is the published checkpoint, not a conversion of
+one.
+
+**2. Every tensor is named differently.** 🤗 renamed the whole model when it
+ported it. `text_encoder.encoder.attn_layers.0.conv_q` here is
+`text_encoder.encoder.layers.0.attention.q_proj` there; `waveform_decoder` is
+`decoder`; the layer norms keep their parameters in `gamma` and `beta` rather
+than `weight` and `bias`, because the class is Coqui's `LayerNorm2` and not
+`nn.LayerNorm`. Same arithmetic, same `eps=1e-5`.
+
+**3. The decoder's weight norm has not been fused.** This is the only structural
+difference and it is the one worth stating twice. The 🤗 export ran
+`remove_weight_norm` before saving, so its upsamplers and resblocks carry a
+plain `weight`. The Coqui save did not, so they carry
+`parametrizations.weight.original0` and `original1` - the magnitude and the
+direction - and the kernel is their product after a division. `MaybeWn` is the
+type that says which was found, and `xabe-tts`'s decoder fuses when it has to.
+
+There is a trap inside the trap. Weight norm normalises over every axis but the
+first, and a **transposed** convolution stores `[in, out, k]` - so the four
+upsamplers have one magnitude per *input* channel where every other convolution
+in the model has one per output channel. Reading `out_ch` there divides 512 rows
+of kernel by 256 norms. Both the CPU and the CUDA path take the row count from
+the magnitude's own length instead, which cannot be wrong.
+
+**4. The vocabulary is IPA, and the blank is not zero.** Coqui builds its symbol
+table as `[pad, eos, bos, blank]` then the sorted alphabet then the punctuation.
+The four specials are multi-character strings - `<PAD>`, `<BLNK>` - so none of
+them can ever be produced by looking a phoneme up, but they occupy ids, and the
+blank interspersed between every symbol is therefore **3**. It is 0 on the 🤗
+path. Getting this wrong shifts nothing and breaks nothing: the model speaks,
+with a padding token between every phoneme.
+
+**5. Durations are scaled the other way round.** The reference multiplies by
+`length_scale`; this workspace divides by `speaking_rate`. They are reciprocals.
+Both are 1.0 here, which is exactly why it is written down - the bug would not
+have shown up in this checkpoint.
+
+## The input is phonemes, and this engine does not produce them
+
+`use_phonemes` is true, `phonemizer` is `pygoruut:v0.6.3` and
+`phoneme_language` is `MinnanHokkien2`. The model's embedding table is indexed
+by IPA, and the thing that turns 你好 into `li˥˧ho˥˧` is a Go binary with a
+140 KB Han-to-IPA dictionary and a learned fallback for what is not in it.
+
+That front end is **not** ported here, and the decision is deliberate rather
+than pending. Porting the dictionary would be an afternoon; porting the fallback
+would not, and a half-port is worse than none - a word outside the dictionary
+would come out *mispronounced* rather than missing, which is precisely the
+failure mode this workspace exists to refuse. So `tools/phonemize_pygoruut.py`
+runs the reference's own front end, and the engine takes what it produces:
+
+```
+.venv-coqui/bin/python tools/phonemize_pygoruut.py --text "你好！我是蔡贏。"
+li˥˧ho˥˧ɡua˥˧si˧˧ĩã˨˦
+```
+
+Two consequences follow, and neither is an error anywhere:
+
+- **Han text fed straight in synthesises nothing.** Every character is outside
+  the table, so tokenisation yields an empty sequence and the engine returns
+  "contains no symbols this model can speak". That is the good case.
+- **This engine cannot serve the conversation pipeline.** No stage upstream
+  produces IPA, and `--tts-script` has no setting that would. `--tts-model`
+  with a Coqui directory warns about that at load and then works, because the
+  one-shot `--text` path is where it is useful.
+
+The phonemiser also leaves characters it does not know alone - the capture in
+`.golden/coqui-base` contains a bare 蔡 and a full-width 。 for that reason -
+and the tokenizer then drops them. That is the reference's behaviour, reproduced
+rather than corrected.
+
+## Where the parameters are
+
+| component | tensors | params | share | needed at inference |
+| --- | --- | --- | --- | --- |
+| `disc` | 111 | 46.75 M | 56.3% | **no** |
+| `waveform_decoder` | 231 | 14.34 M | 17.3% | yes |
+| `posterior_encoder` | 100 | 7.24 M | 8.7% | **no** |
+| `flow` | 112 | 7.10 M | 8.6% | yes |
+| `text_encoder` | 111 | 6.32 M | 7.6% | yes |
+| `duration_predictor` | 284 | 1.32 M | 1.6% | yes |
+
+The discriminator is more than half the file and is a training signal only. With
+the posterior encoder it is 211 tensors and 54.0 M parameters that synthesis
+never reads - which is why the checkpoint is 950 MB and the model is 29.1 M
+parameters. `mms-tts-nan` is 139 MB for a comparable model because its export
+dropped the discriminator and kept only what a synthesiser could conceivably
+read.
+
+## Agreement with the reference
+
+Captured from Coqui's own `Vits` on CPU in float32, single-threaded, by
+`tools/oracle/capture_coqui.py`. Per stage, maximum absolute difference:
+
+| stage | CPU | CUDA |
+| --- | --- | --- |
+| symbol ids | exact | exact |
+| scaled embedding | 0 | — |
+| encoder layers 0-5 | ≤ 9.5e-6 | — |
+| `m_p` | 2.9e-6 | — |
+| `logs_p` | 3.7e-7 | — |
+| waveform, 57,088 samples | **5.8e-5** | **6.2e-5** |
+
+The CUDA figure is looser for the reason `gpu_end_to_end.rs` gives about the
+other checkpoint: the card fuses multiply-add, so its arithmetic is not the
+CPU's rearranged but genuinely different, and the difference compounds through
+twelve residual blocks.
+
+## The capture's tensor layouts are not the reference's
+
+Worth knowing before writing another one. Coqui's text encoder carries its
+activations as `[B, C, T]` and 🤗's as `[B, T, C]`, and that applies to the
+embedding, every layer output, `enc_out`, `m_p` and `logs_p`. After the duration
+expansion both are `[B, C, T]`, so `z_p`, `z` and the waveform need nothing.
+`capture_coqui.py` transposes on the way out, so one `xabe-golden` convention
+serves both dialects and a test does not have to ask which capture it opened.
+
+This was found the way everything here is found: the waveform matched end to
+end while `enc_out` disagreed at 18,595 of 18,624 values, which is not a
+plausible shape for an arithmetic error and is exactly what a transposed
+comparison looks like.

@@ -5,6 +5,17 @@
 //! has changed shape before - a golden file whose `transformers` version is
 //! unknown cannot be trusted to still describe the current reference, and the
 //! only way to notice is to have written the version down.
+//!
+//! # Two references write these
+//!
+//! `tools/oracle/capture.py` records 🤗 `VitsModel` and
+//! `tools/oracle/capture_coqui.py` records Coqui's own `Vits`. The tensor half
+//! is identical - same names, same layouts - because it is the same
+//! architecture. The provenance half is not: one names a `transformers`
+//! version and the other a `coqui_tts` version, and only the second has
+//! phonemes to record. The fields that belong to one dialect default rather
+//! than being required, and [`Manifest::input`] is what a test should read
+//! instead of choosing between them.
 
 use serde::Deserialize;
 
@@ -15,6 +26,16 @@ pub struct Manifest {
     pub model: String,
     /// The input text, verbatim.
     pub text: String,
+    /// Which reference produced this capture: `coqui`, or absent for 🤗.
+    #[serde(default)]
+    pub dialect: Option<String>,
+    /// The phonemes the text became, when the reference phonemised it.
+    ///
+    /// Present only for a Coqui capture, whose model is trained on IPA rather
+    /// than on letters. It is what the engine is actually fed - see
+    /// [`Manifest::input`].
+    #[serde(default)]
+    pub phonemes: Option<String>,
     /// The RNG seed. Recorded for reproducibility, but the draws themselves are
     /// captured too - see `noise_dur` and `noise_prior`.
     pub seed: u64,
@@ -26,8 +47,13 @@ pub struct Manifest {
     pub noise_scale_duration: f32,
     /// Frames per symbol multiplier; the reciprocal of the length scale.
     pub speaking_rate: f32,
-    /// The `transformers` version that produced this capture.
+    /// The `transformers` version that produced this capture. Empty for a
+    /// Coqui capture, which records [`Manifest::coqui_tts`] instead.
+    #[serde(default)]
     pub transformers: String,
+    /// The `coqui-tts` version that produced this capture. Empty for a 🤗 one.
+    #[serde(default)]
+    pub coqui_tts: String,
     /// The `torch` version that produced this capture.
     pub torch: String,
     /// Always `cpu`; a GPU capture would fold PyTorch's kernel choices into the
@@ -40,6 +66,17 @@ pub struct Manifest {
     pub threads: usize,
     /// One entry per captured stage, keyed by stage name.
     pub tensors: std::collections::BTreeMap<String, TensorInfo>,
+}
+
+impl Manifest {
+    /// What the engine should be given to reproduce this capture.
+    ///
+    /// The phonemes where the reference phonemised, the text otherwise. A test
+    /// that reads `text` directly passes on one dialect and silently compares
+    /// two different sentences on the other, so it should read this instead.
+    pub fn input(&self) -> &str {
+        self.phonemes.as_deref().unwrap_or(&self.text)
+    }
 }
 
 /// One captured tensor's description.

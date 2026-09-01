@@ -67,6 +67,70 @@ pub struct WnConv<'a> {
     pub k: usize,
 }
 
+/// A convolution the checkpoint may store either fused or weight-normalised.
+///
+/// The two published checkpoints disagree here and nowhere else. The 🤗 export
+/// of `mms-tts-nan` removed the weight-norm parameterisation from the decoder's
+/// upsamplers and resblocks, so they arrive as a plain `weight`; the Coqui
+/// trainer's own save keeps it, so the same convolutions arrive as `original0`
+/// and `original1`. They are the same convolution once fused, so the difference
+/// belongs here - in what was read - and not in the forward pass, which asks
+/// for a kernel and does not care which form it came from.
+#[derive(Debug, Clone, Copy)]
+pub enum MaybeWn<'a> {
+    /// Stored fused: one `weight` tensor, ready to convolve with.
+    Fused(Conv<'a>),
+    /// Stored the way `weight_norm` keeps it: a direction and a magnitude,
+    /// which multiply to the kernel after a division `xabe-dsp` performs.
+    Normalised(WnConv<'a>),
+}
+
+impl<'a> MaybeWn<'a> {
+    /// Output channels.
+    ///
+    /// For a transposed convolution this is still the *output* count, which is
+    /// the second dimension of the stored kernel rather than the first - see
+    /// [`Decoder::upsampler`].
+    pub fn out_ch(&self) -> usize {
+        match self {
+            Self::Fused(c) => c.out_ch,
+            Self::Normalised(c) => c.out_ch,
+        }
+    }
+
+    /// Input channels.
+    pub fn in_ch(&self) -> usize {
+        match self {
+            Self::Fused(c) => c.in_ch,
+            Self::Normalised(c) => c.in_ch,
+        }
+    }
+
+    /// Kernel width.
+    pub fn k(&self) -> usize {
+        match self {
+            Self::Fused(c) => c.k,
+            Self::Normalised(c) => c.k,
+        }
+    }
+
+    /// Per-output-channel bias, if the layer has one.
+    pub fn bias(&self) -> Option<&'a [f32]> {
+        match self {
+            Self::Fused(c) => c.bias,
+            Self::Normalised(c) => Some(c.bias),
+        }
+    }
+
+    /// Elements bound, counting the magnitude when there is one.
+    fn elements(&self) -> usize {
+        match self {
+            Self::Fused(c) => c.elements(),
+            Self::Normalised(c) => c.elements(),
+        }
+    }
+}
+
 /// A layer normalisation's learned scale and shift.
 #[derive(Debug, Clone, Copy)]
 pub struct Norm<'a> {
@@ -197,9 +261,9 @@ pub struct DurationPredictor<'a> {
 #[derive(Debug)]
 pub struct ResBlock<'a> {
     /// Dilated convolutions.
-    pub convs1: Vec<Conv<'a>>,
+    pub convs1: Vec<MaybeWn<'a>>,
     /// Undilated convolutions paired with them.
-    pub convs2: Vec<Conv<'a>>,
+    pub convs2: Vec<MaybeWn<'a>>,
 }
 
 /// The HiFi-GAN decoder.
@@ -210,7 +274,7 @@ pub struct Decoder<'a> {
     /// Transposed convolutions, laid out `[in_channels, out_channels, kernel]`
     /// — the opposite order to every other convolution in the model, and the
     /// reason `Conv::out_ch` here is the *second* dimension.
-    pub upsampler: Vec<Conv<'a>>,
+    pub upsampler: Vec<MaybeWn<'a>>,
     /// Resblocks, flattened stage-major as the checkpoint stores them.
     pub resblocks: Vec<ResBlock<'a>>,
     /// Final projection to one channel. Has no bias.
@@ -466,13 +530,13 @@ impl<'a> VitsWeights<'a> {
         let stages = cfg.num_upsample_stages();
         let mut upsampler = Vec::with_capacity(stages);
         for s in 0..stages {
-            upsampler.push(conv_transposed(
+            upsampler.push(MaybeWn::Fused(conv_transposed(
                 f,
                 &format!("decoder.upsampler.{s}"),
                 cfg.upsample_in_channels(s),
                 cfg.upsample_out_channels(s),
                 cfg.upsample_kernel_sizes[s],
-            )?);
+            )?));
         }
 
         let mut resblocks = Vec::with_capacity(cfg.num_resblocks());
@@ -484,20 +548,20 @@ impl<'a> VitsWeights<'a> {
                 let mut convs1 = Vec::with_capacity(n);
                 let mut convs2 = Vec::with_capacity(n);
                 for c in 0..n {
-                    convs1.push(conv(
+                    convs1.push(MaybeWn::Fused(conv(
                         f,
                         &format!("decoder.resblocks.{idx}.convs1.{c}"),
                         ch,
                         ch,
                         k,
-                    )?);
-                    convs2.push(conv(
+                    )?));
+                    convs2.push(MaybeWn::Fused(conv(
                         f,
                         &format!("decoder.resblocks.{idx}.convs2.{c}"),
                         ch,
                         ch,
                         k,
-                    )?);
+                    )?));
                 }
                 resblocks.push(ResBlock { convs1, convs2 });
             }
@@ -649,12 +713,12 @@ impl VitsWeights<'_> {
         let d = &self.decoder;
         let dec = d.conv_pre.elements()
             + d.conv_post.elements()
-            + d.upsampler.iter().map(Conv::elements).sum::<usize>()
+            + d.upsampler.iter().map(MaybeWn::elements).sum::<usize>()
             + d.resblocks
                 .iter()
                 .map(|r| {
-                    r.convs1.iter().map(Conv::elements).sum::<usize>()
-                        + r.convs2.iter().map(Conv::elements).sum::<usize>()
+                    r.convs1.iter().map(MaybeWn::elements).sum::<usize>()
+                        + r.convs2.iter().map(MaybeWn::elements).sum::<usize>()
                 })
                 .sum::<usize>();
 
