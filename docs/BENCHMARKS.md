@@ -121,12 +121,25 @@ accumulator type**, which is what this section used to say: measured on this
 card, `mma.m16n8k8.f32.f16.f16.f32` runs at 102.3 TFLOP/s and the f16-accumulate
 form at 103.0, so the trade whisper.cpp makes is worth 0.7% here. `whisper.cpp`
 gets 27.3 TFLOP/s across its whole encoder from cuBLAS, and closing this is a
-question of a tiled matmul that competes with it. Where the gemm's own time
-goes is not established: it is at 78% of what its 128x128 tile's arithmetic
-intensity allows against 672 GB/s, and 22% of what the instruction allows, and
-halving the larger operand stream by rounding the activations to f16 was worth
-5% - so neither ceiling is cleanly the binding one. `ncu` cannot be run on this
-machine (`ERR_NVGPUCTRPERM`) to settle it.
+question of a tiled matmul that competes with it. Neither of the obvious
+ceilings is the binding one - the gemm is at 78% of what its 128x128 tile's
+arithmetic intensity allows against 672 GB/s, 22% of what the instruction
+allows, and halving the larger operand stream by rounding the activations to
+f16 was worth 5%.
+
+**The binding one is the register file, and it is now measured.** `ncu` cannot
+be run on this machine (`ERR_NVGPUCTRPERM`), but `ptxas -v` did not need to be:
+the kernel compiles to exactly 128 registers a thread with no spill, which is
+exactly the budget for the two blocks a SM that `65536 / (2 * 256)` allows, and
+64 of those 128 are the accumulators a 128x128 tile over 256 threads cannot give
+up. Software-pipelining the staging - the standard fix for a `stage; sync; mma;
+sync` loop on an architecture without `cp.async` - was written and measured at
+six tile-and-occupancy arrangements, and **every one of them lost**: 184
+registers and one block a SM at the shipped tile for half the throughput, 108
+bytes of spill when two blocks are forced back, and a fitting pipeline at 128x64
+that gives up more arithmetic intensity than it recovers. `docs/KERNELS.md` has
+the table and the arithmetic. The gap to cuBLAS is an architecture this kernel
+shape has run out of room on, not a missing trick in the staging loop.
 
 ### The round that took the ASR from 0.74x to 0.83x
 
@@ -333,16 +346,27 @@ would buy under one percent, whatever anyone thinks of its accuracy, so the
 refusal recorded in `docs/KERNELS.md` costs this engine nothing and the "only
 way past" framing that stood here was wrong.
 
-What is actually short is the staging, and how short is not established.
+What is short is the staging, and **what limits it is now established.**
 22.4 TFLOP/s is 22% of the instruction ceiling but 78% of what the 128x128
 tile's arithmetic intensity allows against 672 GB/s - and it is not simply
 bandwidth either, because rounding the activations to f16, which halves the
-larger of the two operand streams, was worth 5%. Neither ceiling is cleanly
-binding and `ncu` cannot be run on this machine to say which (`ERR_NVGPUCTRPERM`
-- the account has no GPU performance-counter permission). Every standard escape
-is already recorded as measured-worse in `docs/KERNELS.md`: register prefetch
-and shared double-buffering both cost the second resident block that was
-providing the overlap, KC 64 loses to KC 32, and wider tiles lose to 128x128.
+larger of the two operand streams, was worth 5%. Neither of those is the
+binding ceiling. The register file is: `ptxas -v` puts the kernel at exactly
+128 registers a thread with no spill, which is exactly `65536 / (2 * 256)`, the
+budget for the two resident blocks that provide all of this architecture's
+latency hiding - and 64 of the 128 are accumulators the tile cannot give up.
+`ncu` still cannot be run here (`ERR_NVGPUCTRPERM` - the account has no GPU
+performance-counter permission), and it turned out not to be needed.
+
+This paragraph used to assert that register prefetch cost the second resident
+block without saying by how much. It does, and the number is 184 registers
+against a budget of 128: **half the throughput, 11.7 TFLOP/s against 22.5.**
+Forcing two blocks back with `__launch_bounds__` spills 108 bytes a thread and
+reaches 15.3; shrinking the tile until a pipeline fits reaches 18.6 at 128x64
+and loses more arithmetic intensity than it recovers. Six arrangements, all
+below the shipped one, tabulated in `docs/KERNELS.md`. The other standard
+escapes stand as recorded there: KC 64 loses to KC 32, and wider tiles lose to
+128x128.
 
 So the honest statement of the remaining 28 ms is that it is a tiled matmul
 competing with cuBLAS on an architecture with no `cp.async`, not an arithmetic

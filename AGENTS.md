@@ -99,10 +99,19 @@ between the columns, and 86 of those 111 ms are a tiled `gemm` running at 22.4
 TFLOP/s. **What that is short of is not the arithmetic.** The instruction is
 measured at 102.3 TFLOP/s on this card and f32 accumulation costs 0.7% of it,
 so the f16-accumulation trade this file used to name as the only way past buys
-essentially nothing here. Where the gemm's remaining time goes is not
-established — it is not the memory system either, since rounding the
-activations to f16 was worth 5% — and `ncu` cannot be run on this machine to
-settle it. `docs/KERNELS.md` has all of it.
+essentially nothing here. It is not the memory system either, since rounding the
+activations to f16 was worth 5%. **It is the register file**, and that is
+measured rather than inferred: `ptxas -v` puts the kernel at exactly 128
+registers a thread with no spill, which is exactly the budget for the two
+resident blocks that are this architecture's only latency hiding, and 64 of the
+128 are accumulators a 128x128 tile over 256 threads cannot give up.
+Software-pipelining the staging — the standard fix, and the one thing left to
+try — needs 184 registers and was measured at half the throughput; five further
+tile-and-occupancy arrangements of it were also measured and all lost. So the
+remaining gap is an architecture this kernel shape has run out of room on, not
+a missing trick: a deep pipeline here wants `cp.async`, which arrived with
+sm_80. `docs/KERNELS.md` has the table and `ncu` was never needed.
+
 And the Llama stages are **level with or ahead of llama.cpp on every measured
 row**: the chat model ahead on prefill at both
 prompt lengths (2447 against 2259 at 128 tokens, 2928 against 2513 at 512) and

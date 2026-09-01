@@ -456,12 +456,71 @@ it says what the instruction issues at, not what any kernel that also has to
 feed itself from memory can reach. And the tiled `gemm` is not close to it for
 reasons that are not this instruction - it measures 22.4 TFLOP/s at the ASR's
 projection shape, which is 22% of the ceiling but 78% of what the 128x128
-tile's arithmetic intensity allows against this card's 672 GB/s. Where the rest
-goes is not established: rounding the activations to f16, which halves the
-larger of the two operand streams, was worth 5%, so it is not simply the
-memory system either. `ncu` cannot be run on this machine to settle it -
-`ERR_NVGPUCTRPERM`, the account lacks GPU performance-counter permission - so
-what is written here is what black-box experiment can establish and no more.
+tile's arithmetic intensity allows against this card's 672 GB/s. Rounding the
+activations to f16, which halves the larger of the two operand streams, was
+worth 5%, so it is not simply the memory system either. Where the rest goes is
+the subject of the next section, and it is now established.
+
+### Where the tiled `gemm`'s time goes: the register file
+
+This used to say the question could not be settled, because `ncu` cannot be run
+on this machine - `ERR_NVGPUCTRPERM`, the account lacks GPU performance-counter
+permission. **`ptxas -v` settles it without counters**, and the answer is an
+occupancy limit that no amount of work on the staging can lift.
+
+The kernel compiles to **exactly 128 registers a thread, no spill**. That is
+not a coincidental number: the register file is 65536 a SM, the block is 256
+threads, and two blocks a SM is `65536 / (2 * 256) = 128`. The kernel sits on
+the boundary. **64 of those 128 are accumulators** - `GEMM_MSTEPS` 8 by
+`GEMM_NPW` 2 by 4 - and a 128x128 tile spread over 256 threads cannot give any
+of them up, because 64 outputs a thread is what the tile *is*.
+
+So half the register file is the answer sheet, and the trip has to be staged
+inside the other half.
+
+That is why the obvious fix does not work. The loop is `stage; sync; mma; sync`,
+with no overlap: every thread waits for the slowest global load of the trip and
+only then computes, and the staging is most of the time - with it deleted
+(wrong results, timing only) the same mma loop ran a prefill in 41 ms against
+107 with it. The textbook answer on an architecture with no `cp.async` is to
+software-pipeline through registers - issue trip `kc + 1`'s global loads before
+trip `kc`'s mma, so the latency is paid under arithmetic. It was written and
+measured, at the encoder's three shapes, medians of 20 on one Quadro RTX 8000:
+
+| | q/k/v/o | mlp up | mlp down | registers | blocks/SM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128x128, as shipped | **22.5** | **22.0** | **25.1** | 128 | 2 |
+| 128x128, pipelined | 11.7 | 12.9 | 12.7 | 184 | 1 |
+| 128x128, pipelined, `__launch_bounds__(256, 2)` | 15.3 | 13.6 | 16.9 | 128 + 108 B spill | 2 |
+| 128x64, pipelined | 16.7 | 18.6 | 18.1 | 122 | 2 |
+| 64x128, pipelined | 12.6 | 14.0 | 13.8 | 128 | 2 |
+| 64x64, pipelined | 13.4 | 14.8 | 14.4 | 80 | 3 |
+
+TFLOP/s, higher is better. **Every arrangement of it loses**, and the two ways
+it loses are the same fact seen twice.
+
+Buffering one trip costs 56 registers, so at the shipped tile the kernel goes to
+184 and the SM holds *one* block instead of two. Occupancy is the only
+latency-hiding sm_75 has, so halving it to buy a pipeline that hides latency is
+a trade that cannot come out ahead - and it does not, at exactly half the
+throughput. Forcing two blocks back with `__launch_bounds__` does not rescue it
+either: ptxas then spills 108 bytes a thread and lands between the two.
+
+Shrinking the tile does make room - 128x64 buffers a trip in 122 registers and
+keeps two blocks - but a smaller tile reads more memory for the same arithmetic,
+and that costs more than the pipeline returns. 128x64 gives up a third of the
+128x128 tile's flops per byte and comes back at 18.6 against 22.0.
+
+The generalisation is worth stating plainly, because it is a property of the
+architecture rather than of this code: sm_75 has **4 registers a SM per output
+of a 128x128 tile**, and at the two blocks that latency-hiding needs, the
+accumulators alone are half of them. There is no room in the other half for a
+staged trip. A deep pipeline here needs `cp.async`, which stages global to
+shared without a register in between and arrived with sm_80.
+
+That is the honest end of this line of work. The remaining distance to cuBLAS is
+not a missing trick in the staging loop; it is an architecture that this kernel
+shape has run out of room on.
 
 ## The integer matmul, `gemm_i8`
 
