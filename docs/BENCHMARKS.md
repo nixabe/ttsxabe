@@ -3,7 +3,7 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.94x to 0.99x against `whisper-server` from three to seven seconds of speech
+0.94x to 1.00x against `whisper-server` from three to seven seconds of speech
 and 1.09x at ten - level from five seconds up and short only on the briefest
 clip, alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
@@ -60,10 +60,10 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
-| 2.93 s | 198.9 ms | 186.0 ms | 0.94x | identical |
-| 4.98 s | 237.9 ms | 235.5 ms | 0.99x | identical |
-| 7.28 s | 265.6 ms | 262.1 ms | 0.99x | differ |
-| 9.95 s | 323.4 ms | 351.3 ms | **1.09x** | differ |
+| 2.93 s | 198.0 ms | 186.7 ms | 0.94x | identical |
+| 4.98 s | 237.2 ms | 237.0 ms | **1.00x** | identical |
+| 7.28 s | 266.9 ms | 264.7 ms | 0.99x | differ |
+| 9.95 s | 325.5 ms | 352.9 ms | **1.08x** | differ |
 
 The row before this one was 0.89x / 0.94x / 0.95x / 1.04x, and what moved it
 is in "The round that found the encoder's other half" below: the encoder went
@@ -203,6 +203,27 @@ Measured on the 2.93 s clip, `xabe-asr-bench --stages`, medians of nine:
 | encoder | 110.9 ms | **101.9 ms** |
 | cross-attention KV | 17.0 ms | **14.8 ms** |
 | decode loop | 78.0 ms | 76.3 ms |
+
+### The frontend was spending its time on silence
+
+The mel frontend is CPU work the card sits idle through, and on the shortest
+clip it was 5.3 ms of 199. Three things it was doing to padding rather than to
+audio, all of them exactly equivalent to remove:
+
+- **`log10` on a quarter of a million zeros.** `mel_power` leaves a digitally
+  silent frame's row as it allocated it, so `power` is *exactly* zero there,
+  and on a 2.93 s clip inside a fixed 30-second window that is nine bins in
+  ten. `0f32.max(1e-10).log10()` is a constant; evaluating it once and
+  comparing against zero is the same bits and not thirty cycles a bin.
+- **Transposing frames that are all zero.** `mel_power`'s output transpose ran
+  over all 3001 frames writing `frames` apart, which is 12 KB, so no two writes
+  shared a cache line. Everything outside the live range is zero in the source
+  and already zero in the destination.
+- **Three threads of eight left idle.** The spawn threshold was 64 frames a
+  thread, and 294 live frames is five threads. At 32 it is eight.
+
+5.3 ms to about 3.6, and the 4.98 s clip crossed to 1.00x with it. Nothing
+here touched a number the model sees.
 
 ### The decode step, kernel by kernel
 

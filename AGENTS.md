@@ -81,8 +81,8 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.94x to 0.99x** against `whisper-server` from three to
-seven seconds of speech and **1.09x** at ten — level from about five seconds up
+medians. The ASR is **0.94x to 1.00x** against `whisper-server` from three to
+seven seconds of speech and **1.08x** at ten — level from about five seconds up
 and short only on the briefest clip, and still recorded as a miss because the
 milestone asks for the short end too. The two engines have opposite cost
 structures: the encoder is a fixed 30-second window for both and ours is about

@@ -184,14 +184,16 @@ pub fn mel_power(samples: &[f32], cfg: &MelConfig, filters: &[f32]) -> Vec<f32> 
     let live = hi.saturating_sub(lo);
 
     // One thread a core, at most eight, and never so many that a thread gets
-    // fewer than 64 frames to earn its spawn. The frames are independent and
+    // fewer than 32 frames to earn its spawn. It was 64, which on the clips
+    // this pipeline actually serves left three of the eight idle: a 2.93 s
+    // clip has 294 live frames, and 64 apiece is five threads. The frames are independent and
     // each one's arithmetic is unchanged, so this is bit-for-bit the serial
     // answer - the reduction that could reorder is the filter bank's, and that
     // stays inside a frame.
     let want = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);
-    let threads = want.min(live.div_ceil(64)).max(1);
+    let threads = want.min(live.div_ceil(32)).max(1);
     let per = live.div_ceil(threads);
 
     std::thread::scope(|scope| {
@@ -242,8 +244,15 @@ pub fn mel_power(samples: &[f32], cfg: &MelConfig, filters: &[f32]) -> Vec<f32> 
         }
     });
 
+    // Only the live range is transposed. Everything outside it is zero in
+    // `rows` and already zero in `out`, so copying it would write a quarter of
+    // a million floats to say what the allocation said - and each of those
+    // writes is `frames` apart, which is 12 KB, so none of them shares a cache
+    // line with the one before. On a three-second clip in a thirty-second
+    // window that is nine writes in ten.
     let mut out = vec![0.0f32; n_mels * frames];
-    for (t, row) in rows.chunks(n_mels).enumerate() {
+    for (i, row) in rows[lo * n_mels..hi * n_mels].chunks(n_mels).enumerate() {
+        let t = lo + i;
         for (m, &v) in row.iter().enumerate() {
             out[m * frames + t] = v;
         }

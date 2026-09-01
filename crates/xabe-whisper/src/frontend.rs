@@ -73,11 +73,25 @@ impl Frontend {
         // The reference drops the last frame - `stft[..., :-1]` - because a
         // centred transform of N samples yields N/hop + 1 frames and the model
         // was trained on N/hop of them.
+        // `power` is *exactly* zero wherever the frame was digital silence -
+        // `mel_power` leaves those rows as it allocated them - and on a
+        // three-second clip inside this model's fixed thirty-second window
+        // that is nine bins in ten. `0f32.max(1e-10).log10()` is a constant,
+        // so it is evaluated once here instead of a quarter of a million
+        // times: the same expression on the same input, so the same bits, and
+        // `log10` is thirty-odd cycles that this frontend was spending on
+        // padding.
+        let silent = (1e-10f32).log10();
         let mut out = vec![0.0f32; self.mel.n_mels * self.n_frames];
         let mut peak = f32::NEG_INFINITY;
         for m in 0..self.mel.n_mels {
             for t in 0..self.n_frames {
-                let v = power[m * frames + t].max(1e-10).log10();
+                let p = power[m * frames + t];
+                let v = if p == 0.0 {
+                    silent
+                } else {
+                    p.max(1e-10).log10()
+                };
                 out[m * self.n_frames + t] = v;
                 peak = peak.max(v);
             }
