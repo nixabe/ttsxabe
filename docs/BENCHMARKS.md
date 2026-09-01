@@ -600,6 +600,76 @@ reply path, the measurement to take is decode tokens per second against
 `llama-server` on the f16 GGUF, alternated in pairs on the same card, exactly
 as the ASR is measured above.
 
+### `GEMV_MAX_M` was 16 and the crossover is 4
+
+The mat-vec kernel gives a warp one output column and reads that column's whole
+weight row, so a product of `m` rows reads **the entire weight set `m` times**.
+The tiled kernel reads it once and pays a fixed cost instead. `GEMV_MAX_M` picks
+between them, and it was set at 16 on the reasoning that the tiled path wants a
+whole `m16n8k8` instruction's worth of rows to be worth using - which is true
+about the instruction and wrong about the cost.
+
+Prefill on the 13 B translator, across the threshold, medians of five:
+
+| prompt | path | median |
+| ---: | --- | ---: |
+| 8 tok | mat-vec | 106.6 ms |
+| 16 tok | mat-vec | **209.5 ms** |
+| 17 tok | tiled | **68.8 ms** |
+| 32 tok | tiled | 70.9 ms |
+
+Sixteen rows cost three times what seventeen do, and the mat-vec side grows
+linearly because it is re-reading 8 GB a row. Forcing the tiled path all the way
+down puts it at 66.3 ms at two rows and 69.2 at sixteen - near enough flat,
+because one 128-row tile covers all of them. So the mat-vec wins only while
+`m * 9 ms < 31 ms` of marginal cost, which is **four rows**, and that is what
+the constant now says.
+
+`GEMV_MAX_M` is public precisely so a test that asserts the scalar path's exact
+f32 can sit on the scalar side of it; the one that hard-coded 16 in a comment
+saying "which is `GEMV_MAX_M`" now reads the constant.
+
+### Where a translation's time goes
+
+One clause in, Taigi out, on one Quadro RTX 8000 with the `Q4_K_M` file,
+medians of five, greedy with `repeat_penalty` 1.1:
+
+| clause | prompt | answer | median | per token |
+| --- | ---: | ---: | ---: | ---: |
+| `你好，我是台灣人。` | 24 tok | 23 tok | 413 ms | 17.95 ms |
+| `今天天氣很好，我們去公園散步好嗎？` | 29 tok | 49 tok | 828 ms | 16.90 ms |
+| `我很愛看花，也愛聽鳥兒唱歌，你呢？` | 33 tok | 46 tok | 783 ms | 17.02 ms |
+
+**A translation is its decode loop and nothing else.** Timing the loop's four
+parts separately - the forward pass, the logits download, the repeat penalty,
+the argmax and the stop-string check - puts `forward_last` at **99.1%** of it.
+The 56024-wide logits download is 0.4%, the CPU argmax over them 0.4%, and
+re-decoding the whole answer every token to test two stop strings - which looks
+quadratic and is - 0.003%. None of those is worth touching.
+
+### The decode is within 4% of the memory it has to move
+
+At one row a decode reads every weight in the model, so its floor is bytes over
+bandwidth. The `--packing f16` flag exists to separate the two, and on this
+model it says:
+
+| | streamed a token | per token | effective |
+| --- | ---: | ---: | ---: |
+| packed `Q4_K_M` | 8.0 GB | 15.99 ms | 579 GB/s |
+| the same weights at f16 | 25.9 GB | 45.30 ms | 602 GB/s |
+
+Both figures are the weight stream alone, with the token embedding excluded -
+it is gathered a row at a time, not streamed - and with the 2.3 ms a token of
+non-weight kernels taken off both sides. **Unpacking `Q4_K` costs 4%**, and
+against a ceiling of 599 GB/s measured on the largest mat-vec this card runs,
+that is most of what there is.
+
+What is left is the 2.3 ms a token, which is about a seventh of the step and is
+fifteen small kernels a layer: `rms_norm_q` twice (0.67 ms a token), the
+three-kernel attention chain (0.54), the SiLU gate (0.16), RoPE twice (0.08),
+and the cache append twice (0.03). None of them reads enough to matter and all
+of them cost what a launch costs. The only lever on that is *fewer* of them.
+
 This section holds the current numbers and nothing else. When a measurement
 supersedes a cell, replace the cell — never append a dated note, a before/after
 delta, or an "improved from X" narrative. The change story belongs in the commit

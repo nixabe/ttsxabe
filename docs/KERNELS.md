@@ -907,6 +907,40 @@ spread, and many multiples of the tolerance - so the margin is still the thing
 the test measures. It is reported as the worst error's fraction of its own
 tolerance, so drift shows up before any single point crosses.
 
+## `silu_mul_pair`, and why a launch is the unit that matters
+
+At one decoded row, a 13 B step runs about fifteen kernels a layer that read
+almost nothing - two normalisations, three for attention, the gate, RoPE twice,
+the cache append twice - and together they are a seventh of the step. They do
+not cost what they read. They cost what a launch costs, and on this card that
+is about 3.3 us of queueing and a few microseconds of ramp and drain.
+
+Two measurements say so, and both were taken before anything was written:
+
+- Widening the row-reduction block from 256 threads to 1024, which is four
+  times the warps on the one SM a single-row normalisation can use, moved the
+  translator's decode by **nothing at all**: 16.10 ms a token before and after.
+  It is not the reduction.
+- Sweeping the mat-vec's column count from 4096 to 13824 gives a **smooth**
+  climb from 442 to 545 GB/s with no sawtooth at the wave boundaries. It is not
+  wave quantisation either - it is a fixed cost being amortised over more work.
+
+So the lever is fewer launches, and the MLP is where one was free. `gate` and
+`up` have the same shape and, in every checkpoint here, the same block format,
+so they are one batched product whose output is `[2, rows, inter]` - which is
+exactly the pair the SiLU gate needs. `silu_mul_pair` reads both halves of that
+one buffer, `x[i] = silu(x[i]) * x[i + n]`, and writes the result over the first
+half, which is where the down projection reads its left operand from anyway.
+
+One buffer rather than two pointers because they alias one allocation and one
+`&mut` is the only shape Rust will hand over. The arithmetic is `silu_mul`'s
+exactly - same expression, same order, same group quantiser - and the three
+reference translations come back character for character.
+
+`GMlp::Split` is the fallback, and it is not hypothetical: `Q4_K_M` gives
+`attn_v` and `ffn_down` `Q6_K` while their neighbours get `Q4_K`, which is why
+the attention side of this checkpoint groups q with k and leaves v out.
+
 ## The three kernels the translator added
 
 They are small and none of them needed a design decision, with one exception

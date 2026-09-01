@@ -143,7 +143,7 @@ impl std::fmt::Debug for Gpu {
 /// and the tiled one rounds its operands to f16 - so this constant is exported
 /// rather than hidden. A test that compares `gemm` against a reference has to
 /// know which side of it a shape falls on.
-pub const GEMV_MAX_M: usize = 16;
+pub const GEMV_MAX_M: usize = 4;
 
 /// A block-quantized weight format, by its ggml type id.
 ///
@@ -460,6 +460,7 @@ const NAMES: &[&str] = &[
     "softmax_causal",
     "layer_norm",
     "layer_norm_add",
+    "silu_mul_pair",
     "layer_norm_add_f16",
     "act_gelu_f16",
     "softmax_rows",
@@ -2714,6 +2715,76 @@ impl Gpu {
         Ok(self
             .silu_mul_inner(a, b, rows, k, true)?
             .expect("asked for the twin"))
+    }
+
+    /// SiLU-gates one buffer against its own second half, and quantises.
+    ///
+    /// `x` is `[2, rows, k]` - the output of one batched product over the gate
+    /// and up weights - and the result is `silu(gate) * up` written over the
+    /// first half, which is where the down projection then reads it from. One
+    /// buffer rather than two because that is what a batched product produces,
+    /// and the point of producing it that way is one launch a layer instead of
+    /// two. At a single decoded row a launch is most of what a kernel this size
+    /// costs.
+    ///
+    /// The arithmetic is `silu_mul`'s exactly: same expression, same order,
+    /// same group quantiser.
+    pub fn silu_mul_pair(
+        &self,
+        x: &mut CudaSlice<f32>,
+        rows: usize,
+        k: usize,
+    ) -> Result<Q8, CudaError> {
+        let n = rows * k;
+        if !n.is_multiple_of(BLOCK as usize) || !k.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock {
+                k: n,
+                block: BLOCK as usize,
+            });
+        }
+        Ok(self
+            .silu_mul_pair_inner(x, rows, k, true)?
+            .expect("asked for the twin"))
+    }
+
+    /// [`Self::silu_mul_pair`] without the int8 twin, for an f16 down
+    /// projection that would never read the codes.
+    pub fn silu_mul_halves(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
+        self.silu_mul_pair_inner(x, 1, n, false)?;
+        Ok(())
+    }
+
+    fn silu_mul_pair_inner(
+        &self,
+        x: &mut CudaSlice<f32>,
+        rows: usize,
+        k: usize,
+        quantize: bool,
+    ) -> Result<Option<Q8>, CudaError> {
+        let n = rows * k;
+        // SAFETY: one thread per element writes every code, and its group's
+        // first lane every scale.
+        let mut q8 = match quantize {
+            true => Some(Q8 {
+                buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
+                rows,
+                k,
+            }),
+            false => None,
+        };
+        let off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
+        let null: u64 = 0;
+        let ni = n as i32;
+        let f = self.func("silu_mul_pair");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x);
+        match &mut q8 {
+            Some(q) => lb.arg(&mut q.buf),
+            None => lb.arg(&null),
+        };
+        lb.arg(&off).arg(&ni);
+        launched("silu_mul_pair", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(q8)
     }
 
     /// Both of the above.

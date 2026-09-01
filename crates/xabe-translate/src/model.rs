@@ -234,13 +234,25 @@ struct GGroup {
     count: usize,
 }
 
+/// The gate and the up projection, together where the checkpoint allows it.
+///
+/// They are the same shape and, in every checkpoint here, the same block
+/// format - so they are one batched product over one activation, and the SiLU
+/// gate reads the two halves of its output. That is one launch a layer instead
+/// of two on each side, and at a single decoded row a launch is most of what a
+/// kernel this size costs. `Split` is the fallback for a checkpoint that
+/// quantizes them differently, which is a thing `Q4_K_M` does to other pairs.
+enum GMlp {
+    Fused(GGroup),
+    Split(GLinear, GLinear),
+}
+
 struct GLayer {
     attn_norm: CudaSlice<f32>,
     attn: GAttn,
     o: GLinear,
     ffn_norm: CudaSlice<f32>,
-    gate: GLinear,
-    up: GLinear,
+    mlp: GMlp,
     down: GLinear,
 }
 
@@ -429,8 +441,20 @@ impl Translator {
                 attn: attn(&l.attn)?,
                 o: lin(&l.attn.o)?,
                 ffn_norm: wide(&l.ffn_norm)?,
-                gate: lin(&l.mlp.gate)?,
-                up: lin(&l.mlp.up)?,
+                mlp: {
+                    // The same test `attn` uses to decide a run: identical
+                    // shape and, when packed, identical block format.
+                    let key = |b: &Bound| {
+                        (
+                            b.shape.clone(),
+                            (packing == Packing::Packed).then_some(b.packed).flatten(),
+                        )
+                    };
+                    match key(&l.mlp.gate) == key(&l.mlp.up) {
+                        true => GMlp::Fused(fused(&[&l.mlp.gate, &l.mlp.up])?),
+                        false => GMlp::Split(lin(&l.mlp.gate)?, lin(&l.mlp.up)?),
+                    }
+                },
                 down: lin(&l.mlp.down)?,
             });
         }
@@ -518,6 +542,34 @@ impl Translator {
     }
 
     /// One projection.
+    /// Every matrix of a group against one activation, in one launch.
+    ///
+    /// The output is `[count, rows, out_dim]`. `a` is zero because the whole
+    /// point of a group is that its members share the activation - and share
+    /// its int8 twin, so it is quantized once rather than once a projection.
+    fn project_group(
+        &self,
+        x: Operand<'_>,
+        g: &GGroup,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, TranslateError> {
+        Ok(self.gpu.gemm_batched(
+            x,
+            g.w.operand(),
+            None,
+            Batch {
+                count: g.count,
+                a: 0,
+                w: g.w.in_dim * g.w.out_dim,
+                out: rows * g.w.out_dim,
+                w_row: 0,
+            },
+            rows,
+            g.w.in_dim,
+            g.w.out_dim,
+        )?)
+    }
+
     fn project(
         &self,
         x: Operand<'_>,
@@ -810,19 +862,32 @@ impl Translator {
 
             let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
             let xo = Self::operand(&x, xq.as_ref());
-            let mut gate = self.project(xo, &l.gate, n)?;
-            let up = self.project(xo, &l.up, n)?;
             let inter = self.cfg.intermediate_size;
+            // One product over both halves where the checkpoint allows it, and
+            // then the gate reads its own output; see `GMlp`. `pair` says which
+            // shape the SiLU below has to take, because the fused buffer holds
+            // `[2, n, inter]` and the split one holds two of `[n, inter]`.
+            let (mut gate, up) = match &l.mlp {
+                GMlp::Fused(g) => (self.project_group(xo, g, n)?, None),
+                GMlp::Split(gw, uw) => (self.project(xo, gw, n)?, Some(self.project(xo, uw, n)?)),
+            };
             // The twin is taken at every row count, not only decode's: the
             // tiled integer kernel reads the same codes the mat-vec does, and
             // quantizing inside `project` instead re-reads the whole
             // activation - 28 MB a layer at 512 tokens. Only for a packed
             // `down`, because an f16 one would leave the codes unread.
             let packed_down = matches!(l.down.w, GWeight::Packed { .. });
-            let gq = match packed_down && inter.is_multiple_of(256) {
-                true => Some(self.gpu.silu_mul_q(&mut gate, &up, n, inter)?),
-                false => {
-                    self.gpu.silu_mul(&mut gate, &up, n * inter)?;
+            let want_q = packed_down && inter.is_multiple_of(256);
+            let gq = match (&up, want_q) {
+                (Some(u), true) => Some(self.gpu.silu_mul_q(&mut gate, u, n, inter)?),
+                (Some(u), false) => {
+                    self.gpu.silu_mul(&mut gate, u, n * inter)?;
+                    None
+                }
+                // Fused: the two operands are the two halves of `gate`.
+                (None, true) => Some(self.gpu.silu_mul_pair(&mut gate, n, inter)?),
+                (None, false) => {
+                    self.gpu.silu_mul_halves(&mut gate, n * inter)?;
                     None
                 }
             };

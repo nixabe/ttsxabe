@@ -17,7 +17,7 @@
 //!
 //! Skips when there is no device, like every other GPU test here.
 
-use xabe_cuda::{Batch, Gpu, Operand, Quant};
+use xabe_cuda::{Batch, GEMV_MAX_M, Gpu, Operand, Quant};
 use xabe_gguf::GgmlType;
 
 /// Relative tolerance for the accumulated products.
@@ -157,7 +157,10 @@ fn quant_sizes_match_the_container_crate() {
 /// that catches an ordering mistake, because a permutation inside a block is
 /// invisible to any check on magnitudes.
 ///
-/// Sixteen rows at a time, which is `GEMV_MAX_M`, so it stays on the scalar
+/// `GEMV_MAX_M` rows at a time - taken from the constant rather than written
+/// out, because the whole point of the constant being public is that a test
+/// asserting the scalar path's exactness has to sit on the scalar side of it -
+/// so it stays on the scalar
 /// kernel. One row per launch would work and take sixteen times as long.
 #[test]
 fn every_block_format_unpacks_element_for_element() {
@@ -174,7 +177,7 @@ fn every_block_format_unpacks_element_for_element() {
         let dw = g.upload_quant(q, &raw).unwrap();
 
         for j0 in (0..k).step_by(16) {
-            let rows = 16.min(k - j0);
+            let rows = GEMV_MAX_M.min(k - j0);
             let mut a = vec![0.0f32; rows * k];
             for (r, chunk) in a.chunks_mut(k).enumerate() {
                 chunk[j0 + r] = 1.0;

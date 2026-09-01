@@ -3200,6 +3200,53 @@ extern "C" __global__ void rms_norm(
 //
 // `n` must be a multiple of the block for the twin, or the last block's tail
 // lanes would sit inside a full-mask shuffle without being in the group.
+// The same gate, over one buffer that holds both halves.
+//
+// `gate` and `up` are the same shape and, in every checkpoint here, the same
+// block format - so they are one batched product whose output is
+// `[2, rows, inter]`, and the two operands this needs are the two halves of it.
+// Written as `x[i] = silu(x[i]) * x[i + n]` rather than as two pointers because
+// they alias one allocation, and one `&mut` is the only shape Rust will hand
+// over. What it buys is a launch a layer, and at one row a launch is most of
+// what a small kernel costs.
+extern "C" __global__ void silu_mul_pair(
+    float* __restrict__ x,
+    signed char* __restrict__ qa,
+    int asc_off,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n && !qa) {
+        return;
+    }
+    float y = 0.0f;
+    if (i < n) {
+        // `expf` for the reason `silu_mul` gives.
+        float v = x[i];
+        y = v * (1.0f / (1.0f + expf(-v))) * x[i + n];
+        x[i] = y;
+    }
+    if (!qa) {
+        return;
+    }
+    // The same group quantiser `silu_mul` ends with: one scale a warp, taken
+    // from the largest magnitude in it.
+    float* asc = (float*)(qa + asc_off);
+    float mx = fabsf(y);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    }
+    const float d = mx * (1.0f / 127.0f);
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    if (i < n) {
+        qa[i] = (signed char)__float2int_rn(y * inv);
+        if ((threadIdx.x & 31) == 0) {
+            asc[i >> 5] = d;
+        }
+    }
+}
+
 extern "C" __global__ void silu_mul(
     float* __restrict__ a,
     const float* __restrict__ b,
