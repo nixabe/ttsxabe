@@ -1207,8 +1207,11 @@ impl Gpu {
     ///
     /// The same contract as [`Gpu::linear`] and a different implementation:
     /// this one stages both operands as f16 and accumulates in f32, which is
-    /// worth 17.9 to 99 TFLOP/s on this card and costs one rounding of each
-    /// operand. `linear` stays for the places that want exact f32 and are small
+    /// worth 180x over `linear` at the ASR's encoder shapes and costs one
+    /// rounding of each operand. It measures 22.4 TFLOP/s there against an
+    /// instruction ceiling of 102.3 on this card, so the headroom is in the
+    /// staging rather than the arithmetic; docs/KERNELS.md has both numbers
+    /// and what is and is not known about the difference. `linear` stays for the places that want exact f32 and are small
     /// enough not to care - the choice is per call site, which is why both
     /// exist rather than one replacing the other.
     ///
@@ -1313,9 +1316,10 @@ impl Gpu {
         // Both operands are quantized on this path where the f16 kernel
         // rounded only the operands and kept f32 accumulation, so it is a
         // second deliberate approximation and a larger one - see `gemm_i8`. It
-        // is what llama.cpp does for the same shapes, and what the f16 kernel
-        // cannot reach: that measured 86% of its own ceiling and the ceiling
-        // is a quarter of the integer one.
+        // is what llama.cpp does for the same shapes, and the integer
+        // instruction runs at twice the f16 one on this card, measured - not
+        // the four times an earlier note claimed from a half-rate f32
+        // accumulate this Quadro does not have. See docs/KERNELS.md.
         //
         // `k` must be a multiple of 256 because that is what the quantiser
         // wants; the block check above already requires it of these two

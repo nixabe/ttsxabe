@@ -1338,10 +1338,13 @@ extern "C" __global__ void gemm_reduce(
 //
 // The same product as `gemm`, on the int8 tensor cores instead of the f16 ones.
 //
-// Turing does `m16n8k8.f32.f16.f16.f32` at 65.3 TFLOP/s and `m8n8k16.s32.s8.s8`
-// at four times that, and the f16 kernel measured 86% of its own ceiling - so
-// no amount of work on it reaches llama.cpp, which uses the integer path. This
-// is that path. It is **the engine's second deliberate approximation**, and a
+// Measured on this card, `m16n8k8.f32.f16.f16.f32` runs at 102.3 TFLOP/s and
+// `m8n8k16.s32.s8.s8` at twice that - not the 65.3 and four times this comment
+// used to claim, which assumed a half-rate f32 accumulate that Quadro Turing
+// does not have. Twice the arithmetic rate is still the largest lever on this
+// card and llama.cpp takes it, which is why this path exists; what the old
+// numbers also implied - that the f16 kernel had nothing left - does not
+// follow. See docs/KERNELS.md. It is **the engine's second deliberate approximation**, and a
 // larger one than the mat-vec's: both operands are quantized, where the f16
 // kernel rounded a weight that was already 4-bit and left the arithmetic exact
 // to f32 accumulation.

@@ -414,7 +414,7 @@ ptxas - **NVRTC success is not evidence of reachability**. That constraint, the
 fragment layouts, and the shared-memory stride argument are adapted from
 `llmxabe`, which has been running them on this hardware.
 
-### Why f32 accumulation is not caution
+### Why f32 accumulation is not caution, and on this card is not a cost either
 
 fp16 *operands* are safe; fp16 *accumulation* is not. `llmxabe` records the
 measurement: on IID-random data fp16 accumulation looks safe at every depth with
@@ -424,6 +424,45 @@ Rescale cadence does not help. So `m16n8k8.f32...f32` is the shape used, and the
 operand rounding it does cost is measured rather than assumed: 6.5e-5 of full
 scale on a k=1280 contraction.
 
+**What that refusal costs on this card is nothing, and this file used to say
+otherwise.** Measured back to back out of registers, this Quadro RTX 8000 runs:
+
+| instruction | rate |
+| --- | ---: |
+| `mma.m16n8k8.row.col.f32.f16.f16.f32` | 102.3 TFLOP/s |
+| `mma.m16n8k8.row.col.f16.f16.f16.f16` | 103.0 TFLOP/s |
+| `mma.m8n8k16.row.col.s32.s8.s8.s32` | 203 TOPS |
+
+Flat across one, two, four and eight independent accumulator chains a thread,
+so it is a throughput ceiling and not a latency artefact, and 78-87% of the
+card's 130.5 TFLOP/s and 261 TOPS - which is what a register-resident
+microbenchmark should reach.
+
+**f32 accumulation costs 0.7%.** The half-rate FP32 accumulate that Turing is
+known for is a GeForce restriction; this is a Quadro and does not have it. Two
+numbers recorded here were derived from assuming it did, and both are wrong:
+65.3 TFLOP/s for the f32-accumulate shape - exactly half of 130.5 - and "four
+times that" for the integer shape, which is twice.
+
+Two conclusions have to be withdrawn with them. Adopting fp16 accumulation
+would buy under 1% here, so it is not a lever anyone should reach for, whatever
+they think of the accuracy; and "the f16 kernel is at 86% of its own ceiling so
+no amount of work on the staging reaches llama.cpp" was computed against 65.3 -
+against 102.3 the same measurement puts the `mma` at about 55% of the kernel's
+time, which is a very different amount of room.
+
+**Two caveats, and they matter.** The rate above is a *register-resident* one:
+it says what the instruction issues at, not what any kernel that also has to
+feed itself from memory can reach. And the tiled `gemm` is not close to it for
+reasons that are not this instruction - it measures 22.4 TFLOP/s at the ASR's
+projection shape, which is 22% of the ceiling but 78% of what the 128x128
+tile's arithmetic intensity allows against this card's 672 GB/s. Where the rest
+goes is not established: rounding the activations to f16, which halves the
+larger of the two operand streams, was worth 5%, so it is not simply the
+memory system either. `ncu` cannot be run on this machine to settle it -
+`ERR_NVGPUCTRPERM`, the account lacks GPU performance-counter permission - so
+what is written here is what black-box experiment can establish and no more.
+
 ## The integer matmul, `gemm_i8`
 
 Two entry points, `gemm_i8_q4k` and `gemm_i8_q6k`, over one templated body. It
@@ -432,11 +471,19 @@ past `GEMV_MAX_M` - which is prefill on both Llama stages, and nothing else.
 
 ### Why there is a second matmul at all
 
-The f16 kernel was measured at 86% of the card's `m16n8k8.f32.f16.f16.f32` peak.
-Its remaining 14% is not enough to catch llama.cpp, so the only way up is the
-other reachable shape: `m8n8k16.s32.s8.s8.s32`, which runs at four times the
-rate. That is the whole reason, and it costs an approximation - both operands
-quantized rather than one rounded. `docs/BENCHMARKS.md` has what the
+The f16 kernel was measured at 86% of what was then believed to be the card's
+`m16n8k8.f32.f16.f16.f32` peak, leaving 14% that would not have been enough to
+catch llama.cpp. **That baseline was wrong** - see "Why f32 accumulation is not
+caution" above; the instruction runs at 102.3 TFLOP/s, not 65.3, and the same
+`mma` time is about 55% of the kernel rather than 86%. The integer shape is
+twice the f16 rate, not four times.
+
+Neither correction undoes this kernel. `gemm_i8` still measures what
+`docs/BENCHMARKS.md` records, twice the arithmetic rate is still the largest
+single lever available on this card, and llama.cpp still takes the integer path.
+What changes is the claim that the f16 kernel had nothing left: it had more than
+was recorded, and how much of it is reachable is not established. It costs an
+approximation - both operands quantized rather than one rounded. `docs/BENCHMARKS.md` has what the
 approximation is worth, including the comparison against llama.cpp's own
 integer path on the same file.
 

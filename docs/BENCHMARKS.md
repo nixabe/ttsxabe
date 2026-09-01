@@ -3,7 +3,7 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.85x and 0.89x against `whisper-server` on two clips - a milestone still
+0.89x and 0.95x against `whisper-server` on two clips - a milestone still
 missed, now alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
 stages are **level with or
@@ -59,11 +59,11 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio |
 | --- | --- | --- | --- |
-| 2.93 s | 218.0 ms | 185.0 ms | 0.85x |
-| 4.98 s | 262.5 ms | 233.6 ms | 0.89x |
+| 2.93 s | 211.9 ms | 188.4 ms | 0.89x |
+| 4.98 s | 250.8 ms | 237.7 ms | 0.95x |
 
 **This is the milestone's target missed, not met.** `docs/MILESTONES.md` asked
-for an ASR faster than `whisper-server`; it is 1.12x to 1.18x slower.
+for an ASR faster than `whisper-server`; it is 1.05x to 1.12x slower.
 
 The clips are synthesised rather than recorded, so the row is reproducible on
 any box that has the checkpoints - `bench/` is gitignored and the two lines are
@@ -71,14 +71,14 @@ any box that has the checkpoints - `bench/` is gitignored and the two lines are
 tsin hó, lán lâi khì kong-hn̂g sàn-pōo, hó bô?`, spoken by `mms-tts-nan` at
 16 kHz. They transcribe to ten and sixteen tokens.
 
-Where the 218.0 ms goes, measured with `xabe-asr-bench --stages`:
+Where the 211.9 ms goes, measured with `xabe-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
-| encoder | 111 | 51% |
-| decode loop, 10 tokens | 76 | 35% |
-| cross-attention KV | 19 | 9% |
-| mel frontend (CPU) | 11 | 5% |
+| encoder | 111 | 52% |
+| decode loop, 10 tokens | 77 | 36% |
+| cross-attention KV | 17 | 8% |
+| mel frontend (CPU) | 6 | 3% |
 
 The encoder is 2.26 TFLOP for a 30-second window, so 111 ms is 20.4 TFLOP/s.
 Note that the window is fixed: a 2.93 s clip and a 29 s one cost the same
@@ -87,11 +87,20 @@ encoder, which is why the longer clip's ratio is the better one.
 **The encoder is the whole of the remaining gap.** `whisper-bench` on the same
 build and the same weights puts `whisper.cpp`'s encoder at 83.3 ms against this
 one's 111, which is 28 of the 33 ms between the two columns on the 2.93 s clip.
-Everything else is level. Of those 111 ms, 86 are the tiled `gemm`, which
-`docs/KERNELS.md` measured at 86% of this card's `m16n8k8.f32.f16.f16.f32`
-ceiling - so the remaining gap is mostly the accumulator type, and the only way
-past that shape is f16 accumulation, which this engine refuses on a
-measurement rather than on caution.
+Everything else is level - the decode loop, the cross-attention cache and the
+frontend together are 100 ms against their 102.
+
+Of those 111 ms, 86 are the tiled `gemm` at 22.4 TFLOP/s. **It is not the
+accumulator type**, which is what this section used to say: measured on this
+card, `mma.m16n8k8.f32.f16.f16.f32` runs at 102.3 TFLOP/s and the f16-accumulate
+form at 103.0, so the trade whisper.cpp makes is worth 0.7% here. `whisper.cpp`
+gets 27.3 TFLOP/s across its whole encoder from cuBLAS, and closing this is a
+question of a tiled matmul that competes with it. Where the gemm's own time
+goes is not established: it is at 78% of what its 128x128 tile's arithmetic
+intensity allows against 672 GB/s, and 22% of what the instruction allows, and
+halving the larger operand stream by rounding the activations to f16 was worth
+5% - so neither ceiling is cleanly the binding one. `ncu` cannot be run on this
+machine (`ERR_NVGPUCTRPERM`) to settle it.
 
 ### The round that took the ASR from 0.74x to 0.83x
 
@@ -238,6 +247,80 @@ chat model: 3058.8, 3028.4, 3010.4 tok/s before against 3038.2, 3013.7, 3005.8
 after, which is inside the drift each column shows on its own. Their tile is
 unchanged; what reaches them is the smaller shared footprint, and it does not
 cross a residency boundary for them.
+
+### The round that took the ASR from 0.85x to 0.89x
+
+Three changes, all outside the encoder, and the pattern is the same one the
+fused attention showed: the frontend and the small kernels around the matmuls
+had more in them than the matmuls did. `--stages`, medians of nine:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| mel frontend (CPU) | 11.1 ms | 5.9 ms |
+| cross-attention KV | 19.5 ms | 17.0 ms |
+| encoder | 111.6 ms | 110.8 ms |
+| decode loop, 10 tokens | 77.9 ms | 77.5 ms |
+
+**The frontend threads across frames, and which frames is the whole trick.**
+Splitting all 3001 evenly is the obvious thing and measured *slower than one
+thread* - 12.5 ms against 11.1. The window is a fixed 30 seconds, a clip is a
+few, and the silent frames that cost nothing are all at the end, so an even
+split hands the first thread every non-empty frame and the other seven a run of
+zeros; all it buys is the spawns. Splitting the range that has signal in it,
+found from the first and last non-zero sample rather than by testing each
+frame, gives 5.9.
+
+**`layer_norm_add` takes the residual sum on the way in.** Every normalisation
+in a transformer block reads the stream immediately after a sub-layer added to
+it and nothing between reads it, so the sum is left for the pass that was going
+to be made anyway - four passes and one launch against five and two. That
+removes an `add_inplace` from every block of both stacks, 1132 launches and 4.1
+ms of kernel time a transcription, of which about 1.7 is net once the wider
+normalisation is paid for.
+
+**`split_heads_f16` writes the packed cross-attention cache directly**, where
+the split ran at f32 and a `pack_f16` pass after it read and wrote the same 7.7
+MB tensor again to change nothing but its width.
+
+### What the remaining gap is, and what it is not
+
+The encoder is 111 ms against `whisper.cpp`'s 83 and everything else is level:
+the decode loop, the cross-attention cache and the frontend together are 100 ms
+against their 102. So the gap is the encoder matmul and nothing else, and 86 of
+those 111 ms are the tiled `gemm` at 22.4 TFLOP/s.
+
+**It is not the accumulator type, and this document said for a long time that
+it was.** Measured back to back out of registers on this card:
+
+| instruction | rate |
+| --- | ---: |
+| `mma.m16n8k8.row.col.f32.f16.f16.f32` | 102.3 TFLOP/s |
+| `mma.m16n8k8.row.col.f16.f16.f16.f16` | 103.0 TFLOP/s |
+| `mma.m8n8k16.row.col.s32.s8.s8.s32` | 203 TOPS |
+
+Flat across one, two, four and eight independent accumulator chains a thread,
+so a throughput ceiling rather than a latency artefact, and 78-87% of the
+card's 130.5 TFLOP/s and 261 TOPS. The half-rate f32 accumulate Turing is known
+for is a GeForce restriction and this is a Quadro: **f32 accumulation costs
+0.7% here.** Adopting the fp16 accumulation whisper.cpp's cuBLAS path uses
+would buy under one percent, whatever anyone thinks of its accuracy, so the
+refusal recorded in `docs/KERNELS.md` costs this engine nothing and the "only
+way past" framing that stood here was wrong.
+
+What is actually short is the staging, and how short is not established.
+22.4 TFLOP/s is 22% of the instruction ceiling but 78% of what the 128x128
+tile's arithmetic intensity allows against 672 GB/s - and it is not simply
+bandwidth either, because rounding the activations to f16, which halves the
+larger of the two operand streams, was worth 5%. Neither ceiling is cleanly
+binding and `ncu` cannot be run on this machine to say which (`ERR_NVGPUCTRPERM`
+- the account has no GPU performance-counter permission). Every standard escape
+is already recorded as measured-worse in `docs/KERNELS.md`: register prefetch
+and shared double-buffering both cost the second resident block that was
+providing the overlap, KC 64 loses to KC 32, and wider tiles lose to 128x128.
+
+So the honest statement of the remaining 28 ms is that it is a tiled matmul
+competing with cuBLAS on an architecture with no `cp.async`, not an arithmetic
+or accuracy limit.
 
 ### Translator
 
@@ -511,12 +594,20 @@ everywhere else, reverted.
 
 ## Prefill on the integer tensor cores
 
-The f16 kernel ran out of room. At 1836 tok/s it was measured at 86% of its own
-ceiling - 32 ms of `mma` against the 65.3 TFLOP/s the card does at
-`m16n8k8.f32.f16.f16.f32` - and llama.cpp was 1.32x ahead. No amount of work on
-the staging reaches that, because the staging would have to go to zero. The
-other shape this card assembles, `m8n8k16.s32.s8.s8.s32`, runs at four times the
-rate, and llama.cpp uses it. So `gemm_i8` does too.
+The f16 kernel ran out of room - or so this said. At 1836 tok/s it was measured
+at 86% of its own ceiling, 32 ms of `mma` against a believed 65.3 TFLOP/s for
+`m16n8k8.f32.f16.f16.f32`, with llama.cpp 1.32x ahead. **The 65.3 was wrong.**
+Measured back to back out of registers the instruction runs at 102.3 TFLOP/s on
+this card, so the same 32 ms of `mma` is about 20 and the fraction is 55%, not
+86%. `docs/KERNELS.md` has the microbenchmark and the two other numbers it
+corrects.
+
+The decision survives the correction and the numbers below are unaffected: the
+integer shape is twice the f16 rate rather than four times, which is still the
+largest arithmetic lever this card has, and llama.cpp uses it. What does not
+survive is "no amount of work on the staging reaches that" - the staging had
+more room in it than was recorded, and nobody has established how much of that
+is reachable.
 
 **This is the engine's second deliberate approximation and a larger one than the
 first.** The f16 path rounds a weight that was already four bits and keeps the
@@ -1538,7 +1629,10 @@ more. The encoder is 119 ms and the transcription 211.
 
 Three things account for what is left, in the order they are worth taking.
 
-**The matmul runs at 22-25 of 99 TFLOP/s.** `bench-gemm` on this card, at the
+**The matmul runs at 22-25 TFLOP/s against an instruction ceiling of 102.3
+measured on this card** - the 99 this line used to name was near enough as a
+number, but the reasoning attached to it elsewhere was not; see "Why f32
+accumulation is not caution" in `docs/KERNELS.md`. `bench-gemm` on this card, at the
 encoder's own shapes: 22.5 TFLOP/s for a 1500x1280x1280 projection, 21.9 for
 the feed-forward up, 24.8 for the down. The projections and feed-forwards are
 1.89 TFLOP, which is about 85 ms of the encoder's 125 at that rate. `ldmatrix`
@@ -1556,7 +1650,9 @@ wrong. The kernel does about 117 us of tensor-core work a layer and took 967;
 the gap was read as the four block-wide barriers a key tile costs, each
 amortised over half as many `m16n8k8` issues at `hd` 64 as at 128. **A 64-key
 trip fixes exactly that and changed the encoder by nothing** - 124.9 ms against
-124.3, inside the noise. What the barrier account left out is that a block
+124.3, inside the noise. *That result was itself confounded, and is resolved
+under "the encoder's fused attention" above: a 64-key trip pays once the score
+tile is out of shared memory. What follows is the reasoning as it stood.* What the barrier account left out is that a block
 stages every key and value it walks past, so all of K and V is re-staged once
 per query block: 47 trips through 0.8 MB is 724 MB a layer, and a wider key
 tile moves the same bytes in fewer trips. **The query tile divides it**, and 64

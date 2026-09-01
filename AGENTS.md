@@ -55,8 +55,10 @@ test at exact equality.
 
 **The tiled matmul now reads the same codes.** `gemm_i8` multiplies on the
 integer tensor cores, which is the only way past the f16 kernel: that measured
-86% of its own ceiling while llama.cpp was a third ahead, so there was no
-remaining room in it. The engine therefore has two deliberate approximations
+86% of what was then believed to be its ceiling while llama.cpp was a third
+ahead. That baseline has since been measured and was wrong - `docs/KERNELS.md`
+has the correction - so there was more room in it than recorded, though the
+integer path is still twice the arithmetic rate and still the right call. The engine therefore has two deliberate approximations
 rather than one, and they are the same approximation in two kernels. Together
 they cost 0.69% of the chat model's logit span and 0.42% of the translator's,
 and they moved the agreement with llama-server by nothing at all - 1 of 125
@@ -79,16 +81,21 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.85x and 0.89x** against `whisper-server` on
+medians. The ASR is **0.89x and 0.95x** against `whisper-server` on
 two clips — a stated milestone that is not met, recorded as a miss. That
 comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
 with CUDA against the same checkpoint, converted by its own script, and the two
 are alternated in pairs in one run. What is left of the gap is the **encoder**
 and nothing else: 111 ms against `whisper.cpp`'s 83, which is 28 of the 33 ms
-between the columns, and 86 of those 111 ms are a tiled `gemm` already at 86%
-of what this card's `m16n8k8.f32.f16.f16.f32` can do. Past that shape lies f16
-accumulation, which `docs/KERNELS.md` refuses on a measurement.
+between the columns, and 86 of those 111 ms are a tiled `gemm` running at 22.4
+TFLOP/s. **What that is short of is not the arithmetic.** The instruction is
+measured at 102.3 TFLOP/s on this card and f32 accumulation costs 0.7% of it,
+so the f16-accumulation trade this file used to name as the only way past buys
+essentially nothing here. Where the gemm's remaining time goes is not
+established — it is not the memory system either, since rounding the
+activations to f16 was worth 5% — and `ncu` cannot be run on this machine to
+settle it. `docs/KERNELS.md` has all of it.
 And the Llama stages are **level with or ahead of llama.cpp on every measured
 row**: the chat model ahead on prefill at both
 prompt lengths (2447 against 2259 at 128 tokens, 2928 against 2513 at 512) and

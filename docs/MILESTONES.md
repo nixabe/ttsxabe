@@ -97,19 +97,27 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 **Item 17 is not met, and it is now measured the way the item asks for.**
 Against a `whisper-server` built here with CUDA from the same checkpoint and
 started without `--vad` so both do the same job, alternated in pairs over
-twenty rounds in one sitting: 218 ms against 185 on a 2.93 s clip and 263
-against 234 on a 4.98 s one - 0.85x and 0.89x, with identical transcripts on
+twenty rounds in one sitting: 212 ms against 188 on a 2.93 s clip and 251
+against 238 on a 4.98 s one - 0.89x and 0.95x, with identical transcripts on
 both. The "measured and interleaved" half of this item is satisfied; the
 "faster" half is not.
 
 The remaining gap is the **encoder**, entirely. `whisper-bench` on the same
 build puts `whisper.cpp`'s encoder at 83 ms against this one's 111, which is 28
-of the 33 ms between the columns, and 86 of those 111 are a tiled `gemm` that
-`docs/KERNELS.md` measured at 86% of this card's `m16n8k8.f32.f16.f16.f32`
-ceiling. Closing it means f16 accumulation, which is a refusal with a
-measurement behind it rather than a lever left unpulled - so this item may not
-be reachable without spending that. `docs/BENCHMARKS.md` has the table and the
-one thing tried and rejected on the way here.
+of the 33 ms between the columns, and 86 of those 111 are a tiled `gemm`
+running at 22.4 TFLOP/s.
+
+**This item is not blocked on an accuracy trade, and this entry used to say it
+was.** The `m16n8k8.f32.f16.f16.f32` instruction measures 102.3 TFLOP/s on this
+card and the f16-accumulate form 103.0, so the accumulator type is worth 0.7%
+here and the earlier 65.3 TFLOP/s figure it was called against was wrong.
+`docs/KERNELS.md` has the microbenchmark. What the item *is* blocked on is a
+tiled matmul competitive with cuBLAS, which is where whisper.cpp's encoder gets
+its 27.3 TFLOP/s: the gemm is at 78% of what its 128x128 tile's arithmetic
+intensity allows and 22% of what the instruction allows, and which of those is
+binding has not been established - rounding the activations to f16 was worth
+5%, so it is not simply bandwidth. `ncu` cannot be run here to settle it.
+`docs/BENCHMARKS.md` has the table and everything tried and rejected.
 
 One of the two levers that section costed has been spent. Fused attention took
 the 38 ms the encoder was moving an attention score matrix it never needed to
