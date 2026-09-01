@@ -306,11 +306,24 @@ idle. Sweeping the column count at a fixed 1500x1280 says so directly:
 
 Throughput tracks the fill and nothing else - 1664 columns is *more* work than
 1536 and takes 72% longer, because 156 blocks is one full wave plus a twelfth
-of another. **This is not a lever on the encoder**, and that is the useful half
-of the finding: every shape in a layer is 83% and the ones that could be
-batched are dependent on each other, so there is no rearrangement that lands on
-a multiple of 144. It is a lever on the cross-attention cache, where 64
-independent projections share one activation, and that is not spent yet.
+of another.
+
+That last row is also what says the fill is **not** a lever on the encoder, and
+it is worth being precise about why, because the obvious reading of the table is
+the wrong one. Dispatch rounds up to whole waves rather than trickling: cost is
+`ceil(blocks / 144)` wave-times. A 120-block projection is therefore *already*
+one wave, which is the minimum any amount of that work can take - the idle sixth
+is capacity going unused, not time being spent. Batching q, k and v into one
+360-block launch is three waves and so is issuing them separately, and the same
+holds for overlapping them across streams. There is nothing there.
+
+Where it does bite is `fc1`, which is 480 blocks and so pays four waves for
+3.33 waves of work - about 17% of 32 ms. Recovering it needs 432 blocks or
+fewer at the same total work, which means a taller row tile, which means more
+accumulators, which is the register wall above. And it bites the
+cross-attention cache, where 64 independent projections of 120 blocks are 64
+waves apart and 7680 blocks together are 54 - a real 16%, about 2.4 ms, and the
+only unspent item on this list that survives its own arithmetic.
 
 ### The round that took the ASR from 0.74x to 0.83x
 
@@ -556,15 +569,19 @@ normalisation's re-reads, and the software pipeline - each measured neutral or
 worse, for the same reason each time: the dominant kernels are not the ones
 being changed, and the caches were already covering the traffic being saved.
 
-The remaining candidates, all estimated and none spent, are a GPU mel frontend
-(the 5.3 ms of CPU time the card spends idle), overlapping the independent
-projections across streams so a 120-block launch stops leaving a sixth of the
-machine idle (about 5 ms across the encoder and the cross-attention cache), and
-folding the query scale into `flash_attn` (0.9 ms). Together they are about 11
-ms against the 13 needed, which is to say that even spending all of them lands
-at roughly 0.99x rather than at 1.0x. Reaching parity on a three-second clip
-needs a matmul that gets nearer cuBLAS's rate on sm_75, and that is the thing
-this architecture has been measured to refuse.
+**What is left is smaller than it looked, and this list has been corrected
+downward twice.** The frontend was on it at 5.3 ms and has been spent, for 1.7
+of that. Overlapping the projections across streams was on it at about 5 ms and
+is worth *nothing*, for the reason the wave table above now spells out - a
+120-block launch is already one wave. What survives is batching the
+cross-attention cache's 64 projections into one launch (2.4 ms), reading the
+keys straight out of the projection buffer instead of permuting them (0.8 ms),
+and folding the query scale into `flash_attn` (0.9 ms): **about 4 ms against
+the 11 still needed.**
+
+So the shortest clip is not reachable by any accounting available here.
+Reaching parity on it needs a matmul nearer cuBLAS's rate on sm_75, and that is
+the thing this architecture has been measured to refuse.
 
 ### Translator
 
