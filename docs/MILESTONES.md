@@ -147,6 +147,23 @@ Still recorded as a miss, because the milestone asks for the short end too and
 the briefest clip is 11 ms behind - rather than restated as a different
 target.
 
+**Since then the decoder has had its round, and the miss is 1.3 ms.** The
+accounting above set the decode loop aside as level with `whisper.cpp` and
+costed only the encoder side, and the decoder was where the time was:
+twenty-two launches a layer for one token, now thirteen - each attention one
+kernel reading its caches in place with the query scale folded in, the key and
+value projections placed in the cache by the mat-vec's epilogue, the GELU on
+the same epilogue, and the cross-attention
+cache built by two batched matmuls rather than sixty-four. The decode loop went
+from 74.3 ms to 68.5 on ten tokens and the cache build from 15.3 to 13.5, and
+the interleaved row is now 190.3 against 189.0 on the 2.93 s clip, 227.2
+against 238.9 at 4.98 s, 252.0 against 264.6 at 7.28 s and 307.0 against 354.2
+at 9.95 s - **0.99x, 1.05x, 1.05x and 1.15x**. The 1.3 ms on the shortest clip
+is inside both engines' twenty-round spread, and the item stays ❌ because
+"faster" is the word in it and 0.99x is not that; it is not restated as
+"level" to make the mark. `docs/BENCHMARKS.md` has the round under "The
+decoder's round".
+
 The filter bank is computed rather than shipped, and matches the capture *bit
 for bit*: both sides evaluate the same closed form in f64 and round once, with
 no reduction for an ordering to disagree about. That removes a runtime asset
@@ -575,10 +592,15 @@ non-finding worth recording:
   quantized row is a whole number of blocks, so the same shuffle applies to
   byte ranges and `attn_q` and `attn_k` never have to be unpacked at all.
 
-The limit that remains is narrower than the one it replaces: only the **matmul**
-reads packed blocks. The embedding table is a gather with its own kernel and is
-still widened to f32 at load, which at 8 B is 2.1 GB whatever the file says.
-That is the next lever and is not claimed as done.
+This entry used to end by saying the limit that remained was narrower than the
+one it replaced: only the matmul read packed blocks, and the embedding table -
+a gather with its own kernel - was still widened to f32 at load, 2.1 GB at 8 B
+whatever the file said, the next lever and not claimed as done. **It is done.**
+`embed_q` gathers rows out of the file's own blocks, unpacking each element as
+it goes, and both Llama stages hold their tables packed: 1 730 MiB back on the
+8 B and 928 on the 13 B, the same numbers to the bit, since the blocks decode
+to exactly the f32 that used to be uploaded. `docs/BENCHMARKS.md` has the
+residency table and `docs/KERNELS.md` the kernel.
 
 ## Outside the numbering: a third synthesiser, Tacotron2 + WaveGlow
 

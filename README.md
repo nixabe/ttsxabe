@@ -101,19 +101,19 @@ downstream able to tell which.
 whisper.cpp on every segment of an eight-clip corpus, and refusing all four of
 the noise cases that used to make the ASR invent sentences.
 
-**Speech recognition is complete and correct, and level with what it replaces
-from about five seconds of speech up.** Whisper large-v2 from scratch — 1,259
-tensors, a general-radix mel frontend, a byte-level BPE, a tensor-core matmul,
-encoder and decoder matching a captured oracle layer by layer, and greedy
-decoding reproducing 🤗 `WhisperForConditionalGeneration`'s transcripts token
-for token.
+**Speech recognition is complete and correct, and ahead of what it replaces
+from five seconds of speech up and level at three.** Whisper large-v2 from
+scratch — 1,259 tensors, a general-radix mel frontend, a byte-level BPE, a
+tensor-core matmul, encoder and decoder matching a captured oracle layer by
+layer, and greedy decoding reproducing 🤗 `WhisperForConditionalGeneration`'s
+transcripts token for token.
 
 | clip | `xabe-asr` | `whisper-server` | ratio |
 | --- | --- | --- | --- |
-| 2.93 s | 198.0 ms | 186.7 ms | 0.94x |
-| 4.98 s | 237.2 ms | 237.0 ms | **1.00x** |
-| 7.28 s | 266.9 ms | 264.7 ms | 0.99x |
-| 9.95 s | 325.5 ms | 352.9 ms | **1.08x** |
+| 2.93 s | 190.3 ms | 189.0 ms | 0.99x |
+| 4.98 s | 227.2 ms | 238.9 ms | **1.05x** |
+| 7.28 s | 252.0 ms | 264.6 ms | **1.05x** |
+| 9.95 s | 307.0 ms | 354.2 ms | **1.15x** |
 
 Both halves of every row were measured in one sitting, against a
 `whisper-server` built from this repository's own `whisper.cpp` checkout with
@@ -123,11 +123,14 @@ earlier version of this section quoted 0.55x and then 0.68x; those were two
 sittings arithmetically combined, and they are superseded rather than
 corrected downward.
 
-**It is still recorded as a milestone that is missed**, because the milestone
-asks for the short end too and the 2.93 s clip is 11 ms behind. What is left
-of the gap is the encoder and nothing else — 102 ms against 83 — and
-`docs/BENCHMARKS.md` argues that this kernel shape has run out of room on
-sm_75 rather than that a trick is missing.
+**It is recorded as a milestone that is level rather than won**, because the
+milestone asks for the short end too and the 2.93 s clip is 1.3 ms behind -
+inside both engines' own spread, but not ahead. What is left of the gap is the
+encoder and nothing else — about 102 ms against 83 — and `docs/BENCHMARKS.md`
+argues that this kernel shape has run out of room on sm_75 rather than that a
+trick is missing. The last 8 ms came from the decoder instead, which had been
+set aside as level and was spending twenty-two launches a layer on one token,
+thirteen now.
 
 **CosyVoice3 runs in the engine.** Three networks from scratch — a Qwen2 0.5 B
 speech language model, a 22-layer diffusion transformer with its Euler solver,

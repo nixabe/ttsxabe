@@ -3,10 +3,10 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.94x to 1.00x against `whisper-server` from three to seven seconds of speech
-and 1.08x at ten - level from five seconds up and short only on the briefest
-clip, alternated in one sitting against a `whisper-server` built here
-from the same checkpoint - and both Llama
+0.99x against `whisper-server` on three seconds of speech and 1.05x to 1.15x
+from five seconds up - level on the briefest clip, by a margin inside both
+sides' own spread, and ahead on every other, alternated in one sitting against
+a `whisper-server` built here from the same checkpoint - and both Llama
 stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
 three of its rows (1.08x and 1.17x prefill, 1.06x decode), the translator
@@ -60,15 +60,17 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
-| 2.93 s | 198.0 ms | 186.7 ms | 0.94x | identical |
-| 4.98 s | 237.2 ms | 237.0 ms | **1.00x** | identical |
-| 7.28 s | 266.9 ms | 264.7 ms | 0.99x | differ |
-| 9.95 s | 325.5 ms | 352.9 ms | **1.08x** | differ |
+| 2.93 s | 190.3 ms | 189.0 ms | 0.99x | identical |
+| 4.98 s | 227.2 ms | 238.9 ms | **1.05x** | identical |
+| 7.28 s | 252.0 ms | 264.6 ms | **1.05x** | differ |
+| 9.95 s | 307.0 ms | 354.2 ms | **1.15x** | differ |
 
-The row before this one was 0.89x / 0.94x / 0.95x / 1.04x, and what moved it
-is in "The round that found the encoder's other half" below: the encoder went
-from 110.9 ms to 101.9 and the cross-attention cache from 17.0 to 14.8, none of
-it in the tiled `gemm` and none of it changing a single output bit.
+The row before this one was 0.94x / 1.00x / 0.99x / 1.08x, and what moved it
+is in "The decoder's round" below: the decode loop went from 74.3 ms to 68.5 on
+ten tokens and the cross-attention cache from 15.3 to 13.5, none of it in the
+encoder and none of it changing a single output bit. On the 2.93 s clip the
+twenty rounds spread 188.2 to 191.8 ms here against 183.6 to 190.0 there, so
+the 1.3 ms between the medians is inside both.
 
 `whisper-server` is started `-nf -bo 1 -bs -1` as well as without `--vad`, so
 both sides are strictly single-pass greedy with no temperature fallback -
@@ -77,20 +79,20 @@ which is what this engine does and all it does. That turned out not to matter
 is the difference between a matched comparison and one that happened to be
 matched.
 
-**The milestone's target is met from about five seconds of speech up and missed
-on the shortest clip, and the shape of that is the useful result.** The two
-engines have opposite cost structures. The encoder is a fixed 30-second window
-for both and ours is about 19 ms slower at it, so every transcription starts
-that far behind; the decode is cheaper here, by about 1.8 ms a token. From
-2.93 s to 9.95 s our total grows 125 ms against their 165 for the same
-twenty-odd extra tokens, and the fixed deficit is paid off at roughly seven
-tokens now rather than fifteen.
+**The milestone's target is met from five seconds of speech up and level at
+three, and the shape of that is the useful result.** The two engines have
+opposite cost structures. The encoder is a fixed 30-second window for both and
+ours is about 19 ms slower at it, so every transcription starts that far
+behind; the decode is cheaper here, by about 2 ms a token. From 2.93 s to
+9.95 s our total grows 117 ms against their 165, and the fixed deficit is paid
+off at about eleven tokens - one more than the shortest clip produces, which
+is where its 1.3 ms comes from.
 
 **The workload this engine exists for is the short end.** The pipeline runs
-greedy over VAD-gated utterances of a few seconds, which is 0.89x to 0.94x -
-so the honest reading is that the item is not met for the case that matters,
-and the 1.04x is a fact about where the curve crosses rather than a win to
-quote.
+greedy over VAD-gated utterances of a few seconds, which is the 0.99x row - so
+the honest reading is that the item is level rather than won for the case that
+matters, by less than either side moves between its own rounds, and the 1.15x
+is a fact about where the curve goes rather than the number to quote.
 
 The two longer clips are also weaker evidence for a second reason: the
 transcripts diverge. Both engines are single-pass greedy on the same weights,
@@ -582,6 +584,68 @@ the 11 still needed.**
 So the shortest clip is not reachable by any accounting available here.
 Reaching parity on it needs a matmul nearer cuBLAS's rate on sm_75, and that is
 the thing this architecture has been measured to refuse.
+
+### The decoder's round: 0.94x to 0.99x on the shortest clip, from the stage the accounting called level
+
+The paragraph above was wrong, and the way it was wrong is worth keeping. It
+costed the encoder side of the pipeline to 4 ms against the 11 needed and
+concluded the shortest clip was out of reach, and the 7.7 ms it did not see
+were in the decode loop - which it had set aside as "level" at 100 ms against
+`whisper.cpp`'s 102. Level with the other engine is not the same as done, and
+the decoder turned out to be spending a launch on almost everything it did.
+
+Two clips, `xabe-asr-bench --stages`, nine-round medians, both binaries
+alternated in one sitting:
+
+| stage | 2.93 s, 10 tokens, before | after | 7.28 s, 20 tokens, before | after |
+| --- | ---: | ---: | ---: | ---: |
+| mel frontend (CPU) | 3.6 ms | 4.2 | 5.5 | 7.4 |
+| encoder | 105.0 | 105.0 | 105.3 | 104.9 |
+| cross-attention KV | 15.3 | **13.5** | 15.3 | **13.6** |
+| decode loop | 74.3 | **68.5** | 136.4 | **126.2** |
+
+The frontend is CPU work and swings between 3.5 and 7.6 ms across runs of
+either binary; nothing in it changed. The encoder did not change and did not
+move. What moved is the decoder, by 0.58 ms a token at ten tokens and 0.51 at
+twenty, and the cache build by 1.8 ms - against the 2.4 the accounting above
+had costed for it, which is the one thing on that list that was tried.
+
+Three changes, all of them launch count rather than arithmetic:
+
+- **One launch for each attention.** Self-attention over the f32 cache and
+  cross-attention over the packed f16 encoder cache were each a head split, a
+  batched score matmul, a softmax and a value product; each is now `attn_decode`,
+  reading its caches in place. `bench-attn` at the Whisper decoder's shape - 20
+  heads of 64 - puts the self-attention at 0.18 ms per 32 layers where the
+  chain was 0.47, and the cross-attention over 1 500 encoder positions at 0.76
+  where it was 0.91. `docs/KERNELS.md` has the kernel and the register table.
+- **The projections write where their output lives.** The mat-vec grew an
+  epilogue that places a row: the key projection lands in the self-attention
+  key cache at its position and the value projection in the transposed value
+  cache, so `cache_append` and its twin are not launched at all in the decode
+  loop, and the feed-forward's inner projection applies its GELU on the way out
+  rather than in a kernel of its own. The test for it is exact equality against
+  the three kernels it replaces, run in turn.
+- **The cross-attention cache in two matmuls, not sixty-four.** Every layer's
+  key and value projections of the encoder output are batched into one call
+  each, and the head split that writes the packed cache folds the value bias in
+  as it converts. This is the 2.4 ms item from the accounting above, measured
+  at 1.8.
+
+Nine launches a layer are gone from the decode step - two query scalings,
+four of the attention chains' six, two cache appends and the GELU - which is
+twenty-two down to thirteen, and at 32 layers and ten tokens 2 880 launches;
+at the few microseconds each costs, that is the 5.8 ms the decode loop lost. The layer normalisation was also rewritten on warp
+shuffles with one barrier in place of the two-pass reduction it had, and is
+measured at nothing on this clip; it is kept because it is simpler and because
+the differential test still passes at the same threshold.
+
+What is left after this round is the same encoder - 105 ms in this sitting
+against `whisper.cpp`'s 83 in the one that measured it, and the two sittings'
+clocks are not the same - a cache build at 13.5 ms, and a decoder that spends
+thirteen launches a layer where it spent twenty-two. The shortest clip is 1.3 ms
+behind with both engines' spreads overlapping, and the next 1.3 ms is in none
+of the three places this section names.
 
 ### Translator
 
@@ -1404,6 +1468,72 @@ inside one A/B look exactly like no change at all, and the only way this
 surfaced was profiling the ASR and finding a kernel at 10.4% of its GPU time
 that had not existed that morning.
 
+## One launch for a decode step's attention, and the embedding held packed
+
+A decoded token's attention on both Llama stages was three launches a layer -
+a batched score matmul, a softmax and a value product - on top of the KV
+append, and the value product's one-row shape ran the cache at 200 to
+400 GB/s. `attn_decode` does the three in one, reading the caches in place:
+a block per 64 keys of one KV head, every load issued before anything waits on
+one, and a last-block merge across the chunks in the same launch.
+`docs/KERNELS.md` has the design, the six arrangements that lost to it, and the
+register table.
+
+`bench-attn`, ms per 32 layers, the chain against the fused kernel at each
+model's own shape (32 query heads over 8 KV heads of 128 for the chat model;
+40 over 40 for the translator):
+
+| shape | context | chain | fused |
+| --- | ---: | ---: | ---: |
+| chat | 128 | 0.40 | 0.42 |
+| chat | 512 | 0.64 | **0.45** |
+| chat | 1024 | 0.91 | **0.60** |
+| chat | 2048 | 1.51 | **1.17** |
+| translator | 128 | 0.51 | 0.44 |
+| translator | 1024 | 1.62 | 1.61 |
+
+End to end, nine-round medians, both binaries alternated in one sitting,
+decode in ms a token:
+
+| stage | context | before | after |
+| --- | ---: | ---: | ---: |
+| chat | 128 | 9.65 | 9.74 |
+| chat | 1024 | 10.22 | **10.09** |
+| chat | 2048 | 10.82 | **10.58** |
+| translator | 128 | 15.92 | 15.90 |
+| translator | 1024 | 17.77 | 17.88 |
+
+Prefill did not move on any row - 49.4 ms against 49.4 at 128 tokens, 333
+against 334 at 1024, 706 against 707 at 2048 on the chat model; 89.0 against
+89.0 and 616 against 620 on the translator - because a prefill takes
+`flash_attn` and never sees this kernel.
+
+**1.3% at 1024 and 2.2% at 2048 on the chat model, and 1% the other way at
+128.** The slope is what moved: 0.62 ms more per 1024 tokens of context before,
+0.45 after. The 128-token row is 0.09 ms a token worse, which is more than the
+microbenchmark's 0.02 and is recorded as a cost, not noise: at 128 positions a
+head is two chunks and the merge is a second pass over very little. The rows a
+conversation decodes at are the 1024 and 2048 ones, and that is where this
+kernel was aimed.
+
+**The translator does not move**, and the microbenchmark said it would not:
+1.61 ms against 1.62 at 1024. With 40 KV heads for 40 query heads there is no
+group of queries sharing a head's cache for one launch to serve, so the chain
+was already reading each head once per token, and the fused kernel reads the
+same bytes in one launch instead of three. The launch count saved is worth
+0.07 ms per step at 128 tokens on the microbenchmark and nothing measurable end
+to end; the 0.6% at 1024 is inside the row's run-to-run spread and is not
+claimed either way.
+
+**The embedding tables stay packed.** `embed_q` gathers a token's row straight
+out of the file's own blocks and unpacks each element on the way, so the table
+is no longer widened to f32 at load: the chat model's residency went from
+6 400 MiB to 4 768 and the translator's from 8 608 to 7 778, and the gather
+returns exactly the f32 the widened table held - the differential test is at
+equality against the CPU dequantizer. This is residency and not speed: one row
+of a few kilobytes a token is not where a step's time goes, and the timing
+tables above were measured with it in place.
+
 ## Decode at a context length worth having
 
 Every decode figure above was taken at a 128-token prompt, and that is the
@@ -1426,7 +1556,8 @@ Swept, nine-round medians:
 cost 0.63 ms more per 1024 tokens of context and now costs 0.42. Both binaries
 alternated in one sitting, twice through, because the 128-token column moves by
 more than this change is worth between sittings - the prefill rows drifted 2-4%
-across two sittings here while decode reproduced to 0.02 ms.
+across two sittings here while decode reproduced to 0.02 ms. The section
+before this one has since taken the 2048 row down a further 2.2%.
 
 ### The grouped-query rows were each reading the whole cache
 
@@ -1865,14 +1996,19 @@ would answer a different question and give a smaller number.
 | stage | container | delta MiB | cumulative |
 | --- | --- | --- | --- |
 | TTS, VITS 36 M, + the CUDA context | safetensors, f32 | 297 | 297 |
-| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 200 | 3 497 |
-| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 6 400 | 9 897 |
-| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 8 608 | 18 505 |
-| CosyVoice3, LM + flow + vocoder | safetensors | 3 266 | **21 771** |
+| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 499 |
+| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 267 |
+| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | 16 045 |
+| CosyVoice3, LM + flow + vocoder | safetensors | 3 266 | **19 311** |
 
-**21 771 MiB — 21.3 GiB of a 48 GiB card**, 44% of it, leaving 27 375 MiB for
+**19 311 MiB — 18.9 GiB of a 48 GiB card**, 39% of it, leaving 29 835 MiB for
 KV caches and activations. Without CosyVoice, which is the alternative
-synthesiser rather than a second stage, the four remaining are 18 505 MiB.
+synthesiser rather than a second stage, the four remaining are 16 045 MiB.
+This table stood at 21 771 MiB until the embedding tables were held packed -
+"One launch for a decode step's attention, and the embedding held packed"
+above - which is 1 632 MiB on the chat row and 830 on the translator's against
+the table as it stood, and 1 730 and 928 when the same binary is loaded both
+ways in one sitting, which is the figure the arithmetic below predicts.
 
 The VAD is absent from that table because it occupies nothing: `xabe_vad::open`
 takes no device ordinal, Silero being 1.8 M parameters of CPU arithmetic. The
@@ -1886,12 +2022,12 @@ path is Han text through Tacotron2:
 
 | stage | container | delta MiB | cumulative |
 | --- | --- | --- | --- |
-| Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 | 486 | 486 |
-| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 200 | 3 686 |
-| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 6 496 | 10 182 |
-| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 8 706 | **18 888** |
+| Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 | 489 | 489 |
+| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 691 |
+| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 459 |
+| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | **16 237** |
 
-**18 888 MiB — 18.4 GiB**, leaving 30 255 MiB. Tacotron2 costs 383 MiB more
+**16 237 MiB — 15.9 GiB**, leaving 32 909 MiB. Tacotron2 costs 192 MiB more
 than VITS did in the row above, which is the two models' parameter counts and
 not the context; dropping CosyVoice is what saves the 3 266 MiB.
 
@@ -1935,20 +2071,20 @@ reporting.
 
 | model | file | `Packing::F16` | `Packing::Packed` | ratio |
 | --- | --- | --- | --- | --- |
-| Breeze2 8 B `Q4_K_M` | 4 685 MiB | 16 489 MiB | 6 400 MiB | 2.58x |
-| Taigi Llama-2 13 B `Q4_K_M` | 7 663 MiB | 26 025 MiB | 8 608 MiB | 3.02x |
+| Breeze2 8 B `Q4_K_M` | 4 685 MiB | 16 489 MiB | 4 768 MiB | 3.46x |
+| Taigi Llama-2 13 B `Q4_K_M` | 7 663 MiB | 26 025 MiB | 7 778 MiB | 3.35x |
 
-The packed figures exceed the file sizes by 1 715 and 945 MiB, and that gap is
-the **embedding table**: a gather rather than a matmul, so it has its own kernel
-and is still widened to f32 at load. The gap is what widening costs *over*
-storing it packed - at 8 B, 128 256 x 4 096 as f32 is 2 004 MiB against about
-282 MiB as `Q4_K`, a difference of 1 722 MiB, which is the 1 715 measured. The
-13 B's smaller vocabulary gives 940 MiB by the same arithmetic against 945
-measured.
-
-It is also why the 8 B ratio is the worse of the two despite identical
-quantization: a larger vocabulary over a smaller model puts more of the
-checkpoint into the one tensor that is not packed.
+The packed figures exceed the file sizes by 83 and 115 MiB, under 2%, and
+that is the f32 norms and the allocator's rounding; it is not itemised. This
+table used to read 6 400 and 8 608 MiB, 1 715 and 945 over the files, and the
+whole of that was the **embedding table**: a gather rather than a matmul, so
+it had its own kernel and was widened to f32 at load - at 8 B, 128 256 x 4 096
+as f32 is 2 004 MiB against about 282 as `Q4_K`, a difference of 1 722, which
+was the 1 715 measured. `embed_q` now gathers out of the packed blocks and the
+difference is gone: 1 730 MiB on the 8 B and 928 on the 13 B, the same
+binary loaded both ways in one sitting, against 1 722 and 940 predicted. The 8 B's ratio was the worse of the two for exactly that
+reason - a larger vocabulary over a smaller model put more of the checkpoint
+into the one tensor that was not packed - and now it is the better one.
 
 ### Why this is the difference between fitting and not
 
@@ -1959,10 +2095,10 @@ which is *less than the 13 B's own KV cache* at any useful context length.
 Add CosyVoice, which is unquantized either way, and f16 comes to **49 277
 MiB** against a 49 152 MiB card: it does not merely leave too little headroom,
 it exceeds the card by 125 MiB and fails to load at all. Packed, the same five
-stages are 21 771 MiB and use 44% of one card.
+stages are 19 311 MiB and use 39% of one card.
 
 So the honest statement is not "f16 is tight". At f16 these stages do not share
-a card; packed, they share one with 27 GB to spare.
+a card; packed, they share one with 29 GB to spare.
 
 ### This is residency, not speed
 
