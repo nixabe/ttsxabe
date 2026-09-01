@@ -47,9 +47,9 @@ struct GAttention {
 ///
 /// The key and value projections are not here. They read the encoder's
 /// output and nothing else, so they run once an utterance, and all thirty-two
-/// layers' worth go out as one batched product each - see [`AsrModel::cache`]
-/// - which wants the weights of every layer in one allocation rather than one
-/// a layer. Those live on the model as `cross_k` and `cross_v`.
+/// layers' worth go out as one batched product each, see [`AsrModel::cache`],
+/// which wants the weights of every layer in one allocation rather than one a
+/// layer. Those live on the model as `cross_k` and `cross_v`.
 struct GCrossAttention {
     q: GLinear,
     out: GLinear,
