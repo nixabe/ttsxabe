@@ -753,6 +753,55 @@ so the decoder takes the f32 path and the choice is made on the row count.
 multiplied by, and narrowing it would be a real approximation rather than a
 free one.
 
+## `gemv_rows`, where the weight is not the weight
+
+`gemv` gives output row `r` its own block through `blockIdx.y`. That is right
+whenever the "weight" is a checkpoint tensor: `m` is one at decode, the weight
+is the entire traffic, and there is nothing to share.
+
+Attention is the case where it is wrong. The weight is the KV cache, and the
+`m` rows are the query heads of one grouped-query group - heads that exist
+precisely so that they can share a key head. Four blocks each fetching the same
+cache is four times the traffic for arithmetic that was meant to be free, and
+measured on this card it cost 2.4x rather than the 1.0x sharing would give:
+L2 does not absorb it behind a 4.92 GB weight stream. `docs/BENCHMARKS.md` has
+the sweep and the L2 argument that turned out not to apply.
+
+So `gemv_rows` loads `wv[i]` once and spends it on every row:
+
+```cuda
+for (int i = lane; i < k; i += 32) {
+    const float wi = wv[i];
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+        if (r < m) { acc[r] += af[(size_t)r * k + i] * wi; }
+    }
+}
+```
+
+`m` is a runtime count, so the row loop is unrolled against the compile-time
+bound and predicated on it - an unrolled body is what makes the single load
+pay, because the four products then issue back to back off one register.
+`GEMV_ROWS_MAX` is 4 and `GEMV_MAX_M` must not exceed it; a `debug_assert` at
+the launch says so.
+
+**f32 both sides, and no packed path.** A packed weight is a checkpoint tensor
+and has no case here. The KV cache is the only unpacked `f32` operand that ever
+appears on the right of a mat-vec in these models, which is why this kernel is
+narrow enough to be worth having rather than a second copy of `gemv`.
+
+Two things it deliberately is not:
+
+- **Not a fused decode attention.** Scores, softmax and the value product stay
+  three kernels. Fusing them would need a split over the key range and a
+  combining pass, because eight key heads is eight blocks on 72 SMs; the three
+  kernels already have thousands.
+- **Not a change to the arithmetic.** Lane `l` sums the same elements of `k` in
+  the same order it would have, and the reduction after is the same tree. The
+  test asks for **bit equality** against the same rows computed one at a time -
+  a tolerance there would be hiding the only thing worth checking - and gets it
+  on five shapes, including the strided `w_row` layout the value cache uses.
+
 ## Fused attention, `flash_attn`
 
 Scores, mask, softmax and the value product for a whole prompt - or a whole

@@ -988,6 +988,81 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
 }
 
 
+// The rows of a mat-vec against an *unpacked* weight, carried by one warp
+// instead of one block each.
+//
+// `gemv` puts row `r` at `blockIdx.y`, so `m` rows read the weight `m` times.
+// For a checkpoint tensor that is the right trade - the weight is the whole
+// traffic and `m` is one - but attention is the case where it is not: the
+// "weight" is the KV cache, and the `m` rows are the query heads of a
+// grouped-query group, which exist precisely because they share it. Measured
+// on this card at the 8 B model's decode shapes, four rows cost 2.4x one row
+// rather than the 1.0x sharing would give, so L2 was not absorbing the
+// re-reads. docs/BENCHMARKS.md has the sweep.
+//
+// So this reads `wv[i]` once and spends it on every row. The arithmetic is
+// element-for-element what `gemv` does - the same products accumulated in the
+// same order into the same per-lane partial, and the same reduction - which is
+// why the differential test can demand exact equality between the two.
+//
+// f32 both sides, because that is what the caches are and because a packed
+// weight has no case here: it is a checkpoint tensor read once a token.
+#define GEMV_ROWS_MAX 4
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
+    const float* __restrict__ a,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int m, int k, int n,
+    long sa, long sw, long so,
+    // Elements between consecutive rows of `w`. See the note in `gemv`: the
+    // value cache is why it exists.
+    int w_rs)
+{
+    const int lane = threadIdx.x;
+    const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
+    if (col >= n) {
+        return;
+    }
+    out += (size_t)blockIdx.z * so;
+    const float* af = a + (size_t)blockIdx.z * sa;
+    const float* wv = w + (size_t)blockIdx.z * sw + (size_t)col * (w_rs ? w_rs : k);
+
+    float acc[GEMV_ROWS_MAX];
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+        acc[r] = 0.0f;
+    }
+    // `m` is a runtime count but never above GEMV_ROWS_MAX, so the row loop is
+    // unrolled against the bound and predicated on the count. An unrolled body
+    // is what makes the single `wv[i]` load pay: the four products issue back
+    // to back off one register.
+    for (int i = lane; i < k; i += 32) {
+        const float wi = wv[i];
+        #pragma unroll
+        for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+            if (r < m) {
+                acc[r] += af[(size_t)r * k + i] * wi;
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS_MAX; ++r) {
+        if (r >= m) {
+            break;
+        }
+        float v = acc[r];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            out[(size_t)r * n + col] = v + (bias ? bias[col] : 0.0f);
+        }
+    }
+}
+
+
 extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     const void* __restrict__ a,
     const void* __restrict__ w,
@@ -4018,6 +4093,8 @@ const fn define(key: &str) -> u32 {
 
 /// Warps per `gemm` block; the launch's `block_dim.y`.
 pub const GEMM_WARPS: u32 = define("GEMM_WARPS");
+/// Warps in a `gemv` or `gemv_rows` block; one output column each.
+pub const GEMV_WARPS: u32 = define("GEMV_WARPS");
 /// Rows of the activation one `gemm` block covers; the grid's `y` step.
 pub const GEMM_MT: u32 = define("GEMM_MT");
 /// Rows of the weight one `gemm` block covers; the grid's `x` step.
@@ -4031,5 +4108,7 @@ pub const GEMM_I8_MT: u32 = define("GEMM_I8_MT");
 /// The narrow row tile, for a prefill with fewer rows than the wide one
 /// computes. See the note beside `GEMM_I8_ENTRY`.
 pub const GEMM_I8_MT_NARROW: u32 = define("GEMM_I8_MT_NARROW");
+/// Rows `gemv_rows` will carry in one warp. `GEMV_MAX_M` must not exceed it.
+pub const GEMV_ROWS_MAX: u32 = define("GEMV_ROWS_MAX");
 /// Rows of the weight one `gemm_i8` block covers.
 pub const GEMM_I8_NT: u32 = define("GEMM_I8_NT");

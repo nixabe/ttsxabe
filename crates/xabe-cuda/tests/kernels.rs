@@ -1974,3 +1974,88 @@ fn an_uninstantiated_head_width_is_refused() {
         "heads are not a multiple of kv_heads and supports_flash said they were",
     );
 }
+
+/// The several-row mat-vec against exactly the same products, one row at a time.
+///
+/// `gemv_rows` exists to stop the grouped-query rows of attention from reading
+/// the KV cache once each, and it is worth having only if it is not also a
+/// change to the arithmetic. It is not: the row loop is inside the lane's
+/// accumulation, so lane `l` sums the same elements of `k` in the same order
+/// `gemv` would, and the reduction that follows is the same tree. So this asks
+/// for bit equality rather than a tolerance, and a tolerance here would be
+/// hiding the one thing the test is for.
+///
+/// Both operand layouts attention actually uses: the score product, whose
+/// weight is the key cache read as tight rows, and the context product, whose
+/// weight is the value cache read at a row stride wider than the contraction -
+/// which is the case `w_row` exists for and the easier one to get wrong.
+#[test]
+fn several_rows_of_a_mat_vec_agree_with_one_row_at_a_time() {
+    let Some(g) = gpu() else { return };
+    // (m, k, n, w_row, count) - a ragged `n` so the tail warps of a block sit
+    // out, and a capacity wider than the contraction for the strided case.
+    for &(m, k, n, cap, count) in &[
+        (4usize, 128usize, 300usize, 0usize, 3usize),
+        (4, 617, 128, 0, 2),
+        (2, 128, 64, 0, 1),
+        (3, 200, 129, 512, 2),
+        (4, 200, 128, 512, 3),
+    ] {
+        let rows = if cap == 0 { n } else { k };
+        let wide = if cap == 0 { k } else { cap };
+        let a: Vec<f32> = (0..count * m * k)
+            .map(|i| ((i * 37 % 211) as f32 - 105.0) / 64.0)
+            .collect();
+        let w: Vec<f32> = (0..count * rows * wide)
+            .map(|i| ((i * 53 % 197) as f32 - 98.0) / 32.0)
+            .collect();
+        let (da, dw) = (g.upload(&a).unwrap(), g.upload(&w).unwrap());
+        let batch = Batch {
+            count,
+            a: m * k,
+            w: rows * wide,
+            out: m * n,
+            w_row: cap,
+        };
+        let together = g
+            .gemm_batched(Operand::F32(&da), Operand::F32(&dw), None, batch, m, k, n)
+            .unwrap();
+        let together = g.download(&together).unwrap();
+
+        // One row at a time takes `gemv`, which is the whole point: `m == 1`
+        // has no rows to share and is left on the original path.
+        for r in 0..m {
+            let one: Vec<f32> = (0..count)
+                .flat_map(|c| a[c * m * k + r * k..c * m * k + (r + 1) * k].to_vec())
+                .collect();
+            let done = g.upload(&one).unwrap();
+            let row = g
+                .gemm_batched(
+                    Operand::F32(&done),
+                    Operand::F32(&dw),
+                    None,
+                    Batch {
+                        count,
+                        a: k,
+                        w: rows * wide,
+                        out: n,
+                        w_row: cap,
+                    },
+                    1,
+                    k,
+                    n,
+                )
+                .unwrap();
+            let row = g.download(&row).unwrap();
+            for c in 0..count {
+                for j in 0..n {
+                    assert_eq!(
+                        together[c * m * n + r * n + j],
+                        row[c * n + j],
+                        "({m},{k},{n},{cap},{count}) batch {c} row {r} col {j}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -148,6 +148,11 @@ nine-round median, because five-round runs read about 3% high off the boost
 clock; and the decode lead appeared because llama.cpp's own decode came in
 lower that sitting — the engine's decode did not move, which was the
 constraint the prefill work was under.
+A fourth caution has since been added: every decode figure in that table is
+taken at a 128-token prompt, and decode is **context-sensitive** - it costs
+0.42 ms more per 1024 tokens of context, because the KV cache is re-read in
+full for every token. A conversation carries a system prompt and a history, so
+the row a listener actually waits on is the 1024- or 2048-token one.
 Those numbers and every other comparison belong in `docs/BENCHMARKS.md` and
 nowhere else.
 

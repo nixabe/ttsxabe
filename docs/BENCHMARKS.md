@@ -1404,6 +1404,99 @@ inside one A/B look exactly like no change at all, and the only way this
 surfaced was profiling the ASR and finding a kernel at 10.4% of its GPU time
 that had not existed that morning.
 
+## Decode at a context length worth having
+
+Every decode figure above was taken at a 128-token prompt, and that is the
+wrong place to look at this model. A conversation carries a system prompt and a
+history, so the context a reply is actually decoded against is hundreds to
+thousands of tokens, and decode gets slower as it grows: the weights are a
+fixed 4.92 GB a token but the KV cache is read in full for every token, and at
+2048 positions that cache is 537 MB - 10% again on top of the weights.
+
+Swept, nine-round medians:
+
+| context | decode, before | after |
+| --- | --- | --- |
+| 128 | 9.77 ms/tok | 9.72 |
+| 512 | 10.14 | 9.98 |
+| 1024 | 10.66 | 10.32 |
+| 2048 | 11.71 | 10.98 |
+
+**6.2% at 2048 and 3.2% at 1024**, and the slope is what moved: decode used to
+cost 0.63 ms more per 1024 tokens of context and now costs 0.42. Both binaries
+alternated in one sitting, twice through, because the 128-token column moves by
+more than this change is worth between sittings - the prefill rows drifted 2-4%
+across two sittings here while decode reproduced to 0.02 ms.
+
+### The grouped-query rows were each reading the whole cache
+
+Timing the decode attention on its own, at the 8 B model's shapes and across
+all 32 layers, said where it was going:
+
+| context | scores | softmax | context product | total |
+| --- | --- | --- | --- | --- |
+| 512 | 0.416 ms (161 GB/s) | 0.132 | 0.323 (208 GB/s) | 0.871 |
+| 1024 | 0.731 (184 GB/s) | 0.134 | 0.503 (267 GB/s) | 1.368 |
+| 2048 | 1.430 (188 GB/s) | 0.167 | 0.871 (308 GB/s) | 2.467 |
+
+161 to 188 GB/s against a card that streams at 585. The suspect was `gemv`'s
+grid: it puts output row `r` at `blockIdx.y`, so `m` rows are `m` blocks and
+each one reads the weight for itself. For a checkpoint tensor that is the right
+trade - `m` is one and the weight is the whole traffic - but here the "weight"
+is the KV cache and the `m` rows are the four query heads of a grouped-query
+group, which exist *precisely because* they share it.
+
+The obvious objection is that L2 should absorb the re-reads: one key head's
+cache at 2048 positions is 1 MB and the L2 is 6 MB, which is the same argument
+that correctly explained why an f16 cache did nothing for the ASR encoder. So
+it was measured rather than assumed - the identical call at one row instead of
+four:
+
+| context | four rows | one row |
+| --- | --- | --- |
+| 512 | 0.416 ms | 0.245 |
+| 1024 | 0.731 | 0.353 |
+| 2048 | 1.430 | 0.603 |
+
+Four rows cost **2.4x** one row, not the 1.0x sharing would give. L2 was not
+absorbing them, and the ASR precedent did not transfer: there the re-reads were
+one head's 768 KB walked repeatedly by one kernel, here they are eight heads
+against 32 layers with a 4.92 GB weight stream evicting everything between.
+
+`gemv_rows` reads the column once and spends it on every row. Same shapes:
+
+| context | scores | softmax | context product | total |
+| --- | --- | --- | --- | --- |
+| 512 | 0.269 ms (249 GB/s) | 0.132 | 0.280 (240 GB/s) | 0.681 |
+| 1024 | 0.415 (324 GB/s) | 0.134 | 0.406 (331 GB/s) | 0.955 |
+| 2048 | 0.704 (381 GB/s) | 0.166 | 0.661 (406 GB/s) | 1.531 |
+
+Four rows now cost 1.17x one row rather than 2.4x, and the chain is 1.6x
+faster at 2048. What is left is the softmax, which at 0.166 ms over 32 launches
+is a launch cost and not a bandwidth one, and the gap from 406 to 585 GB/s.
+
+**This is the chat model's kernel and nothing else's.** The translator and the
+ASR are multi-head, not grouped-query, so their decode arrives with one row and
+stays on `gemv`.
+
+### Measured and rejected: capturing the decode step in a CUDA graph
+
+The step issues about 390 kernels a token, and at roughly 3.3 us of queueing
+each that is 1.3 ms of CPU against a 9.7 ms token - close enough to the 1.26 ms
+that separates decode from its bandwidth floor to be worth ruling in or out
+before building anything.
+
+Ruled out. Issuing 390 launches and timing the submission separately from the
+completion:
+
+```
+390 launches: issued in 2.03 ms, finished in 5.09 ms
+```
+
+The CPU finishes queueing the step less than halfway through it and then waits,
+so the launches are already hidden behind the GPU and a graph would remove a
+cost that is not being paid. `cudarc` has `CudaGraph` and it was not used.
+
 ## Sixteen bytes a lane, and the token that was 40% not-matmul
 
 Two separate problems, found in that order, and the second was the larger.

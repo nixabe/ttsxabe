@@ -455,6 +455,7 @@ const NAMES: &[&str] = &[
     "flash_attn",
     "flash_attn_64",
     "gemv",
+    "gemv_rows",
     "quantize_q8",
     "cache_append",
     "cache_append_t",
@@ -1529,6 +1530,48 @@ impl Gpu {
             if let Some(p) = &partial {
                 self.reduce_partials(p, bias, &mut out, batch.count, m, n, ksplit)?;
             }
+            return Ok(out);
+        }
+
+        // Several rows against an unpacked weight read that weight once. Only
+        // attention arrives here - the KV cache is the one f32 "weight" in the
+        // model, and its rows are a grouped-query group - and only above one
+        // row, where there is something to share. See `gemv_rows`.
+        if small
+            && m > 1
+            && matches!(w, Operand::F32(_))
+            && matches!(a, Operand::F32(_) | Operand::F32Q { .. })
+        {
+            debug_assert!(m <= kernels::GEMV_ROWS_MAX as usize, "gemv_rows is bounded");
+            let (Operand::F32(av) | Operand::F32Q { data: av, .. }) = a else {
+                unreachable!("matched above")
+            };
+            let Operand::F32(wv) = w else {
+                unreachable!("matched above")
+            };
+            let f = self.func("gemv_rows");
+            let mut lb = self.stream.launch_builder(f);
+            match bias {
+                Some(v) => lb.arg(av).arg(wv).arg(v),
+                None => lb.arg(av).arg(wv).arg(&null),
+            };
+            lb.arg(&mut out)
+                .arg(&mi)
+                .arg(&ki)
+                .arg(&ni)
+                .arg(&sa)
+                .arg(&sw)
+                .arg(&so)
+                .arg(&w_rs);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (n.div_ceil(8) as u32, 1, batch.count as u32),
+                block_dim: (32, kernels::GEMV_WARPS, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the grid covers every (batch, n) once and the kernel
+            // walks rows 0..m inside, `out` is batch*m*n elements, and every
+            // read is bounds checked against k and n.
+            launched("gemv_rows", unsafe { lb.launch(cfg) })?;
             return Ok(out);
         }
 
