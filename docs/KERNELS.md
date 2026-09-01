@@ -546,6 +546,33 @@ approximation - both operands quantized rather than one rounded. `docs/BENCHMARK
 approximation is worth, including the comparison against llama.cpp's own
 integer path on the same file.
 
+### Two row tiles, because a prefill computes rows it does not have
+
+A block owns `MT` rows of the activation and computes all of them whether `m`
+reaches that far or not - the staging skips the missing rows, the `mma` does
+not. At `MT = 128` and a twenty-four-token clause that is five sixths of the
+arithmetic spent on nothing, and it is nearly all of what a short prefill
+costs: `m = 24` and `m = 128` do the identical `mma` work and measured 69.8 ms
+against 90.5, so the part that scales with real rows is small and the padded
+part is about 65 of the 70.
+
+So the tile is a template parameter, with a second pair of entry points at 64.
+**Sixty-four is a floor and not a choice.** The activation fragment load is an
+`ldmatrix .x4`, which takes four row groups of eight at once, so a warp's share
+`MR` cannot be under 32 rows; two warps down the tile makes 64 the narrowest
+`MT` this warp grid admits. A `static_assert` on `MS % 4 == 0` says so at
+compile time rather than letting a narrower tile silently drop its `m4` loop.
+
+The narrow entry costs 121-124 registers against the wide one's 128, and 19456
+bytes of shared against 25600 - so it keeps the same two blocks a SM, and the
+whole of the gain is arithmetic not done. `docs/BENCHMARKS.md` has what it is
+worth: 27% off a twenty-four-token prefill, and 5% off the first clause of a
+turn, which is what first audio waits on.
+
+The choice is `m <= 64`, made where the kernel name is picked. Below that the
+wide tile would be computing a majority of nothing; above it the narrow one
+would double the block count for the same work.
+
 ### The trip is 64 elements, and that number is not a tuning constant
 
 Two Q4_K sub-blocks. Every part of the kernel's shape follows from it:

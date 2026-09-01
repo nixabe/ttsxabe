@@ -449,6 +449,8 @@ const NAMES: &[&str] = &[
     "gemm",
     "gemm_i8_q4k",
     "gemm_i8_q6k",
+    "gemm_i8_q4k_narrow",
+    "gemm_i8_q6k_narrow",
     "gemm_reduce",
     "flash_attn",
     "flash_attn_64",
@@ -1463,10 +1465,27 @@ impl Gpu {
         if use_i8 {
             let q = q8.expect("`use_i8` implies the activation was quantized");
             let off = q.scale_offset() as i32;
+            // Which row tile. A block computes its tile's rows whether `m` has
+            // them or not, so the narrow one is right exactly when the wide one
+            // would be computing a majority of nothing - which is every prefill
+            // this pipeline runs, because a clause is twenty-odd tokens.
+            let narrow = m <= kernels::GEMM_I8_MT_NARROW as usize;
+            let mt = if narrow {
+                kernels::GEMM_I8_MT_NARROW
+            } else {
+                kernels::GEMM_I8_MT
+            };
             // One kernel per block format: the staging differs entirely and
             // compiling both into one entry point cost registers on both.
             let name = match w.quant() {
+                // The narrow row tile where the wide one would spend most of
+                // its arithmetic on rows the prompt does not have: a block
+                // computes `GEMM_I8_MT` rows either way, so a 24-token prefill
+                // against 128 of them is five sixths padding. See the note
+                // beside `GEMM_I8_ENTRY`.
+                Some(Quant::Q6K) if narrow => "gemm_i8_q6k_narrow",
                 Some(Quant::Q6K) => "gemm_i8_q6k",
+                _ if narrow => "gemm_i8_q4k_narrow",
                 _ => "gemm_i8_q4k",
             };
             let mut lb = self.stream.launch_builder(self.func(name));
@@ -1496,7 +1515,7 @@ impl Gpu {
             };
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (
-                    (m as u32).div_ceil(kernels::GEMM_I8_MT),
+                    (m as u32).div_ceil(mt),
                     (n as u32).div_ceil(kernels::GEMM_I8_NT),
                     (batch.count * ksplit) as u32,
                 ),

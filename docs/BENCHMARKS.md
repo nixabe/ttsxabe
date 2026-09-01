@@ -636,9 +636,9 @@ medians of five, greedy with `repeat_penalty` 1.1:
 
 | clause | prompt | answer | median | per token |
 | --- | ---: | ---: | ---: | ---: |
-| `你好，我是台灣人。` | 24 tok | 23 tok | 413 ms | 17.95 ms |
-| `今天天氣很好，我們去公園散步好嗎？` | 29 tok | 49 tok | 828 ms | 16.90 ms |
-| `我很愛看花，也愛聽鳥兒唱歌，你呢？` | 33 tok | 46 tok | 783 ms | 17.02 ms |
+| `你好，我是台灣人。` | 24 tok | 23 tok | 399 ms | 17.33 ms |
+| `今天天氣很好，我們去公園散步好嗎？` | 29 tok | 49 tok | 814 ms | 16.60 ms |
+| `我很愛看花，也愛聽鳥兒唱歌，你呢？` | 33 tok | 46 tok | 767 ms | 16.68 ms |
 
 **A translation is its decode loop and nothing else.** Timing the loop's four
 parts separately - the forward pass, the logits download, the repeat penalty,
@@ -646,6 +646,32 @@ the argmax and the stop-string check - puts `forward_last` at **99.1%** of it.
 The 56024-wide logits download is 0.4%, the CPU argmax over them 0.4%, and
 re-decoding the whole answer every token to test two stop strings - which looks
 quadratic and is - 0.003%. None of those is worth touching.
+
+### A prefill was computing five times the rows it had
+
+The integer matmul's block owns 128 rows of the activation and computes all of
+them, `m` having that many or not. A translator's prompt is twenty-odd tokens.
+So a clause's prefill was doing five sixths of its arithmetic on rows that did
+not exist, and that is nearly all of what a short prefill cost - `m = 24` and
+`m = 128` produce the same `mma` work and measured 69.8 ms against 90.5, so the
+per-row part is small and the padded part is about 65 ms of the 70.
+
+The row tile is a template parameter now, with a second pair of entry points at
+64. Sixty-four is the floor rather than a choice: the fragment load is an
+`ldmatrix .x4`, which takes four row groups at once, so a warp's share has to be
+at least 32 rows and two warps cover the tile.
+
+| prompt | wide tile, 128 | narrow tile, 64 |
+| ---: | ---: | ---: |
+| 24 tok | 69.8 ms | **51.1 ms** |
+| 32 tok | 70.7 ms | **52.4 ms** |
+| 64 tok | 75.9 ms | **57.8 ms** |
+| 128 tok | 90.5 ms | 86.2 ms (unchanged path) |
+
+Those figures carry about 35 ms of first-call cache zeroing each, so the
+prefill itself went from roughly 35 ms to 16. The narrow entry costs 121-124
+registers against the wide one's 128 and 19456 bytes of shared against 25600,
+so it holds the same two blocks a SM.
 
 ### The decode is within 4% of the memory it has to move
 
