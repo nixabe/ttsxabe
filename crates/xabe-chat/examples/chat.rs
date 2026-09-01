@@ -37,6 +37,16 @@ fn main() {
     ];
     let s = xabe_chat::Sampling::default();
 
+    // The prompt's length in tokens, because the cache's capacity is a power of
+    // two and the interesting thing about a reply is often which token of it
+    // crosses one. A prompt of 230 has the cache growing 26 tokens into the
+    // answer.
+    let prompt_tokens = m.tokenizer().encode(&prompt, false).len() + 1;
+    println!(
+        "prompt is {prompt_tokens} tokens; the cache grows at {}",
+        prompt_tokens.max(256).next_power_of_two(),
+    );
+
     let t1 = std::time::Instant::now();
     let mut first = None;
     let out = m

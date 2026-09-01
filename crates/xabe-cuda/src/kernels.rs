@@ -3488,6 +3488,36 @@ extern "C" __global__ void cache_append_t(
     dst[((size_t)h * head_dim + j) * cap + past + ti] = src[(size_t)src_off + i];
 }
 
+// Re-strides a head-major cache into a larger one.
+//
+// `cap` is a *stride* in both cache layouts, not only a length: keys are
+// `[kv_heads, cap, head_dim]` and values are `[kv_heads, head_dim, cap]`, so a
+// head's data begins at a multiple of `cap` and doubling the capacity moves
+// every head but the first. A flat copy of the live prefix - which is what a
+// position-major cache would want - leaves head 0 where it belongs and lands
+// the rest inside their own earlier positions.
+//
+// Nothing catches that downstream. The buffer is the right length, every read
+// is in bounds, and attention goes on producing fluent text off one correct
+// head. It is the shape of bug this file exists to make impossible, so the
+// growth gets a kernel that knows the layout rather than a memcpy that does
+// not.
+//
+// One kernel for both layouts: the caller turns the layout into `rows` runs of
+// `len` contiguous floats, a source stride and a destination stride.
+extern "C" __global__ void cache_grow(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int rows, int len, int src_stride, int dst_stride)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * len) {
+        return;
+    }
+    const int r = (int)(i / len);
+    const int j = (int)(i % len);
+    dst[(size_t)r * dst_stride + j] = src[(size_t)r * src_stride + j];
+}
+
 extern "C" __global__ void repeat_kv(
     const float* __restrict__ src,
     float* __restrict__ dst,

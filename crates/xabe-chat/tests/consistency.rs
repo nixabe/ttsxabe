@@ -5,6 +5,13 @@
 //! and decoding them one by one compute the same function, and the only licence
 //! between them is arithmetic - a different kernel, a different reduction order.
 //!
+//! It runs at 199 tokens, which is **under** the 256 positions the cache is
+//! first allocated at, so nothing here ever grows one. That is not an oversight
+//! to fix by lengthening this prompt - the length is load-bearing for the
+//! comparison below - but it does mean this test says nothing about a decode
+//! that outgrows its cache, and one that did was wrong for months.
+//! `cache_growth.rs` is that case; see `docs/TESTING.md`.
+//!
 //! It exists because the two disagreed in a way precision could not explain.
 //! The batched path picked a different token from llama-server at 10 of 105
 //! teacher-forced decisions and the stepwise path at 1, and *replacing the

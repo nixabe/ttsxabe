@@ -432,6 +432,47 @@ binary, one `OnceLock<Mutex<Translator>>` keeps cargo's parallel test threads
 from loading three copies and reporting an out-of-memory that reads like a
 broken loader.
 
+### A consistency test that stopped 57 tokens short of the bug
+
+`tests/consistency.rs` asks the right question - does prefilling `n` positions
+compute what decoding them one at a time computes - and answered it correctly
+for months while a decode past 256 tokens produced noise.
+
+The cache is allocated at a floor of 256 positions and doubled from there. The
+consistency prompt is 199 tokens. So the test never grew a cache, and growth was
+where the bug was: `cap` is a **stride** in both cache layouts, keys being
+`[kv_heads, cap, head_dim]` and values `[kv_heads, head_dim, cap]`, and the
+growth copied the live prefix flat. Head 0 begins at zero in both the old
+allocation and the new one, so it survived; every other head landed inside its
+own earlier positions.
+
+What that looks like from outside is the part worth remembering. The model
+answered the first sentence correctly - off the one head that had not moved -
+and then degenerated into fluent nonsense in the wrong language. No crash, no
+shape error, no out-of-bounds read: the buffer is the right length and every
+index is inside it. It reads as the checkpoint being bad.
+
+Measured against a control that never grew, at a 251-token prompt: 65 of 120
+positions over 4% of the logit span, in an unbroken run from exactly 256 to the
+end, worst 80.1%. After the fix, nothing over 4%, worst 2.1%, and the largest
+differences scattered across positions 202, 205, 293, 259 and 221 - no
+clustering at the boundary, which is what the tiled-prefill-against-mat-vec
+rounding floor looks like.
+
+Two things now stand where nothing did. `Gpu::cache_grow` re-strides rather than
+copies, and is checked in `xabe-cuda`'s kernel tests by an invariant that needs
+no golden: appending at a small capacity and then growing must equal appending
+at the large capacity to begin with, for both layouts and with `kv_heads > 1`,
+because at one head the bug is invisible. And `xabe-chat/tests/cache_growth.rs`
+prefills 200 tokens and then steps 120, which crosses the boundary the way
+generation does.
+
+The general lesson is about *coverage of the sizes a test runs at*, not about
+caches. A differential test is only as good as the code paths its inputs reach,
+and a capacity that doubles from a floor means the interesting path opens at one
+specific length. Any test whose input sits below a threshold is not testing what
+happens above it, however exactly it agrees.
+
 ## CosyVoice: two things that cannot be bit-exact, and how each is bounded
 
 Most of this workspace is tested against a captured oracle to within float32

@@ -600,12 +600,19 @@ impl Translator {
         let first = cache.k.is_empty();
         if cache.cap < past + n {
             let want = (past + n).next_power_of_two().max(256);
-            for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
+            let was = cache.cap;
+            // Re-strided, not copied - the cache is head-major and `cap` is the
+            // stride between heads. See `Gpu::cache_grow`, and the chat model,
+            // which has the same growth and had the same bug.
+            let keys = cache.k.iter_mut().map(|s| (s, false));
+            let values = cache.v.iter_mut().map(|s| (s, true));
+            for (slot, transposed) in keys.chain(values) {
                 let mut grown = self.gpu.zeros(want * h_dim)?;
                 // A fresh conversation grows from empty, and eighty zero-byte
                 // copies are still eighty launches.
                 if past > 0 {
-                    self.gpu.copy_into(&mut grown, slot, 0, past * h_dim)?;
+                    self.gpu
+                        .cache_grow(slot, &mut grown, heads, hd, was, want, past, transposed)?;
                 }
                 *slot = grown;
             }

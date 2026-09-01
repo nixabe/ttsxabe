@@ -456,6 +456,7 @@ const NAMES: &[&str] = &[
     "quantize_q8",
     "cache_append",
     "cache_append_t",
+    "cache_grow",
     "softmax_causal",
     "layer_norm",
     "layer_norm_add",
@@ -1672,6 +1673,87 @@ impl Gpu {
         // against `n * kv_heads * head_dim` from `src_off`, the destination
         // range is checked above, and the caller's `src_off` is checked here.
         launched(name, unsafe { lb.launch(Self::flat(total)) })?;
+        Ok(())
+    }
+
+    /// Moves the `live` tokens of a head-major cache into one of a larger
+    /// capacity.
+    ///
+    /// The companion of [`Gpu::cache_append`], and it exists because `cap` is a
+    /// **stride** in both of that method's layouts rather than only a length. A
+    /// head's data begins at a multiple of the capacity, so raising the
+    /// capacity moves every head but the first, and copying the live prefix
+    /// flat - the whole cache is one buffer, so it is tempting - lands heads 1
+    /// upward inside their own earlier positions.
+    ///
+    /// That failure is silent in every way a failure can be: the buffer is the
+    /// right length, every read stays in bounds, and attention keeps producing
+    /// fluent text off the one head that did not move. Hence a kernel that is
+    /// told the layout instead of a copy that assumes one.
+    ///
+    /// `transposed` means the same thing it does in `cache_append`: the values'
+    /// `[kv_heads, head_dim, cap]` rather than the keys' `[kv_heads, cap,
+    /// head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_grow(
+        &self,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        kv_heads: usize,
+        head_dim: usize,
+        old_cap: usize,
+        new_cap: usize,
+        live: usize,
+        transposed: bool,
+    ) -> Result<(), CudaError> {
+        if live > old_cap || new_cap < old_cap {
+            return Err(CudaError::CacheOverrun {
+                at: live.max(old_cap),
+                cap: new_cap.min(old_cap),
+            });
+        }
+        // Both layouts are `rows` runs of `len` contiguous floats, a source
+        // capacity apart and a destination capacity apart. Only what a run is
+        // differs: a whole head's positions for the keys, one head's single
+        // dimension across positions for the values.
+        let (rows, len, src_stride, dst_stride) = match transposed {
+            false => (
+                kv_heads,
+                live * head_dim,
+                old_cap * head_dim,
+                new_cap * head_dim,
+            ),
+            true => (kv_heads * head_dim, live, old_cap, new_cap),
+        };
+        if rows * src_stride > src.len() {
+            return Err(CudaError::SliceOverrun {
+                at: rows * src_stride,
+                len: src.len(),
+            });
+        }
+        if rows * dst_stride > dst.len() {
+            return Err(CudaError::SliceOverrun {
+                at: rows * dst_stride,
+                len: dst.len(),
+            });
+        }
+        let total = rows * len;
+        if total == 0 {
+            return Ok(());
+        }
+        let (r, l, ss, ds) = (
+            rows as i32,
+            len as i32,
+            src_stride as i32,
+            dst_stride as i32,
+        );
+        let f = self.func("cache_grow");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(src).arg(dst).arg(&r).arg(&l).arg(&ss).arg(&ds);
+        // SAFETY: one thread per copied element, bounds checked in the kernel
+        // against `rows * len`, and both allocations are checked above to hold
+        // `rows` runs at their own stride.
+        launched("cache_grow", unsafe { lb.launch(Self::flat(total)) })?;
         Ok(())
     }
 

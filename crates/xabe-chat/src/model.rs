@@ -542,12 +542,22 @@ impl ChatModel {
         let first = cache.k.is_empty();
         if cache.cap < past + n {
             let want = (past + n).next_power_of_two().max(256);
-            for slot in cache.k.iter_mut().chain(cache.v.iter_mut()) {
+            let was = cache.cap;
+            // Re-strided, not copied. The cache is head-major and `cap` is the
+            // stride between heads in both layouts, so a flat copy of the live
+            // prefix moves head 0 correctly and buries every other head inside
+            // its own earlier positions - a reply that is fluent for one
+            // sentence and noise after it, at whatever token first crosses a
+            // power of two. See `Gpu::cache_grow`.
+            let keys = cache.k.iter_mut().map(|s| (s, false));
+            let values = cache.v.iter_mut().map(|s| (s, true));
+            for (slot, transposed) in keys.chain(values) {
                 let mut grown = self.gpu.zeros(want * kv_dim)?;
                 // A fresh conversation grows from empty, and sixty-four
                 // zero-byte copies are still sixty-four launches.
                 if past > 0 {
-                    self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
+                    self.gpu
+                        .cache_grow(slot, &mut grown, kv_heads, hd, was, want, past, transposed)?;
                 }
                 *slot = grown;
             }

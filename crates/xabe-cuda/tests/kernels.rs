@@ -1645,6 +1645,81 @@ fn cache_append_reads_its_own_block_of_a_batched_projection() {
     }
 }
 
+/// Growing a cache leaves every head reading what it read before.
+///
+/// The bug this is here for: `cap` is the stride between heads in both cache
+/// layouts, so a growth that copies the live prefix flat lands head 0 correctly
+/// and buries the rest inside their own earlier positions. Nothing downstream
+/// notices - the buffer is the right length and every read is in bounds - so
+/// the check has to be here, and it has to be per head rather than on the
+/// buffer as a whole.
+///
+/// Expressed as an invariant rather than against a golden: appending `live`
+/// tokens at the small capacity and then growing must equal appending the same
+/// tokens at the large capacity to begin with.
+#[test]
+fn growing_a_cache_puts_every_head_where_the_larger_capacity_wants_it() {
+    let Some(g) = gpu() else { return };
+    // `kv_heads > 1` is the whole point: head 0 is correct either way.
+    let (live, kv_heads, hd, small, large) = (5usize, 3usize, 4usize, 8usize, 16usize);
+    let src = seq(live * kv_heads * hd, 7);
+
+    for transposed in [false, true] {
+        // Appended at the small capacity, then grown.
+        let up = g.upload(&src).expect("upload");
+        let mut grew = g.zeros(small * kv_heads * hd).expect("cache");
+        g.cache_append(&up, 0, &mut grew, live, kv_heads, hd, small, 0, transposed)
+            .expect("append at the small capacity");
+        let mut moved = g.zeros(large * kv_heads * hd).expect("cache");
+        g.cache_grow(
+            &grew, &mut moved, kv_heads, hd, small, large, live, transposed,
+        )
+        .expect("grow");
+
+        // Appended at the large capacity from the start.
+        let mut direct = g.zeros(large * kv_heads * hd).expect("cache");
+        g.cache_append(
+            &up,
+            0,
+            &mut direct,
+            live,
+            kv_heads,
+            hd,
+            large,
+            0,
+            transposed,
+        )
+        .expect("append at the large capacity");
+
+        assert_eq!(
+            g.download(&moved).expect("moved"),
+            g.download(&direct).expect("direct"),
+            "transposed={transposed}: growth did not re-stride the heads",
+        );
+    }
+}
+
+/// Growth refuses the two ways it can be asked for the impossible.
+#[test]
+fn a_growth_that_shrinks_or_overruns_is_refused() {
+    let Some(g) = gpu() else { return };
+    let (kv_heads, hd, small, large) = (2usize, 4usize, 8usize, 16usize);
+    let src = g.zeros(small * kv_heads * hd).expect("cache");
+    let mut dst = g.zeros(large * kv_heads * hd).expect("cache");
+
+    assert!(
+        g.cache_grow(&src, &mut dst, kv_heads, hd, small, large, small + 1, false)
+            .is_err(),
+        "more live tokens than the source held, and it did not say so",
+    );
+    let mut smaller = g.zeros(small * kv_heads * hd).expect("cache");
+    assert!(
+        g.cache_grow(&src, &mut smaller, kv_heads, hd, large, small, 4, false)
+            .is_err(),
+        "a growth into a smaller capacity, and it did not say so",
+    );
+}
+
 /// A read that starts inside the buffer and ends past it is refused.
 #[test]
 fn an_offset_past_the_end_of_the_source_is_refused() {
