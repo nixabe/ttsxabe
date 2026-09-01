@@ -669,6 +669,63 @@ over `ksplit * m * n` floats that nothing ever read. Both tiled kernels have
 this property and the test `every_output_element_is_written_exactly_once` is
 what it rests on.
 
+## A transpose is a transpose, `split_heads_t`
+
+`[t, heads*head_dim]` to `[heads, head_dim, t]` reads like a head permutation
+and is not one. Element `(ti, c)` goes to `(c, ti)` for `c = h * head_dim + j`,
+and `h` and `j` never appear apart in that expression - the head structure
+cancels, and what is left is the transpose of a `[t, d]` matrix. Seeing that is
+the whole fix, because a transpose has a well-known kernel and a permutation
+invites an element-at-a-time scatter.
+
+An element a thread reads coalesced and writes scattered: consecutive lanes
+land `t` floats apart, so one warp store is 32 sectors where a coalesced one is
+four. It measured **141 GB/s** on a card that copies at about 500, which at
+encoder width is 3.5 ms across 32 layers for a pass that carries no arithmetic.
+
+Staging a 32x32 tile in shared makes both halves coalesced and took it to
+**0.042 ms** from 0.109, a shape-for-shape 2.6x. The tile row is **33** words
+rather than 32, and that padding is the trick rather than a detail: the
+write-back reads a *column* of the tile, and at a stride of 32 a column is one
+bank and the read is 32-way conflicted. At 33 it walks all 32 banks exactly
+once.
+
+The f16 twin is the same kernel with a narrower store. Both now allocate their
+output with `uninit`: every element is written, so the zeroing pass was
+establishing nothing, and at encoder width it was 7.7 MB of it.
+
+## Narrowing where the value is already in a register
+
+`layer_norm_add_f16` and `act_gelu_f16` are the f32 kernels with `f32_to_f16`
+on the store, and they exist because of an asymmetry that is easy to get
+backwards.
+
+The tiled matmul stages its left operand as f16 whatever width it arrives at.
+So handing it f16 changes no arithmetic at all - `f32_to_f16` is the same
+round-to-nearest-even `gemm_pack` applies during staging - and halves the
+stream it re-reads once per column tile, which is ten times at encoder width
+and forty at the MLP's. Measured at about **5% of each matmul**.
+
+The asymmetry is that a rounding *pass* of its own costs more than one matmul
+saves: reading 7.7 MB and writing 3.8 to save 5% of a 0.26 ms call is a loss,
+and it was correctly rejected on that basis once. Fused into the kernel that
+already has the value in a register it is free, and the same 5% is a win. So
+the rule is not "narrow activations" but **narrow them where something is
+already touching them**, or where the tensor is read many times:
+
+- inside the encoder, fused into the normalisation and the GELU that produce
+  the activation, because each result feeds one to four projections;
+- in front of the cross-attention cache, as a pass of its own, because there
+  the encoder output is read by *sixty-four* projections and one conversion
+  serves all of them.
+
+Below `GEMV_MAX_M` none of this applies - a mat-vec has no re-read to halve -
+so the decoder takes the f32 path and the choice is made on the row count.
+
+`h` stays f32 throughout. It is the residual stream, it is added to rather than
+multiplied by, and narrowing it would be a real approximation rather than a
+free one.
+
 ## Fused attention, `flash_attn`
 
 Scores, mask, softmax and the value product for a whole prompt - or a whole

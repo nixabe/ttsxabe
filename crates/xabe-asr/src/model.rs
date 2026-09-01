@@ -2,7 +2,7 @@
 
 use crate::AsrError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, GEMV_MAX_M, Gpu, Operand};
 use xabe_st::StSet;
 use xabe_whisper::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, Frontend, GenerationConfig, LayerNorm, Linear,
@@ -355,6 +355,35 @@ impl AsrModel {
             .layer_norm_add(h, res, rows, self.cfg.d_model, &n.w, &n.b, EPS)?)
     }
 
+    /// [`Self::normed`], returning f16 for a result that only a matmul reads.
+    ///
+    /// Every normalisation inside the encoder's stack feeds projections and
+    /// nothing else, and the tiled matmul stages its left operand as f16
+    /// whatever width it arrives at - so this is the same bits, over half the
+    /// traffic, on a tensor each projection re-reads once per column tile.
+    ///
+    /// The first normalisation of the stack has no residual waiting and falls
+    /// back to a separate rounding pass. That is one extra read of 7.7 MB in
+    /// thirty-two layers, and not worth a second kernel to avoid.
+    fn normed_f16(
+        &self,
+        h: &mut CudaSlice<f32>,
+        res: Option<&CudaSlice<f32>>,
+        n: &GNorm,
+        rows: usize,
+    ) -> Result<CudaSlice<u16>, AsrError> {
+        Ok(match res {
+            Some(r) => {
+                self.gpu
+                    .layer_norm_add_f16(h, r, rows, self.cfg.d_model, &n.w, &n.b, EPS)?
+            }
+            None => {
+                let wide = self.norm(h, n, rows)?;
+                self.gpu.to_f16(&wide, rows * self.cfg.d_model)?
+            }
+        })
+    }
+
     /// Attention, given queries already projected and split, and keys and
     /// values already split.
     ///
@@ -484,6 +513,18 @@ impl AsrModel {
         fc2: &GLinear,
         t: usize,
     ) -> Result<CudaSlice<f32>, AsrError> {
+        // Narrowed where the projections will take the tiled path, for the
+        // reason `normed_f16` gives - the MLP is the strongest case in the
+        // model, because `fc2` re-reads its 30.7 MB operand once per column
+        // tile and there are forty of them. Below `GEMV_MAX_M` the matmul is a
+        // mat-vec, there is no re-read to halve, and the rounding pass would be
+        // pure cost - which is the decoder, where this is called with one row.
+        if t > GEMV_MAX_M {
+            let x = self.normed_f16(h, Some(res), ln, t)?;
+            let inner = self.project(Operand::F16(&x), fc1, t)?;
+            let inner = self.gpu.gelu_f16(&inner, t * fc1.out_dim)?;
+            return self.project(Operand::F16(&inner), fc2, t);
+        }
         let x = self.norm_add(h, res, ln, t)?;
         let mut inner = self.project(Operand::F32(&x), fc1, t)?;
         self.gpu.gelu(&mut inner, t * fc1.out_dim)?;
@@ -554,15 +595,15 @@ impl AsrModel {
         // nothing here.
         let mut res: Option<CudaSlice<f32>> = None;
         for (i, l) in self.enc_layers.iter().enumerate() {
-            let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, t)?;
+            let x = self.normed_f16(&mut h, res.take().as_ref(), &l.attn_ln, t)?;
             let k = self.gpu.split_heads(
-                &self.project(Operand::F32(&x), &l.attn.k, t)?,
+                &self.project(Operand::F16(&x), &l.attn.k, t)?,
                 t,
                 heads,
                 hd,
             )?;
             let v = self.gpu.split_heads_t(
-                &self.project(Operand::F32(&x), &l.attn.v, t)?,
+                &self.project(Operand::F16(&x), &l.attn.v, t)?,
                 t,
                 heads,
                 hd,
@@ -574,13 +615,13 @@ impl AsrModel {
                 // fused path also skips the query's head split and the
                 // context's merge: it reads the projection buffer's layout
                 // and writes it back.
-                let mut q = self.project(Operand::F32(&x), &l.attn.q, t)?;
+                let mut q = self.project(Operand::F16(&x), &l.attn.q, t)?;
                 self.gpu
                     .scale_inplace(&mut q, t * d, (hd as f32).powf(-0.5))?;
                 self.gpu
                     .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)?
             } else {
-                let q = self.queries(Operand::F32(&x), &l.attn, t, heads)?;
+                let q = self.queries(Operand::F16(&x), &l.attn, t, heads)?;
                 self.attend(
                     Operand::F32(&q),
                     Operand::F32(&k),
@@ -622,6 +663,16 @@ impl AsrModel {
         // to the decoder's own stream and is applied to the queries in
         // `decode`; normalising the keys and values with it as well would be
         // an easy symmetry to assume and is not what the reference does.
+        //
+        // Narrowed once, here, because sixty-four projections read it: the
+        // tiled matmul stages its left operand as f16 whatever it is handed,
+        // so this is the same bits, and one 7.7 MB pass replaces 64 reads of a
+        // stream twice as wide. That trade only pays because the tensor is
+        // read so many times - the same conversion in front of a *single*
+        // projection costs more than it saves, which is why the encoder's
+        // narrowing is fused into the kernels that produce the activation
+        // rather than done in a pass of its own.
+        let narrow = self.gpu.to_f16(encoded, t * d)?;
         for l in &self.dec_layers {
             // Stored packed: every decode step reads all 32 layers of both, so
             // this is 160 MB of traffic a token rather than 320. The split
@@ -629,13 +680,13 @@ impl AsrModel {
             // a `to_f16` pass after it read and wrote the same 7.7 MB tensor
             // again to change nothing but its width.
             cross_k.push(self.gpu.split_heads_f16(
-                &self.project(Operand::F32(encoded), &l.cross.k, t)?,
+                &self.project(Operand::F16(&narrow), &l.cross.k, t)?,
                 t,
                 heads,
                 hd,
             )?);
             cross_v.push(self.gpu.split_heads_t_f16(
-                &self.project(Operand::F32(encoded), &l.cross.v, t)?,
+                &self.project(Operand::F16(&narrow), &l.cross.v, t)?,
                 t,
                 heads,
                 hd,

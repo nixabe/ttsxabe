@@ -2494,16 +2494,38 @@ __global__ void layer_norm(
 //
 // `h` is updated in place because the residual stream is what the next
 // sub-layer adds to, so the sum has to survive; `out` is dead afterwards.
-__global__ void layer_norm_add(
+// The output width is a template parameter because every consumer of a
+// normalisation here is a matmul, and a matmul stages its left operand as f16
+// whatever it is handed. Rounding in this kernel, where the value is already
+// in a register, is therefore free and *bit-identical*: `f32_to_f16` is the
+// same round-to-nearest-even `gemm_pack` applies during staging, so an operand
+// narrowed here and one narrowed inside the matmul are the same bits. What it
+// buys is the re-reads - a projection's activation is read once per column
+// tile, ten times at encoder width and forty at the MLP's - and halving that
+// stream measured about 5% of each of those matmuls.
+//
+// `h` stays f32 throughout: it is the residual stream, it is added to rather
+// than multiplied by, and narrowing it would be a real approximation.
+} // extern "C" - an overload set and a template cannot have C linkage.
+
+__device__ __forceinline__ void norm_store(float* p, int i, float v) {
+    p[i] = v;
+}
+__device__ __forceinline__ void norm_store(unsigned short* p, int i, float v) {
+    p[i] = f32_to_f16(v);
+}
+
+template <typename OUT>
+__device__ __forceinline__ void layer_norm_add_impl(
     float* __restrict__ h, const float* __restrict__ res,
     const float* __restrict__ weight, const float* __restrict__ bias,
-    float* __restrict__ out, int cols, float eps)
+    OUT* __restrict__ out, int cols, float eps)
 {
     extern __shared__ float sdata[];
     int row = blockIdx.x;
     float* hr = h + (size_t)row * cols;
     const float* rr = res + (size_t)row * cols;
-    float* outr = out + (size_t)row * cols;
+    OUT* outr = out + (size_t)row * cols;
 
     // The sum is folded in here, so `hr` holds it for every pass below and for
     // whatever adds to the residual stream next.
@@ -2537,8 +2559,26 @@ __global__ void layer_norm_add(
     float inv = rsqrtf(sdata[0] / (float)cols + eps);
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        outr[i] = (hr[i] - mean) * inv * weight[i] + bias[i];
+        norm_store(outr, i, (hr[i] - mean) * inv * weight[i] + bias[i]);
     }
+}
+
+extern "C" {
+
+__global__ void layer_norm_add(
+    float* __restrict__ h, const float* __restrict__ res,
+    const float* __restrict__ weight, const float* __restrict__ bias,
+    float* __restrict__ out, int cols, float eps)
+{
+    layer_norm_add_impl<float>(h, res, weight, bias, out, cols, eps);
+}
+
+__global__ void layer_norm_add_f16(
+    float* __restrict__ h, const float* __restrict__ res,
+    const float* __restrict__ weight, const float* __restrict__ bias,
+    unsigned short* __restrict__ out, int cols, float eps)
+{
+    layer_norm_add_impl<unsigned short>(h, res, weight, bias, out, cols, eps);
 }
 
 // One block per row; subtracts the row max before exponentiating.
@@ -2751,6 +2791,23 @@ __global__ void act_gelu(float* x, int n)
     if (i < n) {
         float v = x[i];
         x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+    }
+}
+
+// The same function, reading f32 and writing f16 somewhere else.
+//
+// For the one place the result is a matmul's left operand and nothing else -
+// the encoder's MLP, whose inner activation is 30.7 MB that `fc2` re-reads once
+// per column tile. Out of place rather than in place because the widths differ;
+// bit-identical to running `act_gelu` and letting the matmul stage the result,
+// for the reason `norm_store` gives.
+__global__ void act_gelu_f16(
+    const float* __restrict__ x, unsigned short* __restrict__ out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        out[i] = f32_to_f16(0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
     }
 }
 
@@ -3299,20 +3356,55 @@ extern "C" __global__ void split_heads(
 // `probs [tq, tk] x V [tk, head_dim]`, and the matmul takes its right operand
 // as [n, k]. So V arrives already transposed rather than being transposed
 // again inside the product.
+// A tiled transpose, because that is all this is.
+//
+// `[t, heads*head_dim]` to `[heads, head_dim, t]` sends element `(ti, c)` to
+// `(c, ti)` for `c = h * head_dim + j`. The head structure never enters the
+// address arithmetic - it is the transpose of a `[t, d]` matrix and nothing
+// more, and writing it that way is what makes the staging tile obvious.
+//
+// One element a thread reads coalesced and writes scattered: consecutive lanes
+// land `t` floats apart, so a warp's store is 32 sectors where a coalesced one
+// is four. It measured 141 GB/s on a card that copies at about 500, which is
+// 3.5 ms across the encoder's 32 layers for a pass that carries no arithmetic.
+// Staging a 32x32 tile in shared makes both halves coalesced.
+//
+// The tile row is 33 wide, and that padding is the whole trick: the write-back
+// reads a *column* of the tile, and at a stride of 32 a column is one bank and
+// the read is 32-way conflicted. At 33 it walks all 32.
+#define TR_TILE 32
+#define TR_ROWS 8
+
 extern "C" __global__ void split_heads_t(
     const float* __restrict__ x,
     float* __restrict__ out,
     int t, int heads, int head_dim)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int d = heads * head_dim;
-    if (i >= t * d) {
-        return;
+    __shared__ float tile[TR_TILE][TR_TILE + 1];
+    const int d  = heads * head_dim;
+    const int c0 = blockIdx.x * TR_TILE;
+    const int r0 = blockIdx.y * TR_TILE;
+
+    const int c = c0 + (int)threadIdx.x;
+    #pragma unroll
+    for (int o = 0; o < TR_TILE; o += TR_ROWS) {
+        const int r = r0 + (int)threadIdx.y + o;
+        if (r < t && c < d) {
+            tile[threadIdx.y + o][threadIdx.x] = x[(size_t)r * d + c];
+        }
     }
-    int ti = i / d;
-    int h  = (i % d) / head_dim;
-    int j  = i % head_dim;
-    out[((size_t)h * head_dim + j) * t + ti] = x[i];
+    __syncthreads();
+
+    // `x` runs down the tile's first axis now, so the lane index picks the row
+    // of the source and the store is contiguous in `t`.
+    const int rt = r0 + (int)threadIdx.x;
+    #pragma unroll
+    for (int o = 0; o < TR_TILE; o += TR_ROWS) {
+        const int cc = c0 + (int)threadIdx.y + o;
+        if (rt < t && cc < d) {
+            out[(size_t)cc * t + rt] = tile[threadIdx.x][threadIdx.y + o];
+        }
+    }
 }
 
 // The two above, writing f16 instead of f32.
@@ -3344,15 +3436,32 @@ extern "C" __global__ void split_heads_t_f16(
     unsigned short* __restrict__ out,
     int t, int heads, int head_dim)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int d = heads * head_dim;
-    if (i >= t * d) {
-        return;
+    // The f32 twin's tile, and its note on why the row is 33 wide. The store is
+    // two bytes a lane rather than four, which is half a coalesced warp's
+    // worth - still four sectors against the scattered form's 32.
+    __shared__ float tile[TR_TILE][TR_TILE + 1];
+    const int d  = heads * head_dim;
+    const int c0 = blockIdx.x * TR_TILE;
+    const int r0 = blockIdx.y * TR_TILE;
+
+    const int c = c0 + (int)threadIdx.x;
+    #pragma unroll
+    for (int o = 0; o < TR_TILE; o += TR_ROWS) {
+        const int r = r0 + (int)threadIdx.y + o;
+        if (r < t && c < d) {
+            tile[threadIdx.y + o][threadIdx.x] = x[(size_t)r * d + c];
+        }
     }
-    int ti = i / d;
-    int h  = (i % d) / head_dim;
-    int j  = i % head_dim;
-    out[((size_t)h * head_dim + j) * t + ti] = f32_to_f16(x[i]);
+    __syncthreads();
+
+    const int rt = r0 + (int)threadIdx.x;
+    #pragma unroll
+    for (int o = 0; o < TR_TILE; o += TR_ROWS) {
+        const int cc = c0 + (int)threadIdx.y + o;
+        if (rt < t && cc < d) {
+            out[(size_t)cc * t + rt] = f32_to_f16(tile[threadIdx.x][threadIdx.y + o]);
+        }
+    }
 }
 
 // [heads, t, head_dim] -> [t, heads * head_dim]. The inverse of `split_heads`.

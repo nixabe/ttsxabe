@@ -939,6 +939,9 @@ fn im2col_then_gemm_is_a_convolution() {
 fn the_head_permutations_are_each_other() {
     let Some(g) = gpu() else { return };
     let (t, heads, hd) = (7usize, 4usize, 6usize);
+    // Below one 32x32 staging tile in both axes, so this pins the ragged
+    // corner; `the_transpose_covers_every_tile_of_a_ragged_shape` pins the
+    // case where the tiling actually tiles.
     let x = seq(t * heads * hd, 31);
     let dev = g.upload(&x).expect("upload");
 
@@ -979,6 +982,43 @@ fn the_head_permutations_are_each_other() {
         )
         .expect("download");
     assert_eq!(round, x);
+}
+
+/// The transposing split over a shape that is several staging tiles wide and a
+/// whole number of them in neither axis.
+///
+/// `split_heads_t` is a tiled transpose, and the failure it can have that the
+/// tiny case above cannot see is a tile-indexing one: a shape inside a single
+/// tile exercises the bounds checks but never a second tile, and a shape that
+/// divides evenly never exercises the checks at all. 1500 by 1280 is the
+/// encoder's own, and 1500 is 46 tiles and a remainder of 28.
+#[test]
+fn the_transpose_covers_every_tile_of_a_ragged_shape() {
+    let Some(g) = gpu() else { return };
+    let (t, heads, hd) = (1500usize, 20usize, 64usize);
+    let d = heads * hd;
+    let x = seq(t * d, 17);
+    let dev = g.upload(&x).expect("upload");
+
+    let got = g
+        .download(&g.split_heads_t(&dev, t, heads, hd).expect("split_t"))
+        .expect("download");
+    assert_eq!(got.len(), t * d);
+    for ti in (0..t).step_by(7) {
+        for c in (0..d).step_by(3) {
+            assert_eq!(got[c * t + ti], x[ti * d + c], "row {ti} column {c}");
+        }
+    }
+    // Every element, not only the sampled ones: a tile the kernel skipped
+    // entirely would leave allocator leftovers here, and the stride pattern
+    // above could step right over it.
+    let mut want = vec![0.0f32; t * d];
+    for ti in 0..t {
+        for c in 0..d {
+            want[c * t + ti] = x[ti * d + c];
+        }
+    }
+    assert!(got == want, "the transpose is not the transpose");
 }
 
 #[test]

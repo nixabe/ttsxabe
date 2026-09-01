@@ -460,6 +460,8 @@ const NAMES: &[&str] = &[
     "softmax_causal",
     "layer_norm",
     "layer_norm_add",
+    "layer_norm_add_f16",
+    "act_gelu_f16",
     "softmax_rows",
     "act_relu",
     "act_leaky_relu",
@@ -1822,6 +1824,68 @@ impl Gpu {
         Ok(out)
     }
 
+    /// [`Self::layer_norm_add`], returning the normalisation at f16.
+    ///
+    /// For the case where the result is a matmul's left operand and nothing
+    /// else, which is every normalisation in the Whisper encoder. The matmul
+    /// stages its left operand as f16 regardless, and `f32_to_f16` is the
+    /// rounding it applies, so this returns the same bits the f32 path would
+    /// have produced and halves the stream the matmul re-reads once per column
+    /// tile. `h` is still f32: it is the residual stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm_add_f16(
+        &self,
+        h: &mut CudaSlice<f32>,
+        res: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        weight: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        eps: f32,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        // Every element is written; see `reshape_heads`.
+        let mut out = unsafe { self.stream.alloc::<u16>(rows * cols) }.map_err(|source| {
+            CudaError::Driver {
+                what: "allocating",
+                source,
+            }
+        })?;
+        let c = cols as i32;
+        let f = self.func("layer_norm_add_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(h)
+            .arg(res)
+            .arg(weight)
+            .arg(bias)
+            .arg(&mut out)
+            .arg(&c)
+            .arg(&eps);
+        launched("layer_norm_add_f16", unsafe {
+            lb.launch(Self::per_row(rows))
+        })?;
+        Ok(out)
+    }
+
+    /// GELU reading f32 and writing f16 elsewhere, for a matmul's left operand.
+    ///
+    /// The out-of-place twin of [`Self::gelu`], and bit-identical to calling
+    /// that and letting the matmul stage the result. It exists for the
+    /// encoder's MLP, where the inner activation is 30.7 MB that the second
+    /// projection re-reads once per column tile.
+    pub fn gelu_f16(&self, x: &CudaSlice<f32>, n: usize) -> Result<CudaSlice<u16>, CudaError> {
+        let mut out =
+            unsafe { self.stream.alloc::<u16>(n) }.map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
+        let len = n as i32;
+        let f = self.func("act_gelu_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x).arg(&mut out).arg(&len);
+        launched("act_gelu_f16", unsafe { lb.launch(Self::flat(n)) })?;
+        Ok(out)
+    }
+
     /// Softmax over each row, in place. Mirrors `xabe_dsp::softmax_rows`.
     pub fn softmax_rows(
         &self,
@@ -3081,13 +3145,37 @@ impl Gpu {
         head_dim: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
         let n = t * heads * head_dim;
-        let mut out = self.zeros(n)?;
+        // Every element is written by the kernel, transposed or not, so there
+        // is nothing for a zeroing pass to establish - and at encoder width
+        // that pass is 7.7 MB.
+        let mut out = unsafe { self.uninit(n) }?;
         let (a, b_, c) = (t as i32, heads as i32, head_dim as i32);
         let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(&mut out).arg(&a).arg(&b_).arg(&c);
-        launched(name, unsafe { lb.launch(Self::flat(n)) })?;
+        launched(name, unsafe {
+            lb.launch(Self::reshape_cfg(name, t, heads * head_dim))
+        })?;
         Ok(out)
+    }
+
+    /// The launch shape one of the reshape kernels wants.
+    ///
+    /// The transposing pair stages a 32x32 tile and is launched over that grid;
+    /// the others are element-at-a-time and take the flat one. Getting this
+    /// wrong is not a subtle failure - a tiled kernel under a flat grid covers
+    /// a thirty-second of its output - so the two are chosen by name here
+    /// rather than by a flag a caller could forget.
+    fn reshape_cfg(name: &str, t: usize, d: usize) -> LaunchConfig {
+        if name == "split_heads_t" || name == "split_heads_t_f16" {
+            LaunchConfig {
+                grid_dim: (d.div_ceil(32) as u32, t.div_ceil(32) as u32, 1),
+                block_dim: (32, 8, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            Self::flat(t * d)
+        }
     }
 
     /// [`Self::reshape_heads`] for the kernels that write f16.
@@ -3111,7 +3199,9 @@ impl Gpu {
         let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(&mut out).arg(&a).arg(&b_).arg(&c);
-        launched(name, unsafe { lb.launch(Self::flat(n)) })?;
+        launched(name, unsafe {
+            lb.launch(Self::reshape_cfg(name, t, heads * head_dim))
+        })?;
         Ok(out)
     }
 

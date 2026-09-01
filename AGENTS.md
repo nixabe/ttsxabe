@@ -81,22 +81,32 @@ is the file to read before starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.89x to 0.95x** against `whisper-server` from three to
-seven seconds of speech and **1.04x** at ten — a stated milestone met only at
-the long end, and recorded as a miss because the short end is what the pipeline
-runs on. The two engines have opposite cost structures: the encoder is a fixed
-30-second window for both and ours is 28 ms slower at it, so every
-transcription starts that far behind, while the decode is about 1.8 ms a token
-cheaper here and pays it off at roughly fifteen tokens.
+medians. The ASR is **0.94x to 0.99x** against `whisper-server` from three to
+seven seconds of speech and **1.09x** at ten — level from about five seconds up
+and short only on the briefest clip, and still recorded as a miss because the
+milestone asks for the short end too. The two engines have opposite cost
+structures: the encoder is a fixed 30-second window for both and ours is about
+19 ms slower at it, so every transcription starts that far behind, while the
+decode is about 1.8 ms a token cheaper here and pays it off at roughly seven
+tokens.
 
 That comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
 with CUDA against the same checkpoint, converted by its own script, both sides
 are strictly single-pass greedy, and the two are alternated in pairs in one
-run. What is left of the gap is the **encoder**
-and nothing else: 111 ms against `whisper.cpp`'s 83, which is 28 of the 33 ms
-between the columns, and 86 of those 111 ms are a tiled `gemm` running at 22.4
-TFLOP/s. **What that is short of is not the arithmetic.** The instruction is
+run. What is left of the gap is the **encoder** and nothing else: 102 ms
+against `whisper.cpp`'s 83, and about 73 of those 102 ms are a tiled `gemm`
+running at 22.4 TFLOP/s.
+
+Do not read that as "the encoder is the gemm". It was read that way for three
+rounds and it was wrong by half: `whisper.cpp` does the encoder's 2256 GFLOP in
+83.3 ms, which is 27.1 TFLOP/s *across its whole encoder* and barely above what
+this engine's matmul reaches on its own — so cuBLAS was never running away with
+it, and half the gap was the kernels either side. Timing every one of them
+found a transpose written as a scatter at 141 GB/s and four projections a layer
+reading f32 into a matmul that stages f16 regardless. `docs/BENCHMARKS.md` has
+that round; the point to carry is that the profile was worth taking and the
+assumption was not. **What that is short of is not the arithmetic.** The instruction is
 measured at 102.3 TFLOP/s on this card and f32 accumulation costs 0.7% of it,
 so the f16-accumulation trade this file used to name as the only way past buys
 essentially nothing here. It is not the memory system either, since rounding the

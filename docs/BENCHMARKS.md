@@ -3,8 +3,9 @@
 ## Current standing
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-0.89x to 0.95x against `whisper-server` from three to seven seconds of
-speech and 1.04x at ten, a milestone met only at the long end and missed, now alternated in one sitting against a `whisper-server` built here
+0.94x to 0.99x against `whisper-server` from three to seven seconds of speech
+and 1.09x at ten - level from five seconds up and short only on the briefest
+clip, alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
 stages are **level with or
 ahead of llama.cpp on every number measured** - the chat model ahead on all
@@ -59,10 +60,15 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
-| 2.93 s | 211.4 ms | 188.3 ms | 0.89x | identical |
-| 4.98 s | 251.3 ms | 237.1 ms | 0.94x | identical |
-| 7.28 s | 278.2 ms | 265.2 ms | 0.95x | differ |
-| 9.95 s | 338.7 ms | 352.7 ms | **1.04x** | differ |
+| 2.93 s | 198.9 ms | 186.0 ms | 0.94x | identical |
+| 4.98 s | 237.9 ms | 235.5 ms | 0.99x | identical |
+| 7.28 s | 265.6 ms | 262.1 ms | 0.99x | differ |
+| 9.95 s | 323.4 ms | 351.3 ms | **1.09x** | differ |
+
+The row before this one was 0.89x / 0.94x / 0.95x / 1.04x, and what moved it
+is in "The round that found the encoder's other half" below: the encoder went
+from 110.9 ms to 101.9 and the cross-attention cache from 17.0 to 14.8, none of
+it in the tiled `gemm` and none of it changing a single output bit.
 
 `whisper-server` is started `-nf -bo 1 -bs -1` as well as without `--vad`, so
 both sides are strictly single-pass greedy with no temperature fallback -
@@ -71,13 +77,14 @@ which is what this engine does and all it does. That turned out not to matter
 is the difference between a matched comparison and one that happened to be
 matched.
 
-**The milestone's target is met above about nine seconds of speech and missed
-below it, and the shape of that is the useful result.** The two engines have
-opposite cost structures. The encoder is a fixed 30-second window for both and
-ours is 28 ms slower at it, so every transcription starts 28 ms behind; the
-decode is cheaper here, by about 1.8 ms a token. From 2.93 s to 9.95 s our
-total grows 127 ms against their 164 for the same twenty-odd extra tokens, and
-the fixed deficit is paid off at roughly fifteen tokens.
+**The milestone's target is met from about five seconds of speech up and missed
+on the shortest clip, and the shape of that is the useful result.** The two
+engines have opposite cost structures. The encoder is a fixed 30-second window
+for both and ours is about 19 ms slower at it, so every transcription starts
+that far behind; the decode is cheaper here, by about 1.8 ms a token. From
+2.93 s to 9.95 s our total grows 125 ms against their 165 for the same
+twenty-odd extra tokens, and the fixed deficit is paid off at roughly seven
+tokens now rather than fifteen.
 
 **The workload this engine exists for is the short end.** The pipeline runs
 greedy over VAD-gated utterances of a few seconds, which is 0.89x to 0.94x -
@@ -140,6 +147,85 @@ bytes of spill when two blocks are forced back, and a fitting pipeline at 128x64
 that gives up more arithmetic intensity than it recovers. `docs/KERNELS.md` has
 the table and the arithmetic. The gap to cuBLAS is an architecture this kernel
 shape has run out of room on, not a missing trick in the staging loop.
+
+### The round that found the encoder's other half
+
+The encoder had been treated as "the tiled `gemm` and some noise" for three
+rounds. Timing every kernel it runs, at the encoder's own shapes, said
+otherwise - and two of the rows were nothing like what the assumption implied.
+Medians of nine on one Quadro RTX 8000, one call and then the 32 layers:
+
+| kernel | one call | x32 layers | share |
+| --- | ---: | ---: | ---: |
+| `gemm` q/k/v/out, 1500x1280x1280 | 0.264 ms | 33.7 ms | 24.8% |
+| `gemm` fc1, 1500x1280x5120 | 1.020 ms | 32.6 ms | 24.0% |
+| `gemm` fc2, 1500x5120x1280 | 0.946 ms | 30.3 ms | 22.3% |
+| `flash_attn`, 20 heads over 1500 | 0.740 ms | **23.7 ms** | 17.4% |
+| `layer_norm_add` | 0.087 ms | 5.6 ms | 4.1% |
+| `gelu` | 0.117 ms | 3.7 ms | 2.8% |
+| `split_heads_t` | 0.109 ms | **3.5 ms** | 2.6% |
+| `split_heads` | 0.051 ms | 1.6 ms | 1.2% |
+| `scale_inplace` | 0.035 ms | 1.1 ms | 0.8% |
+
+The arithmetic that reframed the problem is in the first four rows against
+`whisper.cpp`'s column. The encoder's 32 layers are 2256 GFLOP; `whisper.cpp`
+does them in 83.3 ms, which is **27.1 TFLOP/s across its whole encoder** -
+barely above the 22.4 this engine's `gemm` reaches in isolation. cuBLAS was not
+running away with it. Roughly half the gap was everything that is not a matmul.
+
+**`split_heads_t` was a transpose written as a scatter.** It moves 15.4 MB in
+109 us, which is 141 GB/s of a card that copies at about 500: the read is
+coalesced and the write is not, because consecutive lanes land `t` floats apart
+and a warp stores 32 sectors where it could store four. It is also, on
+inspection, not a head permutation at all - the head structure cancels out of
+the address arithmetic and it is the transpose of a `[t, d]` matrix. A 32x32
+staging tile, padded to 33 words so the write-back reads a conflict-free
+column, took it to **0.042 ms**, and dropping the zeroing of a buffer the
+kernel fully overwrites took `split_heads` to 0.039.
+
+**The activations were f32 into every matmul that stages them as f16 anyway.**
+Rounding a projection's left operand before the call was measured at 5% of each
+matmul and had been rejected, correctly, because a rounding *pass* costs more
+than one matmul saves. Fused into the kernel that already has the value in a
+register it is free, so `layer_norm_add` and `gelu` grew f16-emitting twins and
+the encoder's projections read half the stream. This is bit-identical, not
+approximately so: `f32_to_f16` is the same round-to-nearest-even `gemm_pack`
+applies during staging, and the oracle test passes layer by layer unchanged.
+
+The same trick pays a second time in front of the cross-attention cache, where
+one 7.7 MB conversion serves **sixty-four** projections of the encoder output.
+
+Measured on the 2.93 s clip, `xabe-asr-bench --stages`, medians of nine:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| mel frontend (CPU) | 5.2 ms | 5.5 ms |
+| encoder | 110.9 ms | **101.9 ms** |
+| cross-attention KV | 17.0 ms | **14.8 ms** |
+| decode loop | 78.0 ms | 76.3 ms |
+
+### Wave quantisation is real here, and it is measurable
+
+Chasing the rest of the encoder turned up a ceiling worth writing down, because
+it is a property of the shapes rather than of the kernel. A 128x128 tile puts
+1500x1280 at 12 x 10 = 120 blocks, and two blocks a SM over 72 SMs is 144
+concurrent slots - so the launch is one wave that leaves a sixth of the machine
+idle. Sweeping the column count at a fixed 1500x1280 says so directly:
+
+| shape | blocks | wave fill | TFLOP/s |
+| --- | ---: | ---: | ---: |
+| 1500x1280x1280 | 120 | 83% | 18.8 |
+| 1500x1280x1536 | 144 | **100%** | **21.3** |
+| 1500x1280x1664 | 156 | 54% | 13.4 |
+| 1500x1280x1920 | 180 | 62% | 15.1 |
+
+Throughput tracks the fill and nothing else - 1664 columns is *more* work than
+1536 and takes 72% longer, because 156 blocks is one full wave plus a twelfth
+of another. **This is not a lever on the encoder**, and that is the useful half
+of the finding: every shape in a layer is 83% and the ones that could be
+batched are dependent on each other, so there is no rearrangement that lands on
+a multiple of 144. It is a lever on the cross-attention cache, where 64
+independent projections share one activation, and that is not spent yet.
 
 ### The round that took the ASR from 0.74x to 0.83x
 
