@@ -5,6 +5,11 @@ which was true when the workspace was one model; every crate below is now
 implemented, and this is a record of the surface rather than a target to build
 toward. The one thing that has not changed is that none of it is a promise.
 
+The model and container crates are here. `xabe-cuda` and `xabe-dsp` are in
+`docs/KERNELS.md`, `xabe-serve` and `xabe-engine` in `docs/CLI.md`, and
+`xabe-golden` is a test harness rather than a surface - none of the five is
+missing by oversight.
+
 ## `xabe-st`
 
 ```rust
@@ -212,6 +217,53 @@ let taigi = tr.translate("今天天氣很好", "POJ",
 them, `encode` / `decode` / `generate` are public because the oracle tests
 compare per layer, and `encode_tapped` / `decode_tapped` exist for exactly that
 — they are not a streaming API and should not be mistaken for one.
+
+## `xabe-chat` — CUDA only
+
+Opens a GGUF onto a device ordinal. `open` picks the packing that keeps the
+checkpoint's own blocks on the card; `open_with` takes `Packing::F16` instead,
+which reads the same weights 2.6x wider and exists so the two can be compared
+on one file rather than as a choice worth making.
+
+```rust
+let m = ChatModel::open(gguf, ordinal)?;
+let s = Sampling { temperature: 0.3, top_p: 0.9, repeat_penalty: 1.1,
+                   repeat_last_n: 64, max_tokens: 160, seed: 0 };
+let done: Completion = m.complete(prompt, &s, &stops, &mut |piece| {
+    print!("{piece}");
+    true                    // false cancels, at the next token rather than chunk
+})?;
+assert!(matches!(done.stop, Stop::Eos | Stop::Text(_) | Stop::Limit | Stop::Cancelled));
+```
+
+`complete` is the whole surface anyone should need. The text handed to the
+callback is safe to emit: anything that might still be the start of a stop
+string is held back until it completes or is ruled out, and the prompt is
+tokenized with `parse_special = false` so a user who types `<|eot_id|>` into
+the box cannot end the model's turn from inside it.
+
+Beneath it, `forward` / `forward_last` / `forward_tapped` and `Cache` are
+public because the oracle tests drive them per layer. A `Cache` belongs to one
+reply: `complete` makes its own and drops it, so nothing is carried between
+turns.
+
+## `xabe-taco` — CUDA only
+
+Tacotron2 and WaveGlow behind one handle, and the one stage here that reads
+**converted** weights rather than a published checkpoint — `FILES` names the
+three it wants, and `tools/convert_tacotron2.py` produces them. CUDA only and
+deliberately: WaveGlow is 87.9 M parameters of dilated convolution run at the
+sample rate.
+
+```rust
+let t = Taco::open(dir, ordinal, None, seed)?;   // None takes the checkpoint's sigma
+let wav = t.synthesize("li2 ho2")?;              // f32 at t.sample_rate()
+```
+
+`synthesize_timed` returns the same audio with a per-stage `Timings` beside it.
+Input is Tâi-lô with numeric tones, which is what this checkpoint reads;
+`poj_to_tlpa` converts from the POJ the translator emits, and `with_gate_cue`
+adds the terminal cue the checkpoint was trained with.
 
 ## Errors
 

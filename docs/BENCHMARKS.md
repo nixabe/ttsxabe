@@ -4,7 +4,7 @@
 
 The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
 0.94x to 1.00x against `whisper-server` from three to seven seconds of speech
-and 1.09x at ten - level from five seconds up and short only on the briefest
+and 1.08x at ten - level from five seconds up and short only on the briefest
 clip, alternated in one sitting against a `whisper-server` built here
 from the same checkpoint - and both Llama
 stages are **level with or

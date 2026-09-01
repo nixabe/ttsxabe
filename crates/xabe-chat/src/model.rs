@@ -205,10 +205,13 @@ impl Cache {
 impl ChatModel {
     /// Loads a GGUF onto CUDA device `ordinal`.
     ///
-    /// About 16 GB of transfers at f16, and it takes as long as that sounds.
-    /// A quantized copy of the same checkpoint loads faster because the file
-    /// is smaller - and lands at the same 16 GB, because this engine unpacks
-    /// on read rather than running packed blocks. See `docs/MODEL.md`.
+    /// A quantized checkpoint keeps its own blocks and occupies about what the
+    /// file occupies; an f16 or f32 one is rounded to f16 and occupies two
+    /// bytes an element. This used to say a quantized copy "lands at the same
+    /// 16 GB, because this engine unpacks on read", which was true before
+    /// `Packing::Packed` existed and is the default now. Use
+    /// [`Self::open_with`] to load the same file the other way. See
+    /// `docs/MODEL.md`.
     pub fn open(path: &Path, ordinal: usize) -> Result<Self, ChatError> {
         Self::open_with(path, ordinal, Packing::default())
     }

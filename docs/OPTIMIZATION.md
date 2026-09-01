@@ -1,8 +1,15 @@
 # The performance model
 
 Written before the kernels, so that the first implementation is not shaped by a
-wrong intuition. **Nothing here is measured on this implementation yet**; the
-numbers are hardware facts and reference-implementation observations.
+wrong intuition. **Nothing in sections 1 to 5 was measured on this
+implementation when it was written**; the numbers were hardware facts and
+reference-implementation observations. Section 6 was added after the
+synthesiser was measured and section 7 after the engine grew five more models.
+
+**Everything up to section 6 is about the synthesiser**, which was the whole
+project when this was written. Section 7 is there because the scope widened to
+an ASR, two Llama stages and two more synthesisers, and three of this file's
+conclusions invert on those.
 
 ## 1. The card
 
@@ -93,3 +100,33 @@ The second step is the one worth remembering: after the channel tile the kernel
 was loading one weight per multiply-add, so it was still load-bound - just on a
 different operand than before. **Fixing an arithmetic-intensity problem on one
 operand can leave you with the same problem on the other.**
+
+## 7. What inverted when the scope widened
+
+Sections 2 and 4 are right about VITS and wrong about most of what the engine
+now contains. Recorded here rather than edited above, because the reasoning was
+sound for the model it was about and the failure is one of scope:
+
+**"Quantising would be solving a problem this workload does not have."** True of
+36 M parameters in 145 MB. The chat model is 4.9 GB and the translator 7.9 GB,
+both read once per decoded token, and there decode *is* bandwidth bound - the
+matmul streams 4.62 GB in 8.4 ms, which is 93% of what the card can read. The
+weights stay in the checkpoint's own blocks and are unpacked inside the matmul.
+See `docs/KERNELS.md`.
+
+**"Anything about KV caches does not transfer."** Three stages have one: the
+ASR's decoder, and both Llama stages, which hold theirs at f16 and grow it by
+doubling. What still does not transfer is the rest of that sentence - prefix
+reuse, speculative decoding and request scheduling are all still absent, and
+`docs/ARCHITECTURE.md` says why.
+
+**"Launch overhead turned out to be negligible."** True of the synthesiser, and
+measured there. It is not true of a Llama decode, which issues about 390
+kernels for one token; a seventh of a 13 B step is small kernels that cost what
+a launch costs rather than what they read, and that is what `silu_mul_pair`
+exists for. It is still not the *binding* constraint - the CPU queues those 390
+launches in 2.03 ms of a 5.09 ms run and then waits, which is why capturing the
+step in a CUDA graph was measured as pointless and not built.
+
+What did transfer, and held everywhere: NVRTC at runtime, a differential test
+per kernel, and the rule that a measurement lands with its optimisation.

@@ -124,6 +124,15 @@ The ASR changes this only slightly. An utterance is still whole and still shares
 nothing with the next; what it adds is a decoder KV cache *within* one
 utterance, which is a buffer, not a scheduler.
 
+The two Llama stages add the same thing again and no more. Each holds a KV
+cache across the tokens of **one** reply - f16, doubling its capacity from 256
+positions so a long reply pays for the growth a logarithmic number of times -
+and drops it at the end. A new turn re-prefills from `--history-turns` rather
+than reusing the last one's prefix, which is exactly the reuse a server would
+schedule around and this does not. So the heading still holds: three stages
+have a cache, none of them has a scheduler, and nothing here shares a prefix
+between calls.
+
 ## Crate boundaries
 
 Dependencies point one way, and the direction is the point: a crate must be

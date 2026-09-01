@@ -127,14 +127,25 @@ binding has not been established - rounding the activations to f16 was worth
 5%, so it is not simply bandwidth. `ncu` cannot be run here to settle it.
 `docs/BENCHMARKS.md` has the table and everything tried and rejected.
 
-One of the two levers that section costed has been spent. Fused attention took
-the 38 ms the encoder was moving an attention score matrix it never needed to
-materialise, and tuning its query tile took 6 ms more: the encoder went 163 ms
-to 119. What is left is the `ldmatrix` double-buffered matmul for the 85 ms of
-projections still running at 22-25% of this card's peak, and a decode loop
-reading its cross-attention caches at f32. Neither has been costed to the point
-of promising 144 ms. Recorded as a miss rather than restated as a
-different target.
+Both of the levers that section costed have since been spent, and so has a
+third it did not name. Fused attention took the 38 ms the encoder was moving an
+attention score matrix it never needed to materialise and tuning its query tile
+took 6 ms more, 163 ms to 119; the cross-attention caches are held at f16 now;
+and a later round found a transpose written as a scatter and four projections
+feeding f32 into a matmul that stages f16 regardless. The encoder is **102 ms**
+against `whisper.cpp`'s 83, and that is the whole of what is left of the gap.
+
+The one lever that was named and did **not** pay is the double-buffered
+matmul. It was built and measured at half the throughput of the kernel it
+replaces - it needs 184 registers where the budget for two resident blocks is
+128 - and five further tile-and-occupancy arrangements of it lost as well. A
+deep pipeline here wants `cp.async`, which arrived with sm_80. So the remaining
+gap is an architecture this kernel shape has run out of room on rather than a
+trick that has not been tried, and `docs/BENCHMARKS.md` has the register table.
+
+Still recorded as a miss, because the milestone asks for the short end too and
+the briefest clip is 11 ms behind - rather than restated as a different
+target.
 
 The filter bank is computed rather than shipped, and matches the capture *bit
 for bit*: both sides evaluate the same closed form in f64 and round once, with
@@ -697,7 +708,7 @@ profiled as nothing because every individual kernel was fast.
 Batching and streaming synthesis are still deliberately absent. They are
 answers to questions this project has not asked yet.
 
-Streaming has a caveat now that phase 6 is scoped, and it is worth writing down
+Streaming has a caveat now that phase 6 has landed, and it is worth writing down
 before someone reaches item 29 and is surprised. The Python CosyVoice backend
 *does* stream — `inference_instruct2(stream=True)` yields audio as the flow
 solver produces it, and `gateway.py` plays it as it arrives. Items 24-30 above

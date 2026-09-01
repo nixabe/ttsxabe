@@ -88,26 +88,40 @@ the evidence.
 on CPU and on CUDA, matching the PyTorch reference stage by stage; and one
 binary that can be the gateway, a single-stage worker, or the whole assistant.
 A running engine holds a full voice turn today — speech in, Taigi reply, speech
-out — with the ASR and the chat model delegated over HTTP.
+out — with every stage either in-process or delegated over HTTP, and nothing
+downstream able to tell which.
 
 **Voice activity detection is complete**: Silero from scratch, agreeing with
 whisper.cpp on every segment of an eight-clip corpus, and refusing all four of
 the noise cases that used to make the ASR invent sentences.
 
-**Speech recognition is complete and correct, and slower than what it
-replaces.** Whisper large-v2 from scratch — 1,259 tensors, a general-radix mel
-frontend, a byte-level BPE, a tensor-core matmul, encoder and decoder matching
-a captured oracle layer by layer, and greedy decoding reproducing 🤗
-`WhisperForConditionalGeneration`'s transcripts token for token. Measured
-against `whisper-server` on the same card with the same model and no VAD on
-either side, it was **0.55x** — 264 ms against 144 on a 2.7-second clip, with
-identical transcripts. Fusing the encoder's attention has since taken the
-engine side to 211 ms, so the ratio is now about **0.68x** — but that half was
-measured on a machine with no `whisper-server` on it, so it is two sittings
-rather than one alternated run and `docs/BENCHMARKS.md` flags it as the
-weakest number in the document. Either way it is a stated milestone that is not
-met; that file costs what closing the gap would take rather than restating the
-target.
+**Speech recognition is complete and correct, and level with what it replaces
+from about five seconds of speech up.** Whisper large-v2 from scratch — 1,259
+tensors, a general-radix mel frontend, a byte-level BPE, a tensor-core matmul,
+encoder and decoder matching a captured oracle layer by layer, and greedy
+decoding reproducing 🤗 `WhisperForConditionalGeneration`'s transcripts token
+for token.
+
+| clip | `xabe-asr` | `whisper-server` | ratio |
+| --- | --- | --- | --- |
+| 2.93 s | 198.0 ms | 186.7 ms | 0.94x |
+| 4.98 s | 237.2 ms | 237.0 ms | **1.00x** |
+| 7.28 s | 266.9 ms | 264.7 ms | 0.99x |
+| 9.95 s | 325.5 ms | 352.9 ms | **1.08x** |
+
+Both halves of every row were measured in one sitting, against a
+`whisper-server` built from this repository's own `whisper.cpp` checkout with
+`GGML_CUDA=ON`, reading the same checkpoint converted by that tree's own
+script, both sides strictly single-pass greedy and neither using VAD. An
+earlier version of this section quoted 0.55x and then 0.68x; those were two
+sittings arithmetically combined, and they are superseded rather than
+corrected downward.
+
+**It is still recorded as a milestone that is missed**, because the milestone
+asks for the short end too and the 2.93 s clip is 11 ms behind. What is left
+of the gap is the encoder and nothing else — 102 ms against 83 — and
+`docs/BENCHMARKS.md` argues that this kernel shape has run out of room on
+sm_75 rather than that a trick is missing.
 
 **CosyVoice3 runs in the engine.** Three networks from scratch — a Qwen2 0.5 B
 speech language model, a 22-layer diffusion transformer with its Euler solver,
@@ -132,7 +146,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
 | `xabe-vits` | config, weight schema for all 662 inference tensors, tokenizer |
 | `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 59 CUDA kernels, each diffed against its scalar twin |
+| `xabe-cuda` | 75 CUDA kernels, each diffed against its scalar twin |
 | `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
 | `xabe-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
 | `xabe-taco` | Tacotron2 + WaveGlow, POJ to Tâi-lô, converted weights |
@@ -266,12 +280,19 @@ see `docs/CLI.md`. Quantized checkpoints load too: `Q4_0`, `Q4_1`, `Q5_0`,
 a smaller model, because the weights were unpacked on read and landed at full
 width. They now stay **packed on the card** and are unpacked inside the matmul,
 so a quantized model costs about what its file costs — which is what lets every
-stage share one card. It buys residency and is not a speed claim; the embedding
-table is still widened at load. See `docs/KERNELS.md` and `docs/BENCHMARKS.md`.
+stage share one card. That used to be a residency claim and not a speed one;
+it is both now, because the packed mat-vec stopped wasting its loads: the same
+file widened to f16 reads 2.6x more bytes a token and decodes slower. The
+embedding table is still widened at load, and only the matmul reads packed
+blocks. See `docs/KERNELS.md` and `docs/BENCHMARKS.md`.
 
-There is no KV cache and no request scheduler here; an utterance is a single
-forward pass with no state carried between calls. If batching arrives it will be
-because a measurement asked for it.
+There is no request scheduler here and no reuse between calls: a reply is
+prefilled from scratch each turn out of `--history-turns`, and an utterance is
+one forward pass that shares nothing with the next. There *are* KV caches
+**within** a call — the ASR's decoder keeps one, and both Llama stages hold
+theirs at f16, growing by doubling from 256 positions — which is a buffer, not
+a scheduler. If batching arrives it will be because a measurement asked for
+it.
 
 ## Documentation
 

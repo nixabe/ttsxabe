@@ -18,7 +18,7 @@ strings. So:
 
 That held up. The runtime image carries `libnvrtc.so.12` and
 `libnvrtc-builtins.so.12.4`, `libcuda.so.1` arrives from the host driver
-through the NVIDIA container runtime, and a container compiled all 61 kernels
+through the NVIDIA container runtime, and a container compiled all 75 kernels
 and synthesised audio on the first try.
 
 ## The one thing the sketch got wrong: glibc

@@ -74,10 +74,14 @@ left operand of a matmul; that refusal stands.
 
 ## Current standing
 
-Five stages are finished: the synthesiser, the serving layer, voice activity
-detection, speech recognition and Mandarin-to-Taigi translation. CosyVoice is
-scoped and not started — `docs/MILESTONES.md` has the state of every item, and
-is the file to read before starting work rather than this paragraph.
+Every stage is finished: the synthesiser, the serving layer, voice activity
+detection, speech recognition, Mandarin-to-Taigi translation, the chat model,
+CosyVoice3, and a third synthesiser in Tacotron2 + WaveGlow. This paragraph
+said "CosyVoice is scoped and not started" long after phase 6 had closed; the
+one thing still outside the engine is deriving a **new** CosyVoice voice, which
+runs two ONNX models once through `tools/make_cosyvoice_voice.py`.
+`docs/MILESTONES.md` has the state of every item and is the file to read before
+starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
