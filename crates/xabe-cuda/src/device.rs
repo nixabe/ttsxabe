@@ -640,6 +640,8 @@ const NAMES: &[&str] = &[
     "attn_decode_h128",
     "attn_decode_h128_c128",
     "attn_decode_h64",
+    "attn_decode_h64_g8",
+    "attn_decode_h64_g8_c32",
     "attn_decode_f64",
     "embed_q",
 ];
@@ -4758,6 +4760,16 @@ impl Gpu {
     }
 
     /// The f16 decode kernel for a shape, by head width and context.
+    /// How many query rows a key-value head carries in the kernel `name`:
+    /// the `G` its entry was instantiated with.
+    fn ad_gmax(name: &str) -> usize {
+        if name.contains("_g8") {
+            8
+        } else {
+            kernels::AD_GMAX as usize
+        }
+    }
+
     fn attn_decode_f16_name(
         heads: usize,
         kv_heads: usize,
@@ -4776,6 +4788,14 @@ impl Gpu {
             128 if tk <= 256 || heads == kv_heads => "attn_decode_h128_c32",
             128 if tk >= 2048 => "attn_decode_h128_c128",
             128 => "attn_decode_h128",
+            // A query group wider than `AD_GMAX` takes the instantiation
+            // sized for eight: CosyVoice3's speech LLM, 14 heads over 2.
+            // With two key-value heads the grid is `chunks * 2` blocks, so
+            // at a short context the narrow chunk is what fills the card.
+            64 if heads / kv_heads.max(1) > kernels::AD_GMAX as usize && tk <= 1024 => {
+                "attn_decode_h64_g8_c32"
+            }
+            64 if heads / kv_heads.max(1) > kernels::AD_GMAX as usize => "attn_decode_h64_g8",
             64 => "attn_decode_h64",
             _ => {
                 return Err(CudaError::UnsupportedAttention {
@@ -4934,12 +4954,11 @@ impl Gpu {
         out_off: usize,
         twin: Option<&mut Q8>,
     ) -> Result<(), CudaError> {
-        // The kernel carries at most `AD_GMAX` query rows a key-value head,
-        // and a group of zero is a division by it.
-        if kv_heads == 0
-            || !heads.is_multiple_of(kv_heads)
-            || heads / kv_heads > kernels::AD_GMAX as usize
-        {
+        // The kernel carries at most `gmax` query rows a key-value head -
+        // `AD_GMAX`, or eight for the one instantiation named for it - and
+        // a group of zero is a division by it.
+        let gmax = Self::ad_gmax(name);
+        if kv_heads == 0 || !heads.is_multiple_of(kv_heads) || heads / kv_heads > gmax {
             return Err(CudaError::UnsupportedAttention {
                 head_dim,
                 heads,
@@ -5004,7 +5023,7 @@ impl Gpu {
         }
         let group = heads / kv_heads;
         let ch = match name {
-            "attn_decode_h128_c32" => 32,
+            "attn_decode_h128_c32" | "attn_decode_h64_g8_c32" => 32,
             "attn_decode_h128_c128" => 128,
             _ => kernels::AD_CH as usize,
         };
@@ -5013,7 +5032,7 @@ impl Gpu {
         // Grow the scratch to this call's shape. Doubling the chunk count
         // keeps the allocations logarithmic in the context; a change of head
         // geometry, which no stage ever makes, starts over.
-        let stride = kernels::AD_GMAX as usize * (head_dim + 2);
+        let stride = gmax * (head_dim + 2);
         if scratch.kv_heads != kv_heads || scratch.head_dim != head_dim {
             scratch.part = None;
             scratch.ctr = None;

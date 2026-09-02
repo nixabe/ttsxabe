@@ -1,28 +1,45 @@
 //! CosyVoice3's speech language model: Qwen2 0.5 B, text in, speech tokens out.
 
 use crate::{CosyError, LlmConfig};
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, Operand};
 use xabe_st::StFile;
 
 /// One `[out, in]` matrix on the device, with the bias Qwen2 puts on `q`, `k`
 /// and `v` but not on `o`.
+///
+/// The matrix is held at f16. A decode step is one row against every
+/// weight, so the step is the weight stream and nothing else - 1.98 GB a
+/// token at f32, 4.6 ms on this card, against 0.99 GB at f16 - and the
+/// prompt's tiled matmul stages its operands as f16 regardless, so the
+/// prefill's arithmetic does not change at all. The decode mat-vec's does,
+/// from an exact f32 weight to an f16 one against an f32 activation;
+/// `examples/probe_llm.rs` measures what that moves the teacher-forced
+/// log-probabilities by against the f32 build, and `docs/BENCHMARKS.md`
+/// has the figures. The biases stay f32.
 struct GLinear {
-    w: CudaSlice<f32>,
+    w: CudaSlice<u16>,
     bias: Option<CudaSlice<f32>>,
     in_dim: usize,
     out_dim: usize,
 }
 
 /// One decoder block.
+///
+/// The three attention inputs are one `[h + 2 kv, h]` weight and the two
+/// MLP inputs one `[2 inter, h]`, so a decode step projects each set in one
+/// launch; the prompt reads the same allocations a projection at a time
+/// through `Gpu::gemm_batched_from`. The three attention biases are kept
+/// apart as well as stacked, because the prompt's three products each want
+/// their own.
 struct GLayer {
     attn_norm: CudaSlice<f32>,
-    q: GLinear,
-    k: GLinear,
-    v: GLinear,
+    qkv: GLinear,
+    q_bias: CudaSlice<f32>,
+    k_bias: CudaSlice<f32>,
+    v_bias: CudaSlice<f32>,
     o: GLinear,
     ffn_norm: CudaSlice<f32>,
-    gate: GLinear,
-    up: GLinear,
+    gate_up: GLinear,
     down: GLinear,
 }
 
@@ -73,10 +90,24 @@ pub struct SpeechLlm {
 }
 
 /// The keys and values a decode step reuses.
+///
+/// Held at f16 in the layout the attention kernels read - keys
+/// `[kv_heads, cap, head_dim]`, values `[kv_heads, head_dim, cap]` - with
+/// a capacity that doubles, exactly as the chat model's is; see
+/// `xabe_chat`'s `Cache` for why the first version of that, which grew by
+/// the token being added, was quadratic. A single position appends into
+/// it from the projection's rotation kernel and reads it with the fused
+/// decode attention, so a step's attention is two launches a layer where
+/// the f32 chain was eleven and rebuilt the whole cache for every token.
 pub struct Cache {
-    k: Vec<CudaSlice<f32>>,
-    v: Vec<CudaSlice<f32>>,
+    k: Vec<CudaSlice<u16>>,
+    v: Vec<CudaSlice<u16>>,
+    /// Positions the buffers have room for, not how many they hold.
+    cap: usize,
     len: usize,
+    /// The fused decode attention's partials and counter; per cache so two
+    /// utterances decoding by turns never share one.
+    scratch: DecodeScratch,
 }
 
 impl Cache {
@@ -129,8 +160,9 @@ impl SpeechLlm {
         let (h, kv) = (cfg.hidden_size, cfg.kv_dim());
         let lin =
             |prefix: &str, out: usize, inp: usize, bias: bool| -> Result<GLinear, CosyError> {
+                let full = want(&format!("{prefix}.weight"), &[out, inp])?;
                 Ok(GLinear {
-                    w: want(&format!("{prefix}.weight"), &[out, inp])?,
+                    w: gpu.to_f16(&full, out * inp)?,
                     bias: match bias {
                         true => Some(want(&format!("{prefix}.bias"), &[out])?),
                         false => None,
@@ -140,25 +172,59 @@ impl SpeechLlm {
                 })
             };
 
+        // Several `[out_i, in]` tensors stacked along `out`, at f16.
+        let stacked = |names: &[(String, usize)], inp: usize| -> Result<GLinear, CosyError> {
+            let out: usize = names.iter().map(|(_, o)| o).sum();
+            let mut rows = Vec::with_capacity(out * inp);
+            for (name, o) in names {
+                rows.extend_from_slice(f.tensor_shaped(name, &[*o, inp])?);
+            }
+            let full = gpu.upload(&rows)?;
+            Ok(GLinear {
+                w: gpu.to_f16(&full, out * inp)?,
+                bias: None,
+                in_dim: inp,
+                out_dim: out,
+            })
+        };
+
+        let inter = cfg.intermediate_size;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
+            // The biases are the Qwen2 tell. `o_proj` has none, and asking
+            // for one fails here rather than at the first odd utterance.
+            let q_bias = want(&format!("{p}.self_attn.q_proj.bias"), &[h])?;
+            let k_bias = want(&format!("{p}.self_attn.k_proj.bias"), &[kv])?;
+            let v_bias = want(&format!("{p}.self_attn.v_proj.bias"), &[kv])?;
+            let mut qkv = stacked(
+                &[
+                    (format!("{p}.self_attn.q_proj.weight"), h),
+                    (format!("{p}.self_attn.k_proj.weight"), kv),
+                    (format!("{p}.self_attn.v_proj.weight"), kv),
+                ],
+                h,
+            )?;
+            let mut qkv_bias = Vec::with_capacity(h + 2 * kv);
+            for b in [&q_bias, &k_bias, &v_bias] {
+                qkv_bias.extend_from_slice(&gpu.download(b)?);
+            }
+            qkv.bias = Some(gpu.upload(&qkv_bias)?);
             layers.push(GLayer {
                 attn_norm: want(&format!("{p}.input_layernorm.weight"), &[h])?,
-                // The biases are the Qwen2 tell. `o_proj` has none, and asking
-                // for one fails here rather than at the first odd utterance.
-                q: lin(&format!("{p}.self_attn.q_proj"), h, h, true)?,
-                k: lin(&format!("{p}.self_attn.k_proj"), kv, h, true)?,
-                v: lin(&format!("{p}.self_attn.v_proj"), kv, h, true)?,
+                qkv,
+                q_bias,
+                k_bias,
+                v_bias,
                 o: lin(&format!("{p}.self_attn.o_proj"), h, h, false)?,
                 ffn_norm: want(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                gate: lin(
-                    &format!("{p}.mlp.gate_proj"),
-                    cfg.intermediate_size,
+                gate_up: stacked(
+                    &[
+                        (format!("{p}.mlp.gate_proj.weight"), inter),
+                        (format!("{p}.mlp.up_proj.weight"), inter),
+                    ],
                     h,
-                    false,
                 )?,
-                up: lin(&format!("{p}.mlp.up_proj"), cfg.intermediate_size, h, false)?,
                 down: lin(
                     &format!("{p}.mlp.down_proj"),
                     h,
@@ -202,7 +268,9 @@ impl SpeechLlm {
         Cache {
             k: Vec::new(),
             v: Vec::new(),
+            cap: 0,
             len: 0,
+            scratch: DecodeScratch::new(),
         }
     }
 
@@ -271,7 +339,7 @@ impl SpeechLlm {
     ) -> Result<CudaSlice<f32>, CosyError> {
         Ok(self.gpu.gemm_batched(
             x,
-            Operand::F32(&l.w),
+            Operand::F16(&l.w),
             l.bias.as_ref(),
             Batch::single(rows * l.out_dim),
             rows,
@@ -296,95 +364,211 @@ impl SpeechLlm {
         let hd = self.cfg.head_dim();
         let kv_dim = self.cfg.kv_dim();
         let past = cache.len;
+        let first = cache.k.is_empty();
+        let scale = (hd as f32).powf(-0.5);
+        // Several positions read the cache at full width through the f32
+        // chain below, which only the first call can do: after that the
+        // earlier positions exist only at f16 in the attention layout. No
+        // caller here does otherwise - a prompt, then one token at a time -
+        // and refusing is better than an attention that ignores its past.
+        if n > 1 && past > 0 {
+            return Err(CosyError::Geometry {
+                what: "a multi-position forward after decoding began (past positions)",
+                got: past,
+                want: 0,
+            });
+        }
+
+        // Room for this call, doubling so a decode of any length pays for
+        // growth a logarithmic number of times. The first call sizes the
+        // buffers for its prompt and a good stretch of speech after it.
+        if first {
+            cache.cap = (past + n + 256).next_power_of_two();
+        } else if past + n > cache.cap {
+            let (was, want) = (cache.cap, (past + n).next_power_of_two());
+            let keys = cache.k.iter_mut().map(|s| (s, false));
+            let values = cache.v.iter_mut().map(|s| (s, true));
+            for (slot, transposed) in keys.chain(values) {
+                let mut grown = self.gpu.zeros_f16(want * kv_dim)?;
+                self.gpu
+                    .cache_grow_f16(slot, &mut grown, kv_heads, hd, was, want, past, transposed)?;
+                *slot = grown;
+            }
+            cache.cap = want;
+        }
+        let cap = cache.cap;
 
         let mut h = self.gpu.zeros(n * h_dim)?;
         self.gpu.copy_into(&mut h, x, 0, n * h_dim)?;
 
-        let first = cache.k.is_empty();
         for (i, l) in self.layers.iter().enumerate() {
             let xn = self
                 .gpu
                 .rms_norm(&h, n, h_dim, &l.attn_norm, LlmConfig::RMS_EPS)?;
-            let mut q = self.project(Operand::F32(&xn), &l.q, n)?;
-            let mut k = self.project(Operand::F32(&xn), &l.k, n)?;
-            let v = self.project(Operand::F32(&xn), &l.v, n)?;
-
-            // `k` rotates over `kv_heads`, not `heads`: the kernel walks the
-            // tensor as `heads * head_dim` per position, so the query count
-            // would read 896 floats out of a 128-wide row. The buffer is the
-            // right length in total, so nothing checks it and nothing crashes.
-            self.gpu
-                .rope(&mut q, 0, n, heads, hd, LlmConfig::ROPE_THETA, past)?;
-            self.gpu
-                .rope(&mut k, 0, n, kv_heads, hd, LlmConfig::ROPE_THETA, past)?;
-
             if first {
-                cache.k.push(k);
-                cache.v.push(v);
-            } else {
-                for (slot, new) in [(&mut cache.k[i], k), (&mut cache.v[i], v)] {
-                    let mut grown = self.gpu.zeros((past + n) * kv_dim)?;
-                    self.gpu.copy_into(&mut grown, slot, 0, past * kv_dim)?;
-                    self.gpu
-                        .copy_into(&mut grown, &new, past * kv_dim, n * kv_dim)?;
-                    *slot = grown;
-                }
+                cache.k.push(self.gpu.zeros_f16(cap * kv_dim)?);
+                cache.v.push(self.gpu.zeros_f16(cap * kv_dim)?);
             }
             let tk = past + n;
 
-            let qh = self.gpu.split_heads(&q, n, heads, hd)?;
-            let kh = self.gpu.split_heads(&cache.k[i], tk, kv_heads, hd)?;
-            let kh = self.gpu.repeat_kv(&kh, heads, kv_heads, tk, hd)?;
-            let vt = self.gpu.split_heads_t(&cache.v[i], tk, kv_heads, hd)?;
-            let vt = self.gpu.repeat_kv(&vt, heads, kv_heads, tk, hd)?;
+            let ctx = if n == 1 {
+                // One position: the three projections as one mat-vec over
+                // the stacked weight, then the query rotated in place, the
+                // key rotated and the value stored straight into the caches
+                // from the same buffer, then the fused decode attention over
+                // the grouped heads, reading the caches where they are. See
+                // `Gpu::rope_cache_f16` and `Gpu::attn_decode_f16`.
+                let mut proj = [self.project(Operand::F32(&xn), &l.qkv, 1)?];
+                self.gpu.rope_cache_f16(
+                    &mut proj,
+                    (0, 0),
+                    (0, h_dim),
+                    (0, h_dim + kv_dim),
+                    None,
+                    heads,
+                    kv_heads,
+                    hd,
+                    LlmConfig::ROPE_THETA,
+                    past,
+                    &mut cache.k[i],
+                    &mut cache.v[i],
+                    cap,
+                )?;
+                self.gpu.attn_decode_f16(
+                    &proj[0],
+                    &cache.k[i],
+                    &cache.v[i],
+                    heads,
+                    kv_heads,
+                    hd,
+                    tk,
+                    cap,
+                    scale,
+                    false,
+                    &mut cache.scratch,
+                )?
+            } else {
+                let from = |first: usize, bias: &CudaSlice<f32>, out: usize| {
+                    self.gpu.gemm_batched_from(
+                        Operand::F32(&xn),
+                        Operand::F16(&l.qkv.w),
+                        first,
+                        Some(bias),
+                        Batch::single(n * out),
+                        n,
+                        h_dim,
+                        out,
+                    )
+                };
+                let mut q = from(0, &l.q_bias, h_dim)?;
+                let mut k = from(h_dim, &l.k_bias, kv_dim)?;
+                let v = from(h_dim + kv_dim, &l.v_bias, kv_dim)?;
+                // `k` rotates over `kv_heads`, not `heads`: the kernel walks
+                // the tensor as `heads * head_dim` per position, so the query
+                // count would read 896 floats out of a 128-wide row. The
+                // buffer is the right length in total, so nothing checks it
+                // and nothing crashes.
+                self.gpu
+                    .rope(&mut q, 0, n, heads, hd, LlmConfig::ROPE_THETA, past)?;
+                self.gpu
+                    .rope(&mut k, 0, n, kv_heads, hd, LlmConfig::ROPE_THETA, past)?;
+                // Into the f16 caches for the steps that follow, and through
+                // the f32 chain for this call: the prompt is the first call
+                // and the only multi-position one, so the chain's operands
+                // are the rows just projected and nothing has to be read
+                // back out of the cache at full width. The fused f16 prefill
+                // attention is instantiated at a head width of 128 and this
+                // model's is 64, which is why the chain stays.
+                self.gpu.cache_append_f16(
+                    &k,
+                    0,
+                    &mut cache.k[i],
+                    n,
+                    kv_heads,
+                    hd,
+                    cap,
+                    past,
+                    false,
+                )?;
+                self.gpu.cache_append_f16(
+                    &v,
+                    0,
+                    &mut cache.v[i],
+                    n,
+                    kv_heads,
+                    hd,
+                    cap,
+                    past,
+                    true,
+                )?;
 
-            let mut scores = self.gpu.gemm_batched(
-                Operand::F32(&qh),
-                Operand::F32(&kh),
-                None,
-                Batch {
-                    count: heads,
-                    a: n * hd,
-                    w: tk * hd,
-                    out: n * tk,
-                    w_row: 0,
-                },
-                n,
-                hd,
-                tk,
-            )?;
-            self.gpu
-                .scale_inplace(&mut scores, heads * n * tk, (hd as f32).powf(-0.5))?;
-            self.gpu.causal_mask(&mut scores, heads, n, tk, tk - n)?;
-            self.gpu.softmax_rows(&mut scores, heads * n, tk)?;
-
-            let ctx = self.gpu.gemm_batched(
-                Operand::F32(&scores),
-                Operand::F32(&vt),
-                None,
-                Batch {
-                    count: heads,
-                    a: n * tk,
-                    w: hd * tk,
-                    out: n * hd,
-                    w_row: 0,
-                },
-                n,
-                tk,
-                hd,
-            )?;
-            let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
+                let qh = self.gpu.split_heads(&q, n, heads, hd)?;
+                let kh = self.gpu.split_heads(&k, n, kv_heads, hd)?;
+                let kh = self.gpu.repeat_kv(&kh, heads, kv_heads, n, hd)?;
+                let vt = self.gpu.split_heads_t(&v, n, kv_heads, hd)?;
+                let vt = self.gpu.repeat_kv(&vt, heads, kv_heads, n, hd)?;
+                let mut scores = self.gpu.gemm_batched(
+                    Operand::F32(&qh),
+                    Operand::F32(&kh),
+                    None,
+                    Batch {
+                        count: heads,
+                        a: n * hd,
+                        w: n * hd,
+                        out: n * n,
+                        w_row: 0,
+                    },
+                    n,
+                    hd,
+                    n,
+                )?;
+                self.gpu.scale_inplace(&mut scores, heads * n * n, scale)?;
+                self.gpu.causal_mask(&mut scores, heads, n, n, 0)?;
+                self.gpu.softmax_rows(&mut scores, heads * n, n)?;
+                let ctx = self.gpu.gemm_batched(
+                    Operand::F32(&scores),
+                    Operand::F32(&vt),
+                    None,
+                    Batch {
+                        count: heads,
+                        a: n * n,
+                        w: hd * n,
+                        out: n * hd,
+                        w_row: 0,
+                    },
+                    n,
+                    n,
+                    hd,
+                )?;
+                self.gpu.merge_heads(&ctx, n, heads, hd)?
+            };
             let out = self.project(Operand::F32(&ctx), &l.o, n)?;
             self.gpu.add_inplace(&mut h, &out, n * h_dim)?;
 
             let xn = self
                 .gpu
                 .rms_norm(&h, n, h_dim, &l.ffn_norm, LlmConfig::RMS_EPS)?;
-            let mut gate = self.project(Operand::F32(&xn), &l.gate, n)?;
-            let up = self.project(Operand::F32(&xn), &l.up, n)?;
-            self.gpu
-                .silu_mul(&mut gate, &up, n * self.cfg.intermediate_size)?;
-            let down = self.project(Operand::F32(&gate), &l.down, n)?;
+            // Gate and up as one batched product over the stacked weight -
+            // `[2, n, inter]` out - and the gating written over the first
+            // half, which is where the down projection reads.
+            let inter = self.cfg.intermediate_size;
+            let mut gu = self.gpu.gemm_batched(
+                Operand::F32(&xn),
+                Operand::F16(&l.gate_up.w),
+                None,
+                Batch {
+                    count: 2,
+                    a: 0,
+                    w: inter * h_dim,
+                    out: n * inter,
+                    w_row: 0,
+                },
+                n,
+                h_dim,
+                inter,
+            )?;
+            let _twin = self.gpu.silu_mul_pair(&mut gu, n, inter)?;
+            let down = self.project(Operand::F32(&gu), &l.down, n)?;
             self.gpu.add_inplace(&mut h, &down, n * h_dim)?;
         }
         cache.len = past + n;

@@ -4625,7 +4625,12 @@ __device__ __forceinline__ void ad_emit(
     }
 }
 
-template <int HD, bool KVH, int CH>
+// `G` is the most query rows one key-value head serves - the query group.
+// It sizes registers and shared memory, so it is a template parameter
+// rather than the `AD_GMAX` default alone: the Llama stages have groups
+// of 4 and 1, CosyVoice3's speech LLM has 7, and the wider instantiation
+// is taken only by it.
+template <int HD, bool KVH, int CH, int G>
 __device__ __forceinline__ void attn_decode_impl(
     const float* __restrict__ q,
     const unsigned* __restrict__ kc,
@@ -4663,9 +4668,9 @@ __device__ __forceinline__ void attn_decode_impl(
     static_assert(KPWARP % KPW == 0, "a warp's keys are whole trips");
     static_assert(W % 4 == 0, "a key row is whole 16-byte loads");
 
-    __shared__ float qs[AD_GMAX * HD];
-    __shared__ float sc[AD_GMAX * CH];
-    __shared__ float m_s[AD_GMAX], l_s[AD_GMAX];
+    __shared__ float qs[G * HD];
+    __shared__ float sc[G * CH];
+    __shared__ float m_s[G], l_s[G];
     __shared__ int last;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4701,9 +4706,9 @@ __device__ __forceinline__ void attn_decode_impl(
 
     // The lane's slice of each query, in registers: the elements its 16
     // bytes of key cover.
-    float qr[AD_GMAX][EPL];
+    float qr[G][EPL];
     #pragma unroll
-    for (int g = 0; g < AD_GMAX; ++g) {
+    for (int g = 0; g < G; ++g) {
         #pragma unroll
         for (int e = 0; e < EPL; ++e) {
             qr[g][e] = (g < group) ? qs[g * HD + (KVH ? 2 * wo : wo) + e] : 0.0f;
@@ -4716,9 +4721,9 @@ __device__ __forceinline__ void attn_decode_impl(
     const float sf = scale_q ? 1.0f : scale;
     #pragma unroll
     for (int t = 0; t < KTRIPS; ++t) {
-        float acc[AD_GMAX];
+        float acc[G];
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             acc[g] = 0.0f;
         }
         const unsigned wv[4] = {kr[t].x, kr[t].y, kr[t].z, kr[t].w};
@@ -4728,19 +4733,19 @@ __device__ __forceinline__ void attn_decode_impl(
                 float lo, hi;
                 gemm_unpack(wv[w], lo, hi);
                 #pragma unroll
-                for (int g = 0; g < AD_GMAX; ++g) {
+                for (int g = 0; g < G; ++g) {
                     acc[g] += qr[g][2 * w] * lo + qr[g][2 * w + 1] * hi;
                 }
             } else {
                 const float v = __uint_as_float(wv[w]);
                 #pragma unroll
-                for (int g = 0; g < AD_GMAX; ++g) {
+                for (int g = 0; g < G; ++g) {
                     acc[g] += qr[g][w] * v;
                 }
             }
         }
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             #pragma unroll
             for (int o = LPK / 2; o > 0; o >>= 1) {
                 acc[g] += __shfl_xor_sync(0xffffffff, acc[g], o);
@@ -4749,7 +4754,7 @@ __device__ __forceinline__ void attn_decode_impl(
         if (lane == ks * LPK) {
             const int r = warp * KPWARP + t * KPW + ks;
             #pragma unroll
-            for (int g = 0; g < AD_GMAX; ++g) {
+            for (int g = 0; g < G; ++g) {
                 if (g < group) {
                     sc[g * CH + r] = (r < nk) ? acc[g] * sf : ninf;
                 }
@@ -4801,7 +4806,7 @@ __device__ __forceinline__ void attn_decode_impl(
     static_assert(SPL >= 1 && CH % 32 == 0, "a chunk is whole warps of scores");
     if (tid < 32) {
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             if (g < group) {
                 float* row = sc + g * CH;
                 float v[SPL], p[SPL];
@@ -4841,9 +4846,9 @@ __device__ __forceinline__ void attn_decode_impl(
 
     // The context: one thread an output element, the probabilities read as a
     // broadcast and the value row already in registers.
-    float o[AD_GMAX];
+    float o[G];
     #pragma unroll
-    for (int g = 0; g < AD_GMAX; ++g) {
+    for (int g = 0; g < G; ++g) {
         o[g] = 0.0f;
     }
     #pragma unroll
@@ -4852,7 +4857,7 @@ __device__ __forceinline__ void attn_decode_impl(
             float lo, hi;
             gemm_unpack(vr[w], lo, hi);
             #pragma unroll
-            for (int g = 0; g < AD_GMAX; ++g) {
+            for (int g = 0; g < G; ++g) {
                 if (g < group) {
                     o[g] += sc[g * CH + 2 * w] * lo + sc[g * CH + 2 * w + 1] * hi;
                 }
@@ -4860,7 +4865,7 @@ __device__ __forceinline__ void attn_decode_impl(
         } else {
             const float v = __uint_as_float(vr[w]);
             #pragma unroll
-            for (int g = 0; g < AD_GMAX; ++g) {
+            for (int g = 0; g < G; ++g) {
                 if (g < group) {
                     o[g] += sc[g * CH + w] * v;
                 }
@@ -4870,7 +4875,7 @@ __device__ __forceinline__ void attn_decode_impl(
 
     if (chunks == 1) {
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             if (g < group) {
                 ad_emit(out, qa, asc, ((size_t)h * group + g) * HD + tid, o[g] / l_s[g]);
             }
@@ -4879,9 +4884,9 @@ __device__ __forceinline__ void attn_decode_impl(
     }
 
     // Several chunks: publish this one's partial and let the last block merge.
-    float* mine = part + ((size_t)(h * chunks + c) * AD_GMAX) * (HD + 2);
+    float* mine = part + ((size_t)(h * chunks + c) * G) * (HD + 2);
     #pragma unroll
-    for (int g = 0; g < AD_GMAX; ++g) {
+    for (int g = 0; g < G; ++g) {
         if (g < group) {
             mine[g * (HD + 2) + tid] = o[g];
             if (tid == 0) {
@@ -4912,14 +4917,14 @@ __device__ __forceinline__ void attn_decode_impl(
     // and must not be served from this one's L1. Past `AD_CMAX` chunks the
     // shared arrays are too small and the serial form takes over; that is a
     // context of sixteen thousand and more, and correct rather than fast.
-    const float* all = part + ((size_t)h * chunks * AD_GMAX) * (HD + 2);
+    const float* all = part + ((size_t)h * chunks * G) * (HD + 2);
     if (chunks <= AD_CMAX) {
-        __shared__ float mf[AD_GMAX * AD_CMAX];
-        __shared__ float ls[AD_GMAX * AD_CMAX];
-        __shared__ float L_s[AD_GMAX];
+        __shared__ float mf[G * AD_CMAX];
+        __shared__ float ls[G * AD_CMAX];
+        __shared__ float L_s[G];
         for (int i = tid; i < group * chunks; i += T) {
             const int g = i / chunks, cc = i - g * chunks;
-            const float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
+            const float* pc = all + ((size_t)cc * G + g) * (HD + 2);
             mf[g * AD_CMAX + cc] = ld_cg(pc + HD);
             ls[g * AD_CMAX + cc] = ld_cg(pc + HD + 1);
         }
@@ -4948,38 +4953,38 @@ __device__ __forceinline__ void attn_decode_impl(
             }
         }
         __syncthreads();
-        float acc[AD_GMAX];
+        float acc[G];
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             acc[g] = 0.0f;
         }
         #pragma unroll 4
         for (int cc = 0; cc < chunks; ++cc) {
-            const float* pc = all + (size_t)cc * AD_GMAX * (HD + 2) + tid;
+            const float* pc = all + (size_t)cc * G * (HD + 2) + tid;
             #pragma unroll
-            for (int g = 0; g < AD_GMAX; ++g) {
+            for (int g = 0; g < G; ++g) {
                 if (g < group) {
                     acc[g] += ld_cg(pc + g * (HD + 2)) * mf[g * AD_CMAX + cc];
                 }
             }
         }
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             if (g < group) {
                 ad_emit(out, qa, asc, ((size_t)h * group + g) * HD + tid, acc[g] / L_s[g]);
             }
         }
     } else {
         #pragma unroll
-        for (int g = 0; g < AD_GMAX; ++g) {
+        for (int g = 0; g < G; ++g) {
             if (g < group) {
                 float m = ninf;
                 for (int cc = 0; cc < chunks; ++cc) {
-                    m = fmaxf(m, ld_cg(all + ((size_t)cc * AD_GMAX + g) * (HD + 2) + HD));
+                    m = fmaxf(m, ld_cg(all + ((size_t)cc * G + g) * (HD + 2) + HD));
                 }
                 float l = 0.0f, acc = 0.0f;
                 for (int cc = 0; cc < chunks; ++cc) {
-                    const float* pc = all + ((size_t)cc * AD_GMAX + g) * (HD + 2);
+                    const float* pc = all + ((size_t)cc * G + g) * (HD + 2);
                     const float f = __expf(ld_cg(pc + HD) - m);
                     l += ld_cg(pc + HD + 1) * f;
                     acc += ld_cg(pc + tid) * f;
@@ -5000,7 +5005,7 @@ __device__ __forceinline__ void attn_decode_impl(
 // is ahead at 2048 positions, where the merge of thirty-three partials had
 // become the critical path. `docs/BENCHMARKS.md` has the sweep. Each width
 // is an instantiation, and `Gpu::attn_decode` picks by the context.
-#define AD_ENTRY(NAME, HD, KVH, CH, KT, LB)                                    \
+#define AD_ENTRY(NAME, HD, KVH, CH, G, KT, LB)                                 \
 extern "C" __global__ __launch_bounds__(HD, LB) void NAME(                     \
     const float* __restrict__ q,                                               \
     const KT* __restrict__ kc,                                                 \
@@ -5009,16 +5014,18 @@ extern "C" __global__ __launch_bounds__(HD, LB) void NAME(                     \
     int tk, int group, int cap, float scale, int scale_q, int chunks,         \
     signed char* __restrict__ qa, int asc_off, long q_off, long out_off)       \
 {                                                                              \
-    attn_decode_impl<HD, KVH, CH>(q, (const unsigned*)kc, (const unsigned*)vc, \
+    attn_decode_impl<HD, KVH, CH, G>(q, (const unsigned*)kc, (const unsigned*)vc, \
                                   out, part, ctr, tk, group, cap, scale,       \
                                   scale_q, chunks, qa, asc_off, q_off, out_off); \
 }
 
-AD_ENTRY(attn_decode_h128_c32,  128, true,  32,  unsigned short, 4)
-AD_ENTRY(attn_decode_h128,      128, true,  64,  unsigned short, 4)
-AD_ENTRY(attn_decode_h128_c128, 128, true,  128, unsigned short, 4)
-AD_ENTRY(attn_decode_h64,       64,  true,  64,  unsigned short, 8)
-AD_ENTRY(attn_decode_f64,       64,  false, 64,  float,          8)
+AD_ENTRY(attn_decode_h128_c32,  128, true,  32,  AD_GMAX, unsigned short, 4)
+AD_ENTRY(attn_decode_h128,      128, true,  64,  AD_GMAX, unsigned short, 4)
+AD_ENTRY(attn_decode_h128_c128, 128, true,  128, AD_GMAX, unsigned short, 4)
+AD_ENTRY(attn_decode_h64,       64,  true,  64,  AD_GMAX, unsigned short, 8)
+AD_ENTRY(attn_decode_h64_g8,    64,  true,  64,  8,       unsigned short, 8)
+AD_ENTRY(attn_decode_h64_g8_c32, 64,  true,  32,  8,       unsigned short, 8)
+AD_ENTRY(attn_decode_f64,       64,  false, 64,  AD_GMAX, float,          8)
 
 
 // ------------------------------------------- several rows, one weight stream

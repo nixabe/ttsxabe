@@ -1128,6 +1128,22 @@ chunks and an odd tail - the odd tail being the case where a packed value row's
 last word holds a position the softmax must have zeroed - and runs each twice
 through one scratch, because a counter left dirty merges too early or never.
 
+### The query group is a template parameter
+
+The kernel holds one query row a group in registers and in shared memory -
+`qr[G][EPL]`, `acc[G]`, `o[G]`, `qs[G * HD]`, `sc[G * CH]` - so the widest
+group it can serve is fixed when it is compiled. That was `AD_GMAX`, four,
+for every entry, which covers the Llama stages (groups of 4 and 1) and the
+Whisper decoder (1). CosyVoice3's speech LLM has 14 heads over 2, a group
+of seven, and rather than widen every entry - which would cost the h128
+entries registers they use - `G` is the fourth template parameter, the
+existing entries pass `AD_GMAX` and are unchanged, and `attn_decode_h64_g8`
+is instantiated at eight. Its scratch stride follows the entry's `G`, which
+the wrapper reads off the name. With two key-value heads the grid is only
+`chunks * 2` blocks, so the same entry exists at a 32-wide chunk too,
+`attn_decode_h64_g8_c32`, taken below 1024 of context; `docs/BENCHMARKS.md`
+has what each was worth.
+
 ### The chunk width is chosen by the context
 
 The kernel is a template on the chunk width as well as the head width, and

@@ -117,8 +117,11 @@ f16-exact; `docs/BENCHMARKS.md` has the round. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a
-bit-identical mel - 1.4x realtime to 4.4x. The speech LLM is now half of
-what is left and still streams f32 weights. This paragraph
+bit-identical mel - 1.4x realtime to 4.4x. The speech LLM then had its
+own round, to f16 weights and the chat model's f16 cache and fused decode
+attention, at a query group of seven the attention had to be widened for:
+4.6 to 2.6 ms a token, 5.7x realtime on the utterance, and an argmax that
+agrees with the f32 build at every teacher-forced position. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

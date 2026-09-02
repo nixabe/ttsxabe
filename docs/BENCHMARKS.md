@@ -2729,6 +2729,61 @@ tell from a bug without the oracle to hand. With the multiply and the add
 rounded separately the estimator is the same bits, and that identity is a
 sharper test than any tolerance.
 
+### The speech LLM: 4.6 to 2.6 ms a token, and a query group of seven
+
+With the flow on the card the speech LLM was half the utterance: 119
+decode steps at 4.6 ms, streaming 1.98 GB of f32 weight a token at the
+card's bandwidth through an attention chain of eleven launches a layer
+that rebuilt the whole key-value cache from f32 for every token. It runs
+the way the chat model does now. The weights are held at f16 - the
+prompt's tiled matmul staged them as f16 already, so the prompt's
+arithmetic did not change at all and its logits are bit for bit the f32
+build's; the decode mat-vec's did, from an exact f32 weight to an f16 one.
+The cache is f16 in the attention layout with a doubling capacity, written
+from `rope_cache_f16` and read by the fused decode attention; q, k and v
+are one stacked mat-vec and gate and up one batched product with
+`silu_mul_pair`. 346 launches a token became 274.
+
+Two things this model needed that the Llama stages did not. Its query
+group is seven - 14 heads over 2 - and the decode attention carried a
+compile-time maximum of four, so the group is a template parameter now,
+with the existing entries instantiated at four and unchanged, and a new
+entry at eight. And with two key-value heads the kernel's grid is
+`chunks * 2` blocks: at a context of 150 and a chunk of 64 that is six
+blocks on a 72-SM card, 23 µs a layer, so the wide-group entry has a
+32-wide chunk as well and takes it below 1024 of context - 14.8 µs a layer.
+
+Same sitting, alternated pairs, the flow-only build against this one:
+
+| | before | after |
+| --- | ---: | ---: |
+| speech LLM, a token | 4.59-4.61 ms | 2.63-2.65 ms |
+| speech LLM, the utterance | 546-549 ms (119 tokens) | 316-318 ms (120 tokens) |
+| flow | 446-450 ms | 444-447 ms |
+| utterance | 1070-1077 ms | 838-846 ms |
+
+**1.74x on the step**, 1.27x on the utterance; 4.4x realtime to 5.7x, and
+3.44 s to 0.84 s across the two rounds. The token count moved by one
+because the sampler read logits that differ at the third decimal, which
+is the approximation's whole visible effect.
+
+What the f16 decode is measured against, in the absence of the capture
+`tests/speech_llm.rs` wants: `examples/probe_llm.rs` writes the
+teacher-forced log-probabilities of every position from either build, over
+the sampled tokens of the f32 one, through both paths of `forward`. The
+prompt path agrees exactly. The decode path agrees on the argmax at all
+120 positions, with a worst log-probability difference of 1.0e-2 and a
+worst row correlation of 1.000000 - and the f32 build's own two paths
+differ from each other by 1.25e-2 on the same positions, so the
+approximation is inside the arithmetic noise the model already carried.
+That is a build-to-build bound and not the oracle's; when the capture is
+made, the oracle test is the one to trust.
+
+The step is 80% card-busy at 2.13 ms of kernels, 1.46 of them the
+mat-vecs at 0.99 GB a token, which is the memory system. What is left on
+the CPU side is 274 launches, and on the card side a weight stream that
+only a narrower weight would shorten.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,
