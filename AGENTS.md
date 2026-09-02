@@ -131,7 +131,10 @@ a thread per eight windows sharing every weight read, bit-identical, for
 1.04x more on Tacotron2 and **1.085x on VITS**, whose decoder is four of
 them - so the synthesiser's 1.24x against PyTorch above is now against an
 engine that is 1.085x faster than the one measured, and the ratio has not
-been re-taken. CosyVoice3 has since had
+been re-taken. The stride-one convolution then became an implicit
+matmul on the f32 cores, bit-identical, for **1.48x** on VITS and 1.03x on
+Tacotron2 - a kernel a peer session wrote and this one measured and
+committed; the ratio against PyTorch is further from re-taken still. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

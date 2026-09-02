@@ -13,6 +13,7 @@ exists.
 | relative-position self-attention | text encoder (window 4) | `xabe_dsp::self_attention` | `attention_scores` + `attention_context` | `xabe-dsp` relative_position + `xabe-tts` |
 | conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
 | conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
+| conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths) | `xabe-cuda` conv1d |
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` | `depthwise_conv1d` | `xabe-tts` duration |
 | transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` | `transposed_conv1d` | `xabe-tts` decoder |
 | leaky ReLU | decoder | `xabe_dsp::leaky_relu` | `act_leaky_relu` | `xabe-tts` decoder |
@@ -114,6 +115,17 @@ Two entries deserve a note:
   and ran at 0.6 TFLOP/s on WaveGlow's upsample, and this reads it once per
   eight, bit for bit the same sums - 4.6 ms to 0.97, and 1.085x on a VITS
   synthesis whose decoder is four of these.
+- **`conv1d_tiled` is the same convolution as an implicit matmul.** From 32
+  positions a stride-one convolution is computed as a `[out_ch, in_ch * k]`
+  by `[in_ch * k, out_t]` product on the f32 cores, the right operand
+  gathered from the input as it is staged: a block of 32 channels by 128,
+  64 or 32 positions, sixteen (channel, tap) pairs a trip through shared
+  memory, sixteen multiply-adds per staged value. The sums are `conv1d`'s
+  to the bit - bias first, pairs ascending, each an `fmaf` - so the same
+  differential test covers both, at eight shapes chosen to be ragged on
+  every axis, and both synthesisers' audio was byte-identical across the
+  change. 1.48x on a VITS synthesis and 1.03x on Tacotron2; see
+  `docs/BENCHMARKS.md`.
 - **`act_gelu` uses the device's `erff`,** which is IEEE-accurate, while the CPU
   twin carries Cody's rational approximation because Rust has no `erf`. Their
   test compares two different implementations of the same function, so

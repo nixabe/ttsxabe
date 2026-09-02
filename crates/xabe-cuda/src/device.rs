@@ -106,6 +106,9 @@ pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
 /// Output channels each convolution thread accumulates. Must match `OC_TILE`
 /// in the device source.
 const CONV_OC_TILE: u32 = 8;
+/// The tiled convolution's channels a block. Must match `CT_OC` in the
+/// device source; the positions a block are the entry's `4 * TX`.
+const CONV_TILE_OC: u32 = 32;
 
 /// Time positions each convolution thread accumulates. Must match `T_REG`.
 const CONV_T_REG: u32 = 4;
@@ -549,6 +552,9 @@ const RMS_THREADS: u32 = 1024;
 
 const NAMES: &[&str] = &[
     "conv1d",
+    "conv1d_tiled",
+    "conv1d_tiled_64",
+    "conv1d_tiled_32",
     "conv1d_short",
     "depthwise_conv1d",
     "transposed_conv1d",
@@ -1263,7 +1269,22 @@ impl Gpu {
             out_t as i32,
         );
         let null: u64 = 0;
-        let f = self.func(if long_form { "conv1d" } else { "conv1d_short" });
+        // From 32 positions the tiled kernel: an implicit matmul on the f32
+        // cores, exact, several times the direct kernel's rate, in the
+        // widest tile that still gives the card a block an SM slot. Below
+        // 32 a tile would be mostly padding and the direct kernel stays.
+        let oc_blocks = (out_ch as u32).div_ceil(CONV_TILE_OC);
+        let tile = [128u32, 64, 32]
+            .into_iter()
+            .find(|&w| out_t as u32 >= w && oc_blocks * (out_t as u32).div_ceil(w) >= 144)
+            .or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
+        let f = self.func(match (tile, long_form) {
+            (Some(128), _) => "conv1d_tiled",
+            (Some(64), _) => "conv1d_tiled_64",
+            (Some(_), _) => "conv1d_tiled_32",
+            (None, true) => "conv1d",
+            (None, false) => "conv1d_short",
+        });
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(w);
         match bias {
@@ -1278,6 +1299,19 @@ impl Gpu {
             .arg(&e)
             .arg(&g)
             .arg(&h);
+        if let Some(width) = tile {
+            let cfg = LaunchConfig {
+                grid_dim: (oc_blocks, (out_t as u32).div_ceil(width), 1),
+                block_dim: (width * 2, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: a block owns 32 channels by `width` positions with
+            // `width / 4` lanes by eight, and every global read and write
+            // inside is bounds checked against `t`, `out_ch`, `out_t` and
+            // `in_ch * k`.
+            launched("conv1d_tiled", unsafe { lb.launch(cfg) })?;
+            return Ok(out_t);
+        }
         // The tiled kernel's launch shape: one block per (output-channel tile,
         // time tile), with the input window in dynamic shared memory.
         let span = dilation * (k - 1) + 1;

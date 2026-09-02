@@ -2789,6 +2789,43 @@ runs, worst on each side: **46.25 ms to 42.64**, 56.4x realtime to 61.1x,
 re-run; the 1.24x there is against the engine as it was, and this is
 1.085x on top of that engine, not a new ratio against the reference.
 
+### The stride-one convolution as an implicit matmul: 1.48x on VITS, 1.03x on Tacotron2
+
+`conv1d` was a thread per output tile fetching a weight from global memory
+for every four multiply-adds, and on the VITS decoder's residual blocks -
+256 channels, kernels of 3, 7 and 11 over 1300 positions - it ran at
+about 1 TFLOP/s. A stride-one convolution is a `[out_ch, in_ch * k]`
+by `[in_ch * k, out_t]` product whose right operand is gathered from the
+input rather than materialised, and `conv1d_tiled` computes it that way
+on the f32 cores: a block owns 32 channels by 128, 64 or 32 positions,
+each thread 4 by 4, and sixteen (channel, tap) pairs of both operands
+are staged through shared memory a trip, so every staged value feeds
+sixteen multiply-adds. The wrapper takes the widest tile that still
+gives the card a block an SM slot and keeps the direct kernel under 32
+positions, where a tile would be mostly padding. The sums are the direct
+kernel's to the bit - bias first, pairs ascending, each an `fmaf` - and
+both synthesisers' WAVs were compared byte for byte against the previous
+commit's engine: identical.
+
+The kernel was written by a peer session (ttsxabe-15) that ended before
+committing it; the measurements here are this session's. Same sitting,
+GPU 2, alternated in pairs, the worse pair on each side:
+
+| Model | Line | Before | After | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| `mms-tts-nan`, `xabe-tts-bench` default text, 3 x 20 runs | | 42.46 ms | 28.64 ms | **1.48x** |
+| Tacotron2 | `Tâi-lâm ū chiok chē hó-chia̍h--ê,` (206 steps) | 106.1 ms | 103.0 ms | 1.03x |
+| Tacotron2 | `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` (397) | 187.4 ms | 182.2 ms | 1.03x |
+| Tacotron2 | `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` (513) | 240.1 ms | 232.7 ms | 1.03x |
+
+On Tacotron2 the stages that moved are the ones that are convolutions:
+the encoder 3.2 ms to 2.1, the location attention 8.1 to 5.9 and the
+postnet 2.2 to 0.74 on the first line; the WaveGlow coupling, which is
+a dilated convolution through `im2col` and the tiled `gemm`, is
+untouched. The VITS synthesis is 28.6 ms for 2.6 s of audio, about 91x
+realtime by the earlier run's audio length; the PyTorch ratio at the top
+of this file was again not re-taken.
+
 ### A measurement trap in the harness itself
 
 The per-stage breakdown attributed 23.9 ms to `coupling_inverse`, a kernel that

@@ -2654,6 +2654,137 @@ extern "C" __global__ void conv1d(
     conv1d_body<8, 4>(x, w, bias, out, in_ch, t, out_ch, k, pad_left, dilation, out_t, sx);
 }
 
+// ------------------------------------------------ the tiled convolution
+//
+// `conv1d_tiled`: a stride-one convolution as an implicit matmul on the f32
+// cores, exact. Output channel `o` at position `p` is `bias[o]` plus the
+// products over every (input channel, tap) pair `kk = ic * k + tap` of
+// `w[o][ic][tap]` and `x[ic][p + tap * dilation - pad_left]`, zero outside
+// the sequence - which is a `[out_ch, K] x [K, out_t]` product whose right
+// operand is gathered from the input rather than materialised. A block
+// owns 32 channels by `4 * TX` positions and each thread 4 by 4, staging
+// 16 pairs of both operands through shared memory a trip, so every staged
+// value feeds sixteen multiply-adds where the thread-per-tile kernel
+// below fetched a weight from global memory for each four. On the VITS
+// decoder's residual blocks - 256 channels, kernels of 3, 7 and 11 - the
+// direct kernel ran at about 1 TFLOP/s and this runs at several times
+// that; docs/BENCHMARKS.md has the figure.
+//
+// Three widths of tile, 128, 64 and 32 positions, because the same
+// model runs this at 256 channels over 1300 positions - eighty blocks
+// of the widest, one an SM - and at 192 channels over sixty, where a
+// wide tile is mostly padding. The wrapper picks the widest that still
+// fills the card.
+//
+// The sums are bit for bit the direct kernel's: bias first, then the
+// pairs in ascending `kk` - channel by channel, taps ascending - each as
+// `fmaf(x, w, acc)`. Pairs past `K` and positions outside the sequence
+// stage as zero, and `fmaf(0, w, acc)` is `acc`. So the output is the
+// same numbers, and both synthesisers' audio was compared against the
+// previous binary to check it.
+#define CT_OC 32
+#define CT_KK 16
+// The weight tile's row stride, padded so the transposed staging store
+// spreads across banks and each row stays 16-byte aligned.
+#define CT_WS 36
+template <int TX>
+__device__ __forceinline__ void conv1d_tiled_body(
+    const float* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)
+{
+    constexpr int CT_T = 4 * TX;
+    constexpr int THREADS = 8 * TX;
+    __shared__ __align__(16) float Ws[CT_KK][CT_WS];
+    __shared__ __align__(16) float Xs[CT_KK][CT_T];
+    const int tid = threadIdx.x;
+    const int tx = tid % TX, ty = tid / TX;
+    const int oc0 = blockIdx.x * CT_OC;
+    const int t0 = blockIdx.y * CT_T;
+    const int oc = oc0 + ty * 4;
+    const int tt = t0 + tx * 4;
+    const int K = in_ch * k;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const float b = (bias && oc + a < out_ch) ? bias[oc + a] : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[a][j] = b;
+    }
+
+    // Staging roles. Weights: sixteen lanes read sixteen consecutive pairs
+    // of one channel's row and store them transposed, as many rows a pass
+    // as the block has sixteens. Input: `TX` lanes stage one pair's
+    // positions, four a lane, two pairs a lane.
+    const int w_oc = tid >> 4, w_kk = tid & 15;
+    for (int kk0 = 0; kk0 < K; kk0 += CT_KK) {
+        #pragma unroll
+        for (int h = 0; h < CT_OC * 16 / THREADS; ++h) {
+            const int o = w_oc + (THREADS / 16) * h;
+            const int kk = kk0 + w_kk;
+            float v = 0.0f;
+            if (oc0 + o < out_ch && kk < K) v = w[(size_t)(oc0 + o) * K + kk];
+            Ws[w_kk][o] = v;
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int kr = ty + 8 * h;
+            const int kk = kk0 + kr;
+            const int ic = kk / k;
+            const int tap = kk - ic * k;
+            const float* xr = x + (size_t)ic * t;
+            const int base = tt + tap * dilation - pad_left;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int src = base + j;
+                float v = 0.0f;
+                if (kk < K && src >= 0 && src < t) v = xr[src];
+                Xs[kr][tx * 4 + j] = v;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < CT_KK; ++kk) {
+            const float4 wv = *(const float4*)&Ws[kk][ty * 4];
+            const float4 xv = *(const float4*)&Xs[kk][tx * 4];
+            const float wa[4] = {wv.x, wv.y, wv.z, wv.w};
+            const float xa[4] = {xv.x, xv.y, xv.z, xv.w};
+            #pragma unroll
+            for (int a = 0; a < 4; ++a) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[a][j] = fmaf(xa[j], wa[a], acc[a][j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        if (oc + a >= out_ch) break;
+        float* orow = out + (size_t)(oc + a) * out_t;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (tt + j < out_t) orow[tt + j] = acc[a][j];
+        }
+    }
+}
+
+#define CONV_TILED_ENTRY(NAME, TX)                                                      \
+    extern "C" __global__ __launch_bounds__(8 * TX) void NAME(                          \
+        const float* __restrict__ x, const float* __restrict__ w,                       \
+        const float* __restrict__ bias, float* __restrict__ out,                        \
+        int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)     \
+    {                                                                                   \
+        conv1d_tiled_body<TX>(x, w, bias, out, in_ch, t, out_ch, k, pad_left,           \
+                              dilation, out_t);                                         \
+    }
+CONV_TILED_ENTRY(conv1d_tiled, 32)
+CONV_TILED_ENTRY(conv1d_tiled_64, 16)
+CONV_TILED_ENTRY(conv1d_tiled_32, 8)
+
 // For sequences too short to fill a four-deep time tile. The text encoder runs
 // over 69 symbols and the flow over a couple of hundred frames; at T_REG = 4
 // three quarters of every thread's arithmetic would fall past the end.

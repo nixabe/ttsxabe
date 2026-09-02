@@ -139,6 +139,17 @@ fn conv1d_matches_at_every_awkward_shape() {
         (4, 23, 6, 3, 3, true),
         (4, 23, 6, 3, 9, true),
         (16, 64, 32, 7, 1, true),
+        // From 128 positions the tiled kernel: ragged channels both sides,
+        // a tail of the pair count, an even kernel, wide dilation, no bias.
+        (5, 301, 37, 3, 1, true),
+        (7, 1000, 40, 11, 5, true),
+        (33, 517, 3, 7, 3, false),
+        (2, 129, 65, 4, 1, true),
+        (64, 700, 64, 3, 1, true),
+        // The narrower tiles: 32 and 64 positions, ragged.
+        (16, 45, 40, 5, 1, true),
+        (3, 100, 9, 3, 2, false),
+        (192, 61, 768, 3, 1, true),
     ] {
         let x = seq(in_ch * t, 1);
         let w = seq(out_ch * in_ch * k, 2);
