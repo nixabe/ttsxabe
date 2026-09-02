@@ -3173,6 +3173,32 @@ is mostly its own floor. The chat model folds those four into the
 projections' tails with `gemv_norm`, which exists only for packed
 weights; the f16 twin is the next round.
 
+### The speech LLM's closing projections carry their norms: 2.60 to 2.32 ms a token
+
+After the sampler the step was the card's: eleven launches a layer at one
+token, four of them the two residual adds and the two `rms_norm`s that
+follow the attention output and the MLP down projections, each under four
+microseconds and each mostly its own floor. The chat model folds those
+into the projections' tails with `gemv_norm`, which reads a packed weight
+and an int8 activation; the speech LLM holds f16 weights and quantizes
+nothing, so it needed the f16 twin - `gemv_norm_f16`, the same tail on
+`gemv`'s f16 column product, in `docs/KERNELS.md`. Seven launches a layer
+now, the down projection's tail making the next layer's first normalised
+row and the last one the final norm's.
+
+GPU 2, the nine-run harness, two alternated pairs, the c783811 build
+against this one, worst median each side, and the utterance's token
+sequence identical between them:
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| speech LLM step, harness median | 2.60 ms/token | 2.32 ms/token | 1.12x |
+
+Against the 2.61 the sampler's round started from, the step is 1.12x
+over the two rounds together. What is left: the decode attention at
+about 18 µs a layer over 131 positions, which is a fixed cost the chunk
+width does not reach, and the weight stream itself at 1.2 ms a token.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

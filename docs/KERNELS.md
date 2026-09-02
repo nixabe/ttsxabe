@@ -49,6 +49,7 @@ exists.
 | mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
 | rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
 | mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `xabe_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `xabe-cuda` quant |
+| the same, for an f16 weight and no twin | CosyVoice3 speech LLM, decode | the mat-vec, then `xabe_dsp::rms_norm` | `gemv_norm_f16` | `xabe-cuda` quant |
 | f16 mat-vec with the residual add and the next layer normalisation in its tail | ASR decode | the mat-vec, then `xabe_dsp::layer_norm_add` | `gemv_ln` | `xabe-cuda` kernels |
 | stacked q/k/v mat-vec, placed into the caches | ASR decode | `gemv_into` three times, in the test | `gemv_qkv_f16` | `xabe-cuda` kernels |
 | packed mat-vec over several int8 rows, one weight stream | the translator, batched decode | `gemv` a row at a time, in the test | `gemv_q_rows2`, `gemv_q_rows3`, `gemv_q_rows4` | `xabe-cuda` quant |
@@ -1380,6 +1381,20 @@ activation lifted out character for character, so that "bit for bit against
 the chain" is a property of the code rather than of a test that happened to
 pass. Thirteen launches a layer became eight. `docs/BENCHMARKS.md` has what
 that is worth under "The decoder's round".
+
+`gemv_norm_f16` is the third of the family: `gemv_norm`'s tail - the
+partials a slot a block, the fixed tree, the RMS scale, the row four
+columns a thread - on `dot_f16_row`'s column product, with an optional
+bias and no int8 twin. It is what CosyVoice3's speech LLM decodes with:
+every projection there is held at f16 and no activation is quantized, so
+neither `gemv_norm` nor `gemv_ln` fit, and its two closing projections
+were each followed by an add and an `rms_norm`, eleven launches a layer
+at one token where seven would do. `h` is held at exact equality against
+`gemv_batched` then `add_inplace` and the row within `1e-5` of the CPU
+twin at the model's two closing shapes, with and without a bias; the odd
+contraction, the row that is not four wide and the short bias are
+refused. The speech LLM's token sequence on the benchmark utterance is
+identical with and without it, and `docs/BENCHMARKS.md` has the step.
 
 ## Several rows, one weight stream: `gemv_q_rows`
 

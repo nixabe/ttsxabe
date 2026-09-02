@@ -1,7 +1,7 @@
 //! CosyVoice3's speech language model: Qwen2 0.5 B, text in, speech tokens out.
 
 use crate::{CosyError, LlmConfig};
-use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, Operand};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, NormScratch, Operand};
 use xabe_st::StFile;
 
 /// One `[out, in]` matrix on the device, with the bias Qwen2 puts on `q`, `k`
@@ -113,6 +113,9 @@ pub struct Cache {
     /// The fused decode attention's partials and counter; per cache so two
     /// utterances decoding by turns never share one.
     scratch: DecodeScratch,
+    /// The norm-fused mat-vec's partials and counter, for the same reason;
+    /// see `Gpu::gemv_norm_f16`.
+    norm_scratch: NormScratch,
 }
 
 impl Cache {
@@ -278,6 +281,7 @@ impl SpeechLlm {
             cap: 0,
             len: 0,
             scratch: DecodeScratch::new(),
+            norm_scratch: NormScratch::new(),
         }
     }
 
@@ -414,10 +418,19 @@ impl SpeechLlm {
         let mut h = unsafe { self.gpu.uninit(n * h_dim) }?;
         self.gpu.copy_into(&mut h, x, 0, n * h_dim)?;
 
+        // At one position the projection that closes each sub-layer carries
+        // the residual add and the next normalisation in its tail - see
+        // `Gpu::gemv_norm_f16` - so the normalised row the next sub-layer
+        // reads is already made when the loop comes round. `pending` is
+        // that row, and `None` where the chain made it.
+        let mut pending: Option<CudaSlice<f32>> = None;
         for (i, l) in self.layers.iter().enumerate() {
-            let xn = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.attn_norm, LlmConfig::RMS_EPS)?;
+            let xn = match pending.take() {
+                Some(x) => x,
+                None => self
+                    .gpu
+                    .rms_norm(&h, n, h_dim, &l.attn_norm, LlmConfig::RMS_EPS)?,
+            };
             if first {
                 cache.k.push(self.gpu.zeros_f16(cap * kv_dim)?);
                 cache.v.push(self.gpu.zeros_f16(cap * kv_dim)?);
@@ -555,12 +568,27 @@ impl SpeechLlm {
                 )?;
                 self.gpu.merge_heads(&ctx, n, heads, hd)?
             };
-            let out = self.project(Operand::F32(&ctx), &l.o, n)?;
-            self.gpu.add_inplace(&mut h, &out, n * h_dim)?;
-
-            let xn = self
-                .gpu
-                .rms_norm(&h, n, h_dim, &l.ffn_norm, LlmConfig::RMS_EPS)?;
+            let xn = if n == 1 {
+                // The output projection with the residual add and the MLP's
+                // normalisation in its tail: one launch where there were
+                // three.
+                self.gpu.gemv_norm_f16(
+                    &l.o.w,
+                    &ctx,
+                    l.o.bias.as_ref(),
+                    l.o.in_dim,
+                    l.o.out_dim,
+                    &mut h,
+                    &l.ffn_norm,
+                    LlmConfig::RMS_EPS,
+                    &mut cache.norm_scratch,
+                )?
+            } else {
+                let out = self.project(Operand::F32(&ctx), &l.o, n)?;
+                self.gpu.add_inplace(&mut h, &out, n * h_dim)?;
+                self.gpu
+                    .rms_norm(&h, n, h_dim, &l.ffn_norm, LlmConfig::RMS_EPS)?
+            };
             // Gate and up as one batched product over the stacked weight -
             // `[2, n, inter]` out - and the gating written over the first
             // half, which is where the down projection reads.
@@ -581,14 +609,37 @@ impl SpeechLlm {
                 inter,
             )?;
             let _twin = self.gpu.silu_mul_pair(&mut gu, n, inter)?;
-            let down = self.project(Operand::F32(&gu), &l.down, n)?;
-            self.gpu.add_inplace(&mut h, &down, n * h_dim)?;
+            if n == 1 {
+                // The down projection likewise, with the next layer's first
+                // normalisation - or the final one - in its tail.
+                let next = self
+                    .layers
+                    .get(i + 1)
+                    .map_or(&self.norm, |nl| &nl.attn_norm);
+                pending = Some(self.gpu.gemv_norm_f16(
+                    &l.down.w,
+                    &gu,
+                    l.down.bias.as_ref(),
+                    l.down.in_dim,
+                    l.down.out_dim,
+                    &mut h,
+                    next,
+                    LlmConfig::RMS_EPS,
+                    &mut cache.norm_scratch,
+                )?);
+            } else {
+                let down = self.project(Operand::F32(&gu), &l.down, n)?;
+                self.gpu.add_inplace(&mut h, &down, n * h_dim)?;
+            }
         }
         cache.len = past + n;
 
-        let h = self
-            .gpu
-            .rms_norm(&h, n, h_dim, &self.norm, LlmConfig::RMS_EPS)?;
+        let h = match pending {
+            Some(x) => x,
+            None => self
+                .gpu
+                .rms_norm(&h, n, h_dim, &self.norm, LlmConfig::RMS_EPS)?,
+        };
         Ok(self.gpu.gemm_batched(
             Operand::F32(&h),
             Operand::F16(&self.decoder),

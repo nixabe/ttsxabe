@@ -5842,6 +5842,134 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm(
     }
 }
 
+// `gemv_norm` for an f16 weight and an f32 activation, without the twin.
+//
+// The same tail on a different column product: `dot_f16_row`, which is the
+// f16 branch of `gemv` for an f32 activation, so the column lands in `h`
+// bit for bit as `gemv` then `add` would. What it serves is a model whose
+// projections are held at f16 and whose activations are never quantized -
+// CosyVoice3's speech LLM - where the two closing projections of a layer
+// were each followed by an add and an rms norm, eleven launches a layer at
+// one token where seven would do. `bias` may be null; Qwen2's closing
+// projections have none, but the kernel does not assume it.
+//
+// The reduction is `gemv_norm`'s exactly: partials in a fixed tree, the last
+// block to arrive normalising the whole row, and the counter left at zero.
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm_f16(
+    const unsigned* __restrict__ w,
+    const float* __restrict__ a,
+    const float* __restrict__ bias,
+    int k, int n,
+    float* h,
+    const float* __restrict__ weight, float eps,
+    float* __restrict__ x,
+    float* __restrict__ part, unsigned* __restrict__ ctr)
+{
+    constexpr int T = GEMV_WARPS * 32;
+    __shared__ float red[GEMV_WARPS];
+    __shared__ float tree[T];
+    __shared__ int last;
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int col = blockIdx.x * GEMV_WARPS + warp;
+    const int kh = k >> 1;
+
+    // The residual element this warp will add to, fetched before the
+    // contraction so its round trip hides under the weight stream.
+    const float h0 = (lane == 0 && col < n) ? h[col] : 0.0f;
+    const float b = (lane == 0 && col < n && bias) ? bias[col] : 0.0f;
+    float acc = 0.0f;
+    if (col < n) {
+        acc = dot_f16_row(a, w + (size_t)col * kh, kh);
+    }
+    // The residual add - `h + (acc + bias)`, the order `gemv`'s epilogue
+    // and then `add_inplace` take - and this column's share of the sum of
+    // squares.
+    float sq = 0.0f;
+    if (lane == 0 && col < n) {
+        const float s = h0 + (acc + b);
+        h[col] = s;
+        sq = s * s;
+    }
+    if (lane == 0) {
+        red[warp] = sq;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GEMV_WARPS; ++i) {
+            s += red[i];
+        }
+        part[blockIdx.x] = s;
+        __threadfence();
+        last = (atomicAdd(ctr, 1u) == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // The partials in a fixed order - see `gemv_norm`.
+    float s = 0.0f;
+    {
+        constexpr int PL = 4;
+        for (int i0 = tid; i0 < (int)gridDim.x; i0 += PL * T) {
+            float pv[PL];
+            #pragma unroll
+            for (int e = 0; e < PL; ++e) {
+                const int i = i0 + e * T;
+                pv[e] = (i < (int)gridDim.x) ? ld_cg(part + i) : 0.0f;
+            }
+            #pragma unroll
+            for (int e = 0; e < PL; ++e) {
+                s += pv[e];
+            }
+        }
+    }
+    tree[tid] = s;
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tree[tid] += tree[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(tree[0] / (float)n + eps);
+
+    // The normalised row, four columns a thread, `NL` groups loaded before
+    // any is used. `n` is a multiple of 4, which the wrapper checks.
+    const int n4 = n >> 2;
+    constexpr int NL = 4;
+    for (int i0 = tid; i0 < n4; i0 += NL * T) {
+        float4 hv[NL], wv[NL];
+        #pragma unroll
+        for (int e = 0; e < NL; ++e) {
+            const int i = i0 + e * T;
+            if (i < n4) {
+                hv[e] = ld_cg4(h + (i << 2));
+                wv[e] = *((const float4*)weight + i);
+            }
+        }
+        #pragma unroll
+        for (int e = 0; e < NL; ++e) {
+            const int i = i0 + e * T;
+            if (i < n4) {
+                float4 y;
+                y.x = hv[e].x * scale * wv[e].x;
+                y.y = hv[e].y * scale * wv[e].y;
+                y.z = hv[e].z * scale * wv[e].z;
+                y.w = hv[e].w * scale * wv[e].w;
+                *((float4*)x + i) = y;
+            }
+        }
+    }
+    if (tid == 0) {
+        *ctr = 0u;
+    }
+}
+
 // Gathers rows of a block-quantized embedding table, unpacking as it goes.
 //
 // The one tensor of a packed checkpoint that is not a matmul operand. It was

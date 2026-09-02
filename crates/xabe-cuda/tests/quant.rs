@@ -1047,3 +1047,91 @@ fn several_rows_against_a_packed_weight_are_the_rows_one_at_a_time() {
         }
     }
 }
+
+/// `gemv_norm_f16` against the chain it replaces: the f16 mat-vec, the
+/// residual add and `rms_norm`, at the speech LLM's two closing shapes and
+/// a ragged block count, with and without a bias.
+#[test]
+fn the_f16_norm_fused_mat_vec_is_the_chain() {
+    let Some(g) = gpu() else { return };
+    let eps = 1e-6;
+    for (k, n, with_bias) in [(896, 896, false), (4864, 896, true), (64, 132, true)] {
+        let a = seq(k, 3);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let h0 = seq(n, 5);
+        let nw: Vec<f32> = (0..n).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i % 5) as f32 * 0.25 - 0.5).collect();
+
+        let da = g.upload(&a).unwrap();
+        let dw = g.upload_f16(&w).unwrap();
+        let dnw = g.upload(&nw).unwrap();
+        let db = g.upload(&bias).unwrap();
+        let b = with_bias.then_some(&db);
+
+        // The chain on the card: `h` after `gemv` and `add_inplace` is the
+        // number the fused kernel must land bit for bit.
+        let out = g
+            .gemm_batched(
+                Operand::F32(&da),
+                Operand::F16(&dw),
+                b,
+                Batch::single(n),
+                1,
+                k,
+                n,
+            )
+            .expect("the chain's mat-vec");
+        let mut h_chain = g.upload(&h0).unwrap();
+        g.add_inplace(&mut h_chain, &out, n).unwrap();
+        let h_want = g.download(&h_chain).unwrap();
+        let x_want = xabe_dsp::rms_norm(&h_want, 1, n, &nw, eps);
+
+        let mut scratch = NormScratch::new();
+        // Twice through one scratch: the counter must come back to zero.
+        for pass in 0..2 {
+            let mut h = g.upload(&h0).unwrap();
+            let x = g
+                .gemv_norm_f16(&dw, &da, b, k, n, &mut h, &dnw, eps, &mut scratch)
+                .expect("gemv_norm_f16");
+            assert_eq!(
+                h_want,
+                g.download(&h).unwrap(),
+                "k {k} n {n} bias {with_bias} pass {pass}: the residual stream differs"
+            );
+            let x_got = g.download(&x).unwrap();
+            for i in 0..n {
+                assert!(
+                    (x_want[i] - x_got[i]).abs() <= 1e-5 + 1e-5 * x_want[i].abs(),
+                    "k {k} n {n} bias {with_bias} pass {pass}: x[{i}] is {} wanted {}",
+                    x_got[i],
+                    x_want[i]
+                );
+            }
+        }
+    }
+
+    // Refusals: an odd contraction, a row that is not four wide, a short bias.
+    let da = g.upload(&seq(6, 1)).unwrap();
+    let dw = g.upload_f16(&seq(6 * 8, 2)).unwrap();
+    let dnw = g.upload(&seq(8, 1)).unwrap();
+    let mut h = g.upload(&seq(8, 1)).unwrap();
+    let mut s = NormScratch::new();
+    assert!(
+        g.gemv_norm_f16(&dw, &da, None, 5, 8, &mut h, &dnw, 1e-6, &mut s)
+            .is_err()
+    );
+    assert!(
+        g.gemv_norm_f16(&dw, &da, None, 6, 6, &mut h, &dnw, 1e-6, &mut s)
+            .is_err()
+    );
+    let short = g.upload(&seq(4, 1)).unwrap();
+    assert!(
+        g.gemv_norm_f16(&dw, &da, Some(&short), 6, 8, &mut h, &dnw, 1e-6, &mut s)
+            .is_err()
+    );
+    let _ = g
+        .gemv_norm_f16(&dw, &da, None, 6, 8, &mut h, &dnw, 1e-6, &mut s)
+        .expect("the sane shape");
+}

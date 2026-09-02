@@ -569,6 +569,7 @@ const NAMES: &[&str] = &[
     "flash_attn_64",
     "gemv",
     "gemv_norm",
+    "gemv_norm_f16",
     "gemv_q_rows2",
     "gemv_q_rows3",
     "gemv_q_rows4",
@@ -3842,6 +3843,97 @@ impl Gpu {
         // checked above, and the counter is left at zero for the next call.
         launched("gemv_norm", unsafe { lb.launch(cfg) })?;
         Ok((x, xq))
+    }
+
+    /// [`Self::gemv_norm`] for an f16 weight and an f32 activation, with no
+    /// twin: `h += w · a + bias`, then `x = rms_norm(h) * weight`, in one
+    /// launch. See `gemv_norm_f16` in the kernels.
+    ///
+    /// The shape CosyVoice3's speech LLM decodes with, where every
+    /// projection is held at f16 and no activation is quantized. `k` must
+    /// be even - the weight is read in words of two halves - and `n` a
+    /// multiple of four, which is the row's store width; both are refused
+    /// by name. The column product is `gemv`'s f16 branch and the row
+    /// lands in `h` as `gemv` then `add_inplace` would leave it; the norm's
+    /// scale is summed in a fixed order that is not `rms_norm`'s, so `x`
+    /// can differ from the chain's by an ulp, and the test holds both to
+    /// the CPU twin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_f16(
+        &self,
+        w: &CudaSlice<u16>,
+        a: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        k: usize,
+        n: usize,
+        h: &mut CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+        scratch: &mut NormScratch,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        if !n.is_multiple_of(4) {
+            return Err(CudaError::RaggedBlock { k: n, block: 4 });
+        }
+        if w.len() < n * k / 2 {
+            return Err(CudaError::SliceOverrun {
+                at: n * k / 2,
+                len: w.len(),
+            });
+        }
+        if a.len() < k {
+            return Err(CudaError::SliceOverrun {
+                at: k,
+                len: a.len(),
+            });
+        }
+        let short = bias.is_some_and(|b| b.len() < n);
+        if h.len() < n || weight.len() < n || short {
+            return Err(CudaError::SliceOverrun {
+                at: n,
+                len: h.len().min(weight.len()).min(bias.map_or(n, |b| b.len())),
+            });
+        }
+        let blocks = n.div_ceil(kernels::GEMV_WARPS as usize);
+        self.norm_counter(scratch)?;
+        if scratch.blocks < blocks || scratch.part.is_none() {
+            // SAFETY: every partial is written by its block before the last
+            // block reads it, and only `blocks` of them are read.
+            scratch.part = Some(unsafe { self.uninit(blocks) }?);
+            scratch.blocks = blocks;
+        }
+        let part = scratch.part.as_mut().expect("allocated above");
+        let ctr = scratch.ctr.as_mut().expect("allocated above");
+        // SAFETY: the last block writes every one of the `n` outputs.
+        let mut x = unsafe { self.uninit(n) }?;
+        let null: u64 = 0;
+        let (ki, ni) = (k as i32, n as i32);
+        let f = self.func("gemv_norm_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(w).arg(a);
+        match bias {
+            Some(b) => lb.arg(b),
+            None => lb.arg(&null),
+        };
+        lb.arg(&ki)
+            .arg(&ni)
+            .arg(h)
+            .arg(weight)
+            .arg(&eps)
+            .arg(&mut x)
+            .arg(part)
+            .arg(ctr);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, kernels::GEMV_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the grid covers every column once, every read is bounds
+        // checked above, and the counter is left at zero for the next call.
+        launched("gemv_norm_f16", unsafe { lb.launch(cfg) })?;
+        Ok(x)
     }
 
     /// [`Self::embed_scaled`] off a table that stays in its checkpoint's

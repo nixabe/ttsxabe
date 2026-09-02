@@ -153,8 +153,12 @@ kernel - 409 ms to 276, **1.48x**, oracle tests unchanged. And the
 speech LLM's sampler was found sorting the whole 6761-way head for the
 first 25 of it, 198 µs a token on the host, a tenth of the step: a
 partial selection under the same comparator is the same draw to the
-bit, and the step is 2.61 to 2.49 ms a token for it. The utterance is
-832 ms to 675 across those rounds, 7.8x realtime. This paragraph
+bit, and the step is 2.61 to 2.49 ms a token for it; its two closing
+projections then took their residual adds and norms into their tails
+through an f16 twin of the chat model's `gemv_norm`, seven launches a
+layer from eleven, for 2.32 ms a token with the token sequence unchanged.
+The utterance is 832 ms to 675 across the first two of those rounds,
+7.8x realtime, and not re-taken after the third. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.
