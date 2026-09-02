@@ -136,6 +136,42 @@ schedule around and this does not. So the heading still holds: three stages
 have a cache, none of them has a scheduler, and nothing here shares a prefix
 between calls.
 
+## The gap between two clauses is the page's, not the pipeline's
+
+A reply is spoken clause by clause, and a listener sometimes heard a pause in
+the middle of one - a second of nothing, then the rest. The obvious suspect is
+the pipeline, since `translate_ahead` is 0 whenever the translator and the
+synthesiser share a card: one permit, taken before a clause is translated and
+released only after it has been spoken, so a turn runs strictly translate,
+speak, translate, speak. That is a real serialisation and it is worth knowing
+about. It is not what the listener was hearing.
+
+Measured, all four stages on one Quadro RTX 8000, a three-clause reply:
+
+| Clause | Translate | Synthesise | Audio it produced | Arrived |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 534 ms | 26 ms | 2.11 s | 0.76 s |
+| 2 | 551 ms | 26 ms | 2.13 s | 1.35 s |
+| 3 | 935 ms | 38 ms | 5.68 s | 2.38 s |
+
+The whole reply - 9.9 seconds of audio - is on the wire 2.4 seconds in, before
+the first clause has finished playing. The serial pipeline keeps up because a
+clause takes about half a second to produce and buys two seconds of speech, and
+the default is left alone on that evidence rather than changed on the theory.
+
+The gap was in `static/index.html`. Its playback loop decoded a chunk only
+after awaiting the previous chunk's `onended`, then called `start()` with no
+argument - so between two clauses there was nothing playing for as long as the
+next chunk's base64 decode and `decodeAudioData` took, plus at least one
+event-loop turn, and longer whenever the main thread was busy capturing
+microphone audio. Chunks are now decoded as they arrive and each is started at
+the exact time the previous one ends, on the AudioContext's clock, which it
+honours to the sample.
+
+The lesson is the ordinary one about where to measure: the server's own
+`chunk spoken` log said 0.5 s of work per 2 s of speech, and no amount of
+staring at the translator would have found a browser scheduling gap.
+
 ## Crate boundaries
 
 Dependencies point one way, and the direction is the point: a crate must be

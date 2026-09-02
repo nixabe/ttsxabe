@@ -64,6 +64,9 @@ const $=s=>document.querySelector(s);
 const log=$("#log"), dot=$("#dot"), hint=$("#hint");
 let ws, ctx, stream, node, src, recording=false, buf=[], vadOn=true;
 let speaking=false, queue=[], playing=false, curBot=null, micOK=false;
+// When everything scheduled so far finishes, on the AudioContext's own clock,
+// and the timer that clears the mic gate at that moment. See drain().
+let playAt=0, quiet=null;
 
 // Turn-taking policy. These numbers are NOT defined here: the server sends them
 // with /api/config and they are unit-tested there against recorded traces. The
@@ -128,7 +131,14 @@ function connect(){
     }
     else if(m.type==="audio"){
       queue.push(m); drain();
-      if(curBot && m.taigi) meta(curBot, `台語 ${m.taigi}\n羅馬字 ${m.roman}`);
+      // Every clause of the reply, not just the newest. This used to replace
+      // the line each time, so a three-clause answer showed its third clause
+      // and looked truncated whether or not it was.
+      if(curBot && (m.taigi || m.roman)){
+        curBot._taigi = (curBot._taigi || []).concat(m.taigi || m.roman);
+        curBot._roman = (curBot._roman || []).concat(m.roman);
+        meta(curBot, `台語 ${curBot._taigi.join(" ")}\n羅馬字 ${curBot._roman.join(" ")}`);
+      }
     }
     else if(m.type==="done"){
       hint.textContent = m.first_audio_ms
@@ -163,13 +173,31 @@ function playViaTag(bytes){                 // fallback when WebAudio is unavail
   });
 }
 
+// Schedules the reply's chunks back to back on the AudioContext's clock.
+//
+// This used to decode a chunk and then await its `onended` before touching the
+// next one, so the gap between two clauses was however long the next chunk's
+// base64 and decodeAudioData took, plus at least one event-loop turn - and it
+// grew when the main thread was busy capturing microphone audio. The server is
+// not what a listener waits on here: measured on one card it delivered 9.9 s of
+// audio in 2.35 s, the whole reply arriving before the first clause had
+// finished playing. So the chunks are decoded as they arrive and each one is
+// started at `playAt`, the moment the previous one ends, which the audio clock
+// honours to the sample.
+//
+// `draining` guards re-entry; `playing` and `speaking` gate the microphone and
+// have to outlive this function, because it now returns while the audio it
+// scheduled is still to come.
+let draining=false;
 async function drain(){
-  if(playing||!queue.length)return; playing=true; speaking=true;
-  // seq is monotonic for the whole connection, so this global sort is correct.
-  // It was not when the server restarted seq at 1 per turn: a new turn's first
-  // chunk could sort ahead of the previous turn's last and play out of order.
-  queue.sort((a,b)=>a.seq-b.seq);
+  if(draining||!queue.length)return;
+  draining=true; playing=true; speaking=true; clearTimeout(quiet);
   while(queue.length){
+    // seq is monotonic for the whole connection, so this global sort is
+    // correct. It was not when the server restarted seq at 1 per turn: a new
+    // turn's first chunk could sort ahead of the previous turn's last and play
+    // out of order. Sorted every pass, because chunks arrive while we decode.
+    queue.sort((a,b)=>a.seq-b.seq);
     const m=queue.shift();
     const bytes=Uint8Array.from(atob(m.wav),c=>c.charCodeAt(0));
     const c=audioCtx();
@@ -177,15 +205,26 @@ async function drain(){
     if(c){
       try{
         const ab=await c.decodeAudioData(bytes.buffer.slice(0));
-        await new Promise(res=>{const s=c.createBufferSource();s.buffer=ab;
-          s.connect(c.destination);s.onended=res;s.start()});
+        const s=c.createBufferSource(); s.buffer=ab; s.connect(c.destination);
+        // A little ahead of now when nothing is playing, otherwise exactly
+        // where the last chunk ends. The max also recovers the clock after a
+        // pause, when `playAt` has fallen into the past.
+        const at=Math.max(c.currentTime+0.05, playAt);
+        s.start(at); playAt=at+ab.duration;
         done=true;
       }catch(err){ console.warn("WebAudio failed, falling back:",err); }
     }
-    if(!done) await playViaTag(bytes);      // <audio> works without AudioContext
+    // <audio> works without an AudioContext, and cannot be scheduled: this
+    // path waits, as the whole loop used to.
+    if(!done){ await playViaTag(bytes); playAt=0; }
   }
-  playing=false;
-  setTimeout(()=>{speaking=false},250);
+  draining=false;
+  // Hold the microphone gate until the audio actually stops, which is now
+  // later than this function returns.
+  const c=audioCtx();
+  const left=c?Math.max(0,(playAt-c.currentTime)*1000):0;
+  clearTimeout(quiet);
+  quiet=setTimeout(()=>{playing=false;speaking=false},left+250);
 }
 
 function send(obj){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(
