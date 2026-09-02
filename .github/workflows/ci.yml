@@ -26,7 +26,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # The branch this repository actually publishes. It was `master` when
+    # this file was written and the filter was not moved with the rename,
+    # so every push since matched nothing and the last run on a push was
+    # the last commit under the old name. A trigger naming a branch that
+    # does not exist fails silently, which is the worst way for a gate to
+    # fail: the absence of a red tick reads exactly like a green one.
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
