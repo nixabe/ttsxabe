@@ -2537,7 +2537,11 @@ them, checked - so holding the decoder's two at f16 is not a rounding, it
 is the same numbers at half the bytes. Measured on the real checkpoint,
 same seed and masks, the mel moves by 5.7e-6 on a span of 10, which is the
 half-width mat-vec's accumulation order and nothing else; the test in
-`xabe-taco`'s `pipeline` holds it at 1e-4. The mat-vec went from 30.3 to
+`xabe-taco`'s `pipeline` holds it at 1e-4. Every other checkpoint in
+`models/` was scanned the same way afterwards and none of them is: under
+0.3% of sampled f32 values are f16-exact in the ASR, both VITS, CosyVoice3,
+WaveGlow and Silero, which is what random f32 looks like. The finding is
+Tacotron2's alone, and it came from how NVIDIA trained it. The mat-vec went from 30.3 to
 16.5 µs and the frame from 265 to 233 µs, with the card busy for 110.
 
 Same sitting, alternated in pairs, the previous binary against this one,
