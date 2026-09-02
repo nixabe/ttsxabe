@@ -3079,6 +3079,64 @@ no closer - so it is held like the rest. These are single-run figures,
 not a paired sitting, and the flow's 4% is inside what a sitting could
 move; the residency is the result here.
 
+### The flow's two rows as one pass, and its attention fused: 409 ms to 276
+
+An utterance's flow is ten Euler steps, each an estimator call over a
+batch of two - the conditioned row and the unconditioned one that
+classifier-free guidance extrapolates between - and the estimator is a
+22-block DiT over about 300 positions. The trace of one block, per row,
+was seven products of `[300, 1024]` against a `[1024, 1024]` or wider
+weight at 72 to 88 µs each, and the unfused attention chain - two head
+splits, a transposed one, a scores product, a scale, a softmax, a value
+product and a merge - at about 150 µs. Both were the card underfilled:
+at 300 rows a `[1024, 1024]` projection is 8 by 3 tiles with a split of
+two, 48 blocks on 72 SMs, and the attention's scores product was a
+batch of sixteen `[300, 64] x [64, 300]` products with a `gemm_reduce`
+after it.
+
+Three changes, all in `xabe-cosy` and none to a kernel:
+
+- **Both rows go through the blocks as one `[600, 1024]` activation.**
+  Every block kernel but the rope and the attention is row-wise - the
+  adaptive normalisations, the gated residual adds, the feed-forward -
+  so a product over 600 rows is the same arithmetic as two over 300 with
+  the card twice as full. The input embedding stays per row, because its
+  positional convolution pads on the left and a `[1024, 600]` would let
+  row 1's first frames see row 0's last.
+- **The query, key and value projections are one product** over a
+  `[3072, 1024]` weight stacked at load, 120 blocks where three launches
+  of 48 each left two thirds of the card idle. The rope is partial - the
+  first 64 of 1024, one head of sixteen - and counts positions from the
+  first row it is handed, so row 0 of the query is rotated where it lies
+  and the other three `[300, 1024]` blocks are copied out first; a
+  `rope_gptj` with an offset would remove three copies a block and is
+  not written yet.
+- **The attention is `flash_attn`**, the Whisper encoder's fused kernel
+  at a head width of 64, one launch per row with no mask, in place of the
+  eight-launch chain. Its arithmetic is the chain's - f32 accumulation
+  from f16-rounded operands, which is what the tiled matmul stages
+  anyway.
+
+The estimator and whole-mel oracle tests pass unchanged (the mel
+correlates above 0.9999 with the reference's, worst bin under 0.5).
+The stages example on GPU 2, the same 131-token utterance, the 4894faa
+build against this one alternated in two pairs of four runs, the first
+run of each process set aside as its warm-up and the worst of the rest
+on each side:
+
+| Stage | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| flow, 262 frames | 409 ms | 276 ms | 1.48x |
+
+Two-thirds of the flow's launches are still the products, now at 80 to
+160 blocks each; the next cut is an offset rope and the positional
+convolution, whose `grouped_conv1d` is 688 µs a call at 1.8 TFLOP/s
+and runs four times an evaluation.
+
+This change was written by the earlier process of this session, which
+was still running after the conversation was resumed; it was tested,
+measured and committed by the later one.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

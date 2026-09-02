@@ -75,9 +75,12 @@ struct Block {
     /// `[6 * dim, dim]`: shift, scale and gate for attention and then for the
     /// feed-forward, in that order.
     attn_norm: Linear,
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    /// `to_q`, `to_k` and `to_v` stacked as one `[3 * dim, dim]` weight and
+    /// one `[3 * dim]` bias, so the three projections are one launch over
+    /// one read of the normalised input - 120 blocks where three launches of
+    /// 48 each left two thirds of the card idle. Product `i` of the batch
+    /// reads rows `i * dim ..` of both.
+    qkv: Linear,
     o: Linear,
     ff_in: Linear,
     ff_out: Linear,
@@ -210,15 +213,33 @@ impl Flow {
         };
 
         let d = cfg.dim;
+        // Several `[d, d]` linears as one `[len * d, d]` weight at f16 and one
+        // `[len * d]` bias, each checked at its own shape before it is placed.
+        let stacked = |ps: &[&str]| -> Result<Linear, CosyError> {
+            let mut w = Vec::with_capacity(ps.len() * d * d);
+            let mut b = Vec::with_capacity(ps.len() * d);
+            for p in ps {
+                w.extend_from_slice(f.tensor_shaped(&format!("{p}.weight"), &[d, d])?);
+                b.extend_from_slice(f.tensor_shaped(&format!("{p}.bias"), &[d])?);
+            }
+            Ok(Linear {
+                w: LinearWeight::Half(gpu.upload_f16(&w)?),
+                b: Some(gpu.upload(&b)?),
+                in_dim: d,
+                out_dim: ps.len() * d,
+            })
+        };
         let est = "decoder.estimator";
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
             let p = format!("{est}.transformer_blocks.{i}");
             blocks.push(Block {
                 attn_norm: lin(&format!("{p}.attn_norm.linear"), 6 * d, d, true, false)?,
-                q: lin(&format!("{p}.attn.to_q"), d, d, true, true)?,
-                k: lin(&format!("{p}.attn.to_k"), d, d, true, true)?,
-                v: lin(&format!("{p}.attn.to_v"), d, d, true, true)?,
+                qkv: stacked(&[
+                    &format!("{p}.attn.to_q"),
+                    &format!("{p}.attn.to_k"),
+                    &format!("{p}.attn.to_v"),
+                ])?,
                 o: lin(&format!("{p}.attn.to_out.0"), d, d, true, true)?,
                 ff_in: lin(&format!("{p}.ff.ff.0.0"), d * cfg.ff_mult, d, true, true)?,
                 ff_out: lin(&format!("{p}.ff.ff.2"), d, d * cfg.ff_mult, true, true)?,
@@ -352,6 +373,17 @@ impl Flow {
     /// is how the reference holds them - and are transposed here because every
     /// linear wants `[position, feature]`.
     ///
+    /// **Both rows go through the blocks as one `[2 n, dim]` activation.**
+    /// The two rows of the classifier-free pair are independent sequences
+    /// with the same weights and the same modulation, and every block
+    /// kernel but the rope and the attention is row-wise, so a linear over
+    /// 600 rows is the same arithmetic as two over 300 with the card twice
+    /// as full: at 300 rows a `[1024, 1024]` projection is 48 blocks on 72
+    /// SMs. The attention is per row - each row's heads are split out of the
+    /// shared buffer at its offset, f16, which is the width the tiled matmul
+    /// stages at anyway - and the rope, which has no offset form, rotates
+    /// row 0 in place and the other three `[n, dim]` blocks through a copy.
+    ///
     /// Everything between the input projection and the output projection
     /// stays on the card. The adaptive normalisations are `layer_norm_mod`
     /// reading the modulation vector where the block's timestep projection
@@ -371,13 +403,14 @@ impl Flow {
     ) -> Result<Vec<f32>, CosyError> {
         let (d, m) = (self.cfg.dim, self.cfg.mel_dim);
         let eps = FlowConfig::NORM_EPS;
+        let gpu = &self.gpu;
         // The timestep embedding, then SiLU of it: one vector for every
         // modulation projection in the network, so it is taken once.
         let mut te = self.time_embed(t)?;
         if let Some(taps) = taps.as_deref_mut() {
-            taps.push(("dit_temb".into(), self.gpu.download(&te)?));
+            taps.push(("dit_temb".into(), gpu.download(&te)?));
         }
-        self.gpu.silu(&mut te, d)?;
+        gpu.silu(&mut te, d)?;
 
         // The modulation vectors depend on the timestep alone, so they are
         // projected once an evaluation and read by both batch rows: 23
@@ -389,7 +422,10 @@ impl Flow {
             .collect::<Result<Vec<_>, _>>()?;
         let fin_mods = self.linear(&te, &self.norm_out, 1)?;
 
-        let mut out = vec![0.0f32; 2 * m * n];
+        // The residual stream, `[2 n, d]`: row 0 conditioned, row 1 not.
+        // SAFETY: both halves are written whole by `copy_into` below before
+        // anything reads them.
+        let mut h = unsafe { gpu.uninit(2 * n * d) }?;
         for b in 0..2 {
             // `[4 * mel_dim, n]` on the host, transposed into `[n, 4 * mel_dim]`.
             // The order is the reference's: noisy mel, condition, token
@@ -409,20 +445,22 @@ impl Flow {
             {
                 taps.push(("dit_cat".into(), cat.clone()));
             }
-            let h = self.linear(&self.gpu.upload(&cat)?, &self.input_proj, n)?;
+            let mut hb = self.linear(&gpu.upload(&cat)?, &self.input_proj, n)?;
             if b == 0
                 && let Some(taps) = taps.as_deref_mut()
             {
-                taps.push(("dit_proj".into(), self.gpu.download(&h)?));
+                taps.push(("dit_proj".into(), gpu.download(&hb)?));
             }
 
             // The convolutional positional embedding, added as a residual.
             // Both convolutions are grouped and pad `kernel - 1` on the left,
             // and both are followed by Mish. `[n, dim]` has to become
-            // `[dim, n]` for a convolution and back again afterwards.
-            let hc = self.gpu.transpose(&h, n, d)?;
+            // `[dim, n]` for a convolution and back again afterwards. It is
+            // per row because the convolution runs along the position axis,
+            // and a `[d, 2 n]` would let row 1's first frames see row 0's last.
+            let hc = gpu.transpose(&hb, n, d)?;
             let pad = FlowConfig::POS_KERNEL - 1;
-            let (mut p1, t1) = self.gpu.grouped_conv1d(
+            let (mut p1, t1) = gpu.grouped_conv1d(
                 &hc,
                 &self.pos1.0,
                 &self.pos1.1,
@@ -434,8 +472,8 @@ impl Flow {
                 pad,
             )?;
             debug_assert_eq!(t1, n);
-            self.gpu.mish(&mut p1, d * n)?;
-            let (mut p2, t2) = self.gpu.grouped_conv1d(
+            gpu.mish(&mut p1, d * n)?;
+            let (mut p2, t2) = gpu.grouped_conv1d(
                 &p1,
                 &self.pos2.0,
                 &self.pos2.1,
@@ -447,116 +485,135 @@ impl Flow {
                 pad,
             )?;
             debug_assert_eq!(t2, n);
-            self.gpu.mish(&mut p2, d * n)?;
+            gpu.mish(&mut p2, d * n)?;
+            let back = gpu.transpose(&p2, d, n)?;
             if b == 0
                 && let Some(taps) = taps.as_deref_mut()
             {
-                taps.push((
-                    "dit_pos".into(),
-                    self.gpu.download(&self.gpu.transpose(&p2, d, n)?)?,
-                ));
+                taps.push(("dit_pos".into(), gpu.download(&back)?));
             }
+            gpu.add_inplace(&mut hb, &back, n * d)?;
+            gpu.copy_into(&mut h, &hb, b * n * d, n * d)?;
+        }
+        if let Some(taps) = taps.as_deref_mut() {
+            let mut row0 = gpu.download(&h)?;
+            row0.truncate(n * d);
+            taps.push(("dit_input_embed".into(), row0));
+        }
 
-            let mut h = h;
-            let back = self.gpu.transpose(&p2, d, n)?;
-            self.gpu.add_inplace(&mut h, &back, n * d)?;
-            if b == 0
-                && let Some(taps) = taps.as_deref_mut()
+        let hd = self.cfg.dim_head;
+        let heads = self.cfg.heads;
+        let rows = 2 * n;
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            // The six modulation vectors, from the timestep: shift, scale
+            // and gate for the attention, then the same three for the
+            // feed-forward, each `d` wide.
+            let mods = &mods_all[bi];
+
+            // Attention, modulated in. q, k and v of both rows as one
+            // `[3, 2 n, d]` product over one read of the normalised input.
+            let xin = gpu.layer_norm_mod(&h, rows, d, mods, 0, d, eps)?;
+            // SAFETY: the matmul writes every element of its three outputs.
+            let mut qkv = unsafe { gpu.uninit(3 * rows * d) }?;
+            gpu.gemm_batched_into(
+                Operand::F32(&xin),
+                blk.qkv.w.operand(),
+                blk.qkv.b.as_ref(),
+                d,
+                Batch {
+                    count: 3,
+                    a: 0,
+                    w: d * d,
+                    out: rows * d,
+                    w_row: 0,
+                },
+                rows,
+                d,
+                d,
+                false,
+                &mut qkv,
+                0,
+            )?;
+
+            // The rope is partial and interleaved: the first `dim_head` of
+            // each 1024-wide row, before the heads are split - so one head of
+            // sixteen carries position. Positions restart at each row of the
+            // pair, and the kernel rotates from the start of what it is
+            // handed, so row 0 of q is rotated where it lies and the other
+            // three `[n, d]` blocks are copied out first; v is copied for the
+            // same reason, because its head split has no offset form either.
+            gpu.rope_gptj(&mut qkv, &self.inv_freq, n, d, hd)?;
+            let mut parts = Vec::with_capacity(5);
+            for (i, off) in [n * d, 2 * n * d, 3 * n * d, 4 * n * d, 5 * n * d]
+                .into_iter()
+                .enumerate()
             {
-                taps.push(("dit_input_embed".into(), self.gpu.download(&h)?));
-            }
-
-            for (bi, blk) in self.blocks.iter().enumerate() {
-                // The six modulation vectors, from the timestep: shift, scale
-                // and gate for the attention, then the same three for the
-                // feed-forward, each `d` wide.
-                let mods = &mods_all[bi];
-
-                // Attention, modulated in.
-                let xin = self.gpu.layer_norm_mod(&h, n, d, mods, 0, d, eps)?;
-
-                let mut q = self.linear(&xin, &blk.q, n)?;
-                let mut k = self.linear(&xin, &blk.k, n)?;
-                let v = self.linear(&xin, &blk.v, n)?;
-                // Partial and interleaved: the first `dim_head` of each 1024
-                // wide row, before the heads are split - so one head of
-                // sixteen carries position.
-                self.gpu
-                    .rope_gptj(&mut q, &self.inv_freq, n, d, self.cfg.dim_head)?;
-                self.gpu
-                    .rope_gptj(&mut k, &self.inv_freq, n, d, self.cfg.dim_head)?;
-
-                let hd = self.cfg.dim_head;
-                let heads = self.cfg.heads;
-                let qh = self.gpu.split_heads(&q, n, heads, hd)?;
-                let kh = self.gpu.split_heads(&k, n, heads, hd)?;
-                let vt = self.gpu.split_heads_t(&v, n, heads, hd)?;
-
-                let mut scores = self.gpu.gemm_batched(
-                    Operand::F32(&qh),
-                    Operand::F32(&kh),
-                    None,
-                    Batch {
-                        count: heads,
-                        a: n * hd,
-                        w: n * hd,
-                        out: n * n,
-                        w_row: 0,
-                    },
-                    n,
-                    hd,
-                    n,
-                )?;
-                self.gpu
-                    .scale_inplace(&mut scores, heads * n * n, (hd as f32).powf(-0.5))?;
-                // No causal mask: the flow sees the whole utterance at once,
-                // which is what makes it a flow rather than a decoder.
-                self.gpu.softmax_rows(&mut scores, heads * n, n)?;
-
-                let ctx = self.gpu.gemm_batched(
-                    Operand::F32(&scores),
-                    Operand::F32(&vt),
-                    None,
-                    Batch {
-                        count: heads,
-                        a: n * n,
-                        w: hd * n,
-                        out: n * hd,
-                        w_row: 0,
-                    },
-                    n,
-                    n,
-                    hd,
-                )?;
-                let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
-                let attn = self.linear(&ctx, &blk.o, n)?;
-                self.gpu.gate_add(&mut h, &attn, mods, 2 * d, n, d)?;
-
-                // Feed-forward, modulated in the same way.
-                let fin = self.gpu.layer_norm_mod(&h, n, d, mods, 3 * d, 4 * d, eps)?;
-                let mut ff = self.linear(&fin, &blk.ff_in, n)?;
-                // The tanh approximation, not the erf form.
-                self.gpu.gelu_tanh(&mut ff, n * d * self.cfg.ff_mult)?;
-                let ff = self.linear(&ff, &blk.ff_out, n)?;
-                self.gpu.gate_add(&mut h, &ff, mods, 5 * d, n, d)?;
-                if b == 0
-                    && matches!(bi, 0 | 1 | 7 | 14 | 21)
-                    && let Some(taps) = taps.as_deref_mut()
-                {
-                    taps.push((format!("dit_block{bi}"), self.gpu.download(&h)?));
+                let mut r = gpu.copy_range(&qkv, off, n * d)?;
+                if i < 3 {
+                    gpu.rope_gptj(&mut r, &self.inv_freq, n, d, hd)?;
                 }
+                parts.push(r);
             }
 
-            // The final modulation chunks **(scale, shift)** - the reverse of
-            // every other one in the file - so the shift is the second
-            // segment here and the first everywhere above.
-            let last = self.gpu.layer_norm_mod(&h, n, d, &fin_mods, d, 0, eps)?;
-            let y = self.gpu.download(&self.linear(&last, &self.proj_out, n)?)?;
+            // The attention is per row and fused: scores, softmax and the
+            // value product in one kernel, nothing materialised - the same
+            // kernel the Whisper encoder runs at this head width, with no
+            // mask because the flow sees the whole utterance at once, which
+            // is what makes it a flow rather than a decoder. It takes q
+            // unsplit and returns the context merged, so only k and v are
+            // laid out by head. The chain it replaces wrote 16 `[n, n]`
+            // score planes, scaled them in place, and read them twice more.
+            let mut attn = unsafe { gpu.uninit(rows * d) }?;
+            let scale = (hd as f32).powf(-0.5);
+            for b in 0..2 {
+                let kh = gpu.split_heads(&parts[1 + b], n, heads, hd)?;
+                let vt = gpu.split_heads_t(&parts[3 + b], n, heads, hd)?;
+                let q = if b == 0 { &qkv } else { &parts[0] };
+                let ctx = gpu.flash_attn(q, &kh, &vt, n, 0, heads, heads, hd, n, scale, false)?;
+                gpu.gemm_batched_into(
+                    Operand::F32(&ctx),
+                    blk.o.w.operand(),
+                    blk.o.b.as_ref(),
+                    0,
+                    Batch::single(n * d),
+                    n,
+                    d,
+                    d,
+                    false,
+                    &mut attn,
+                    b * n,
+                )?;
+            }
+            gpu.gate_add(&mut h, &attn, mods, 2 * d, rows, d)?;
 
-            // Back to channel-major, which is what the solver works in.
+            // Feed-forward, modulated in the same way.
+            let fin = gpu.layer_norm_mod(&h, rows, d, mods, 3 * d, 4 * d, eps)?;
+            let mut ff = self.linear(&fin, &blk.ff_in, rows)?;
+            // The tanh approximation, not the erf form.
+            gpu.gelu_tanh(&mut ff, rows * d * self.cfg.ff_mult)?;
+            let ff = self.linear(&ff, &blk.ff_out, rows)?;
+            gpu.gate_add(&mut h, &ff, mods, 5 * d, rows, d)?;
+            if matches!(bi, 0 | 1 | 7 | 14 | 21)
+                && let Some(taps) = taps.as_deref_mut()
+            {
+                let mut row0 = gpu.download(&h)?;
+                row0.truncate(n * d);
+                taps.push((format!("dit_block{bi}"), row0));
+            }
+        }
+
+        // The final modulation chunks **(scale, shift)** - the reverse of
+        // every other one in the file - so the shift is the second
+        // segment here and the first everywhere above.
+        let last = gpu.layer_norm_mod(&h, rows, d, &fin_mods, d, 0, eps)?;
+        let y = gpu.download(&self.linear(&last, &self.proj_out, rows)?)?;
+
+        // Back to channel-major, which is what the solver works in.
+        let mut out = vec![0.0f32; 2 * m * n];
+        for b in 0..2 {
             for c in 0..m {
                 for p in 0..n {
-                    out[(b * m + c) * n + p] = y[p * m + c];
+                    out[(b * m + c) * n + p] = y[(b * n + p) * m + c];
                 }
             }
         }
