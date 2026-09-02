@@ -105,7 +105,15 @@ torch `.pth` directly rather than converting one - a second naming scheme, a
 decoder whose weight norm had not been fused before saving, and a 137-symbol IPA
 vocabulary whose blank is at id 3 rather than 0. It agrees with its own captured
 oracle to 5.8e-5 on the CPU and 6.2e-5 on the card. `docs/MODEL.md` has the five
-differences and the one that is a genuine trap. This paragraph
+differences and the one that is a genuine trap. Tacotron2's decode loop has
+since had a round of its own - 39 launches a frame to 19, and the decoder's
+LSTM weights held at f16 - for **1.21x** on three lines in one sitting. The
+finding to carry from it is not the fold: the converted checkpoint was
+trained under AMP and every LSTM weight in it is **exactly representable in
+f16**, so the half-width form was the same numbers at half the bytes, and
+two thirds of the card's time had been spent streaming zeros in the low
+mantissa. Before spending bandwidth on an f32 tensor, check whether it is
+f16-exact; `docs/BENCHMARKS.md` has the round. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

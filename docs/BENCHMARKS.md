@@ -2506,7 +2506,65 @@ and are now real tensor-core work, and the decode loop is 69 ms and is **launch
 bound**. Thirty-five launches a step, 138 steps, at ten to fifteen microseconds
 of latency each - the arithmetic in a step is a handful of `gemv`s over
 kilobytes. Fusing them, or replaying the step as a CUDA graph, is the next
-lever and is a project rather than a change.
+lever and is a project rather than a change. (It has since been pulled; the
+next section is that round, and it found the loop was only half launches.)
+
+### The decode loop, fused: 1.21x, and a checkpoint that was f16 all along
+
+That paragraph named the next lever and this is the round that pulled it.
+Two things were done to the loop and one was found about the weights.
+
+**The loop was CPU-bound, not launch-bound.** `nsys` on the shortest line
+put the decode loop at 39.2 operations a frame and 380 µs a frame, with the
+card busy for 174 of them - 46%. What the other half was: a stop-gate
+download every frame, a dropout mask uploaded every frame, an allocation
+and a `memset` for every intermediate. Folding what could be folded -
+`relu_mask`, `concat2`, `attn_weights_update`, `copy_from_into`, the
+projection and the gate as one stacked mat-vec, the masks drawn once and
+the gate read in batches of eight (`GATE_LOOKAHEAD`, bit-identical frames
+against reading it every frame) - took it to 26.8 operations and 298 µs.
+The location attention was then nine of the 27, and it is two now:
+`taco_energies` and `taco_context`, held to a CPU chain of the seven
+kernels they replace at 1e-4. That is 19.3 operations and 265 µs.
+
+**Two thirds of the card's time was the LSTMs streaming f32.** With the
+launches out of the way the profile was readable: four mat-vecs a frame
+over the two decoder LSTMs, 71 MB of f32 weight a frame, 30 µs each, and
+between them 107 of the 158 µs the card was busy. That is 666 GB/s, which
+is the card. The checkpoint was trained under AMP, and **every LSTM weight
+in the published file is exactly representable in f16** - all 19.4 M of
+them, checked - so holding the decoder's two at f16 is not a rounding, it
+is the same numbers at half the bytes. Measured on the real checkpoint,
+same seed and masks, the mel moves by 5.7e-6 on a span of 10, which is the
+half-width mat-vec's accumulation order and nothing else; the test in
+`xabe-taco`'s `pipeline` holds it at 1e-4. The mat-vec went from 30.3 to
+16.5 µs and the frame from 265 to 233 µs, with the card busy for 110.
+
+Same sitting, alternated in pairs, the previous binary against this one,
+the two pairs' worse figure on each side. Synthesis is seeded, so the
+frame counts are identical across the four runs of each line.
+
+| Text | Frames | Before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `Tâi-lâm ū chiok chē hó-chia̍h--ê,` | 206 | 149.5 ms | 123.5 ms | 1.21x |
+| `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` | 397 | 278.1 ms | 224.6 ms | 1.24x |
+| `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` | 513 | 358.5 ms | 287.3 ms | 1.25x |
+
+The better pair reads 148.6 → 122.0, 268.9 → 223.2 and 345.8 → 284.7, which
+is 1.20x to 1.22x; **1.21x** is the figure to quote. 16.1x realtime to
+19.6x on the shortest line.
+
+**What is left is the CPU again, and it is a different project.** At 19
+operations a frame the card is busy 47% of the time; `cuLaunchKernel` has a
+median of 5.4 µs in the API trace and the loop issues one every 12 µs, so
+the card finishes each frame's work and waits for the next to be described.
+The encoder's per-token LSTM steps are the same shape at a much smaller
+weight and were left at f32, because that stage is held to its reference
+at 1e-5 and runs once a line. Replaying a frame as a CUDA graph would
+remove the issue cost, and every offset a frame's kernels take is
+data-dependent on the frame index, so that is the kernels taking their
+position from device memory rather than the wrapper - a design change
+rather than a fold, and where the next round would start.
 
 ### A measurement trap in the harness itself
 

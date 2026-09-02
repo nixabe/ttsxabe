@@ -3242,3 +3242,182 @@ fn the_decode_attention_into_a_row_is_the_decode_attention() {
         "a twin with too few rows must be refused"
     );
 }
+
+/// The four small kernels the Tacotron2 decoder folds its bookkeeping into
+/// are each the composition they replace, at exact equality, and refuse a
+/// short buffer.
+#[test]
+fn the_decoder_bookkeeping_kernels_are_the_copies_they_replace() {
+    let Some(g) = gpu() else { return };
+    let (na, nb, t) = (37usize, 21usize, 19usize);
+    let a = seq(na, 90);
+    let b = seq(nb, 91);
+
+    let mut dst = g.upload(&seq(na + nb + 5, 92)).unwrap();
+    g.concat2(&mut dst, &a_up(&g, &a), na, &a_up(&g, &b), nb)
+        .unwrap();
+    let got = g.download(&dst).unwrap();
+    let mut want = a.clone();
+    want.extend_from_slice(&b);
+    assert_eq!(&got[..na + nb], &want[..], "concat2");
+    let mut short = g.upload(&seq(na, 93)).unwrap();
+    assert!(
+        g.concat2(&mut short, &a_up(&g, &a), na, &a_up(&g, &b), nb)
+            .is_err()
+    );
+
+    let mut d2 = g.upload(&seq(50, 94)).unwrap();
+    let src = seq(40, 95);
+    g.copy_from_into(&mut d2, 7, &a_up(&g, &src), 11, 20)
+        .unwrap();
+    let got = g.download(&d2).unwrap();
+    assert_eq!(&got[7..27], &src[11..31], "copy_from_into");
+    assert!(
+        g.copy_from_into(&mut d2, 40, &a_up(&g, &src), 0, 20)
+            .is_err()
+    );
+
+    let y0: Vec<f32> = seq(na, 96).iter().map(|v| v - 0.5).collect();
+    let mask = seq(3 * na, 97);
+    let mut y = g.upload(&y0).unwrap();
+    g.relu_mask(&mut y, &a_up(&g, &mask), na, na).unwrap();
+    let got = g.download(&y).unwrap();
+    let want: Vec<f32> = y0
+        .iter()
+        .zip(&mask[na..2 * na])
+        .map(|(v, m)| v.max(0.0) * m)
+        .collect();
+    assert_eq!(got, want, "relu_mask");
+    assert!(g.relu_mask(&mut y, &a_up(&g, &mask), 3 * na, na).is_err());
+
+    let cat0 = seq(2 * t, 98);
+    let al = seq(t, 99);
+    let mut cat = g.upload(&cat0).unwrap();
+    g.attn_weights_update(&mut cat, &a_up(&g, &al), t).unwrap();
+    let got = g.download(&cat).unwrap();
+    let mut want = al.clone();
+    want.extend(cat0[t..].iter().zip(&al).map(|(c, a)| c + a));
+    assert_eq!(got, want, "attn_weights_update");
+    assert!(
+        g.attn_weights_update(&mut cat, &a_up(&g, &al), t + 1)
+            .is_err()
+    );
+}
+
+fn a_up(g: &Gpu, v: &[f32]) -> xabe_cuda::CudaSlice<f32> {
+    g.upload(v).unwrap()
+}
+
+/// The fused location attention against the chain of seven it replaces,
+/// written out on the CPU: the energies through `linear`'s `fmaf` order,
+/// the softmax, the context and the running weights.
+#[test]
+fn the_fused_location_attention_is_the_chain_it_replaces() {
+    let Some(g) = gpu() else { return };
+    let (t, f, a, e) = (37usize, 32usize, 128usize, 512usize);
+    let loc = seq(f * t, 101);
+    let wl: Vec<f32> = seq(a * f, 102).iter().map(|v| v * 0.1).collect();
+    let query = seq(a, 103);
+    let processed: Vec<f32> = seq(t * a, 104).iter().map(|v| v * 0.5).collect();
+    let v = seq(a, 105);
+    let memory = seq(t * e, 106);
+    let cat0 = seq(2 * t, 107);
+
+    // The chain, on the CPU.
+    let mut score = vec![0.0f32; t];
+    for r in 0..t {
+        let mut s = 0.0f32;
+        for u in 0..a {
+            let mut acc = query[u];
+            for i in 0..f {
+                acc = loc[i * t + r].mul_add(wl[u * f + i], acc);
+            }
+            let en = (acc + processed[r * a + u]).tanh();
+            s += en * v[u];
+        }
+        score[r] = s;
+    }
+    let m = score.iter().cloned().fold(f32::MIN, f32::max);
+    let ex: Vec<f32> = score.iter().map(|s| (s - m).exp()).collect();
+    let sum: f32 = ex.iter().sum();
+    let al: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+    let mut context = vec![0.0f32; e];
+    for (j, c) in context.iter_mut().enumerate() {
+        *c = (0..t).map(|i| al[i] * memory[i * e + j]).sum();
+    }
+    let mut cat_want = al.clone();
+    cat_want.extend(cat0[t..].iter().zip(&al).map(|(c, x)| c + x));
+
+    let mut cat = g.upload(&cat0).unwrap();
+    let mut ctx = g.upload(&seq(e, 108)).unwrap();
+    g.taco_attention(
+        &a_up(&g, &loc),
+        &a_up(&g, &wl),
+        &a_up(&g, &query),
+        &a_up(&g, &processed),
+        &a_up(&g, &v),
+        &a_up(&g, &memory),
+        t,
+        f,
+        a,
+        e,
+        &mut cat,
+        &mut ctx,
+    )
+    .expect("the fused attention");
+    let cat_got = g.download(&cat).unwrap();
+    let ctx_got = g.download(&ctx).unwrap();
+    for i in 0..2 * t {
+        assert!(
+            (cat_got[i] - cat_want[i]).abs() <= 1e-5 + 1e-4 * cat_want[i].abs(),
+            "cat[{i}] is {} wanted {}",
+            cat_got[i],
+            cat_want[i]
+        );
+    }
+    for j in 0..e {
+        assert!(
+            (ctx_got[j] - context[j]).abs() <= 1e-4 + 1e-4 * context[j].abs(),
+            "context[{j}] is {} wanted {}",
+            ctx_got[j],
+            context[j]
+        );
+    }
+    let mut short = g.upload(&seq(t, 109)).unwrap();
+    assert!(
+        g.taco_attention(
+            &a_up(&g, &loc),
+            &a_up(&g, &wl),
+            &a_up(&g, &query),
+            &a_up(&g, &processed),
+            &a_up(&g, &v),
+            &a_up(&g, &memory),
+            t,
+            f,
+            a,
+            e,
+            &mut short,
+            &mut ctx,
+        )
+        .is_err(),
+        "short running weights must be refused"
+    );
+    assert!(
+        g.taco_attention(
+            &a_up(&g, &loc),
+            &a_up(&g, &wl),
+            &a_up(&g, &query),
+            &a_up(&g, &processed),
+            &a_up(&g, &v),
+            &a_up(&g, &memory),
+            t,
+            f,
+            96,
+            e,
+            &mut cat,
+            &mut ctx,
+        )
+        .is_err(),
+        "a unit count that is not a power of two must be refused"
+    );
+}

@@ -109,9 +109,25 @@ impl Dense {
 /// The two biases are kept apart rather than summed because they are summed
 /// on different sides of the recurrence: `bias_ih` folds into the projection of
 /// the whole input sequence, `bias_hh` into the per-step one.
+///
+/// The weights are f32 or f16 by `half`, and the two LSTMs of the encoder and
+/// the two of the decoder choose differently. The decoder's are streamed in
+/// full for every frame - 71 MB a frame at f32, two thirds of a frame's time
+/// on the card, at the card's bandwidth - and the frame is one row, so the
+/// mat-vec is the memory system and nothing else. Halving the width halves
+/// the frame's largest cost.
+///
+/// It is also lossless, and that is a property of the checkpoint rather than
+/// of f16: NVIDIA trained this model under AMP, and every LSTM weight in the
+/// published file is exactly representable in f16 (checked over all 19.4 M
+/// of them). What the half-width path changes is accumulation order, and the
+/// test in `pipeline` measures that on the real checkpoint at 6e-6 on mels
+/// of span 10. The encoder's two are held at f32 anyway: they run once a
+/// line, and the encoder is held to its reference at 1e-5, which is a bound
+/// worth not spending on nothing.
 pub(crate) struct Lstm {
-    pub(crate) w_ih: CudaSlice<f32>,
-    pub(crate) w_hh: CudaSlice<f32>,
+    pub(crate) w_ih: Weight,
+    pub(crate) w_hh: Weight,
     pub(crate) b_ih: CudaSlice<f32>,
     pub(crate) b_hh: CudaSlice<f32>,
     pub(crate) hidden: usize,
@@ -125,13 +141,20 @@ impl Lstm {
         suffix: &str,
         input: usize,
         hidden: usize,
+        half: bool,
     ) -> Result<Self, TacoError> {
         let g = 4 * hidden;
+        let up = |name: &str, shape: &[usize]| -> Result<Weight, TacoError> {
+            let t = f.tensor_shaped(name, shape)?;
+            if half {
+                upload_weight(gpu, t, shape[0], shape[1])
+            } else {
+                Ok(Weight::Full(gpu.upload(t)?))
+            }
+        };
         Ok(Self {
-            w_ih: gpu
-                .upload(f.tensor_shaped(&format!("{prefix}weight_ih{suffix}"), &[g, input])?)?,
-            w_hh: gpu
-                .upload(f.tensor_shaped(&format!("{prefix}weight_hh{suffix}"), &[g, hidden])?)?,
+            w_ih: up(&format!("{prefix}weight_ih{suffix}"), &[g, input])?,
+            w_hh: up(&format!("{prefix}weight_hh{suffix}"), &[g, hidden])?,
             b_ih: gpu.upload(f.tensor_shaped(&format!("{prefix}bias_ih{suffix}"), &[g])?)?,
             b_hh: gpu.upload(f.tensor_shaped(&format!("{prefix}bias_hh{suffix}"), &[g])?)?,
             hidden,
@@ -328,13 +351,29 @@ pub(crate) struct Taco2 {
     pub(crate) location_conv: Conv,
     pub(crate) location_dense: Dense,
     pub(crate) decoder_rnn: Lstm,
-    pub(crate) projection: Dense,
-    pub(crate) gate: Dense,
+    /// The frame projection and the stop gate stacked into one
+    /// `[n_mel + 1, dhac]` with their biases, so a frame's mel and its stop
+    /// logit are one mat-vec. Both have a bias in every Tacotron2 checkpoint,
+    /// so the stack adds nothing that was not there.
+    pub(crate) proj_gate: Dense,
     pub(crate) postnet: Vec<Conv>,
 }
 
 impl Taco2 {
     pub(crate) fn open(f: &StFile, gpu: &Gpu, c: &Config) -> Result<Self, TacoError> {
+        Self::open_with(f, gpu, c, true)
+    }
+
+    /// As [`Taco2::open`], with the decoder's LSTM weights at f16 or f32.
+    /// The engine always takes f16 - see [`Lstm`] - and the f32 form exists
+    /// so the test in `pipeline` can measure the difference on the real
+    /// checkpoint rather than assert it.
+    pub(crate) fn open_with(
+        f: &StFile,
+        gpu: &Gpu,
+        c: &Config,
+        decoder_half: bool,
+    ) -> Result<Self, TacoError> {
         let (e, mel) = (c.encoder_dim, c.n_mel);
         let n = c.symbols.len();
 
@@ -386,8 +425,16 @@ impl Taco2 {
         Ok(Self {
             embedding: f.tensor_shaped("embedding.weight", &[n, e])?.to_vec(),
             enc_convs,
-            enc_fwd: Lstm::bind(f, gpu, "encoder.lstm.", "_l0", e, c.lstm_hidden)?,
-            enc_rev: Lstm::bind(f, gpu, "encoder.lstm.", "_l0_reverse", e, c.lstm_hidden)?,
+            enc_fwd: Lstm::bind(f, gpu, "encoder.lstm.", "_l0", e, c.lstm_hidden, false)?,
+            enc_rev: Lstm::bind(
+                f,
+                gpu,
+                "encoder.lstm.",
+                "_l0_reverse",
+                e,
+                c.lstm_hidden,
+                false,
+            )?,
             prenet,
             attention_rnn: Lstm::bind(
                 f,
@@ -396,6 +443,7 @@ impl Taco2 {
                 "",
                 c.prenet_dim + e,
                 c.attention_rnn_dim,
+                decoder_half,
             )?,
             query: Dense::bind(
                 f,
@@ -448,23 +496,29 @@ impl Taco2 {
                 "",
                 c.attention_rnn_dim + e,
                 c.decoder_rnn_dim,
+                decoder_half,
             )?,
-            projection: Dense::bind(
-                f,
-                gpu,
-                "decoder.linear_projection.linear_layer.weight",
-                mel,
-                dhac,
-                Some("decoder.linear_projection.linear_layer.bias"),
-            )?,
-            gate: Dense::bind(
-                f,
-                gpu,
-                "decoder.gate_layer.linear_layer.weight",
-                1,
-                dhac,
-                Some("decoder.gate_layer.linear_layer.bias"),
-            )?,
+            proj_gate: {
+                let mut w = f
+                    .tensor_shaped(
+                        "decoder.linear_projection.linear_layer.weight",
+                        &[mel, dhac],
+                    )?
+                    .to_vec();
+                w.extend_from_slice(
+                    f.tensor_shaped("decoder.gate_layer.linear_layer.weight", &[1, dhac])?,
+                );
+                let mut b = f
+                    .tensor_shaped("decoder.linear_projection.linear_layer.bias", &[mel])?
+                    .to_vec();
+                b.extend_from_slice(f.tensor_shaped("decoder.gate_layer.linear_layer.bias", &[1])?);
+                Dense {
+                    w: gpu.upload(&w)?,
+                    bias: Some(gpu.upload(&b)?),
+                    in_c: dhac,
+                    out_c: mel + 1,
+                }
+            },
             postnet,
         })
     }

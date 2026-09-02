@@ -601,6 +601,12 @@ const NAMES: &[&str] = &[
     "scale_inplace",
     "copy_range",
     "copy_into",
+    "copy_from_into",
+    "concat2",
+    "relu_mask",
+    "attn_weights_update",
+    "taco_energies",
+    "taco_context",
     "transpose",
     "flip_channels",
     "embed_scaled",
@@ -2763,6 +2769,191 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(dst).arg(src).arg(&a).arg(&b_);
         launched("copy_into", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// `dst[doff..doff + n] = src[soff..soff + n]`, both ranges checked.
+    pub fn copy_from_into(
+        &self,
+        dst: &mut CudaSlice<f32>,
+        doff: usize,
+        src: &CudaSlice<f32>,
+        soff: usize,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        if dst.len() < doff + n || src.len() < soff + n {
+            return Err(CudaError::SliceOverrun {
+                at: (doff + n).max(soff + n),
+                len: dst.len().min(src.len()),
+            });
+        }
+        let (d, s, ni) = (doff as i32, soff as i32, n as i32);
+        let f = self.func("copy_from_into");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(dst).arg(&d).arg(src).arg(&s).arg(&ni);
+        // SAFETY: both ranges are checked above and the grid covers `n`.
+        launched("copy_from_into", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// `dst[0..na] = a[0..na]` and `dst[na..na + nb] = b[0..nb]` in one
+    /// launch; see `concat2` in the kernels.
+    pub fn concat2(
+        &self,
+        dst: &mut CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        na: usize,
+        b: &CudaSlice<f32>,
+        nb: usize,
+    ) -> Result<(), CudaError> {
+        if dst.len() < na + nb || a.len() < na || b.len() < nb {
+            return Err(CudaError::SliceOverrun {
+                at: na + nb,
+                len: dst.len().min(a.len() + nb).min(b.len() + na),
+            });
+        }
+        let (nai, nbi) = (na as i32, nb as i32);
+        let f = self.func("concat2");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(dst).arg(a).arg(&nai).arg(b).arg(&nbi);
+        // SAFETY: every range is checked above and the grid covers `na + nb`.
+        launched("concat2", unsafe { lb.launch(Self::flat(na + nb)) })
+    }
+
+    /// `y = relu(y) * mask[off..off + n]`, the prenet's dropout in one pass;
+    /// exactly `relu` then `mul_inplace`. See `relu_mask` in the kernels.
+    pub fn relu_mask(
+        &self,
+        y: &mut CudaSlice<f32>,
+        mask: &CudaSlice<f32>,
+        off: usize,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        if y.len() < n || mask.len() < off + n {
+            return Err(CudaError::SliceOverrun {
+                at: off + n,
+                len: mask.len().min(y.len() + off),
+            });
+        }
+        let (o, ni) = (off as i32, n as i32);
+        let f = self.func("relu_mask");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(y).arg(mask).arg(&o).arg(&ni);
+        // SAFETY: both ranges are checked above and the grid covers `n`.
+        launched("relu_mask", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// The location attention's `[alignment; cumulative]` of `t` each,
+    /// updated with a new alignment: the first half replaced, the second
+    /// added to. See `attn_weights_update` in the kernels.
+    pub fn attn_weights_update(
+        &self,
+        cat: &mut CudaSlice<f32>,
+        alignment: &CudaSlice<f32>,
+        t: usize,
+    ) -> Result<(), CudaError> {
+        if cat.len() < 2 * t || alignment.len() < t {
+            return Err(CudaError::SliceOverrun {
+                at: 2 * t,
+                len: cat.len().min(2 * alignment.len()),
+            });
+        }
+        let ti = t as i32;
+        let f = self.func("attn_weights_update");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(cat).arg(alignment).arg(&ti);
+        // SAFETY: `cat` holds `2 t` and `alignment` `t`, checked above.
+        launched("attn_weights_update", unsafe { lb.launch(Self::flat(t)) })
+    }
+
+    /// Tacotron2's location-sensitive attention for one decoder step, in two
+    /// launches: the energies and scores of the `t` encoder positions from
+    /// the location features `loc` (`[f, t]`, as `conv1d` leaves them), the
+    /// location dense weight `wl` (`[a, f]`), the `query` (`[a]`) and the
+    /// `processed` memory (`[t, a]`) against `v` (`[a]`); then the softmax,
+    /// the context (`[e]`, from `memory` `[t, e]`) and the running weights
+    /// `cat` (`[2 t]`, the alignment then the cumulative sum). See
+    /// `taco_energies` and `taco_context` in the kernels; the test holds
+    /// both to a CPU chain of the seven kernels they replace.
+    ///
+    /// `a` is a thread count and must be a power of two up to 1024; `t` and
+    /// `e` are bounded by shared memory and the block, at 4096 and 1024.
+    #[allow(clippy::too_many_arguments)]
+    pub fn taco_attention(
+        &self,
+        loc: &CudaSlice<f32>,
+        wl: &CudaSlice<f32>,
+        query: &CudaSlice<f32>,
+        processed: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        memory: &CudaSlice<f32>,
+        t: usize,
+        f: usize,
+        a: usize,
+        e: usize,
+        cat: &mut CudaSlice<f32>,
+        context: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
+        if a == 0 || !a.is_power_of_two() || a > 1024 || t == 0 || t > 4096 || e > 1024 {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim: a,
+                heads: t,
+                kv_heads: e,
+            });
+        }
+        let checks = [
+            (loc.len(), f * t),
+            (wl.len(), a * f),
+            (query.len(), a),
+            (processed.len(), t * a),
+            (v.len(), a),
+            (memory.len(), t * e),
+            (cat.len(), 2 * t),
+            (context.len(), e),
+        ];
+        for (len, need) in checks {
+            if len < need {
+                return Err(CudaError::SliceOverrun { at: need, len });
+            }
+        }
+        // SAFETY: every score is written by its block below.
+        let mut score = unsafe { self.uninit(t) }?;
+        let (ti, fi, ai, ei) = (t as i32, f as i32, a as i32, e as i32);
+        let fun = self.func("taco_energies");
+        let mut lb = self.stream.launch_builder(fun);
+        lb.arg(loc)
+            .arg(wl)
+            .arg(query)
+            .arg(processed)
+            .arg(v)
+            .arg(&mut score)
+            .arg(&ti)
+            .arg(&fi)
+            .arg(&ai);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (t as u32, 1, 1),
+            block_dim: (a as u32, 1, 1),
+            shared_mem_bytes: (a * 4) as u32,
+        };
+        // SAFETY: a block a position and a thread a unit, every read bounded
+        // by the lengths checked above.
+        launched("taco_energies", unsafe { lb.launch(cfg) })?;
+
+        let n = e.max(t.min(1024)).max(32).next_power_of_two().min(1024);
+        let fun = self.func("taco_context");
+        let mut lb = self.stream.launch_builder(fun);
+        lb.arg(&score)
+            .arg(memory)
+            .arg(context)
+            .arg(cat)
+            .arg(&ti)
+            .arg(&ei);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (n as u32, 1, 1),
+            shared_mem_bytes: ((t + n) * 4) as u32,
+        };
+        // SAFETY: one block; the shared buffer holds `t` alignments and `n`
+        // partials, and every global access is bounded by `t` and `e`.
+        launched("taco_context", unsafe { lb.launch(cfg) })
     }
 
     /// Transposes a row-major `[rows, cols]`. Mirrors `xabe_dsp::transpose`.

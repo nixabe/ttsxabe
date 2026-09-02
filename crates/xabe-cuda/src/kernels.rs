@@ -3184,6 +3184,148 @@ __global__ void copy_into(
     if (i < n) dst[offset + i] = src[i];
 }
 
+// `copy_into` from an offset of the source as well.
+__global__ void copy_from_into(
+    float* __restrict__ dst, int doff, const float* __restrict__ src, int soff, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[doff + i] = src[soff + i];
+}
+
+// Two rows end to end: `dst[0..na] = a`, `dst[na..na + nb] = b`. What a memset
+// and two `copy_into` did, at one launch instead of three; a decoder that
+// concatenates three pairs a frame was spending nine launches on it.
+__global__ void concat2(
+    float* __restrict__ dst, const float* __restrict__ a, int na,
+    const float* __restrict__ b, int nb)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < na) {
+        dst[i] = a[i];
+    } else if (i < na + nb) {
+        dst[i] = b[i - na];
+    }
+}
+
+// `act_relu` then `mul_inplace` against `mask[off..]`, in one pass: the
+// prenet's dropout, which Tacotron2 keeps on at inference, with the masks
+// for a whole utterance drawn up front and read from one buffer. The
+// value is `fmaxf(x, 0) * m`, exactly the two kernels' composition.
+__global__ void relu_mask(float* __restrict__ y, const float* __restrict__ mask, int off, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = fmaxf(y[i], 0.0f) * mask[off + i];
+}
+
+// The location attention's running weights, `[alignment; cumulative]` of
+// `t` each: the new alignment replaces the first half and adds into the
+// second. `copy_range`, `add_inplace` and two `copy_into` were four launches
+// a frame for this.
+__global__ void attn_weights_update(
+    float* __restrict__ cat, const float* __restrict__ alignment, int t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < t) {
+        cat[i] = alignment[i];
+        cat[t + i] += alignment[i];
+    }
+}
+
+// Tacotron2's location-sensitive attention, in two launches where it was
+// seven: the energies and the score of every encoder position, then the
+// softmax, the context and the running weights.
+//
+// `taco_energies`: one block an encoder position, one thread an attention
+// unit. The energy is `linear`'s arithmetic - the bias first, then `fmaf`
+// over the location features in order - with the query as the bias, the
+// processed memory added and `tanhf` applied, and the score is the
+// energies against `v`, reduced through a shared tree. `loc` is read as the
+// convolution left it, `[filters, t]`, so the transpose is not launched.
+extern "C" __global__ void taco_energies(
+    const float* __restrict__ loc, const float* __restrict__ wl,
+    const float* __restrict__ query, const float* __restrict__ processed,
+    const float* __restrict__ v, float* __restrict__ score,
+    int t, int f, int a)
+{
+    extern __shared__ float red[];
+    const int r = blockIdx.x, u = threadIdx.x;
+    float acc = query[u];
+    for (int i = 0; i < f; ++i) {
+        acc = fmaf(loc[(size_t)i * t + r], wl[(size_t)u * f + i], acc);
+    }
+    acc = tanhf(acc + processed[(size_t)r * a + u]);
+    red[u] = acc * v[u];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (u < s) {
+            red[u] += red[u + s];
+        }
+        __syncthreads();
+    }
+    if (u == 0) {
+        score[r] = red[0];
+    }
+}
+
+// `taco_context`: one block. The softmax over the `t` scores is
+// `softmax_rows`'s - the max, `__expf` about it, the sum - held in shared
+// memory; then every thread owns output channels of the context, summing
+// the alignment against the memory `[t, e]` down its column, and the first
+// `t` threads update the running weights as `attn_weights_update` does.
+extern "C" __global__ void taco_context(
+    const float* __restrict__ score, const float* __restrict__ memory,
+    float* __restrict__ context, float* __restrict__ cat, int t, int e)
+{
+    extern __shared__ float al[];   // t alignments, then blockDim.x scratch
+    float* red = al + t;
+    const int u = threadIdx.x, n = blockDim.x;
+    float m = __int_as_float(0xff800000);
+    for (int i = u; i < t; i += n) {
+        m = fmaxf(m, score[i]);
+    }
+    red[u] = m;
+    __syncthreads();
+    for (int s = n / 2; s > 0; s >>= 1) {
+        if (u < s) {
+            red[u] = fmaxf(red[u], red[u + s]);
+        }
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float partial = 0.0f;
+    for (int i = u; i < t; i += n) {
+        const float x = __expf(score[i] - m);
+        al[i] = x;
+        partial += x;
+    }
+    red[u] = partial;
+    __syncthreads();
+    for (int s = n / 2; s > 0; s >>= 1) {
+        if (u < s) {
+            red[u] += red[u + s];
+        }
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    __syncthreads();
+    for (int i = u; i < t; i += n) {
+        al[i] *= inv;
+    }
+    __syncthreads();
+    for (int j = u; j < e; j += n) {
+        float c = 0.0f;
+        for (int i = 0; i < t; ++i) {
+            c = fmaf(al[i], memory[(size_t)i * e + j], c);
+        }
+        context[j] = c;
+    }
+    for (int i = u; i < t; i += n) {
+        cat[i] = al[i];
+        cat[t + i] += al[i];
+    }
+}
+
 __global__ void transpose(
     const float* __restrict__ x, float* __restrict__ out, int rows, int cols)
 {

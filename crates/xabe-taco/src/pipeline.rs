@@ -175,7 +175,15 @@ impl Taco {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1),
         );
-        let mel = model::synthesize(&self.gpu, &self.taco, &self.cfg, &ids, &mut rng, &mut clock)?;
+        let mel = model::synthesize(
+            &self.gpu,
+            &self.taco,
+            &self.cfg,
+            &ids,
+            &mut rng,
+            &mut clock,
+            model::GATE_LOOKAHEAD,
+        )?;
         if !mel.stopped {
             tracing::warn!(frames = mel.frames, text = %converted, "no stop token");
         }
@@ -195,5 +203,118 @@ impl Taco {
             clock.into_marks(),
             steps,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The batched gate read against the frame-by-frame one, on the real
+    //! checkpoint: the same seed, the same line, the mel frames bit for bit
+    //! and the same stop. Needs `models/tts/tacotron2-nan` and
+    //! `XABE_TEST_DEVICE`; prints `SKIP` without them.
+
+    use super::*;
+    use crate::model::{self, Rng};
+    use std::path::PathBuf;
+
+    fn mel(taco: &Taco, text: &str, seed: u64, lookahead: usize) -> (Vec<f32>, usize, bool) {
+        mel_with(taco, &taco.taco, text, seed, lookahead)
+    }
+
+    fn mel_with(
+        taco: &Taco,
+        weights: &Taco2,
+        text: &str,
+        seed: u64,
+        lookahead: usize,
+    ) -> (Vec<f32>, usize, bool) {
+        let ids = taco
+            .tokens(&with_gate_cue(&poj_to_tlpa(text)))
+            .expect("the line is in the alphabet");
+        let mut rng = Rng::new(seed);
+        let mut clock = Clock::off();
+        let m = model::synthesize(
+            &taco.gpu, weights, &taco.cfg, &ids, &mut rng, &mut clock, lookahead,
+        )
+        .expect("a synthesis");
+        let data = taco.gpu.download(&m.data).expect("the mel");
+        (
+            data[..m.frames * taco.cfg.n_mel].to_vec(),
+            m.frames,
+            m.stopped,
+        )
+    }
+
+    fn checkpoint() -> Option<(PathBuf, usize)> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tts/tacotron2-nan");
+        let Some(dev) = std::env::var("XABE_TEST_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        else {
+            println!("SKIP: set XABE_TEST_DEVICE");
+            return None;
+        };
+        if !dir.is_dir() {
+            println!("SKIP: no {}", dir.display());
+            return None;
+        }
+        Some((dir, dev))
+    }
+
+    /// The decoder with its LSTM weights at f16 against the same decoder at
+    /// f32: the same seed, the same masks, the same line. The weights are
+    /// f16-exact in the published file - see `Lstm` - so what this measures
+    /// is the half-width mat-vec's accumulation order over a recurrence of
+    /// hundreds of steps: 5.7e-6 and 6.0e-6 on mels of span 10, on the two
+    /// lines below. The bound is an order of magnitude above that.
+    #[test]
+    fn the_half_width_decoder_says_what_the_full_width_one_says() {
+        let Some((dir, dev)) = checkpoint() else {
+            return;
+        };
+        let taco = Taco::open(&dir, dev, None, 7).expect("the checkpoint");
+        let tf = StFile::open(dir.join("tacotron2.safetensors")).expect("the weights");
+        let full = Taco2::open_with(&tf, &taco.gpu, &taco.cfg, false).expect("the f32 decoder");
+        for text in ["Tâi-lâm ū chiok chē hó-chia̍h--ê,", "Lí hó."] {
+            let (a, fa, sa) = mel_with(&taco, &full, text, 12345, model::GATE_LOOKAHEAD);
+            let (b, fb, sb) = mel(&taco, text, 12345, model::GATE_LOOKAHEAD);
+            assert_eq!((fa, sa), (fb, sb), "{text}: the stop");
+            let (mut worst, mut span) = (0.0f32, 0.0f32);
+            let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+                span = span.max(x.abs());
+                dot += f64::from(*x) * f64::from(*y);
+                na += f64::from(*x).powi(2);
+                nb += f64::from(*y).powi(2);
+            }
+            let cosine = dot / (na.sqrt() * nb.sqrt());
+            println!(
+                "{text}: {fa} frames, max-abs {worst:.3e} of span {span:.2}, cosine {cosine:.7}"
+            );
+            assert!(
+                worst < 1e-4,
+                "{text}: max-abs {worst:.3e} against span {span:.2}"
+            );
+            assert!(
+                cosine > 0.999_999,
+                "{text}: cosine {cosine:.7} - a different mel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batched_gate_read_produces_the_frames_the_frame_by_frame_one_did() {
+        let Some((dir, dev)) = checkpoint() else {
+            return;
+        };
+        let taco = Taco::open(&dir, dev, None, 7).expect("the checkpoint");
+        for text in ["Tâi-lâm ū chiok chē hó-chia̍h--ê,", "Lí hó."] {
+            let (a, fa, sa) = mel(&taco, text, 12345, 1);
+            let (b, fb, sb) = mel(&taco, text, 12345, model::GATE_LOOKAHEAD);
+            assert_eq!((fa, sa), (fb, sb), "{text}: the stop");
+            assert_eq!(a, b, "{text}: the frames");
+            println!("{text}: {fa} frames, identical");
+        }
     }
 }

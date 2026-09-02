@@ -30,7 +30,7 @@
 use crate::clock::Clock;
 use crate::weights::{Lstm, Taco2};
 use crate::{Config, TacoError};
-use xabe_cuda::{CudaSlice, Gpu};
+use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
 
 /// An LSTM's carried state.
 pub(crate) struct Cell {
@@ -49,10 +49,19 @@ impl Cell {
 
 /// Advances one LSTM step. `gi` is the input side, bias already in it.
 fn step(gpu: &Gpu, w: &Lstm, gi: &CudaSlice<f32>, st: &mut Cell) -> Result<(), TacoError> {
-    // `gemm` rather than `linear`: with one row it dispatches to the `gemv`
-    // kernel, which keeps f32 end to end - only the tiled kernel stages f16 -
-    // so this is the faster path at identical precision.
-    let gh = gpu.gemm(&st.h, &w.w_hh, Some(&w.b_hh), 1, w.hidden, 4 * w.hidden)?;
+    // `gemm_batched` rather than `linear`: with one row it dispatches to the
+    // `gemv` kernel, which keeps the activation f32 end to end and reads the
+    // weight at whichever width it was bound - see `Lstm`.
+    let g = 4 * w.hidden;
+    let gh = gpu.gemm_batched(
+        Operand::F32(&st.h),
+        w.w_hh.operand(),
+        Some(&w.b_hh),
+        Batch::single(g),
+        1,
+        w.hidden,
+        g,
+    )?;
     gpu.lstm_gates(gi, &gh, &mut st.c, &mut st.h, w.hidden)?;
     Ok(())
 }
@@ -156,7 +165,7 @@ pub(crate) fn encode(
     let h = c.lstm_hidden;
     let mut memory = gpu.zeros(t * 2 * h)?;
     for (lstm, offset) in [(&w.enc_fwd, 0), (&w.enc_rev, h)] {
-        let gi_all = gpu.linear(&seq, &lstm.w_ih, Some(&lstm.b_ih), t, e, 4 * h)?;
+        let gi_all = gpu.linear(&seq, lstm.w_ih.full(), Some(&lstm.b_ih), t, e, 4 * h)?;
         let mut st = Cell::zeros(gpu, h)?;
         for i in 0..t {
             let at = if offset == 0 { i } else { t - 1 - i };
@@ -170,7 +179,15 @@ pub(crate) fn encode(
     Ok(memory)
 }
 
+/// Frames decoded between reads of the stop gate. See the loop in
+/// [`synthesize`].
+pub(crate) const GATE_LOOKAHEAD: usize = 8;
+
 /// Runs the encoder and then the decode loop.
+///
+/// `lookahead` is how many frames are decoded between reads of the stop
+/// gate; [`GATE_LOOKAHEAD`] in service, and one in the test that holds the
+/// batched read to the frame-by-frame one. Zero is taken as one.
 pub(crate) fn synthesize(
     gpu: &Gpu,
     w: &Taco2,
@@ -178,14 +195,15 @@ pub(crate) fn synthesize(
     ids: &[i64],
     rng: &mut Rng,
     clock: &mut Clock,
+    lookahead: usize,
 ) -> Result<Mel, TacoError> {
+    let lookahead = lookahead.max(1);
     let (e, mel, t) = (c.encoder_dim, c.n_mel, ids.len());
     let at = clock.start();
     let memory = encode(gpu, w, c, ids)?;
     clock.stop(gpu, "encoder", at)?;
 
     let processed = gpu.linear(&memory, &w.memory.w, None, t, e, c.attention_dim)?;
-    let memory_t = gpu.transpose(&memory, t, e)?;
 
     // Decoder state. The go frame is zeros, and so is everything else.
     let mut att = Cell::zeros(gpu, c.attention_rnn_dim)?;
@@ -200,33 +218,56 @@ pub(crate) fn synthesize(
     // `sigmoid(x) > p` without the sigmoid.
     let gate_logit = (c.gate_threshold / (1.0 - c.gate_threshold)).ln();
 
+    // The prenet's dropout masks for the whole utterance, drawn now in the
+    // order the loop used to draw them - layer by layer, frame by frame - and
+    // uploaded once. They were two host draws and two uploads a frame, each
+    // upload a synchronous copy that held the stream. A frame reads its own
+    // row of the table, so the masks a frame gets are the ones it always got.
+    let mask_w: usize = w.prenet.iter().map(|l| l.out_c).sum();
+    let mut mask_table = Vec::with_capacity(c.max_decoder_steps * mask_w);
+    for _ in 0..c.max_decoder_steps {
+        for layer in &w.prenet {
+            mask_table
+                .extend((0..layer.out_c).map(|_| if rng.uniform() < 0.5 { 0.0 } else { 2.0 }));
+        }
+    }
+    let masks = gpu.upload(&mask_table)?;
+    drop(mask_table);
+
+    // The three concatenations a frame feeds its projections, allocated once
+    // and written whole every frame.
+    // SAFETY: each is filled by `concat2` before any kernel reads it.
+    let mut cell_in = unsafe { gpu.uninit(c.prenet_dim + e) }?;
+    let mut dec_in = unsafe { gpu.uninit(c.attention_rnn_dim + e) }?;
+    let mut both = unsafe { gpu.uninit(dhac) }?;
+    // Every frame's stop logit, read back `GATE_LOOKAHEAD` frames at a time.
+    let mut gates = gpu.zeros(c.max_decoder_steps)?;
+
     let mut frames = 0usize;
+    let mut checked = 0usize;
     let mut stopped = false;
     while frames < c.max_decoder_steps {
         let at = clock.start();
-        // Prenet, dropout included.
+        // Prenet, dropout included: the activation and this frame's mask in
+        // one pass.
         let mut p = frame;
+        let mut mask_off = frames * mask_w;
         for layer in &w.prenet {
             let mut y = gpu.gemm(&p, &layer.w, None, 1, layer.in_c, layer.out_c)?;
-            gpu.relu(&mut y, layer.out_c)?;
-            let mask: Vec<f32> = (0..layer.out_c)
-                .map(|_| if rng.uniform() < 0.5 { 0.0 } else { 2.0 })
-                .collect();
-            let m = gpu.upload(&mask)?;
-            gpu.mul_inplace(&mut y, &m, layer.out_c)?;
+            gpu.relu_mask(&mut y, &masks, mask_off, layer.out_c)?;
+            mask_off += layer.out_c;
             p = y;
         }
 
         clock.stop(gpu, "  prenet", at)?;
 
         let at = clock.start();
-        let mut cell_in = gpu.zeros(c.prenet_dim + e)?;
-        gpu.copy_into(&mut cell_in, &p, 0, c.prenet_dim)?;
-        gpu.copy_into(&mut cell_in, &context, c.prenet_dim, e)?;
-        let gi = gpu.gemm(
-            &cell_in,
-            &w.attention_rnn.w_ih,
+        gpu.concat2(&mut cell_in, &p, c.prenet_dim, &context, e)?;
+        let gi = gpu.gemm_batched(
+            Operand::F32(&cell_in),
+            w.attention_rnn.w_ih.operand(),
             Some(&w.attention_rnn.b_ih),
+            Batch::single(4 * c.attention_rnn_dim),
             1,
             c.prenet_dim + e,
             4 * c.attention_rnn_dim,
@@ -248,7 +289,6 @@ pub(crate) fn synthesize(
             lpad,
             1,
         )?;
-        let loc_t = gpu.transpose(&loc, c.location_filters, t)?;
         // `gemm` and not `linear` for the single-row projections. Both keep
         // f32 - one row dispatches to `gemv`, which is a warp per output column
         // and a shuffle reduction - where `linear` gives one *thread* per output
@@ -262,39 +302,34 @@ pub(crate) fn synthesize(
             c.attention_rnn_dim,
             c.attention_dim,
         )?;
-        // The query rides in as the bias: one `[128]` vector added to every row.
-        let mut energies = gpu.linear(
-            &loc_t,
+        // The energies, the scores, the softmax, the context and the running
+        // weights - the query riding in as the bias of the energies - in two
+        // launches. See `Gpu::taco_attention`; it was seven launches and a
+        // transpose, each mostly its own floor at these sizes.
+        gpu.taco_attention(
+            &loc,
             &w.location_dense.w,
-            Some(&query),
+            &query,
+            &processed,
+            &w.v.w,
+            &memory,
             t,
             c.location_filters,
             c.attention_dim,
+            e,
+            &mut weights_cat,
+            &mut context,
         )?;
-        gpu.add_inplace(&mut energies, &processed, t * c.attention_dim)?;
-        gpu.tanh(&mut energies, t * c.attention_dim)?;
-        let mut alignment = gpu.linear(&energies, &w.v.w, None, t, c.attention_dim, 1)?;
-        gpu.softmax_rows(&mut alignment, 1, t)?;
-
-        context = gpu.gemm(&alignment, &memory_t, None, 1, t, e)?;
-
-        // The cumulative row grows by this step's weights; the current row is
-        // replaced by them. Order matters: the sum includes the new weights.
-        let mut cum = gpu.copy_range(&weights_cat, t, t)?;
-        gpu.add_inplace(&mut cum, &alignment, t)?;
-        gpu.copy_into(&mut weights_cat, &alignment, 0, t)?;
-        gpu.copy_into(&mut weights_cat, &cum, t, t)?;
 
         clock.stop(gpu, "  attention", at)?;
 
         let at = clock.start();
-        let mut dec_in = gpu.zeros(c.attention_rnn_dim + e)?;
-        gpu.copy_into(&mut dec_in, &att.h, 0, c.attention_rnn_dim)?;
-        gpu.copy_into(&mut dec_in, &context, c.attention_rnn_dim, e)?;
-        let gi = gpu.gemm(
-            &dec_in,
-            &w.decoder_rnn.w_ih,
+        gpu.concat2(&mut dec_in, &att.h, c.attention_rnn_dim, &context, e)?;
+        let gi = gpu.gemm_batched(
+            Operand::F32(&dec_in),
+            w.decoder_rnn.w_ih.operand(),
             Some(&w.decoder_rnn.b_ih),
+            Batch::single(4 * c.decoder_rnn_dim),
             1,
             c.attention_rnn_dim + e,
             4 * c.decoder_rnn_dim,
@@ -304,32 +339,43 @@ pub(crate) fn synthesize(
         clock.stop(gpu, "  decoder_rnn", at)?;
 
         let at = clock.start();
-        let mut both = gpu.zeros(dhac)?;
-        gpu.copy_into(&mut both, &dec.h, 0, c.decoder_rnn_dim)?;
-        gpu.copy_into(&mut both, &context, c.decoder_rnn_dim, e)?;
+        gpu.concat2(&mut both, &dec.h, c.decoder_rnn_dim, &context, e)?;
 
+        // The frame and its stop logit from one stacked mat-vec: the first
+        // `mel` outputs are the frame, the last is the gate.
         let next = gpu.gemm(
             &both,
-            &w.projection.w,
-            w.projection.bias.as_ref(),
+            &w.proj_gate.w,
+            w.proj_gate.bias.as_ref(),
             1,
             dhac,
-            mel,
+            mel + 1,
         )?;
-        let gate = gpu.gemm(&both, &w.gate.w, w.gate.bias.as_ref(), 1, dhac, 1)?;
-
         gpu.copy_into(&mut out, &next, frames * mel, mel)?;
+        gpu.copy_from_into(&mut gates, frames, &next, mel, 1)?;
         frames += 1;
         clock.stop(gpu, "  projection", at)?;
 
-        // The one host round trip per step, and the reason the loop is a loop.
-        let at = clock.start();
-        let stop = gpu.download(&gate)?[0] > gate_logit;
-        clock.stop(gpu, "  gate sync", at)?;
-        if stop {
-            stopped = true;
-            break;
+        // The host round trip, once every `GATE_LOOKAHEAD` frames rather than
+        // every frame. Reading the gate every frame drained the stream once a
+        // frame, so each of a frame's launches paid its full latency and the
+        // card sat idle more than half the loop. Reading it in batches keeps
+        // the queue full, at the cost of at most `lookahead - 1` frames
+        // computed past the stop and discarded. The frames up to the stop are
+        // the frames the frame-by-frame read produced, bit for bit; the test
+        // holds the two apart.
+        if frames.is_multiple_of(lookahead) || frames == c.max_decoder_steps {
+            let at = clock.start();
+            let logits = gpu.download(&gates)?;
+            clock.stop(gpu, "  gate sync", at)?;
+            if let Some(i) = logits[checked..frames].iter().position(|&g| g > gate_logit) {
+                frames = checked + i + 1;
+                stopped = true;
+                break;
+            }
+            checked = frames;
         }
+        // The next frame's prenet reads the first `mel` of the stacked row.
         frame = next;
     }
 

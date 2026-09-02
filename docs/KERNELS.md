@@ -130,6 +130,8 @@ to reason about is not a reference.
 | --- | --- | --- | --- |
 | `gemm` | encoder and decoder projections | `xabe_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
 | `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
+| `taco_energies`, `taco_context` | Tacotron2's location attention, one frame | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
+| `relu_mask`, `concat2`, `attn_weights_update`, `copy_from_into` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
 
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
 not have the same precision, which is why the constant is public: a test that
@@ -1378,6 +1380,48 @@ a group, which every head geometry here does. Same kernel, same arithmetic;
 the test holds the row against the single-row call bit for bit and the
 neighbouring rows untouched. `docs/BENCHMARKS.md` has what the batched step
 costs against the single one.
+
+## The Tacotron2 decode loop in nineteen launches
+
+The decoder produces one 80-channel mel frame a step through two LSTMs, a
+location-sensitive attention and a projection, and the profile of that
+loop was 39 operations a frame with the card busy under half the time. The
+rule from the Llama decode rounds applies unchanged: at one row everything
+here is under ten microseconds and mostly its own floor, so the unit that
+matters is the launch, and a seam that puts two bodies under one grid is
+free.
+
+Four of the new kernels are bookkeeping and say what they are:
+`relu_mask` is the prenet's ReLU and its dropout mask in one pass, reading
+the mask from a table drawn once for the whole line rather than uploaded
+every frame; `concat2` builds the cell's input from two vectors where two
+`copy_into`s did; `attn_weights_update` replaces the current attention row
+and grows the cumulative one in one pass; `copy_from_into` moves the gate
+logit into a per-line buffer so the stop can be read every eighth frame
+instead of every frame. Each is held against the copies it replaces at
+exact equality.
+
+The location attention is the fold worth describing. It was a transpose,
+a `linear` with the query as its bias, an `add_inplace`, a `tanh`, a second
+`linear` down to one score a position, a `softmax_rows`, a `gemm` for the
+context and the weights update - nine launches and five allocations. It is
+two now. `taco_energies` is a block per encoder position and a thread per
+attention unit: the energy is `linear`'s arithmetic - bias first, `fmaf`
+over the location features in order - with the query as the bias, the
+processed memory added and `tanhf` applied, reading the location features
+as the convolution left them so the transpose is never launched, and the
+score is the energies against `v` through a shared tree. `taco_context` is
+one block: `softmax_rows`'s max, `__expf` and sum over the scores in shared
+memory, then every thread owns channels of the context and sums the
+alignment down its column of the memory, and the first `t` threads do the
+weights update. The test holds both against the chain written out on the
+CPU at 1e-4 on the context and the weights.
+
+What the fold exposed is in `docs/BENCHMARKS.md`: with the launches gone,
+two thirds of the card's time was four mat-vecs streaming the decoder
+LSTMs' f32 weights at the card's bandwidth, and those weights turned out
+to be f16-exact in the published file. `gemv` reads f16 weights against an
+f32 activation already, so that was a binding change and not a kernel.
 
 ## Measured and rejected: sixteen-byte loads on the f16 mat-vec
 
