@@ -121,7 +121,11 @@ bit-identical mel - 1.4x realtime to 4.4x. The speech LLM then had its
 own round, to f16 weights and the chat model's f16 cache and fused decode
 attention, at a query group of seven the attention had to be widened for:
 4.6 to 2.6 ms a token, 5.7x realtime on the utterance, and an argmax that
-agrees with the f32 build at every teacher-forced position. This paragraph
+agrees with the f32 build at every teacher-forced position. Its residency
+is 2 157 MiB from 3 469, and the second number is a trap worth knowing:
+the memory pool keeps its pages, so a loader that uploads f32 and converts
+on the card leaves the f32 peak in what `nvidia-smi` reports - convert on
+the host. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

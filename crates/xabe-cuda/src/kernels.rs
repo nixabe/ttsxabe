@@ -130,6 +130,13 @@ __device__ __forceinline__ unsigned short f32_to_f16(float v) {
     return r;
 }
 
+// One half back to one float, exactly.
+__device__ __forceinline__ float f16_to_f32(unsigned short h) {
+    float r;
+    asm("{ .reg .f16 x; mov.b16 x, %1; cvt.f32.f16 %0, x; }" : "=f"(r) : "h"(h));
+    return r;
+}
+
 // The inverse, for the scalar path. `gemm_pack`'s output and a pair of halves
 // stored contiguously are the same 32 bits, which is the whole reason an f16
 // weight needs no conversion at all on the tiled path.
@@ -3408,6 +3415,19 @@ __global__ void embed_scaled(
     int pos = i / ch;
     int c = i - pos * ch;
     out[i] = table[(size_t)ids[pos] * ch + c] * scale;
+}
+
+// The same gather off an f16 table, for a table that is only ever read a
+// few rows at a time and would otherwise cost twice its width to hold.
+__global__ void embed_scaled_f16(
+    const unsigned short* __restrict__ table, const long long* __restrict__ ids,
+    float* __restrict__ out, int t, int ch, float scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= t * ch) return;
+    int pos = i / ch;
+    int c = i - pos * ch;
+    out[i] = f16_to_f32(table[(size_t)ids[pos] * ch + c]) * scale;
 }
 
 // Fuses weight_norm's direction and magnitude into a plain kernel.

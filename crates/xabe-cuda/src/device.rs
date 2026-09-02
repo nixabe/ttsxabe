@@ -612,6 +612,7 @@ const NAMES: &[&str] = &[
     "transpose",
     "flip_channels",
     "embed_scaled",
+    "embed_scaled_f16",
     "fuse_weight_norm",
     "attention_scores",
     "attention_context",
@@ -3103,6 +3104,41 @@ impl Gpu {
             .arg(&b_)
             .arg(&scale);
         launched("embed_scaled", unsafe { lb.launch(Self::flat(t * ch)) })?;
+        Ok(out)
+    }
+
+    /// [`Self::embed_scaled`] off an f16 table, widened as it is read.
+    /// Mirrors `embed_scaled` on the same table rounded to f16 exactly.
+    pub fn embed_scaled_f16(
+        &self,
+        table: &CudaSlice<u16>,
+        ids: &CudaSlice<i64>,
+        t: usize,
+        ch: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if ids.len() < t {
+            return Err(CudaError::SliceOverrun {
+                at: t,
+                len: ids.len(),
+            });
+        }
+        let n = t * ch;
+        // SAFETY: every element below `t * ch` is written by the kernel.
+        let mut out = unsafe { self.uninit(n) }?;
+        let (ti, ci) = (t as i32, ch as i32);
+        let f = self.func("embed_scaled_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(table)
+            .arg(ids)
+            .arg(&mut out)
+            .arg(&ti)
+            .arg(&ci)
+            .arg(&scale);
+        // SAFETY: an id past the table reads out of bounds, exactly as the
+        // f32 gather would; the callers bind their vocabularies and check ids
+        // against them before embedding.
+        launched("embed_scaled_f16", unsafe { lb.launch(Self::flat(n)) })?;
         Ok(out)
     }
 

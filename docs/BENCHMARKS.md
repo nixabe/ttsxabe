@@ -2266,11 +2266,15 @@ would answer a different question and give a smaller number.
 | ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 499 |
 | chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 267 |
 | translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | 16 045 |
-| CosyVoice3, LM + flow + vocoder | safetensors | 3 266 | **19 311** |
+| CosyVoice3, LM + flow + vocoder | safetensors → f16 where read as f16 | 2 157 | **18 202** |
 
-**19 311 MiB — 18.9 GiB of a 48 GiB card**, 39% of it, leaving 29 835 MiB for
+**18 202 MiB — 17.8 GiB of a 48 GiB card**, 37% of it, leaving 30 944 MiB for
 KV caches and activations. Without CosyVoice, which is the alternative
 synthesiser rather than a second stage, the four remaining are 16 045 MiB.
+The CosyVoice row stood at 3 266 MiB, and then at 3 469 when it was measured
+again after the speech LLM's weights were halved - which is the trap
+described under "CosyVoice3's residency" below, and the row here is from
+after it was closed; the other rows are as measured before it.
 This table stood at 21 771 MiB until the embedding tables were held packed -
 "One launch for a decode step's attention, and the embedding held packed"
 above - which is 1 632 MiB on the chat row and 830 on the translator's against
@@ -2783,6 +2787,44 @@ The step is 80% card-busy at 2.13 ms of kernels, 1.46 of them the
 mat-vecs at 0.99 GB a token, which is the memory system. What is left on
 the CPU side is 274 launches, and on the card side a weight stream that
 only a narrower weight would shorten.
+
+### CosyVoice3's residency: 3 469 MiB to 2 157, and the number that did not move
+
+The speech LLM's weights were halved and `xabe-vram` read **3 469 MiB**,
+against the 3 266 in the table above from before - more, not less. The
+same command on the commit before the halving read 3 469 too. The reason
+is the memory pool, which is told to keep its pages: the loader was
+uploading each f32 tensor and converting it on the card, so for a moment
+both widths were resident, and the pool kept that peak as its own and
+`nvidia-smi` reported it. The halving had happened; the measurement could
+not see it.
+
+Converting on the host (`Gpu::upload_f16`, round-to-nearest-even, the same
+bits the card's conversion produces) removes the peak, and three more
+tables go to f16 on the way: the text embedding, 151 936 rows of which a
+prompt reads a few dozen, gathered by a new `embed_scaled_f16`; the speech
+embedding and the speech head; and the flow's block linears - q, k, v, o
+and the two feed-forwards of 22 blocks, plus the input and output
+projections - which the tiled matmul stages as f16 regardless, so the
+estimator is **bit for bit** what it was (`examples/probe_est.rs`, all
+eleven taps). The single-row linears of the flow stay f32, because the
+mat-vec reads a weight at its own width and the identity would not
+survive them.
+
+| | before | after |
+| --- | ---: | ---: |
+| `xabe-vram`, CosyVoice3 alone | 3 469 MiB | **2 157 MiB** |
+| speech LLM, a token | 2.63-2.65 ms | 2.61 ms |
+| flow, 262 frames | 443 ms (240 frames) | 424 ms |
+
+What the f16 embeddings cost: the teacher-forced log-probabilities
+against the f32 build move from a worst difference of 1.0e-2 to 1.8e-2,
+the argmax still agreeing at all 120 positions and the worst row
+correlation 0.999999. The speech embedding was tried at f32 as well, since
+every decoded token enters through it, and the figure came out 2.6e-2 -
+no closer - so it is held like the rest. These are single-run figures,
+not a paired sitting, and the flow's 4% is inside what a sitting could
+move; the residency is the result here.
 
 ## The baseline to beat
 

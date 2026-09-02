@@ -78,15 +78,20 @@ struct GLayer {
 pub struct SpeechLlm {
     cfg: LlmConfig,
     gpu: Gpu,
-    /// Qwen2's text embedding, `[vocab, hidden]`.
-    embed: CudaSlice<f32>,
-    /// The speech-token embedding, `[speech_vocab, hidden]`. Also the source
-    /// of the `sos` and `task_id` markers.
-    speech_embed: CudaSlice<f32>,
+    /// Qwen2's text embedding, `[vocab, hidden]`, at f16: 151936 rows of
+    /// which a prompt reads a few dozen, and 544 MB at f32.
+    embed: CudaSlice<u16>,
+    /// The speech-token embedding, `[speech_vocab, hidden]`, at f16 like the
+    /// text one. Also the source of the `sos` and `task_id` markers. It was
+    /// tried at f32 as well - every decoded token enters through it - and
+    /// the teacher-forced log-probabilities came out no closer to the f32
+    /// build's, so it is held the way every other matrix here is.
+    speech_embed: CudaSlice<u16>,
     layers: Vec<GLayer>,
     norm: CudaSlice<f32>,
-    /// The speech head, `[speech_vocab, hidden]`.
-    decoder: CudaSlice<f32>,
+    /// The speech head, `[speech_vocab, hidden]`, at f16 like every other
+    /// matrix here.
+    decoder: CudaSlice<u16>,
 }
 
 /// The keys and values a decode step reuses.
@@ -160,9 +165,9 @@ impl SpeechLlm {
         let (h, kv) = (cfg.hidden_size, cfg.kv_dim());
         let lin =
             |prefix: &str, out: usize, inp: usize, bias: bool| -> Result<GLinear, CosyError> {
-                let full = want(&format!("{prefix}.weight"), &[out, inp])?;
                 Ok(GLinear {
-                    w: gpu.to_f16(&full, out * inp)?,
+                    w: gpu
+                        .upload_f16(f.tensor_shaped(&format!("{prefix}.weight"), &[out, inp])?)?,
                     bias: match bias {
                         true => Some(want(&format!("{prefix}.bias"), &[out])?),
                         false => None,
@@ -179,9 +184,8 @@ impl SpeechLlm {
             for (name, o) in names {
                 rows.extend_from_slice(f.tensor_shaped(name, &[*o, inp])?);
             }
-            let full = gpu.upload(&rows)?;
             Ok(GLinear {
-                w: gpu.to_f16(&full, out * inp)?,
+                w: gpu.upload_f16(&rows)?,
                 bias: None,
                 in_dim: inp,
                 out_dim: out,
@@ -234,12 +238,15 @@ impl SpeechLlm {
             });
         }
 
+        let half = |name: &str, shape: &[usize]| -> Result<CudaSlice<u16>, CosyError> {
+            Ok(gpu.upload_f16(f.tensor_shaped(name, shape)?)?)
+        };
         let model = Self {
-            embed: want("model.embed_tokens.weight", &[cfg.vocab_size, h])?,
-            speech_embed: want("speech_embedding.weight", &[cfg.speech_vocab_size, h])?,
+            embed: half("model.embed_tokens.weight", &[cfg.vocab_size, h])?,
+            speech_embed: half("speech_embedding.weight", &[cfg.speech_vocab_size, h])?,
             layers,
             norm: want("model.norm.weight", &[h])?,
-            decoder: want("llm_decoder.weight", &[cfg.speech_vocab_size, h])?,
+            decoder: half("llm_decoder.weight", &[cfg.speech_vocab_size, h])?,
             cfg,
             gpu,
         };
@@ -289,11 +296,15 @@ impl SpeechLlm {
         let mut out = self.gpu.zeros(n * h)?;
 
         let ids: Vec<i64> = text.iter().map(|&i| i64::from(i)).collect();
-        let body =
-            self.gpu
-                .embed_scaled(&self.embed, &self.gpu.upload_i64(&ids)?, text.len(), h, 1.0)?;
+        let body = self.gpu.embed_scaled_f16(
+            &self.embed,
+            &self.gpu.upload_i64(&ids)?,
+            text.len(),
+            h,
+            1.0,
+        )?;
         // The two markers come from the *speech* table, not the text one.
-        let markers = self.gpu.embed_scaled(
+        let markers = self.gpu.embed_scaled_f16(
             &self.speech_embed,
             &self
                 .gpu
@@ -321,7 +332,7 @@ impl SpeechLlm {
 
     /// Embeds one generated speech token, to be fed back in.
     pub fn speech_step(&self, id: u32) -> Result<CudaSlice<f32>, CosyError> {
-        Ok(self.gpu.embed_scaled(
+        Ok(self.gpu.embed_scaled_f16(
             &self.speech_embed,
             &self.gpu.upload_i64(&[i64::from(id)])?,
             1,
@@ -578,7 +589,7 @@ impl SpeechLlm {
             .rms_norm(&h, n, h_dim, &self.norm, LlmConfig::RMS_EPS)?;
         Ok(self.gpu.gemm_batched(
             Operand::F32(&h),
-            Operand::F32(&self.decoder),
+            Operand::F16(&self.decoder),
             None,
             Batch::single(n * self.cfg.speech_vocab_size),
             n,

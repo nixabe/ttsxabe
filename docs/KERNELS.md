@@ -132,6 +132,7 @@ to reason about is not a reference.
 | `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
 | `taco_energies`, `taco_context` | Tacotron2's location attention, one frame | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
 | `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `xabe_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
+| `embed_scaled_f16` | the speech LLM's tables at f16 | `embed_scaled` on the table rounded on the host, exactly | a 544 MB table read a few rows at a time |
 | `relu_mask`, `concat2`, `attn_weights_update`, `copy_from_into` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
 
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do

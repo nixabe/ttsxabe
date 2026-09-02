@@ -3484,3 +3484,37 @@ fn the_modulated_layer_norm_and_the_gated_residual_are_the_chain_they_replace() 
         "a segment past the end of the vector must be refused"
     );
 }
+
+/// The f16 gather against the f32 one over a table rounded to f16 on the
+/// host: the same rows, exactly.
+#[test]
+fn the_f16_embedding_gather_is_the_f32_one_on_the_rounded_table() {
+    let Some(g) = gpu() else { return };
+    let (vocab, ch) = (300usize, 96usize);
+    let table = seq(vocab * ch, 301);
+    let rounded: Vec<f32> = table
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_f32())
+        .collect();
+    let ids: Vec<i64> = vec![0, 299, 17, 17, 128];
+    let idd = g.upload_i64(&ids).unwrap();
+    let want = g
+        .download(
+            &g.embed_scaled(&a_up(&g, &rounded), &idd, ids.len(), ch, 1.5)
+                .unwrap(),
+        )
+        .unwrap();
+    let half_table = g.upload_f16(&table).unwrap();
+    let got = g
+        .download(
+            &g.embed_scaled_f16(&half_table, &idd, ids.len(), ch, 1.5)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(got, want, "the f16 gather is not the f32 one");
+    assert!(
+        g.embed_scaled_f16(&half_table, &idd, ids.len() + 1, ch, 1.0)
+            .is_err(),
+        "more positions than ids must be refused"
+    );
+}

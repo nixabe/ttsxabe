@@ -41,10 +41,33 @@ use xabe_st::StFile;
 
 /// A row-major `[out, in]` matrix with an optional bias.
 struct Linear {
-    w: CudaSlice<f32>,
+    w: LinearWeight,
     b: Option<CudaSlice<f32>>,
     in_dim: usize,
     out_dim: usize,
+}
+
+/// A linear's matrix, at the width its consumer reads.
+///
+/// The block linears are read by the tiled matmul over a few hundred rows,
+/// and that kernel stages its operands as f16 whatever it is handed, so
+/// holding them at f16 is the same numbers reaching the tensor cores and
+/// half the bytes - 560 MB of the flow. The single-row linears (the
+/// timestep MLP, the modulation projections, the speaker affine) go through
+/// the mat-vec, which reads a weight at its own width exactly, and stay at
+/// f32 so the estimator remains bit for bit what it was.
+enum LinearWeight {
+    Full(CudaSlice<f32>),
+    Half(CudaSlice<u16>),
+}
+
+impl LinearWeight {
+    fn operand(&self) -> Operand<'_> {
+        match self {
+            LinearWeight::Full(w) => Operand::F32(w),
+            LinearWeight::Half(w) => Operand::F16(w),
+        }
+    }
 }
 
 /// One DiT block.
@@ -153,9 +176,20 @@ impl Flow {
 
     /// The same, on a device already open.
     pub fn from_parts(cfg: FlowConfig, f: StFile, gpu: Gpu) -> Result<Self, CosyError> {
-        let lin = |p: &str, out: usize, inp: usize, bias: bool| -> Result<Linear, CosyError> {
+        // `half` for the linears the tiled matmul reads; see `LinearWeight`.
+        let lin = |p: &str,
+                   out: usize,
+                   inp: usize,
+                   bias: bool,
+                   half: bool|
+         -> Result<Linear, CosyError> {
+            let w = f.tensor_shaped(&format!("{p}.weight"), &[out, inp])?;
             Ok(Linear {
-                w: gpu.upload(f.tensor_shaped(&format!("{p}.weight"), &[out, inp])?)?,
+                w: if half {
+                    LinearWeight::Half(gpu.upload_f16(w)?)
+                } else {
+                    LinearWeight::Full(gpu.upload(w)?)
+                },
                 b: match bias {
                     true => Some(gpu.upload(f.tensor_shaped(&format!("{p}.bias"), &[out])?)?),
                     false => None,
@@ -181,13 +215,13 @@ impl Flow {
         for i in 0..cfg.depth {
             let p = format!("{est}.transformer_blocks.{i}");
             blocks.push(Block {
-                attn_norm: lin(&format!("{p}.attn_norm.linear"), 6 * d, d, true)?,
-                q: lin(&format!("{p}.attn.to_q"), d, d, true)?,
-                k: lin(&format!("{p}.attn.to_k"), d, d, true)?,
-                v: lin(&format!("{p}.attn.to_v"), d, d, true)?,
-                o: lin(&format!("{p}.attn.to_out.0"), d, d, true)?,
-                ff_in: lin(&format!("{p}.ff.ff.0.0"), d * cfg.ff_mult, d, true)?,
-                ff_out: lin(&format!("{p}.ff.ff.2"), d, d * cfg.ff_mult, true)?,
+                attn_norm: lin(&format!("{p}.attn_norm.linear"), 6 * d, d, true, false)?,
+                q: lin(&format!("{p}.attn.to_q"), d, d, true, true)?,
+                k: lin(&format!("{p}.attn.to_k"), d, d, true, true)?,
+                v: lin(&format!("{p}.attn.to_v"), d, d, true, true)?,
+                o: lin(&format!("{p}.attn.to_out.0"), d, d, true, true)?,
+                ff_in: lin(&format!("{p}.ff.ff.0.0"), d * cfg.ff_mult, d, true, true)?,
+                ff_out: lin(&format!("{p}.ff.ff.2"), d, d * cfg.ff_mult, true, true)?,
             });
         }
 
@@ -203,6 +237,7 @@ impl Flow {
                 cfg.mel_dim,
                 cfg.spk_embed_dim,
                 true,
+                false,
             )?,
             // The look-ahead pair: 80 to 1024 over four frames, then back to
             // 80 over three. Both are ordinary convolutions with left padding
@@ -214,11 +249,18 @@ impl Flow {
                 d,
                 FlowConfig::FREQ_EMBED_DIM,
                 true,
+                false,
             )?,
-            time_mlp2: lin(&format!("{est}.time_embed.time_mlp.2"), d, d, true)?,
+            time_mlp2: lin(&format!("{est}.time_embed.time_mlp.2"), d, d, true, false)?,
             // 320 in: the noisy mel, the condition, the token embedding and
             // the speaker, each 80 wide.
-            input_proj: lin(&format!("{est}.input_embed.proj"), d, 4 * cfg.mel_dim, true)?,
+            input_proj: lin(
+                &format!("{est}.input_embed.proj"),
+                d,
+                4 * cfg.mel_dim,
+                true,
+                true,
+            )?,
             pos1: conv(
                 &format!("{est}.input_embed.conv_pos_embed.conv1.0"),
                 d,
@@ -232,8 +274,8 @@ impl Flow {
                 FlowConfig::POS_KERNEL,
             )?,
             blocks,
-            norm_out: lin(&format!("{est}.norm_out.linear"), 2 * d, d, true)?,
-            proj_out: lin(&format!("{est}.proj_out"), cfg.mel_dim, d, true)?,
+            norm_out: lin(&format!("{est}.norm_out.linear"), 2 * d, d, true, false)?,
+            proj_out: lin(&format!("{est}.proj_out"), cfg.mel_dim, d, true, true)?,
             inv_freq: gpu.upload(
                 f.tensor_shaped(&format!("{est}.rotary_embed.inv_freq"), &[cfg.dim_head / 2])?,
             )?,
@@ -267,7 +309,7 @@ impl Flow {
     ) -> Result<CudaSlice<f32>, CosyError> {
         Ok(self.gpu.gemm_batched(
             Operand::F32(x),
-            Operand::F32(&l.w),
+            l.w.operand(),
             l.b.as_ref(),
             Batch::single(rows * l.out_dim),
             rows,
