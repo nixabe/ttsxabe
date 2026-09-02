@@ -541,10 +541,12 @@ pub(crate) struct Wn {
     /// of every row, which [`Gpu::add_strided`] adds without materialising.
     pub(crate) cond: Conv,
     pub(crate) in_layers: Vec<Conv>,
-    /// The residual half, absent on the last layer, which feeds only the skip.
-    pub(crate) res: Vec<Option<Conv>>,
-    /// The skip half, `[ch, ch]`.
-    pub(crate) skip: Vec<Conv>,
+    /// Each layer's residual and skip projections as the one `[2 * ch, ch]`
+    /// the checkpoint stores - residual rows, then skip rows - or `[ch, ch]`
+    /// on the last layer, which feeds only the skip. One tensor because the
+    /// two are one launch: a batch of two over one activation, each half
+    /// accumulating into its own running sum; see `vocoder::coupling`.
+    pub(crate) res_skip: Vec<Conv>,
 }
 
 /// One flow: an inverted 1x1 mixing convolution and a coupling network.
@@ -577,8 +579,7 @@ impl Glow {
             let inv = gpu.upload(&invert(raw, channels, k)?)?;
 
             let mut in_layers = Vec::with_capacity(c.wn_layers);
-            let mut res = Vec::with_capacity(c.wn_layers);
-            let mut skip = Vec::with_capacity(c.wn_layers);
+            let mut res_skip = Vec::with_capacity(c.wn_layers);
             // One projection for all the layers: see `Wn::cond`.
             let cond = bind_wn_rows(
                 f,
@@ -600,16 +601,12 @@ impl Glow {
                     c.wn_kernel,
                 )?);
                 // The last layer feeds only the skip path, so it has no
-                // residual half. Getting this backwards runs, and mixes the
-                // residual into the output.
+                // residual half and the tensor is `[ch, ch]`. Getting this
+                // backwards runs, and mixes the residual into the output; the
+                // shape check in `bind_wn` is what catches it.
                 let name = format!("WN.{k}.res_skip_layers.{i}");
-                if i == c.wn_layers - 1 {
-                    res.push(None);
-                    skip.push(bind_wn_rows(f, gpu, &name, ch, ch, 1, 0, 1)?);
-                } else {
-                    res.push(Some(bind_wn_rows(f, gpu, &name, 2 * ch, ch, 1, 0, 2)?));
-                    skip.push(bind_wn_rows(f, gpu, &name, 2 * ch, ch, 1, 1, 2)?);
-                }
+                let out = if i == c.wn_layers - 1 { ch } else { 2 * ch };
+                res_skip.push(bind_wn(f, gpu, &name, out, ch, 1)?);
             }
 
             flows.push(Flow {
@@ -622,8 +619,7 @@ impl Glow {
                     end: bind_plain(f, gpu, &format!("WN.{k}.end"), 2 * half, ch, 1, true)?,
                     cond,
                     in_layers,
-                    res,
-                    skip,
+                    res_skip,
                 },
             });
         }

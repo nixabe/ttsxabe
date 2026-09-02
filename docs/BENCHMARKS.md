@@ -2672,6 +2672,86 @@ the projection's epilogue, the `memset`s under outputs the kernel writes
 whole. That is the next round, and it is worth several times what the
 loop has left.
 
+### The vocoder's folds: 1.07x to 1.11x, and an epilogue that cost double before it cost half
+
+The accounting above named the adds, the `im2col`, the `memset`s and the
+two half-width projections as folds and shapes. This is the round that
+did the first three of those four, and what it found in the matmul on the
+way is worth more than the folds.
+
+**What changed.** Each layer's residual and skip projections were two
+products of `n = 256` over the same activation, each into a fresh buffer
+and each followed by an `add_inplace` into a running sum. The checkpoint
+stores the two as one `[512, 256]` tensor, residual rows then skip rows,
+so they are bound as one and run as one batched product with a shared
+left operand, a bias of the batch's own, and a store that *adds* to the
+buffer it writes - `Gpu::gemm_batched_into` - with the two running sums
+laid out as one `[2, steps, 256]` so a batch's outputs are a stride
+apart. The conditioning add was a read, a write and a launch over 27 MB
+a layer to leave a sum the gate then read; `gated_cond_rows` reads the
+conditioning on the way into the gate instead. And the two allocations
+the loop zeroed every layer are written whole by their kernels, so they
+are not zeroed: 445 `memset`s an utterance are 265, and the survivors
+are the small ones.
+
+**The accumulating store cost double before it cost half.** The first
+form of the epilogue loaded, added and stored each element in turn, and
+the batched product ran at 224 µs where the two it replaced ran 55 each
+- the single-product form at 108. The compiler cannot prove that a store
+to `out` does not alias the next load from it, so the sixty-four loads a
+thread were serialised behind the sixty-four stores. Written as two
+passes - the running values folded into the accumulators in a pass that
+stores nothing, then the plain store - the batched product is 159 µs,
+which is 80 a product: the plain kernel plus the read of its output,
+where the two adds it replaces were 34 each on top of the products. Even
+the plain store loop had slowed, 55 to 70 µs, from a per-element branch
+added to it, because at `k = 256` this kernel is mostly its epilogue;
+the plain loop is untouched now and the accumulating one is its own
+branch.
+
+By kernel, after the decoder, one utterance of 206 frames:
+
+| Kernel | Before | After |
+| --- | ---: | ---: |
+| residual and skip products | 10.6 ms | 14.0 ms |
+| their two adds | 6.1 ms | - |
+| conditioning add | 6.9 ms | - |
+| gated activation | 3.6 ms | 6.0 ms |
+| `memset` | 5.0 ms | 0.75 ms |
+| everything else | 54.7 ms | 56.6 ms |
+| kernel time | 86.9 ms | 77.4 ms |
+| wall | 99.1 ms | 84.7 ms |
+
+The audio is **bit-identical** to the previous commit's - the engine's
+one-shot output on the shortest line, compared sample for sample - which
+is the ordering rule in the epilogue: `(product + bias)` first and the
+running value added to that, exactly what the add kernel computed.
+
+Same sitting, alternated in pairs, the previous binary against this one,
+the worse pair on each side:
+
+| Text | Frames | Before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `Tâi-lâm ū chiok chē hó-chia̍h--ê,` | 206 | 119.3 ms | 111.3 ms | 1.07x |
+| `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` | 397 | 218.6 ms | 197.3 ms | 1.11x |
+| `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` | 513 | 279.9 ms | 252.6 ms | 1.11x |
+
+The better pair reads 117.9 → 110.1, 217.2 → 195.2 and 277.9 → 251.9.
+The longer lines gain more because the vocoder's share grows with the
+line; 20.0x realtime to 21.5x on the shortest and 21.4x to 23.6x on the
+longest.
+
+**What is left there.** The dilated products at 24.7 ms and the
+conditioning at 17 ms are the tiled kernel at 21 and 25 TFLOP/s, its
+ceiling on this card. `im2col` is 6.1 ms of gather that an A-loader
+reading three taps of the residual stream would not need; the gate is
+6.0 ms at 545 GB/s, bandwidth. The mel upsample is 4.6 ms at 0.6
+TFLOP/s, and an integer division per tap per channel that looked like
+the reason was hoisted and measured as nothing; the kernel is read-bound
+on a weight each thread walks 320 elements of, and the fix is threads
+that share the walk. The postnet's five convolutions are 2.1 ms at 1.3
+TFLOP/s through the direct kernel.
+
 ### A measurement trap in the harness itself
 
 The per-stage breakdown attributed 23.9 ms to `coupling_inverse`, a kernel that

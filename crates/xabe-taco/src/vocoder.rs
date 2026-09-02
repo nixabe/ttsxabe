@@ -78,8 +78,26 @@ fn coupling(
 ) -> Result<CudaSlice<f32>, TacoError> {
     let ch = c.wn_channels;
     let at = clock.start();
-    let mut a = matmul(gpu, audio_t, &wn.start, steps, half, ch)?;
-    let mut skip = gpu.zeros(steps * ch)?;
+    // The two running sums as one `[2, steps, ch]`: the residual stream
+    // first, the skip sum after it. One allocation because each layer's
+    // residual and skip projections are one batched product that
+    // accumulates straight into both - `Gpu::gemm_batched_into` - and a
+    // batch's outputs are a stride apart. The zeros are the skip sum's
+    // start; the residual half is written whole by the start projection.
+    let mut sums = gpu.zeros(2 * steps * ch)?;
+    gpu.gemm_batched_into(
+        Operand::F32(audio_t),
+        wn.start.w.operand(),
+        Some(&wn.start.bias),
+        0,
+        Batch::single(steps * ch),
+        steps,
+        half,
+        ch,
+        false,
+        &mut sums,
+        0,
+    )?;
     clock.stop(gpu, "    wn start", at)?;
 
     // Every layer's conditioning at once. It depends only on the mel, not on
@@ -96,35 +114,57 @@ fn coupling(
         let at = clock.start();
         let dil = 1usize << i;
         let layer = &wn.in_layers[i];
-        let (col, out_t) = gpu.im2col(&a, steps, ch, c.wn_kernel, 1, dil, dil)?;
+        // `im2col` reads the first `steps * ch` of `sums`: the residual
+        // stream.
+        let (col, out_t) = gpu.im2col(&sums, steps, ch, c.wn_kernel, 1, dil, dil)?;
         debug_assert_eq!(out_t, steps, "the dilated padding did not preserve length");
-        let mut act = matmul(gpu, &col, layer, steps, ch * c.wn_kernel, 2 * ch)?;
+        let act = matmul(gpu, &col, layer, steps, ch * c.wn_kernel, 2 * ch)?;
         clock.stop(gpu, "    wn dilated", at)?;
 
+        // The layer's share of the conditioning added on the way into the
+        // gate, which reads it once, where `add_strided` read and wrote the
+        // whole activation to leave the sum behind.
         let at = clock.start();
-        gpu.add_strided(
-            &mut act,
-            &cond_all,
-            2 * ch,
-            wn.cond.out_ch,
-            i * 2 * ch,
-            steps,
-        )?;
-        clock.stop(gpu, "    wn cond add", at)?;
+        let gated = gpu.gated_cond_rows(&act, &cond_all, wn.cond.out_ch, i * 2 * ch, ch, steps)?;
+        clock.stop(gpu, "    wn gate", at)?;
 
+        // The residual and skip projections as one launch over one
+        // activation, each accumulating into its own sum. On the last layer
+        // there is only the skip half, and it lands at row `steps`.
         let at = clock.start();
-        let gated = gpu.gated_activation_rows(&act, ch, steps)?;
-        if let Some(res) = &wn.res[i] {
-            let r = matmul(gpu, &gated, res, steps, ch, ch)?;
-            gpu.add_inplace(&mut a, &r, steps * ch)?;
-        }
-        let sk = &wn.skip[i];
-        let s = matmul(gpu, &gated, sk, steps, ch, ch)?;
-        gpu.add_inplace(&mut skip, &s, steps * ch)?;
+        let rs = &wn.res_skip[i];
+        let (batch, first) = if rs.out_ch == 2 * ch {
+            (
+                Batch {
+                    count: 2,
+                    a: 0,
+                    w: ch * ch,
+                    out: steps * ch,
+                    w_row: 0,
+                },
+                0,
+            )
+        } else {
+            (Batch::single(steps * ch), steps)
+        };
+        gpu.gemm_batched_into(
+            Operand::F32(&gated),
+            rs.w.operand(),
+            Some(&rs.bias),
+            ch,
+            batch,
+            steps,
+            ch,
+            ch,
+            true,
+            &mut sums,
+            first,
+        )?;
         clock.stop(gpu, "    wn res_skip", at)?;
     }
 
     let at = clock.start();
+    let skip = gpu.copy_range(&sums, steps * ch, steps * ch)?;
     let end = matmul(gpu, &skip, &wn.end, steps, ch, 2 * half)?;
     clock.stop(gpu, "    wn end", at)?;
     Ok(end)

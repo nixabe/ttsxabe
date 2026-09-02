@@ -856,7 +856,12 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
     // position, and at `o_off + col * o_cs` otherwise, which is a transposed
     // value cache when `o_cs` is the capacity. The defaults `0, 1, 0, 0, 0`
     // are the plain store. See `Gpu::gemv_into`.
-    int epi_act, int o_cs, int o_hs, int o_hd, long o_off)
+    int epi_act, int o_cs, int o_hs, int o_hd, long o_off,
+    // Elements between consecutive products' biases, when a batch does not
+    // share one; and whether the result is added to what `out` holds rather
+    // than stored over it. Both zero is the plain product. See
+    // `Gpu::gemm_batched_into`.
+    long sb, int accum)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -1023,7 +1028,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (lane == 0) {
-        float v = acc + (bias ? bias[col] : 0.0f);
+        float v = acc + (bias ? bias[(size_t)blockIdx.z * sb + col] : 0.0f);
         if (epi_act == 1) {
             // `act_gelu`'s expression, character for character.
             v = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
@@ -1036,7 +1041,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
         } else {
             idx = (size_t)o_off + (size_t)row * n + col;
         }
-        out[idx] = v;
+        out[idx] = accum ? out[idx] + v : v;
     }
 }
 
@@ -1073,7 +1078,9 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
     int w_rs,
     // Whether `w` is f16, two halves to a word. `k` and `w_rs` are then both
     // even - a cache is head_dim wide or capacity apart and both are.
-    int w_half)
+    int w_half,
+    // As in `gemv`: the batch's bias stride and the accumulating store.
+    long sb, int accum)
 {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * GEMV_WARPS + threadIdx.y;
@@ -1150,7 +1157,9 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_rows(
             v += __shfl_down_sync(0xffffffff, v, off);
         }
         if (lane == 0) {
-            out[(size_t)r * n + col] = v + (bias ? bias[col] : 0.0f);
+            const size_t i = (size_t)r * n + col;
+            v += bias ? bias[(size_t)blockIdx.z * sb + col] : 0.0f;
+            out[i] = accum ? out[i] + v : v;
         }
     }
 }
@@ -1176,7 +1185,12 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     // them. See the note above `partial`.
     int ksplit,
     // `[ksplit, batch, m, n]`, written instead of `out` when `ksplit > 1`.
-    float* __restrict__ partial)
+    float* __restrict__ partial,
+    // Elements between consecutive products' biases, when a batch does not
+    // share one; and whether the result is added to what `out` holds rather
+    // than stored over it - by `gemm_reduce` when the contraction is split,
+    // since a partial is not the result. See `Gpu::gemm_batched_into`.
+    long sb, int accum)
 {
     // Aligned for the quad-wide staging stores: `GEMM_WSTRIDE` is a multiple
     // of four words, so a row start is 16-byte aligned when the array is.
@@ -1463,11 +1477,63 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
     if (ksplit > 1) {
         out = partial + ((size_t)slice * (gridDim.z / ksplit) + bat) * (size_t)m * n;
     }
+    const float* bb = bias ? bias + (size_t)bat * sb : bias;
+    if (accum && ksplit == 1) {
+        // The accumulating store, as its own two passes. The first folds
+        // what `out` holds into the accumulators and stores nothing, so its
+        // sixty-four loads a thread are independent and pipeline; a loop
+        // that loaded, added and stored each element in turn measured at
+        // twice the plain kernel on WaveGlow's k = 256, because a store to
+        // `out` may alias the next load and the compiler serialised them.
+        // `(acc + bias)` first and the running value added to that, so the
+        // result is exactly the plain product added to what was there -
+        // which is what the test checks it against. The second pass is the
+        // plain store with the bias already in.
+        #pragma unroll
+        for (int nt = 0; nt < GEMM_NPW; ++nt) {
+            const int col0 = n0 + (warp * GEMM_NPW + nt) * 8 + 2 * tg;
+            const float bias0 = (bias && col0     < n) ? bb[col0]     : 0.0f;
+            const float bias1 = (bias && col0 + 1 < n) ? bb[col0 + 1] : 0.0f;
+            #pragma unroll
+            for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
+                int row0 = m0 + 16 * ms + g;
+                int row1 = row0 + 8;
+                if (row0 < m) {
+                    const float* o = out + (size_t)row0 * n + col0;
+                    if (col0     < n) acc[ms][nt][0] = o[0] + (acc[ms][nt][0] + bias0);
+                    if (col0 + 1 < n) acc[ms][nt][1] = o[1] + (acc[ms][nt][1] + bias1);
+                }
+                if (row1 < m) {
+                    const float* o = out + (size_t)row1 * n + col0;
+                    if (col0     < n) acc[ms][nt][2] = o[0] + (acc[ms][nt][2] + bias0);
+                    if (col0 + 1 < n) acc[ms][nt][3] = o[1] + (acc[ms][nt][3] + bias1);
+                }
+            }
+        }
+        #pragma unroll
+        for (int nt = 0; nt < GEMM_NPW; ++nt) {
+            const int col0 = n0 + (warp * GEMM_NPW + nt) * 8 + 2 * tg;
+            #pragma unroll
+            for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
+                int row0 = m0 + 16 * ms + g;
+                int row1 = row0 + 8;
+                if (row0 < m) {
+                    if (col0     < n) out[(size_t)row0 * n + col0]     = acc[ms][nt][0];
+                    if (col0 + 1 < n) out[(size_t)row0 * n + col0 + 1] = acc[ms][nt][1];
+                }
+                if (row1 < m) {
+                    if (col0     < n) out[(size_t)row1 * n + col0]     = acc[ms][nt][2];
+                    if (col0 + 1 < n) out[(size_t)row1 * n + col0 + 1] = acc[ms][nt][3];
+                }
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int nt = 0; nt < GEMM_NPW; ++nt) {
         const int col0 = n0 + (warp * GEMM_NPW + nt) * 8 + 2 * tg;
-        const float bias0 = (bias && ksplit == 1 && col0     < n) ? bias[col0]     : 0.0f;
-        const float bias1 = (bias && ksplit == 1 && col0 + 1 < n) ? bias[col0 + 1] : 0.0f;
+        const float bias0 = (bias && ksplit == 1 && col0     < n) ? bb[col0]     : 0.0f;
+        const float bias1 = (bias && ksplit == 1 && col0 + 1 < n) ? bb[col0 + 1] : 0.0f;
         #pragma unroll
         for (int ms = 0; ms < GEMM_MSTEPS; ++ms) {
             int row0 = m0 + 16 * ms + g;
@@ -1492,7 +1558,8 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
 // every differential threshold in the workspace a coin toss.
 extern "C" __global__ void gemm_reduce(
     const float* __restrict__ partial, const float* __restrict__ bias,
-    float* __restrict__ out, int mn, int n, int batch, int ksplit)
+    float* __restrict__ out, int mn, int n, int batch, int ksplit,
+    long sb, int accum)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= mn * batch) return;
@@ -1500,7 +1567,9 @@ extern "C" __global__ void gemm_reduce(
     for (int s = 0; s < ksplit; ++s) {
         acc += partial[(size_t)s * mn * batch + i];
     }
-    out[i] = acc + (bias ? bias[i % n] : 0.0f);
+    const int bat = i / mn;
+    const float v = acc + (bias ? bias[(size_t)bat * sb + (i % n)] : 0.0f);
+    out[i] = accum ? out[i] + v : v;
 }
 // ------------------------------------------------------- the integer matmul
 //
@@ -2638,15 +2707,23 @@ __global__ void transposed_conv1d(
     int p = idx - o * out_t;
 
     float acc = bias ? bias[o] : 0.0f;
-    int shifted = p + pad;
-    int first = shifted % stride;
+    // The taps that touch this sample are `first + j * stride`, from input
+    // position `n0 - j`: one division here rather than one per tap per
+    // channel, which at WaveGlow's 80 channels and four taps was 320 integer
+    // divisions a sample and the whole cost of the kernel - 4.6 ms for
+    // 2.7 GFLOP. The order of the sums is unchanged, channel by channel and
+    // taps ascending, so the result is the same to the bit.
+    const int shifted = p + pad;
+    const int n0 = shifted / stride;
+    const int first = shifted - n0 * stride;
+    const int taps = (k - first + stride - 1) / stride;
     for (int i = 0; i < in_ch; ++i) {
         const float* xi = x + (size_t)i * t;
         const float* wi = w + ((size_t)i * out_ch + o) * k;
-        for (int tap = first; tap < k; tap += stride) {
-            int n = (shifted - tap) / stride;
+        for (int j = 0; j < taps; ++j) {
+            const int n = n0 - j;
             if (n < 0 || n >= t) continue;
-            acc = fmaf(xi[n], wi[tap], acc);
+            acc = fmaf(xi[n], wi[first + j * stride], acc);
         }
     }
     out[idx] = acc;
@@ -3162,6 +3239,27 @@ __global__ void gated_activation_rows(
     int c = i - p * ch;
     float a = x[(size_t)p * 2 * ch + c];
     float b = x[(size_t)p * 2 * ch + ch + c];
+    out[i] = tanhf(a) * (1.0f / (1.0f + __expf(-b)));
+}
+
+// The same gate with the conditioning added on the way in: `x + cond` where
+// `cond` is a column block of a wide `[t, stride]` matrix, exactly the sum
+// `add_strided` would have left in `x`, then `gated_activation_rows` of it.
+// WaveGlow's coupling network adds a layer's share of one wide conditioning
+// product into every activation before gating it; the add was a read, a
+// write and a launch over 27 MB a layer, and this reads the conditioning
+// once instead.
+__global__ void gated_cond_rows(
+    const float* __restrict__ x, const float* __restrict__ cond,
+    int stride, int off, float* __restrict__ out, int ch, int t)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch * t) return;
+    int p = i / ch;
+    int c = i - p * ch;
+    const float* cr = cond + (size_t)p * stride + off;
+    float a = x[(size_t)p * 2 * ch + c] + cr[c];
+    float b = x[(size_t)p * 2 * ch + ch + c] + cr[ch + c];
     out[i] = tanhf(a) * (1.0f / (1.0f + __expf(-b)));
 }
 

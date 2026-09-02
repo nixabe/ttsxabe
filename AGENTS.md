@@ -118,8 +118,15 @@ frame to sixteen launches with no allocation, for **1.03x**, and measured a
 CUDA-graph replay of the frame as level with issuing it launch by launch:
 the launch floor here is the card's front end, which hides a launch only
 behind a long kernel, and not the CPU as the previous round had diagnosed.
-`docs/BENCHMARKS.md` has the trace and the vocoder accounting that is the
-next round. CosyVoice3 has since had
+`docs/BENCHMARKS.md` has the trace. The vocoder then had the round that
+accounting named, for **1.07x to 1.11x** on three lines: each layer's
+residual and skip projections are one batched product accumulating into
+the two running sums, the conditioning add rides into the gate, and the
+zeroed allocations are not zeroed. The finding to carry is in the matmul's
+store: an accumulating epilogue written as load-add-store per element ran
+at twice the plain kernel, because a store to the output may alias the next
+load and the compiler serialised them; two passes, loads then stores, is
+the form. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

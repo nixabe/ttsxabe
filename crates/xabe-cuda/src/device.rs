@@ -8,7 +8,9 @@
 use crate::error::CudaError;
 use crate::kernels::{self, SOURCE};
 use cudarc::driver::PushKernelArg;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, LaunchConfig,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -596,6 +598,7 @@ const NAMES: &[&str] = &[
     "act_gelu",
     "gated_activation",
     "gated_activation_rows",
+    "gated_cond_rows",
     "add_inplace",
     "sub_inplace",
     "mul_inplace",
@@ -1491,6 +1494,103 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
+        // SAFETY: both kernels write every element of the tile they own, with
+        // the predication covering exactly the (m, n) range - see the store
+        // loop in kernels.rs, and `every_output_element_is_written_exactly_once`
+        // in the tests, which is the check this relies on.
+        let mut out = unsafe { self.uninit(batch.count * m * n) }?;
+        self.gemm_core(a, w, w_first, bias, 0, batch, m, k, n, false, &mut out, 0)?;
+        Ok(out)
+    }
+
+    /// [`Self::gemm_batched`] into a buffer the caller owns, optionally
+    /// added to what the buffer holds, with a bias of the batch's own.
+    ///
+    /// `out` is written from row `out_first` - `out_first * n` elements in -
+    /// and product `b` of the batch reads its bias from `bias_stride * b`,
+    /// so a `[2 * n]` bias serves a batch of two. With `accumulate` the
+    /// result is `out + (product + bias)`, in that order, so it is exactly
+    /// the plain product added to what was there; the test holds it to that.
+    ///
+    /// What this is for: WaveGlow's coupling network adds a residual and a
+    /// skip projection into two running sums every layer, and its two
+    /// projections are two row halves of one checkpoint tensor. With a
+    /// shared left operand, a per-batch bias and an accumulating store,
+    /// the two products and the two adds are one launch that writes into
+    /// the sums - 212 blocks where two launches of 106 each left a third of
+    /// the card idle - and the adds' 20 MB of traffic a layer are gone.
+    ///
+    /// The integer kernels have no such epilogue, so a packed weight is
+    /// refused when either is asked for; the caller this serves never packs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched_into(
+        &self,
+        a: Operand<'_>,
+        w: Operand<'_>,
+        bias: Option<&CudaSlice<f32>>,
+        bias_stride: usize,
+        batch: Batch,
+        m: usize,
+        k: usize,
+        n: usize,
+        accumulate: bool,
+        out: &mut CudaSlice<f32>,
+        out_first: usize,
+    ) -> Result<(), CudaError> {
+        self.gemm_core(
+            a,
+            w,
+            0,
+            bias,
+            bias_stride,
+            batch,
+            m,
+            k,
+            n,
+            accumulate,
+            out,
+            out_first,
+        )
+    }
+
+    /// The body of every batched product: the checks, the choice of kernel,
+    /// the launch, and the split reduction.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_core(
+        &self,
+        a: Operand<'_>,
+        w: Operand<'_>,
+        w_first: usize,
+        bias: Option<&CudaSlice<f32>>,
+        bias_stride: usize,
+        batch: Batch,
+        m: usize,
+        k: usize,
+        n: usize,
+        accumulate: bool,
+        out: &mut CudaSlice<f32>,
+        out_first: usize,
+    ) -> Result<(), CudaError> {
+        if (accumulate || bias_stride > 0) && w.quant().is_some() {
+            return Err(CudaError::PackedAccumulate);
+        }
+        let out_need = out_first * n + (batch.count - 1) * batch.out + m * n;
+        if out.len() < out_need {
+            return Err(CudaError::SliceOverrun {
+                at: out_need,
+                len: out.len(),
+            });
+        }
+        if let Some(b) = bias
+            && b.len() < (batch.count - 1) * bias_stride + n
+        {
+            return Err(CudaError::SliceOverrun {
+                at: (batch.count - 1) * bias_stride + n,
+                len: b.len(),
+            });
+        }
+        let (sb, accum) = (bias_stride as i64, i32::from(accumulate));
+        let mut out = out.slice_mut(out_first * n..);
         // The offset in the weight's own units, and the bytes it has to have.
         let w_skip = w_first * k;
         let (w_len, w_need) = match w {
@@ -1548,11 +1648,6 @@ impl Gpu {
                 block: q.block_size(),
             });
         }
-        // SAFETY: both kernels write every element of the tile they own, with
-        // the predication covering exactly the (m, n) range - see the store
-        // loop in kernels.rs, and `every_output_element_is_written_exactly_once`
-        // in the tests, which is the check this relies on.
-        let mut out = unsafe { self.uninit(batch.count * m * n) }?;
         // A row stride is meaningful only where a row is read as a row. The
         // packed paths derive it from the block layout, so a caller asking for
         // one there is asking for something that would be silently ignored.
@@ -1800,9 +1895,19 @@ impl Gpu {
             // the kernel is bounds checked against m, k and n.
             launched(name, unsafe { lb.launch(cfg) })?;
             if let Some(p) = &partial {
-                self.reduce_partials(p, bias, &mut out, batch.count, m, n, ksplit)?;
+                self.reduce_partials(
+                    p,
+                    bias,
+                    bias_stride,
+                    accumulate,
+                    &mut out,
+                    batch.count,
+                    m,
+                    n,
+                    ksplit,
+                )?;
             }
-            return Ok(out);
+            return Ok(());
         }
 
         // Several rows against an unpacked weight read that weight once. Only
@@ -1839,7 +1944,9 @@ impl Gpu {
                 .arg(&sw)
                 .arg(&so)
                 .arg(&w_rs)
-                .arg(&w_half);
+                .arg(&w_half)
+                .arg(&sb)
+                .arg(&accum);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (n.div_ceil(8) as u32, 1, batch.count as u32),
                 block_dim: (32, kernels::GEMV_WARPS, 1),
@@ -1849,7 +1956,7 @@ impl Gpu {
             // walks rows 0..m inside, `out` is batch*m*n elements, and every
             // read is bounds checked against k and n.
             launched("gemv_rows", unsafe { lb.launch(cfg) })?;
-            return Ok(out);
+            return Ok(());
         }
 
         // Several rows against a *packed* weight share its stream too. This
@@ -1901,7 +2008,7 @@ impl Gpu {
             // the codes were taken at `(q_rows, k)` above, and the weight's
             // blocks are bounds checked against n and k.
             launched(name, unsafe { lb.launch(cfg) })?;
-            return Ok(out);
+            return Ok(());
         }
 
         let f = self.func(if small { "gemv" } else { "gemm" });
@@ -1969,6 +2076,7 @@ impl Gpu {
                 .arg(&o_hd)
                 .arg(&o_off);
         }
+        lb.arg(&sb).arg(&accum);
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: if small {
@@ -1991,9 +2099,19 @@ impl Gpu {
         })?;
 
         if let Some(p) = &partial {
-            self.reduce_partials(p, bias, &mut out, batch.count, m, n, ksplit)?;
+            self.reduce_partials(
+                p,
+                bias,
+                bias_stride,
+                accumulate,
+                &mut out,
+                batch.count,
+                m,
+                n,
+                ksplit,
+            )?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Sums a split contraction's slices and adds the bias.
@@ -2005,7 +2123,9 @@ impl Gpu {
         &self,
         partial: &CudaSlice<f32>,
         bias: Option<&CudaSlice<f32>>,
-        out: &mut CudaSlice<f32>,
+        bias_stride: usize,
+        accumulate: bool,
+        out: &mut CudaViewMut<'_, f32>,
         batch: usize,
         m: usize,
         n: usize,
@@ -2014,13 +2134,20 @@ impl Gpu {
         let null: u64 = 0;
         let total = batch * m * n;
         let (mn, ni, bi, ks) = ((m * n) as i32, n as i32, batch as i32, ksplit as i32);
+        let (sb, accum) = (bias_stride as i64, i32::from(accumulate));
         let mut lb = self.stream.launch_builder(self.func("gemm_reduce"));
         lb.arg(partial);
         match bias {
             Some(v) => lb.arg(v),
             None => lb.arg(&null),
         };
-        lb.arg(out).arg(&mn).arg(&ni).arg(&bi).arg(&ks);
+        lb.arg(out)
+            .arg(&mn)
+            .arg(&ni)
+            .arg(&bi)
+            .arg(&ks)
+            .arg(&sb)
+            .arg(&accum);
         // SAFETY: one thread per output element, bounds checked in the kernel,
         // and `partial` holds exactly `ksplit * batch * m * n`.
         launched("gemm_reduce", unsafe {
@@ -2738,7 +2865,8 @@ impl Gpu {
         ch: usize,
         t: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(ch * t)?;
+        // SAFETY: one thread an element, every one of `ch * t` written.
+        let mut out = unsafe { self.uninit(ch * t) }?;
         let (a, b_) = (ch as i32, t as i32);
         let f = self.func("gated_activation_rows");
         let mut lb = self.stream.launch_builder(f);
@@ -2807,6 +2935,43 @@ impl Gpu {
         let mut lb = self.stream.launch_builder(f);
         lb.arg(a).arg(b).arg(&len);
         launched("add_inplace", unsafe { lb.launch(Self::flat(n)) })
+    }
+
+    /// [`Self::gated_activation_rows`] of `x + cond`, where `cond` is the
+    /// column block `[off, off + 2 * ch)` of every row of a `[t, stride]`
+    /// matrix - the sum [`Self::add_strided`] would have left in `x`, gated,
+    /// without the add's launch or its traffic. Exactly equal to the two;
+    /// the test holds it there.
+    pub fn gated_cond_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        cond: &CudaSlice<f32>,
+        stride: usize,
+        off: usize,
+        ch: usize,
+        t: usize,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if off + 2 * ch > stride || x.len() < 2 * ch * t || cond.len() < t * stride {
+            return Err(CudaError::SliceOverrun {
+                at: (2 * ch * t).max(t * stride),
+                len: x.len().min(cond.len()),
+            });
+        }
+        // SAFETY: one thread an element, every one of `ch * t` written.
+        let mut out = unsafe { self.uninit(ch * t) }?;
+        let (st, o, c, ti) = (stride as i32, off as i32, ch as i32, t as i32);
+        let f = self.func("gated_cond_rows");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(cond)
+            .arg(&st)
+            .arg(&o)
+            .arg(&mut out)
+            .arg(&c)
+            .arg(&ti);
+        // SAFETY: every read is inside the lengths checked above.
+        launched("gated_cond_rows", unsafe { lb.launch(Self::flat(ch * t)) })?;
+        Ok(out)
     }
 
     /// `a[r * cols + j] += b[r * stride + off + j]`.
@@ -3283,6 +3448,7 @@ impl Gpu {
         let (asc_off, a_rows) = (0i32, 1i32);
         let epi_act = i32::from(gelu);
         let (cs, hs, hd, off) = (o_cs as i32, o_hs as i32, o_hd as i32, o_off as i64);
+        let (sb, accum) = (0i64, 0i32);
         let f = self.func("gemv");
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x);
@@ -3315,7 +3481,9 @@ impl Gpu {
             .arg(&cs)
             .arg(&hs)
             .arg(&hd)
-            .arg(&off);
+            .arg(&off)
+            .arg(&sb)
+            .arg(&accum);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (n.div_ceil(8) as u32, 1, 1),
             block_dim: (32, kernels::GEMV_WARPS, 1),
@@ -4410,7 +4578,9 @@ impl Gpu {
         let span = dilation * (k - 1) + 1;
         let out_t = (t + 2 * pad - span) / stride + 1;
         let cols = in_ch * k;
-        let mut out = self.zeros(out_t * cols)?;
+        // SAFETY: the kernel writes every `[out_t, cols]` position, a zero
+        // where the window falls outside the sequence.
+        let mut out = unsafe { self.uninit(out_t * cols) }?;
         let (a, b_, c, d, e, dl, g) = (
             t as i32,
             in_ch as i32,

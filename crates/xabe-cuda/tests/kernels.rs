@@ -3549,3 +3549,180 @@ fn the_frame_end_is_its_two_copies() {
         "a row that does not fit must be refused"
     );
 }
+
+/// An accumulating batched product with a bias of the batch's own and an
+/// output offset is the two plain products added to what the buffer held -
+/// exactly, on the tiled kernel, on the split contraction, on the mat-vec,
+/// and for both weight widths.
+#[test]
+fn the_accumulating_product_is_the_plain_one_added_to_what_was_there() {
+    let Some(g) = gpu() else { return };
+    for &(m, k, n) in &[(70usize, 64usize, 48usize), (70, 4096, 48), (3, 64, 48)] {
+        for half in [false, true] {
+            let x = seq(m * k, 601);
+            let w: Vec<f32> = seq(2 * n * k, 602).iter().map(|v| v * 0.01).collect();
+            let bias = seq(2 * n, 603);
+            let first = 2usize;
+            let out0 = seq((first + 2 * m) * n, 604);
+            let xd = a_up(&g, &x);
+            let bd = a_up(&g, &bias);
+            let mut out = a_up(&g, &out0);
+            let (wf, wh) = (a_up(&g, &w), g.upload_f16(&w).unwrap());
+            let wop = if half {
+                Operand::F16(&wh)
+            } else {
+                Operand::F32(&wf)
+            };
+            g.gemm_batched_into(
+                Operand::F32(&xd),
+                wop,
+                Some(&bd),
+                n,
+                Batch {
+                    count: 2,
+                    a: 0,
+                    w: n * k,
+                    out: m * n,
+                    w_row: 0,
+                },
+                m,
+                k,
+                n,
+                true,
+                &mut out,
+                first,
+            )
+            .unwrap();
+            let got = g.download(&out).unwrap();
+            let plain = |lo: usize| -> Vec<f32> {
+                let (w0f, w0h) = (
+                    a_up(&g, &w[lo * k..(lo + n) * k]),
+                    g.upload_f16(&w[lo * k..(lo + n) * k]).unwrap(),
+                );
+                let w0 = if half {
+                    Operand::F16(&w0h)
+                } else {
+                    Operand::F32(&w0f)
+                };
+                let b0 = a_up(&g, &bias[lo..lo + n]);
+                let r = g
+                    .gemm_batched(
+                        Operand::F32(&xd),
+                        w0,
+                        Some(&b0),
+                        Batch::single(m * n),
+                        m,
+                        k,
+                        n,
+                    )
+                    .unwrap();
+                g.download(&r).unwrap()
+            };
+            let (r0, r1) = (plain(0), plain(n));
+            assert_eq!(
+                &got[..first * n],
+                &out0[..first * n],
+                "rows before the offset"
+            );
+            for i in 0..m * n {
+                assert_eq!(
+                    got[first * n + i],
+                    out0[first * n + i] + r0[i],
+                    "batch 0 at {i} (m {m}, k {k}, half {half})"
+                );
+                assert_eq!(
+                    got[(first + m) * n + i],
+                    out0[(first + m) * n + i] + r1[i],
+                    "batch 1 at {i} (m {m}, k {k}, half {half})"
+                );
+            }
+            let batch = Batch {
+                count: 2,
+                a: 0,
+                w: n * k,
+                out: m * n,
+                w_row: 0,
+            };
+            let mut short = g.zeros((first + 2 * m) * n - 1).unwrap();
+            assert!(
+                g.gemm_batched_into(
+                    Operand::F32(&xd),
+                    Operand::F32(&wf),
+                    Some(&bd),
+                    n,
+                    batch,
+                    m,
+                    k,
+                    n,
+                    true,
+                    &mut short,
+                    first,
+                )
+                .is_err(),
+                "an output that does not fit must be refused"
+            );
+            let short_bias = a_up(&g, &bias[..2 * n - 1]);
+            assert!(
+                g.gemm_batched_into(
+                    Operand::F32(&xd),
+                    Operand::F32(&wf),
+                    Some(&short_bias),
+                    n,
+                    batch,
+                    m,
+                    k,
+                    n,
+                    true,
+                    &mut out,
+                    first,
+                )
+                .is_err(),
+                "a bias that does not cover the batch must be refused"
+            );
+        }
+    }
+}
+
+/// The gate with its conditioning folded in is `add_strided` then
+/// `gated_activation_rows`, exactly, and the CPU expression within rounding.
+#[test]
+fn the_gate_with_its_conditioning_is_the_add_then_the_gate() {
+    let Some(g) = gpu() else { return };
+    let (ch, t, layers) = (24usize, 37usize, 3usize);
+    let x: Vec<f32> = seq(2 * ch * t, 611).iter().map(|v| v * 0.1).collect();
+    let stride = 2 * ch * layers;
+    let cond: Vec<f32> = seq(t * stride, 612).iter().map(|v| v * 0.1).collect();
+    for l in 0..layers {
+        let off = l * 2 * ch;
+        let mut a = a_up(&g, &x);
+        g.add_strided(&mut a, &a_up(&g, &cond), 2 * ch, stride, off, t)
+            .unwrap();
+        let want = g
+            .download(&g.gated_activation_rows(&a, ch, t).unwrap())
+            .unwrap();
+        let got = g
+            .download(
+                &g.gated_cond_rows(&a_up(&g, &x), &a_up(&g, &cond), stride, off, ch, t)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(got, want, "layer {l}");
+        for p in 0..t {
+            for c in 0..ch {
+                let a = x[p * 2 * ch + c] + cond[p * stride + off + c];
+                let b = x[p * 2 * ch + ch + c] + cond[p * stride + off + ch + c];
+                let cpu = a.tanh() * (1.0 / (1.0 + (-b).exp()));
+                assert!(
+                    (got[p * ch + c] - cpu).abs() <= 1e-5,
+                    "({p}, {c}) is {} wanted {cpu}",
+                    got[p * ch + c]
+                );
+            }
+        }
+    }
+    assert!(
+        g.gated_cond_rows(&a_up(&g, &x), &a_up(&g, &cond), stride, stride - ch, ch, t)
+            .is_err(),
+        "a block past the row must be refused"
+    );
+}

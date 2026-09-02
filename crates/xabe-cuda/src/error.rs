@@ -143,6 +143,13 @@ pub enum CudaError {
         align: usize,
     },
 
+    /// An accumulating store or a per-batch bias asked of a product whose
+    /// weight is packed. The integer kernels have neither epilogue, and
+    /// silently storing over the running sum would be the wrong answer at
+    /// full speed.
+    #[error("an accumulating or per-batch-bias product cannot read a packed weight")]
+    PackedAccumulate,
+
     #[error("a rotary head of odd width {head_dim}")]
     OddHeadDim {
         /// The head width asked for.

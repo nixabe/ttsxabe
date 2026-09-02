@@ -134,6 +134,7 @@ to reason about is not a reference.
 | `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `xabe_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
 | `embed_scaled_f16` | the speech LLM's tables at f16 | `embed_scaled` on the table rounded on the host, exactly | a 544 MB table read a few rows at a time |
 | `relu_mask`, `taco_emit` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
+| `gated_cond_rows` | WaveGlow's gate with its conditioning added on the way in | `add_strided` then `gated_activation_rows`, exactly | one read of the activation where there were a read, a write and a read |
 
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
 not have the same precision, which is why the constant is public: a test that
@@ -1506,6 +1507,40 @@ rows are short of is the per-grid floor, about three microseconds of ramp
 and tail that a 3.3 MB launch cannot amortise, and no change inside the body
 touches that. The wide code was removed; the bench stays, because the next
 person will want to try the same thing.
+
+## An accumulating product, `gemm_batched_into`
+
+Not a new kernel: `gemm`, `gemv` and `gemv_rows` given three more things
+to do at the store - write from row `out_first` of a buffer the caller
+owns, read product `b`'s bias from `bias_stride * b`, and add to what the
+buffer holds rather than store over it. `gemm_batched` and everything
+above it are the same call with the three at zero and a fresh buffer.
+
+What it is for is WaveGlow's coupling network. Each layer projects one
+gated activation twice, residual and skip, and adds each into a running
+sum; the checkpoint stores the two projections as one `[512, 256]`, so
+with a shared left operand, a per-batch bias and an accumulating store
+the two products and the two adds are one launch of 212 blocks writing
+into the sums, where two launches of 106 each left a third of the card's
+slots idle and the adds moved 20 MB a layer. The integer kernels have no
+such epilogue and a packed weight is refused; the one caller never packs.
+
+The store is written as two passes, and that is measured rather than
+tidy. A loop that loaded, added and stored each element in turn ran at
+twice the plain kernel on `k = 256`: a store to `out` may alias the next
+load from it, so the compiler serialised the sixty-four loads a thread
+behind the stores. Folding the running values into the accumulators in a
+pass that stores nothing, then storing, lets the loads pipeline, and the
+accumulating product costs the plain one plus the read of its output.
+The order is `out + (acc + bias)`, so the result is exactly the plain
+product added to what was there, which is what the test holds it to on
+all three kernels, both weight widths, and the split contraction.
+
+`gated_cond_rows` is the other half of the same round: WaveNet's gate
+over `x + cond`, with `cond` a column block of the wide conditioning
+product, reading the conditioning once where `add_strided` read and wrote
+the whole activation to leave the sum for the gate to read again. Exactly
+the two kernels it replaces.
 
 ## A weight read from a row, `gemm_batched_from`
 
