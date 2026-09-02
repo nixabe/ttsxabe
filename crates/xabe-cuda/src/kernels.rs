@@ -2687,7 +2687,7 @@ extern "C" __global__ void conv1d(
 // The weight tile's row stride, padded so the transposed staging store
 // spreads across banks and each row stays 16-byte aligned.
 #define CT_WS 36
-template <int TX>
+template <int TX, int OCT>
 __device__ __forceinline__ void conv1d_tiled_body(
     const float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ bias, float* __restrict__ out,
@@ -2695,19 +2695,21 @@ __device__ __forceinline__ void conv1d_tiled_body(
 {
     constexpr int CT_T = 4 * TX;
     constexpr int THREADS = 8 * TX;
-    __shared__ __align__(16) float Ws[CT_KK][CT_WS];
+    constexpr int OC = 8 * OCT;          // channels a block
+    constexpr int WS = OC + 4;           // the weight tile's padded row
+    __shared__ __align__(16) float Ws[CT_KK][WS];
     __shared__ __align__(16) float Xs[CT_KK][CT_T];
     const int tid = threadIdx.x;
     const int tx = tid % TX, ty = tid / TX;
-    const int oc0 = blockIdx.x * CT_OC;
+    const int oc0 = blockIdx.x * OC;
     const int t0 = blockIdx.y * CT_T;
-    const int oc = oc0 + ty * 4;
+    const int oc = oc0 + ty * OCT;
     const int tt = t0 + tx * 4;
     const int K = in_ch * k;
 
-    float acc[4][4];
+    float acc[OCT][4];
     #pragma unroll
-    for (int a = 0; a < 4; ++a) {
+    for (int a = 0; a < OCT; ++a) {
         const float b = (bias && oc + a < out_ch) ? bias[oc + a] : 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; ++j) acc[a][j] = b;
@@ -2717,20 +2719,30 @@ __device__ __forceinline__ void conv1d_tiled_body(
     // of one channel's row and store them transposed, as many rows a pass
     // as the block has sixteens. Input: `TX` lanes stage one pair's
     // positions, four a lane, two pairs a lane.
-    const int w_oc = tid >> 4, w_kk = tid & 15;
-    for (int kk0 = 0; kk0 < K; kk0 += CT_KK) {
+    //
+    // A trip's operands are fetched into registers one trip ahead: the
+    // loads for trip `i + 1` go out before trip `i`'s multiply-adds and
+    // are stored to shared memory after them, so a global round trip is
+    // paid under the arithmetic rather than in front of it. Without that
+    // the k=3 residual convolutions ran at a quarter of their own
+    // compute floor, four blocks an SM notwithstanding - see
+    // docs/KERNELS.md.
+    constexpr int WH = OC * CT_KK / THREADS;
+    constexpr int XH = CT_KK / 8;
+    const int w_oc = tid / CT_KK, w_kk = tid % CT_KK;
+    float wr[WH];
+    float xv[XH][4];
+    auto fetch = [&](int kk0) {
         #pragma unroll
-        for (int h = 0; h < CT_OC * 16 / THREADS; ++h) {
-            const int o = w_oc + (THREADS / 16) * h;
+        for (int h = 0; h < WH; ++h) {
+            const int o = w_oc + (THREADS / CT_KK) * h;
             const int kk = kk0 + w_kk;
-            float v = 0.0f;
-            if (oc0 + o < out_ch && kk < K) v = w[(size_t)(oc0 + o) * K + kk];
-            Ws[w_kk][o] = v;
+            wr[h] = 0.0f;
+            if (oc0 + o < out_ch && kk < K) wr[h] = w[(size_t)(oc0 + o) * K + kk];
         }
         #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int kr = ty + 8 * h;
-            const int kk = kk0 + kr;
+        for (int h = 0; h < XH; ++h) {
+            const int kk = kk0 + ty + 8 * h;
             const int ic = kk / k;
             const int tap = kk - ic * k;
             const float* xr = x + (size_t)ic * t;
@@ -2738,20 +2750,38 @@ __device__ __forceinline__ void conv1d_tiled_body(
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int src = base + j;
-                float v = 0.0f;
-                if (kk < K && src >= 0 && src < t) v = xr[src];
-                Xs[kr][tx * 4 + j] = v;
+                xv[h][j] = 0.0f;
+                if (kk < K && src >= 0 && src < t) xv[h][j] = xr[src];
+            }
+        }
+    };
+    fetch(0);
+    for (int kk0 = 0; kk0 < K; kk0 += CT_KK) {
+        #pragma unroll
+        for (int h = 0; h < WH; ++h) {
+            Ws[w_kk][w_oc + (THREADS / CT_KK) * h] = wr[h];
+        }
+        #pragma unroll
+        for (int h = 0; h < XH; ++h) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                Xs[ty + 8 * h][tx * 4 + j] = xv[h][j];
             }
         }
         __syncthreads();
+        if (kk0 + CT_KK < K) fetch(kk0 + CT_KK);
         #pragma unroll
         for (int kk = 0; kk < CT_KK; ++kk) {
-            const float4 wv = *(const float4*)&Ws[kk][ty * 4];
+            float wa[OCT];
+            #pragma unroll
+            for (int q = 0; q < OCT / 4; ++q) {
+                const float4 wv = *(const float4*)&Ws[kk][ty * OCT + 4 * q];
+                wa[4 * q] = wv.x; wa[4 * q + 1] = wv.y; wa[4 * q + 2] = wv.z; wa[4 * q + 3] = wv.w;
+            }
             const float4 xv = *(const float4*)&Xs[kk][tx * 4];
-            const float wa[4] = {wv.x, wv.y, wv.z, wv.w};
             const float xa[4] = {xv.x, xv.y, xv.z, xv.w};
             #pragma unroll
-            for (int a = 0; a < 4; ++a) {
+            for (int a = 0; a < OCT; ++a) {
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     acc[a][j] = fmaf(xa[j], wa[a], acc[a][j]);
@@ -2762,7 +2792,7 @@ __device__ __forceinline__ void conv1d_tiled_body(
     }
 
     #pragma unroll
-    for (int a = 0; a < 4; ++a) {
+    for (int a = 0; a < OCT; ++a) {
         if (oc + a >= out_ch) break;
         float* orow = out + (size_t)(oc + a) * out_t;
         #pragma unroll
@@ -2772,18 +2802,23 @@ __device__ __forceinline__ void conv1d_tiled_body(
     }
 }
 
-#define CONV_TILED_ENTRY(NAME, TX)                                                      \
+#define CONV_TILED_ENTRY(NAME, TX, OCT)                                                 \
     extern "C" __global__ __launch_bounds__(8 * TX) void NAME(                          \
         const float* __restrict__ x, const float* __restrict__ w,                       \
         const float* __restrict__ bias, float* __restrict__ out,                        \
         int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)     \
     {                                                                                   \
-        conv1d_tiled_body<TX>(x, w, bias, out, in_ch, t, out_ch, k, pad_left,           \
-                              dilation, out_t);                                         \
+        conv1d_tiled_body<TX, OCT>(x, w, bias, out, in_ch, t, out_ch, k, pad_left,      \
+                                   dilation, out_t);                                    \
     }
-CONV_TILED_ENTRY(conv1d_tiled, 32)
-CONV_TILED_ENTRY(conv1d_tiled_64, 16)
-CONV_TILED_ENTRY(conv1d_tiled_32, 8)
+CONV_TILED_ENTRY(conv1d_tiled, 32, 4)
+CONV_TILED_ENTRY(conv1d_tiled_64, 16, 4)
+CONV_TILED_ENTRY(conv1d_tiled_32, 8, 4)
+// Eight channels a thread, 64 a block: twice the multiply-adds per staged
+// input value, for the shapes with the channels to fill it.
+CONV_TILED_ENTRY(conv1d_tiled_w, 32, 8)
+CONV_TILED_ENTRY(conv1d_tiled_w64, 16, 8)
+CONV_TILED_ENTRY(conv1d_tiled_w32, 8, 8)
 
 // The grouped convolution on the same body, a group a `blockIdx.z`: each
 // group is an ordinary convolution over its own slice of the channels, so
@@ -2798,10 +2833,10 @@ CONV_TILED_ENTRY(conv1d_tiled_32, 8)
     {                                                                                   \
         const int g = blockIdx.z;                                                       \
         const int in_per = in_ch / groups, out_per = out_ch / groups;                   \
-        conv1d_tiled_body<TX>(x + (size_t)g * in_per * t,                               \
-                              w + (size_t)g * out_per * in_per * k,                     \
-                              bias + g * out_per, out + (size_t)g * out_per * out_t,    \
-                              in_per, t, out_per, k, pad_left, 1, out_t);               \
+        conv1d_tiled_body<TX, 4>(x + (size_t)g * in_per * t,                            \
+                                 w + (size_t)g * out_per * in_per * k,                  \
+                                 bias + g * out_per, out + (size_t)g * out_per * out_t, \
+                                 in_per, t, out_per, k, pad_left, 1, out_t);            \
     }
 GCONV_TILED_ENTRY(grouped_conv1d_tiled, 32)
 GCONV_TILED_ENTRY(grouped_conv1d_tiled_64, 16)

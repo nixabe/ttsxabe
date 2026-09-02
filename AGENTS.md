@@ -134,7 +134,13 @@ engine that is 1.085x faster than the one measured, and the ratio has not
 been re-taken. The stride-one convolution then became an implicit
 matmul on the f32 cores, bit-identical, for **1.48x** on VITS and 1.03x on
 Tacotron2 - a kernel a peer session wrote and this one measured and
-committed; the ratio against PyTorch is further from re-taken still. CosyVoice3 has since had
+committed; the ratio against PyTorch is further from re-taken still. That
+kernel then had a round of its own - the next trip's operands fetched a
+trip ahead, and eight channels a thread where there are 64 to fill them -
+for **1.15x** more on VITS, 28.7 ms to 24.9, still bit-identical; its
+128-channel shapes run at 7.9 TFLOP/s of the card's 16.3 now, and
+`docs/BENCHMARKS.md` has the shape table and the two things that did not
+work. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

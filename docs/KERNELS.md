@@ -13,7 +13,7 @@ exists.
 | relative-position self-attention | text encoder (window 4) | `xabe_dsp::self_attention` | `attention_scores` + `attention_context` | `xabe-dsp` relative_position + `xabe-tts` |
 | conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
 | conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
-| conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths) | `xabe-cuda` conv1d |
+| conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths, two channel tiles) | `xabe-cuda` conv1d |
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` | `depthwise_conv1d` | `xabe-tts` duration |
 | transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` | `transposed_conv1d` | `xabe-tts` decoder |
 | grouped conv1d, left-padded | CosyVoice3 DiT positional embedding | `xabe_dsp::grouped_conv1d` | `grouped_conv1d`, `grouped_conv1d_tiled` | `xabe-cuda` kernels |
@@ -127,7 +127,20 @@ Two entries deserve a note:
   differential test covers both, at eight shapes chosen to be ragged on
   every axis, and both synthesisers' audio was byte-identical across the
   change. 1.48x on a VITS synthesis and 1.03x on Tacotron2; see
-  `docs/BENCHMARKS.md`.
+  `docs/BENCHMARKS.md`. Its second round kept the sums and changed two
+  things: a trip's operands are fetched into registers a trip ahead, so
+  the global round trip is paid under the previous trip's multiply-adds
+  rather than in front of them - `ptxas` had it at 64 registers and four
+  blocks an SM, and it still ran at a quarter of its compute floor - and
+  a second tile of 64 channels gives each thread eight channels by four
+  positions, twice the multiply-adds per staged input value. The
+  decoder's 128-channel shapes went from 5.2 to 7.9 TFLOP/s of the card's
+  16.3 and its 64-channel ones from 4.7 to 5.7; a trip of 32 pairs
+  measured slower at every shape and is not kept. The wrapper takes the
+  wide tile where there are 64 channels and its grid still reaches a
+  block an SM, the narrow one otherwise. The 256-channel stage at 1344
+  positions is short of blocks in either and sits at 4.6 TFLOP/s; a
+  split of the contraction is the thing not tried.
 - **`grouped_conv1d_tiled` is `conv1d_tiled`'s body a group a `blockIdx.z`.**
   A grouped convolution is `groups` ordinary ones over consecutive channel
   slices, so the tile runs on the slice's pointers with the group's channel

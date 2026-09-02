@@ -3226,6 +3226,45 @@ attention at 47 µs a row, and then small things: the five copies a block
 that an offset rope would remove, the gated residual adds that the
 matmul's epilogue could carry, the modulation projections read at f32.
 
+### The tiled convolution's second round: 1.15x on VITS
+
+After the tiled convolution the VITS decoder was 23.4 ms of a 28.8 ms
+synthesis, and a harness timing the wrapper at the decoder's own shapes
+put every one of them at 4.3 to 5.3 TFLOP/s against a 16.3 TFLOP/s f32
+card. `ptxas -v` gave the kernel 64 registers and 10.5 KB of shared
+memory, four blocks an SM, so the 128-channel k=3 shape is exactly one
+wave, and its trips cost about four times their compute floor.
+
+Two changes, both bit-identical (both synthesisers' WAVs byte for byte
+the previous engine's). Each trip's operands are now fetched into
+registers a trip ahead, so the global round trip hides under the
+arithmetic: the decoder 23.4 ms to 21.0. And a second tile gives each
+thread eight channels by four positions, halving the shared-memory
+loads per multiply-add, for the shapes with 64 channels to fill it.
+The harness, `conv1d` at the decoder's shapes on GPU 2, best of three
+twenty-launch runs:
+
+| Shape | Before | After |
+| --- | ---: | ---: |
+| 128 ch, 9216 positions, k=3 | 175 µs, 5.2 TFLOP/s | 119 µs, 7.6 |
+| 128 ch, 9216, k=11, dilation 5 | 630 µs, 5.3 | 418 µs, 8.0 |
+| 64 ch, 21376, k=3 | 112 µs, 4.7 | 92 µs, 5.7 |
+| 64 ch, 21376, k=11, dilation 5 | 390 µs, 4.9 | 309 µs, 6.2 |
+| 256 ch, 1344, k=3 | 116 µs, 4.5 | 115 µs, 4.6 |
+| 32 ch, 42752, k=3 | 61 µs, 4.3 | 61 µs, 4.3 |
+
+A trip of 32 pairs instead of 16 was measured at every shape and lost
+by 2 to 8%; the syncs were not the cost. The 256-channel stage is
+parallelism-limited - 84 blocks in the widest tile that reaches a block
+an SM - and wants the contraction split rather than a tile; the
+32-channel one has no channels to widen into.
+
+`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+twenty runs against the eb94f9c bench, worst on each side: **28.72 ms to
+24.88**, **1.15x**. Tacotron2 on the same three lines is level - its
+convolutions are the 32-channel location filter and a 512-channel
+postnet over 200 positions, neither of which takes the wide tile.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

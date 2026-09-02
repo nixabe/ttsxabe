@@ -555,6 +555,9 @@ const NAMES: &[&str] = &[
     "conv1d_tiled",
     "conv1d_tiled_64",
     "conv1d_tiled_32",
+    "conv1d_tiled_w",
+    "conv1d_tiled_w64",
+    "conv1d_tiled_w32",
     "grouped_conv1d_tiled",
     "grouped_conv1d_tiled_64",
     "grouped_conv1d_tiled_32",
@@ -1277,17 +1280,35 @@ impl Gpu {
         // cores, exact, several times the direct kernel's rate, in the
         // widest tile that still gives the card a block an SM slot. Below
         // 32 a tile would be mostly padding and the direct kernel stays.
-        let oc_blocks = (out_ch as u32).div_ceil(CONV_TILE_OC);
-        let tile = [128u32, 64, 32]
-            .into_iter()
-            .find(|&w| out_t as u32 >= w && oc_blocks * (out_t as u32).div_ceil(w) >= 144)
-            .or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
-        let f = self.func(match (tile, long_form) {
-            (Some(128), _) => "conv1d_tiled",
-            (Some(64), _) => "conv1d_tiled_64",
-            (Some(_), _) => "conv1d_tiled_32",
-            (None, true) => "conv1d",
-            (None, false) => "conv1d_short",
+        // Sixty-four channels a block and eight a thread where there are
+        // the channels for it and the grid still reaches a block an SM in
+        // some width; thirty-two and four otherwise. The widest tile that
+        // fills the card, or the narrowest that fits when none does.
+        let grid = |oc_tile: u32| {
+            let oc_blocks = (out_ch as u32).div_ceil(oc_tile);
+            let tile = [128u32, 64, 32]
+                .into_iter()
+                .find(|&w| out_t as u32 >= w && oc_blocks * (out_t as u32).div_ceil(w) >= 72);
+            (oc_blocks, tile)
+        };
+        let (wide, oc_blocks, tile) = match (out_ch >= 64, grid(2 * CONV_TILE_OC)) {
+            (true, (blocks, Some(w))) => (true, blocks, Some(w)),
+            _ => {
+                let (blocks, tile) = grid(CONV_TILE_OC);
+                let tile =
+                    tile.or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
+                (false, blocks, tile)
+            }
+        };
+        let f = self.func(match (tile, wide, long_form) {
+            (Some(128), true, _) => "conv1d_tiled_w",
+            (Some(64), true, _) => "conv1d_tiled_w64",
+            (Some(_), true, _) => "conv1d_tiled_w32",
+            (Some(128), false, _) => "conv1d_tiled",
+            (Some(64), false, _) => "conv1d_tiled_64",
+            (Some(_), false, _) => "conv1d_tiled_32",
+            (None, _, true) => "conv1d",
+            (None, _, false) => "conv1d_short",
         });
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(w);
