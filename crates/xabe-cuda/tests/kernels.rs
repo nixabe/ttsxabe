@@ -3421,3 +3421,66 @@ fn the_fused_location_attention_is_the_chain_it_replaces() {
         "a unit count that is not a power of two must be refused"
     );
 }
+
+/// The DiT's adaptive normalisation against `xabe_dsp::layer_norm` on the
+/// weight `1 + scale` and bias `shift` it stands for, with the segments read
+/// out of one modulation vector at offsets; and the gated residual against
+/// the loop it replaces, exactly.
+#[test]
+fn the_modulated_layer_norm_and_the_gated_residual_are_the_chain_they_replace() {
+    let Some(g) = gpu() else { return };
+    let (rows, d) = (37usize, 1024usize);
+    let h = seq(rows * d, 201);
+    let mods: Vec<f32> = seq(6 * d, 202).iter().map(|v| v * 0.3).collect();
+    let (shift_off, scale_off, gate_off) = (3 * d, 4 * d, 5 * d);
+    let weight: Vec<f32> = mods[scale_off..scale_off + d]
+        .iter()
+        .map(|s| 1.0 + s)
+        .collect();
+    let bias = mods[shift_off..shift_off + d].to_vec();
+    let want = xabe_dsp::layer_norm(&h, rows, d, &weight, &bias, 1e-6);
+
+    let hd = a_up(&g, &h);
+    let md = a_up(&g, &mods);
+    let got = g
+        .download(
+            &g.layer_norm_mod(&hd, rows, d, &md, shift_off, scale_off, 1e-6)
+                .unwrap(),
+        )
+        .unwrap();
+    let (mut worst, mut span) = (0.0f32, 0.0f32);
+    for (a, b) in got.iter().zip(&want) {
+        worst = worst.max((a - b).abs());
+        span = span.max(b.abs());
+    }
+    assert!(
+        worst <= 1e-5 * span.max(1.0),
+        "layer_norm_mod: max-abs {worst:.3e} of span {span:.2}"
+    );
+
+    let x = seq(rows * d, 203);
+    let mut want_h = h.clone();
+    for p in 0..rows {
+        for c in 0..d {
+            // Two roundings, as the host loop this replaces had, and as the
+            // kernel keeps them; `mul_add` would be one and would not match.
+            want_h[p * d + c] += mods[gate_off + c] * x[p * d + c];
+        }
+    }
+    let mut hd = a_up(&g, &h);
+    g.gate_add(&mut hd, &a_up(&g, &x), &md, gate_off, rows, d)
+        .unwrap();
+    let got_h = g.download(&hd).unwrap();
+    assert_eq!(got_h, want_h, "gate_add is not the loop it replaces");
+
+    assert!(
+        g.layer_norm_mod(&a_up(&g, &h), rows, d, &md, 5 * d + 2, 0, 1e-6)
+            .is_err(),
+        "a segment off the four-float boundary must be refused"
+    );
+    assert!(
+        g.layer_norm_mod(&a_up(&g, &h), rows, d, &md, 6 * d, 0, 1e-6)
+            .is_err(),
+        "a segment past the end of the vector must be refused"
+    );
+}

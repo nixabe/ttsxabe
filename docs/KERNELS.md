@@ -131,6 +131,7 @@ to reason about is not a reference.
 | `gemm` | encoder and decoder projections | `xabe_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
 | `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
 | `taco_energies`, `taco_context` | Tacotron2's location attention, one frame | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
+| `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `xabe_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
 | `relu_mask`, `concat2`, `attn_weights_update`, `copy_from_into` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
 
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
@@ -1380,6 +1381,30 @@ a group, which every head geometry here does. Same kernel, same arithmetic;
 the test holds the row against the single-row call bit for bit and the
 neighbouring rows untouched. `docs/BENCHMARKS.md` has what the batched step
 costs against the single one.
+
+## The DiT's modulation on the card, `layer_norm_mod` and `gate_add`
+
+A DiT block's normalisation is `LayerNorm` with no affine followed by
+`* (1 + scale) + shift`, where `scale` and `shift` are two segments of the
+six-chunk vector the block projects from the timestep; its residuals are
+`h += gate * x` with `gate` a third segment. CosyVoice3's flow was computing
+the normalisation on the card and the rest on the host, and
+`docs/BENCHMARKS.md` has what that cost. `layer_norm_mod` is
+`layer_norm_impl` handed `mods + scale_off` as its weight and
+`mods + shift_off` as its bias, with a `wadd` of one applied to the weight -
+the plain kernels pass zero, and adding zero is exact, so they are unchanged
+bit for bit. The two offsets must be multiples of four because the affine is
+read as `float4`, and the wrapper refuses one that is not. `gate_add` is a
+flat elementwise kernel with the gate indexed by column.
+
+The thing that was not obvious: both kernels round the multiply and the add
+**separately**, with `__fmul_rn` and `__fadd_rn`, rather than letting the
+compiler contract them into an `fmaf`. The host loops they replace did two
+roundings, and the tiled matmul that reads the result stages it as f16, so
+a one-ulp difference in f32 becomes a 5e-4 jump whenever it crosses an f16
+rounding boundary. With the roundings matched the flow's estimator is bit
+for bit what it was, which is the test; with them contracted it was a 0.45
+difference in the mel that no tolerance could tell from a bug.
 
 ## The Tacotron2 decode loop in nineteen launches
 

@@ -304,20 +304,18 @@ impl Flow {
         self.linear(&h, &self.time_mlp2, 1)
     }
 
-    /// LayerNorm with no affine, which is what `elementwise_affine=False` is.
-    fn norm(&self, x: &CudaSlice<f32>, rows: usize) -> Result<CudaSlice<f32>, CosyError> {
-        let ones = self.gpu.upload(&vec![1.0f32; self.cfg.dim])?;
-        let zeros = self.gpu.zeros(self.cfg.dim)?;
-        Ok(self
-            .gpu
-            .layer_norm(x, rows, self.cfg.dim, &ones, &zeros, FlowConfig::NORM_EPS)?)
-    }
-
     /// One estimator evaluation over a batch of two.
     ///
     /// `x`, `mu` and `cond` arrive as `[2, mel_dim, n]` - channel-major, which
     /// is how the reference holds them - and are transposed here because every
     /// linear wants `[position, feature]`.
+    ///
+    /// Everything between the input projection and the output projection
+    /// stays on the card. The adaptive normalisations are `layer_norm_mod`
+    /// reading the modulation vector where the block's timestep projection
+    /// left it, and the gated residuals are `gate_add` on the residual
+    /// stream in place; `taps` is `None` on the solver's path, and only a
+    /// probe pays for the downloads it names.
     #[allow(clippy::too_many_arguments)]
     fn estimator(
         &self,
@@ -327,11 +325,17 @@ impl Flow {
         spk: &[f32],
         t: f32,
         n: usize,
-        taps: &mut Vec<(String, Vec<f32>)>,
+        mut taps: Option<&mut Vec<(String, Vec<f32>)>>,
     ) -> Result<Vec<f32>, CosyError> {
         let (d, m) = (self.cfg.dim, self.cfg.mel_dim);
-        let temb = self.gpu.download(&self.time_embed(t)?)?;
-        taps.push(("dit_temb".into(), temb.clone()));
+        let eps = FlowConfig::NORM_EPS;
+        // The timestep embedding, then SiLU of it: one vector for every
+        // modulation projection in the network, so it is taken once.
+        let mut te = self.time_embed(t)?;
+        if let Some(taps) = taps.as_deref_mut() {
+            taps.push(("dit_temb".into(), self.gpu.download(&te)?));
+        }
+        self.gpu.silu(&mut te, d)?;
 
         let mut out = vec![0.0f32; 2 * m * n];
         for b in 0..2 {
@@ -348,11 +352,15 @@ impl Flow {
                     cat[p * 4 * m + 3 * m + c] = spk[b * m + c];
                 }
             }
-            if b == 0 {
+            if b == 0
+                && let Some(taps) = taps.as_deref_mut()
+            {
                 taps.push(("dit_cat".into(), cat.clone()));
             }
             let h = self.linear(&self.gpu.upload(&cat)?, &self.input_proj, n)?;
-            if b == 0 {
+            if b == 0
+                && let Some(taps) = taps.as_deref_mut()
+            {
                 taps.push(("dit_proj".into(), self.gpu.download(&h)?));
             }
 
@@ -388,7 +396,9 @@ impl Flow {
             )?;
             debug_assert_eq!(t2, n);
             self.gpu.mish(&mut p2, d * n)?;
-            if b == 0 {
+            if b == 0
+                && let Some(taps) = taps.as_deref_mut()
+            {
                 taps.push((
                     "dit_pos".into(),
                     self.gpu.download(&self.gpu.transpose(&p2, d, n)?)?,
@@ -398,29 +408,21 @@ impl Flow {
             let mut h = h;
             let back = self.gpu.transpose(&p2, d, n)?;
             self.gpu.add_inplace(&mut h, &back, n * d)?;
-            if b == 0 {
+            if b == 0
+                && let Some(taps) = taps.as_deref_mut()
+            {
                 taps.push(("dit_input_embed".into(), self.gpu.download(&h)?));
             }
 
             for (bi, blk) in self.blocks.iter().enumerate() {
-                // The six modulation vectors, from the timestep. Each block
-                // has its own projection, so this is per block and not hoisted.
-                let mut te = self.gpu.upload(&temb)?;
-                self.gpu.silu(&mut te, d)?;
-                let mods = self.gpu.download(&self.linear(&te, &blk.attn_norm, 1)?)?;
-                let (shift_a, scale_a, gate_a) = (&mods[..d], &mods[d..2 * d], &mods[2 * d..3 * d]);
-                let (shift_f, scale_f, gate_f) =
-                    (&mods[3 * d..4 * d], &mods[4 * d..5 * d], &mods[5 * d..]);
+                // The six modulation vectors, from the timestep: shift, scale
+                // and gate for the attention, then the same three for the
+                // feed-forward, each `d` wide. Each block has its own
+                // projection, so this is per block and not hoisted.
+                let mods = self.linear(&te, &blk.attn_norm, 1)?;
 
                 // Attention, modulated in.
-                let normed = self.gpu.download(&self.norm(&h, n)?)?;
-                let mut xin = vec![0.0f32; n * d];
-                for p in 0..n {
-                    for c in 0..d {
-                        xin[p * d + c] = normed[p * d + c] * (1.0 + scale_a[c]) + shift_a[c];
-                    }
-                }
-                let xin = self.gpu.upload(&xin)?;
+                let xin = self.gpu.layer_norm_mod(&h, n, d, &mods, 0, d, eps)?;
 
                 let mut q = self.linear(&xin, &blk.q, n)?;
                 let mut k = self.linear(&xin, &blk.k, n)?;
@@ -476,58 +478,32 @@ impl Flow {
                     hd,
                 )?;
                 let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
-                let attn = self.gpu.download(&self.linear(&ctx, &blk.o, n)?)?;
-
-                let mut hh = self.gpu.download(&h)?;
-                for p in 0..n {
-                    for c in 0..d {
-                        hh[p * d + c] += gate_a[c] * attn[p * d + c];
-                    }
-                }
-                h = self.gpu.upload(&hh)?;
+                let attn = self.linear(&ctx, &blk.o, n)?;
+                self.gpu.gate_add(&mut h, &attn, &mods, 2 * d, n, d)?;
 
                 // Feed-forward, modulated in the same way.
-                let normed = self.gpu.download(&self.norm(&h, n)?)?;
-                let mut fin = vec![0.0f32; n * d];
-                for p in 0..n {
-                    for c in 0..d {
-                        fin[p * d + c] = normed[p * d + c] * (1.0 + scale_f[c]) + shift_f[c];
-                    }
-                }
-                let mut ff = self.linear(&self.gpu.upload(&fin)?, &blk.ff_in, n)?;
+                let fin = self
+                    .gpu
+                    .layer_norm_mod(&h, n, d, &mods, 3 * d, 4 * d, eps)?;
+                let mut ff = self.linear(&fin, &blk.ff_in, n)?;
                 // The tanh approximation, not the erf form.
                 self.gpu.gelu_tanh(&mut ff, n * d * self.cfg.ff_mult)?;
-                let ff = self.gpu.download(&self.linear(&ff, &blk.ff_out, n)?)?;
-
-                let mut hh = self.gpu.download(&h)?;
-                for p in 0..n {
-                    for c in 0..d {
-                        hh[p * d + c] += gate_f[c] * ff[p * d + c];
-                    }
-                }
-                h = self.gpu.upload(&hh)?;
-                if b == 0 && matches!(bi, 0 | 1 | 7 | 14 | 21) {
+                let ff = self.linear(&ff, &blk.ff_out, n)?;
+                self.gpu.gate_add(&mut h, &ff, &mods, 5 * d, n, d)?;
+                if b == 0
+                    && matches!(bi, 0 | 1 | 7 | 14 | 21)
+                    && let Some(taps) = taps.as_deref_mut()
+                {
                     taps.push((format!("dit_block{bi}"), self.gpu.download(&h)?));
                 }
             }
 
             // The final modulation chunks **(scale, shift)** - the reverse of
-            // every other one in the file.
-            let mut te = self.gpu.upload(&temb)?;
-            self.gpu.silu(&mut te, d)?;
-            let fin = self.gpu.download(&self.linear(&te, &self.norm_out, 1)?)?;
-            let (scale, shift) = (&fin[..d], &fin[d..]);
-
-            let normed = self.gpu.download(&self.norm(&h, n)?)?;
-            let mut last = vec![0.0f32; n * d];
-            for p in 0..n {
-                for c in 0..d {
-                    last[p * d + c] = normed[p * d + c] * (1.0 + scale[c]) + shift[c];
-                }
-            }
-            let y =
-                self.gpu
-                    .download(&self.linear(&self.gpu.upload(&last)?, &self.proj_out, n)?)?;
+            // every other one in the file - so the shift is the second
+            // segment here and the first everywhere above.
+            let fin = self.linear(&te, &self.norm_out, 1)?;
+            let last = self.gpu.layer_norm_mod(&h, n, d, &fin, d, 0, eps)?;
+            let y = self.gpu.download(&self.linear(&last, &self.proj_out, n)?)?;
 
             // Back to channel-major, which is what the solver works in.
             for c in 0..m {
@@ -554,7 +530,7 @@ impl Flow {
         n: usize,
     ) -> Result<Vec<(String, Vec<f32>)>, CosyError> {
         let mut taps = Vec::new();
-        let out = self.estimator(x, mu, cond, spk, t, n, &mut taps)?;
+        let out = self.estimator(x, mu, cond, spk, t, n, Some(&mut taps))?;
         taps.push(("dit_step0".into(), out));
         Ok(taps)
     }
@@ -572,7 +548,7 @@ impl Flow {
         t: f32,
         n: usize,
     ) -> Result<Vec<f32>, CosyError> {
-        self.estimator(x, mu, cond, spk, t, n, &mut Vec::new())
+        self.estimator(x, mu, cond, spk, t, n, None)
     }
 
     /// The speaker vector the DiT sees: L2-normalised, then projected 192 to 80.
@@ -749,7 +725,7 @@ impl Flow {
         for step in 1..ts.len() {
             x2[..m * n].copy_from_slice(&x);
             x2[m * n..].copy_from_slice(&x);
-            let d = self.estimator(&x2, &mu2, &cond2, &spk2, t, n, &mut Vec::new())?;
+            let d = self.estimator(&x2, &mu2, &cond2, &spk2, t, n, None)?;
             let r = self.cfg.cfg_rate;
             for (i, xi) in x.iter_mut().enumerate() {
                 *xi += dt * ((1.0 + r) * d[i] - r * d[m * n + i]);

@@ -2725,11 +2725,21 @@ __device__ __forceinline__ void norm_store(unsigned short* p, int i, float v) {
 // `ADD` folds the residual sum in: `h += res` on the way through the first
 // pass, so `h` holds the sum for every pass below and for whatever adds to the
 // residual stream next. Without it `h` is read and never written.
-template <typename OUT, bool ADD>
+// `wadd` is added to every weight before it is applied: zero for a plain
+// affine, one for a DiT modulation, whose scale is `1 + s`. Adding zero is
+// exact, so the plain kernels are unchanged bit for bit.
+//
+// `SPLIT` keeps the affine as a rounded multiply and a rounded add rather
+// than letting the compiler contract it into one `fmaf`. The modulation
+// kernel sets it, because what it replaces computed the normalisation on the
+// card and the affine on the host, where a multiply and an add are two
+// roundings; with the same two roundings here the flow's estimator is bit
+// for bit what it was, and that identity is the test.
+template <typename OUT, bool ADD, bool SPLIT>
 __device__ __forceinline__ void layer_norm_impl(
     float* __restrict__ h, const float* __restrict__ res,
     const float* __restrict__ weight, const float* __restrict__ bias,
-    OUT* __restrict__ out, int cols, float eps)
+    OUT* __restrict__ out, int cols, float eps, float wadd)
 {
     __shared__ float red[32];
     const int row = blockIdx.x;
@@ -2797,14 +2807,25 @@ __device__ __forceinline__ void layer_norm_impl(
         for (int i = tid; i < n4; i += nt, ++slot) {
             const float4 v = (slot < LN_REG) ? keep[slot] : h4[i];
             const float4 w = w4[i], b = b4[i];
-            norm_store(outr, 4 * i + 0, (v.x - mean) * inv * w.x + b.x);
-            norm_store(outr, 4 * i + 1, (v.y - mean) * inv * w.y + b.y);
-            norm_store(outr, 4 * i + 2, (v.z - mean) * inv * w.z + b.z);
-            norm_store(outr, 4 * i + 3, (v.w - mean) * inv * w.w + b.w);
+            if (SPLIT) {
+                norm_store(outr, 4 * i + 0, __fadd_rn(__fmul_rn((v.x - mean) * inv, w.x + wadd), b.x));
+                norm_store(outr, 4 * i + 1, __fadd_rn(__fmul_rn((v.y - mean) * inv, w.y + wadd), b.y));
+                norm_store(outr, 4 * i + 2, __fadd_rn(__fmul_rn((v.z - mean) * inv, w.z + wadd), b.z));
+                norm_store(outr, 4 * i + 3, __fadd_rn(__fmul_rn((v.w - mean) * inv, w.w + wadd), b.w));
+            } else {
+                norm_store(outr, 4 * i + 0, (v.x - mean) * inv * (w.x + wadd) + b.x);
+                norm_store(outr, 4 * i + 1, (v.y - mean) * inv * (w.y + wadd) + b.y);
+                norm_store(outr, 4 * i + 2, (v.z - mean) * inv * (w.z + wadd) + b.z);
+                norm_store(outr, 4 * i + 3, (v.w - mean) * inv * (w.w + wadd) + b.w);
+            }
         }
     } else {
         for (int i = tid; i < cols; i += nt) {
-            norm_store(outr, i, (hr[i] - mean) * inv * weight[i] + bias[i]);
+            if (SPLIT) {
+                norm_store(outr, i, __fadd_rn(__fmul_rn((hr[i] - mean) * inv, weight[i] + wadd), bias[i]));
+            } else {
+                norm_store(outr, i, (hr[i] - mean) * inv * (weight[i] + wadd) + bias[i]);
+            }
         }
     }
 }
@@ -2817,7 +2838,35 @@ __global__ void layer_norm(
     int cols, float eps)
 {
     // `x` is not written: `ADD` is off, and the only store to `h` is under it.
-    layer_norm_impl<float, false>((float*)x, x, weight, bias, out, cols, eps);
+    layer_norm_impl<float, false, false>((float*)x, x, weight, bias, out, cols, eps, 0.0f);
+}
+
+// A DiT block's adaptive normalisation: LayerNorm with no affine, then
+// `* (1 + scale) + shift`, where `scale` and `shift` are two `cols`-wide
+// segments of one modulation vector `mods` - the six chunks a block's
+// timestep projection produces, or the two the final one does. One launch
+// where the flow was downloading the normalised rows and modulating them on
+// the host. `scale_off` and `shift_off` must keep the segments 16-byte
+// aligned, which every offset here is, being a multiple of `cols`.
+extern "C" __global__ void layer_norm_mod(
+    const float* __restrict__ x, const float* __restrict__ mods,
+    int shift_off, int scale_off, float* __restrict__ out, int cols, float eps)
+{
+    layer_norm_impl<float, false, true>(
+        (float*)x, x, mods + scale_off, mods + shift_off, out, cols, eps, 1.0f);
+}
+
+// The gated residual of the same block: `h[p, c] += mods[gate_off + c] * x[p, c]`,
+// as a rounded multiply and a rounded add - the host loop it replaces, bit
+// for bit, for the reason given at `layer_norm_impl`.
+extern "C" __global__ void gate_add(
+    float* __restrict__ h, const float* __restrict__ x,
+    const float* __restrict__ mods, int gate_off, int cols, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        h[i] = __fadd_rn(h[i], __fmul_rn(mods[gate_off + i % cols], x[i]));
+    }
 }
 
 // The same, taking the residual sum on the way in.
@@ -2850,7 +2899,7 @@ __global__ void layer_norm_add(
     const float* __restrict__ weight, const float* __restrict__ bias,
     float* __restrict__ out, int cols, float eps)
 {
-    layer_norm_impl<float, true>(h, res, weight, bias, out, cols, eps);
+    layer_norm_impl<float, true, false>(h, res, weight, bias, out, cols, eps, 0.0f);
 }
 
 __global__ void layer_norm_add_f16(
@@ -2858,7 +2907,7 @@ __global__ void layer_norm_add_f16(
     const float* __restrict__ weight, const float* __restrict__ bias,
     unsigned short* __restrict__ out, int cols, float eps)
 {
-    layer_norm_impl<unsigned short, true>(h, res, weight, bias, out, cols, eps);
+    layer_norm_impl<unsigned short, true, false>(h, res, weight, bias, out, cols, eps, 0.0f);
 }
 
 // One block per row; subtracts the row max before exponentiating.

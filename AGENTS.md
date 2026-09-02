@@ -113,7 +113,12 @@ trained under AMP and every LSTM weight in it is **exactly representable in
 f16**, so the half-width form was the same numbers at half the bytes, and
 two thirds of the card's time had been spent streaming zeros in the low
 mantissa. Before spending bandwidth on an f32 tensor, check whether it is
-f16-exact; `docs/BENCHMARKS.md` has the round. This paragraph
+f16-exact; `docs/BENCHMARKS.md` has the round. CosyVoice3 has since had
+its first round too, and the largest single result in this file: its flow
+was moving the DiT's residual stream through host memory twice a block, and
+holding it on the card took an utterance from 3.4 s to 1.1 s with a
+bit-identical mel - 1.4x realtime to 4.4x. The speech LLM is now half of
+what is left and still streams f32 weights. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

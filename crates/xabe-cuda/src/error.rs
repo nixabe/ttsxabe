@@ -132,6 +132,17 @@ pub enum CudaError {
     /// untouched, which is a model that is nearly right - the failure this
     /// workspace exists to refuse. No checkpoint here has one; the check is
     /// what makes that a fact rather than an assumption.
+    /// A segment offset that would break a kernel's vector loads. The layer
+    /// norm reads its affine four floats at a time, so a modulation segment
+    /// that starts off a four-float boundary would read across it and
+    /// produce numbers rather than fault.
+    #[error("{what} starts at {offset}, which is not a multiple of {align}")]
+    Misaligned {
+        what: &'static str,
+        offset: usize,
+        align: usize,
+    },
+
     #[error("a rotary head of odd width {head_dim}")]
     OddHeadDim {
         /// The head width asked for.

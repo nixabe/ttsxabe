@@ -2677,6 +2677,58 @@ The `examples/say` path, measured on its own: 3.1 s to load all three networks,
 then 6.08 s of audio in 5.06 s — 1.20x realtime, one utterance at a time, no
 batching and no streaming.
 
+### The flow was on the host: 3.4 s to 1.1 s, bit-identical
+
+That preliminary figure stood until the stage was timed on its own, which
+`examples/stages.rs` now does - each of the four stages synchronised before
+its clock stops, so the split is honest and the sum is slightly pessimistic
+against `Cosy::synthesize`. One utterance of 17 text ids, 119 speech tokens,
+238 mel frames, 4.76 s of audio, on card 0 with nothing else on the box:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| speech LLM, 119 tokens | 549 ms (4.6 ms a token) | 552 ms |
+| flow, 10 Euler steps of a batch of two | **2809 ms** | **448 ms** |
+| F0 and excitation | 7 ms | 8 ms |
+| vocoder | 70 ms | 82 ms |
+| utterance | 3436 ms | 1091 ms |
+
+Two pairs alternated in one sitting; the table is the better pair of the old
+binary against the worse of the new, and the other pair reads 3686 against
+1094. **3.1x on the utterance, 6.3x on the flow**, and the mel is
+**bit for bit** what the previous build produced on the same seed -
+`examples/probe_est.rs` writes one estimator evaluation's every tap on
+seeded inputs from either build, and the eleven agree exactly. 1.4x realtime
+to 4.4x.
+
+What the flow was doing: the DiT's adaptive normalisation was computed as a
+`layer_norm` on the card, **downloaded**, modulated by `(1 + scale)` and
+`shift` in a host loop, and uploaded again; the gated residual was the same
+in reverse, with the residual stream downloaded and re-uploaded around it.
+Twice a block, 22 blocks, two batch rows, ten solver steps: 3238
+device-to-host copies and 3174 the other way an utterance, and the card busy
+40% of the flow's time, a third of that busy time being the copies
+themselves. Two kernels replace it - `layer_norm_mod`, the normalisation
+with the modulation read straight out of the block's timestep projection,
+and `gate_add`, the gated residual in place - and the timestep's SiLU is
+taken once an evaluation rather than once a block. The card is busy 94% of
+the flow's time now, and 277 of its 438 busy milliseconds are the tiled
+`gemm`. `docs/KERNELS.md` has the two kernels and the one thing about them
+that was not obvious.
+
+Why bit-identical was worth insisting on: the first version of the two
+kernels let the compiler contract the affine into an `fmaf`, one rounding
+where the host loop had two. That is a one-ulp difference on the block's
+input, and one ulp is enough to flip the f16 rounding the tiled matmul
+applies to its operands, which is a 5e-4 relative jump on the elements it
+flips. Through 22 blocks that read as 1e-4 relative after the first block
+and 5e-4 after the last, and through ten solver steps as a mel that
+correlated with the previous build's at 0.99996 and differed by 0.45 at
+worst - inside what the flow's own oracle test permits, and impossible to
+tell from a bug without the oracle to hand. With the multiply and the add
+rounded separately the estimator is the same bits, and that identity is a
+sharper test than any tolerance.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

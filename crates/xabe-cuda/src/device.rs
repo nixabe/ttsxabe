@@ -581,6 +581,8 @@ const NAMES: &[&str] = &[
     "layer_norm_add",
     "silu_mul_pair",
     "layer_norm_add_f16",
+    "layer_norm_mod",
+    "gate_add",
     "act_gelu_f16",
     "softmax_rows",
     "act_relu",
@@ -2388,6 +2390,97 @@ impl Gpu {
             .arg(&eps);
         launched("layer_norm", unsafe { lb.launch(Self::per_row(rows)) })?;
         Ok(out)
+    }
+
+    /// A DiT block's adaptive normalisation: `layer_norm` with no affine,
+    /// then `* (1 + scale) + shift`, with `scale` and `shift` read as
+    /// `cols`-wide segments of `mods` at `scale_off` and `shift_off`. What
+    /// `layer_norm` with weight `1 + scale` and bias `shift` computes, in one
+    /// launch and without the two vectors being built; the test holds it to
+    /// `xabe_dsp::layer_norm` on exactly that weight and bias.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm_mod(
+        &self,
+        x: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        mods: &CudaSlice<f32>,
+        shift_off: usize,
+        scale_off: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        let need = shift_off.max(scale_off) + cols;
+        if mods.len() < need {
+            return Err(CudaError::SliceOverrun {
+                at: need,
+                len: mods.len(),
+            });
+        }
+        if x.len() < rows * cols {
+            return Err(CudaError::SliceOverrun {
+                at: rows * cols,
+                len: x.len(),
+            });
+        }
+        if !shift_off.is_multiple_of(4) || !scale_off.is_multiple_of(4) {
+            return Err(CudaError::Misaligned {
+                what: "a modulation segment",
+                offset: if shift_off.is_multiple_of(4) {
+                    scale_off
+                } else {
+                    shift_off
+                },
+                align: 4,
+            });
+        }
+        // SAFETY: one block a row writes every element of its row.
+        let mut out = unsafe { self.uninit(rows * cols) }?;
+        let (c, so, sc) = (cols as i32, shift_off as i32, scale_off as i32);
+        let f = self.func("layer_norm_mod");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(x)
+            .arg(mods)
+            .arg(&so)
+            .arg(&sc)
+            .arg(&mut out)
+            .arg(&c)
+            .arg(&eps);
+        // SAFETY: both segments were checked to lie inside `mods` above.
+        launched("layer_norm_mod", unsafe { lb.launch(Self::per_row(rows)) })?;
+        Ok(out)
+    }
+
+    /// The gated residual of a DiT block: `h[p, c] += mods[gate_off + c] * x[p, c]`
+    /// over `rows` rows of `cols`.
+    pub fn gate_add(
+        &self,
+        h: &mut CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        mods: &CudaSlice<f32>,
+        gate_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), CudaError> {
+        let n = rows * cols;
+        if h.len() < n || x.len() < n {
+            return Err(CudaError::SliceOverrun {
+                at: n,
+                len: h.len().min(x.len()),
+            });
+        }
+        if mods.len() < gate_off + cols {
+            return Err(CudaError::SliceOverrun {
+                at: gate_off + cols,
+                len: mods.len(),
+            });
+        }
+        let (go, c, ni) = (gate_off as i32, cols as i32, n as i32);
+        let f = self.func("gate_add");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(h).arg(x).arg(mods).arg(&go).arg(&c).arg(&ni);
+        // SAFETY: every index is bounded by `n` and the gate segment by the
+        // check above.
+        launched("gate_add", unsafe { lb.launch(Self::flat(n)) })
     }
 
     /// The residual sum and the normalisation of it, in one pass.
