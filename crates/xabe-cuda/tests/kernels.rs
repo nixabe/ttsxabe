@@ -305,20 +305,38 @@ fn transposed_conv1d_matches_the_scatter_form() {
     }
 }
 
+/// Every tile width and both channel tiles, with row and channel counts
+/// off every tile edge: the text encoder's projections (70 rows of 192),
+/// the Tacotron2 encoder's input gates (206 rows, 512 to 4096), a handful
+/// of rows and a single one in a tile that is mostly padding, and odd ones.
 #[test]
 fn linear_matches() {
     let Some(g) = gpu() else { return };
-    let (rows, in_c, out_c) = (37usize, 64usize, 48usize);
-    let x = seq(rows * in_c, 10);
-    let w = seq(out_c * in_c, 11);
-    let b = seq(out_c, 12);
+    for (rows, in_c, out_c, bias) in [
+        (37usize, 64usize, 48usize, true),
+        (70, 192, 192, true),
+        (206, 512, 4096, true),
+        (206, 512, 128, false),
+        (33, 17, 65, true),
+        (130, 50, 40, true),
+        (5, 192, 192, true),
+        (1, 64, 48, false),
+    ] {
+        let x = seq(rows * in_c, 10);
+        let w = seq(out_c * in_c, 11);
+        let b = seq(out_c, 12);
 
-    let want = xabe_dsp::linear(&x, rows, in_c, &w, Some(&b), out_c);
-    let dx = g.upload(&x).unwrap();
-    let dw = g.upload(&w).unwrap();
-    let db = g.upload(&b).unwrap();
-    let out = g.linear(&dx, &dw, Some(&db), rows, in_c, out_c).unwrap();
-    assert_close("linear", &want, &g.download(&out).unwrap());
+        let want = xabe_dsp::linear(&x, rows, in_c, &w, bias.then_some(&b[..]), out_c);
+        let dx = g.upload(&x).unwrap();
+        let dw = g.upload(&w).unwrap();
+        let db = g.upload(&b).unwrap();
+        let out = g
+            .linear(&dx, &dw, bias.then_some(&db), rows, in_c, out_c)
+            .unwrap();
+        let got = g.download(&out).unwrap();
+        assert_eq!(want.len(), got.len(), "linear {rows}x{in_c}->{out_c}");
+        assert_close(&format!("linear {rows}x{in_c}->{out_c}"), &want, &got);
+    }
 }
 
 /// The shared tolerance up to the widest row any model here normalises, and

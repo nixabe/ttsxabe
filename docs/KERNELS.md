@@ -15,6 +15,7 @@ exists.
 | conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
 | conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths, two channel tiles) | `xabe-cuda` conv1d |
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` | `depthwise_conv1d` | `xabe-tts` duration |
+| linear, exact f32 | text encoder q/k/v/o, Tacotron2's encoder gates and attention memory | `xabe_dsp::linear` | `linear_tiled` (the convolution's body, row-major) | `xabe-cuda` kernels |
 | transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` | `transposed_conv1d` | `xabe-tts` decoder |
 | grouped conv1d, left-padded | CosyVoice3 DiT positional embedding | `xabe_dsp::grouped_conv1d` | `grouped_conv1d`, `grouped_conv1d_tiled` | `xabe-cuda` kernels |
 | leaky ReLU | decoder | `xabe_dsp::leaky_relu` | `act_leaky_relu` | `xabe-tts` decoder |
@@ -141,6 +142,20 @@ Two entries deserve a note:
   block an SM, the narrow one otherwise. The 256-channel stage at 1344
   positions is short of blocks in either and sits at 4.6 TFLOP/s; a
   split of the contraction is the thing not tried.
+- **`linear_tiled` is `conv1d_tiled`'s body over `nn.Linear`'s layout.** The
+  same template with a flag: `x` is `[rows, in]` rather than `[in, t]`, so
+  the input tile is read a row at a time along its channels and stored
+  transposed the way the weights are, into a row padded by four; the
+  output goes to `[rows, out]`; `k` is one and a pair is an input channel.
+  The sum is what the thread-per-output `linear` computed - bias, then the
+  inputs ascending, each an `fmaf` - and both synthesisers' audio was byte
+  for byte the previous engine's on a long text and a three-syllable one.
+  That kernel read each weight row down a column of the warp, thirty-two
+  lines a load, and the tile beats it at every row count including one:
+  the text encoder's 70-row projections 79 µs to 15, Tacotron2's 206-row
+  attention memory 218 to 33, a single row of 192 by 192 26 to 14. So the
+  wrapper has no row count at which it keeps the old kernel, and the old
+  kernel is gone. `docs/BENCHMARKS.md` has the round.
 - **`grouped_conv1d_tiled` is `conv1d_tiled`'s body a group a `blockIdx.z`.**
   A grouped convolution is `groups` ordinary ones over consecutive channel
   slices, so the tile runs on the slice's pointers with the group's channel
@@ -363,6 +378,12 @@ Medians of 20, one Quadro RTX 8000, against the one-thread-per-output `linear`:
 
 The output head is bandwidth-bound and running at 88% of the card's 672 GB/s,
 which is about as good as a GEMV gets.
+
+The `linear` column is the thread-per-output kernel as it was when this
+table was taken; that kernel has since been replaced by `linear_tiled`,
+which is about five times faster at the synthesisers' shapes and still
+exact. The table stands as the reason `gemm` was written, not as a
+measurement of the current `linear`.
 
 ### Why the tile is 128x128
 

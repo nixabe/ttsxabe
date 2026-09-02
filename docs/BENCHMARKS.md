@@ -3265,6 +3265,49 @@ twenty runs against the eb94f9c bench, worst on each side: **28.72 ms to
 convolutions are the 32-channel location filter and a 512-channel
 postnet over 200 positions, neither of which takes the wide tile.
 
+### The text encoder's projections as the tiled kernel: 1.06x on VITS
+
+With the decoder at 21 ms the profile of a VITS synthesis had a second
+kernel worth reading: `linear`, the thread-per-output matmul the text
+encoder runs for q, k, v and the output projection in each of its six
+layers, 75 µs a launch at 70 rows of 192 - 1.8 ms of a 24.9 ms run for
+2.6 MFLOP a call. A thread there walked its weight row while the
+thirty-one lanes beside it walked theirs, so every load touched
+thirty-two lines of the weight; at thirty rows of 512 to 1024, which is
+what Tacotron2's encoder asks of it once a direction, the same kernel took
+394 µs for 31 MFLOP.
+
+The tiled convolution's body already is a matmul, gathering its right
+operand as it stages it, so `linear_tiled` is that template with a flag:
+the input read a row at a time along its channels and stored transposed
+the way the weights are, `k` of one, the output row-major. The sum is
+the old kernel's to the bit - bias, inputs ascending, `fmaf` - and both
+synthesisers' WAVs are byte for byte the eb94f9c engine's on a long text
+and a three-syllable one. The harness, `Gpu::linear` on GPU 2, best of
+three fifty-launch runs, against the b1188a8 tree:
+
+| Shape | What it is | Before | After |
+| --- | --- | ---: | ---: |
+| 70 x 192 -> 192 | text encoder q, k, v, o | 78.8 µs | 14.6 |
+| 26 x 192 -> 192 | the same at a short clause | 33.6 | 14.7 |
+| 1 x 192 -> 192 | one symbol | 26.5 | 14.3 |
+| 30 x 512 -> 1024 | Tacotron2 encoder LSTM gates, a direction | 394.0 | 33.1 |
+| 50 x 512 -> 1024 | the same at a longer line | 429.0 | 34.0 |
+| 30 x 512 -> 128 | Tacotron2 attention memory | 108.4 | 32.7 |
+
+The tile wins at one row, where it is 31/32 padding, because the old
+kernel's cost was the weight read and not the arithmetic; so the wrapper
+has no row count at which it keeps the old kernel, and the old kernel is
+deleted rather than left unreachable. At 70 rows the tile is 14.6 µs for
+2.6 MFLOP, which is a launch and twelve trips of sixteen pairs in
+sequence, not a rate; the text encoder's projections are latency now.
+
+`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+twenty runs against the b1188a8 bench, worst on each side: **24.76 ms
+to 23.30**, **1.06x**. Tacotron2's encoder on the same three lines is
+2.19, 2.96 and 3.06 ms to 1.45, 1.99 and 2.05, and its synthesis is level
+inside the pairs' spread - the encoder was 2% of it.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

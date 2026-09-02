@@ -140,7 +140,11 @@ trip ahead, and eight channels a thread where there are 64 to fill them -
 for **1.15x** more on VITS, 28.7 ms to 24.9, still bit-identical; its
 128-channel shapes run at 7.9 TFLOP/s of the card's 16.3 now, and
 `docs/BENCHMARKS.md` has the shape table and the two things that did not
-work. CosyVoice3 has since had
+work. The text encoder's projections then went from a thread per output
+to that same tiled body over `nn.Linear`'s layout, exact, 79 µs a call to
+15, for **1.06x** more on VITS, 24.8 ms to 23.3, and Tacotron2's encoder
+2.2 ms to 1.5; the tile won at every row count down to one, so the old
+kernel is deleted rather than kept for short rows. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

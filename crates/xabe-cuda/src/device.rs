@@ -558,13 +558,18 @@ const NAMES: &[&str] = &[
     "conv1d_tiled_w",
     "conv1d_tiled_w64",
     "conv1d_tiled_w32",
+    "linear_tiled",
+    "linear_tiled_64",
+    "linear_tiled_32",
+    "linear_tiled_w",
+    "linear_tiled_w64",
+    "linear_tiled_w32",
     "grouped_conv1d_tiled",
     "grouped_conv1d_tiled_64",
     "grouped_conv1d_tiled_32",
     "conv1d_short",
     "depthwise_conv1d",
     "transposed_conv1d",
-    "linear",
     "gemm",
     "gemm_i8_q4k",
     "gemm_i8_q6k",
@@ -1200,6 +1205,33 @@ fn launched<T>(
 /// device pointer for an empty allocation.
 impl Gpu {
     /// General 1-D convolution. Mirrors `xabe_dsp::conv1d`.
+    /// The tiled convolution's launch shape for `out_ch` channels over
+    /// `out_t` positions: whether the block takes 64 channels or 32, how
+    /// many channel blocks, and the tile width, `None` when the sequence
+    /// is too short for the narrowest tile and the direct kernel stays.
+    /// Sixty-four channels a block and eight a thread where there are the
+    /// channels for it and the grid still reaches a block an SM in some
+    /// width; thirty-two and four otherwise. The widest tile that fills
+    /// the card, or the narrowest that fits when none does.
+    fn conv_tile(out_ch: usize, out_t: usize) -> (bool, u32, Option<u32>) {
+        let grid = |oc_tile: u32| {
+            let oc_blocks = (out_ch as u32).div_ceil(oc_tile);
+            let tile = [128u32, 64, 32]
+                .into_iter()
+                .find(|&w| out_t as u32 >= w && oc_blocks * (out_t as u32).div_ceil(w) >= 72);
+            (oc_blocks, tile)
+        };
+        match (out_ch >= 64, grid(2 * CONV_TILE_OC)) {
+            (true, (blocks, Some(w))) => (true, blocks, Some(w)),
+            _ => {
+                let (blocks, tile) = grid(CONV_TILE_OC);
+                let tile =
+                    tile.or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
+                (false, blocks, tile)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn conv1d(
         &self,
@@ -1284,22 +1316,7 @@ impl Gpu {
         // the channels for it and the grid still reaches a block an SM in
         // some width; thirty-two and four otherwise. The widest tile that
         // fills the card, or the narrowest that fits when none does.
-        let grid = |oc_tile: u32| {
-            let oc_blocks = (out_ch as u32).div_ceil(oc_tile);
-            let tile = [128u32, 64, 32]
-                .into_iter()
-                .find(|&w| out_t as u32 >= w && oc_blocks * (out_t as u32).div_ceil(w) >= 72);
-            (oc_blocks, tile)
-        };
-        let (wide, oc_blocks, tile) = match (out_ch >= 64, grid(2 * CONV_TILE_OC)) {
-            (true, (blocks, Some(w))) => (true, blocks, Some(w)),
-            _ => {
-                let (blocks, tile) = grid(CONV_TILE_OC);
-                let tile =
-                    tile.or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
-                (false, blocks, tile)
-            }
-        };
+        let (wide, oc_blocks, tile) = Self::conv_tile(out_ch, out_t);
         let f = self.func(match (tile, wide, long_form) {
             (Some(128), true, _) => "conv1d_tiled_w",
             (Some(64), true, _) => "conv1d_tiled_w64",
@@ -1462,10 +1479,27 @@ impl Gpu {
         in_c: usize,
         out_c: usize,
     ) -> Result<CudaSlice<f32>, CudaError> {
-        let mut out = self.zeros(rows * out_c)?;
+        // SAFETY: the kernel writes every `[rows, out_c]` element - the
+        // tail of a tile past `rows` is skipped, not left - so nothing
+        // reads a byte it did not store.
+        let mut out = unsafe { self.uninit(rows * out_c) }?;
         let (a, b_, c) = (rows as i32, in_c as i32, out_c as i32);
         let null: u64 = 0;
-        let f = self.func("linear");
+        // The convolution's tile rule with the rows as positions, and the
+        // narrowest tile when the rows cannot fill even that: a
+        // thread-per-output kernel read each weight row down a column of
+        // the warp and lost to the tile at every row count, one row
+        // included - docs/BENCHMARKS.md has the shapes.
+        let (wide, oc_blocks, tile) = Self::conv_tile(out_c, rows);
+        let width = tile.unwrap_or(32);
+        let f = self.func(match (width, wide) {
+            (128, true) => "linear_tiled_w",
+            (64, true) => "linear_tiled_w64",
+            (_, true) => "linear_tiled_w32",
+            (128, false) => "linear_tiled",
+            (64, false) => "linear_tiled_64",
+            (_, false) => "linear_tiled_32",
+        });
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x).arg(w);
         match bias {
@@ -1473,7 +1507,15 @@ impl Gpu {
             None => lb.arg(&null),
         };
         lb.arg(&mut out).arg(&a).arg(&b_).arg(&c);
-        launched("linear", unsafe { lb.launch(Self::flat(rows * out_c)) })?;
+        let cfg = LaunchConfig {
+            grid_dim: (oc_blocks, (rows as u32).div_ceil(width), 1),
+            block_dim: (width * 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: a block owns a channel tile by `width` rows and every
+        // global read and write inside is bounds checked against `rows`,
+        // `in_c` and `out_c`.
+        launched("linear", unsafe { lb.launch(cfg) })?;
         Ok(out)
     }
 

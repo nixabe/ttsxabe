@@ -2687,7 +2687,15 @@ extern "C" __global__ void conv1d(
 // The weight tile's row stride, padded so the transposed staging store
 // spreads across banks and each row stays 16-byte aligned.
 #define CT_WS 36
-template <int TX, int OCT>
+//
+// `ROWMAJOR` is the same body over `nn.Linear`'s layout: `x` is `[t, in_ch]`
+// and `out` is `[out_ch, t]` transposed to `[t, out_ch]`, with `k = 1` so a
+// pair is an input channel. The sum is `linear`'s to the bit - bias, then
+// the inputs ascending - and only the staging and the store change: the
+// input tile is read a row at a time along its channels, coalesced, and
+// stored transposed the way the weights are, into a row padded by four so
+// the transposed stores spread over the banks.
+template <int TX, int OCT, bool ROWMAJOR = false>
 __device__ __forceinline__ void conv1d_tiled_body(
     const float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ bias, float* __restrict__ out,
@@ -2697,8 +2705,9 @@ __device__ __forceinline__ void conv1d_tiled_body(
     constexpr int THREADS = 8 * TX;
     constexpr int OC = 8 * OCT;          // channels a block
     constexpr int WS = OC + 4;           // the weight tile's padded row
+    constexpr int XS = ROWMAJOR ? CT_T + 4 : CT_T;
     __shared__ __align__(16) float Ws[CT_KK][WS];
-    __shared__ __align__(16) float Xs[CT_KK][CT_T];
+    __shared__ __align__(16) float Xs[CT_KK][XS];
     const int tid = threadIdx.x;
     const int tx = tid % TX, ty = tid / TX;
     const int oc0 = blockIdx.x * OC;
@@ -2729,9 +2738,11 @@ __device__ __forceinline__ void conv1d_tiled_body(
     // docs/KERNELS.md.
     constexpr int WH = OC * CT_KK / THREADS;
     constexpr int XH = CT_KK / 8;
+    constexpr int RH = CT_T * CT_KK / THREADS;   // row-major: rows a lane
     const int w_oc = tid / CT_KK, w_kk = tid % CT_KK;
     float wr[WH];
     float xv[XH][4];
+    float xr_[ROWMAJOR ? RH : 1];
     auto fetch = [&](int kk0) {
         #pragma unroll
         for (int h = 0; h < WH; ++h) {
@@ -2739,6 +2750,16 @@ __device__ __forceinline__ void conv1d_tiled_body(
             const int kk = kk0 + w_kk;
             wr[h] = 0.0f;
             if (oc0 + o < out_ch && kk < K) wr[h] = w[(size_t)(oc0 + o) * K + kk];
+        }
+        if (ROWMAJOR) {
+            #pragma unroll
+            for (int h = 0; h < RH; ++h) {
+                const int r = w_oc + (THREADS / CT_KK) * h;
+                const int kk = kk0 + w_kk;
+                xr_[h] = 0.0f;
+                if (t0 + r < t && kk < K) xr_[h] = x[(size_t)(t0 + r) * K + kk];
+            }
+            return;
         }
         #pragma unroll
         for (int h = 0; h < XH; ++h) {
@@ -2761,11 +2782,18 @@ __device__ __forceinline__ void conv1d_tiled_body(
         for (int h = 0; h < WH; ++h) {
             Ws[w_kk][w_oc + (THREADS / CT_KK) * h] = wr[h];
         }
-        #pragma unroll
-        for (int h = 0; h < XH; ++h) {
+        if (ROWMAJOR) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                Xs[ty + 8 * h][tx * 4 + j] = xv[h][j];
+            for (int h = 0; h < RH; ++h) {
+                Xs[w_kk][w_oc + (THREADS / CT_KK) * h] = xr_[h];
+            }
+        } else {
+            #pragma unroll
+            for (int h = 0; h < XH; ++h) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    Xs[ty + 8 * h][tx * 4 + j] = xv[h][j];
+                }
             }
         }
         __syncthreads();
@@ -2791,6 +2819,18 @@ __device__ __forceinline__ void conv1d_tiled_body(
         __syncthreads();
     }
 
+    if (ROWMAJOR) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (tt + j >= out_t) break;
+            float* orow = out + (size_t)(tt + j) * out_ch + oc;
+            #pragma unroll
+            for (int a = 0; a < OCT; ++a) {
+                if (oc + a < out_ch) orow[a] = acc[a][j];
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int a = 0; a < OCT; ++a) {
         if (oc + a >= out_ch) break;
@@ -2819,6 +2859,27 @@ CONV_TILED_ENTRY(conv1d_tiled_32, 8, 4)
 CONV_TILED_ENTRY(conv1d_tiled_w, 32, 8)
 CONV_TILED_ENTRY(conv1d_tiled_w64, 16, 8)
 CONV_TILED_ENTRY(conv1d_tiled_w32, 8, 8)
+
+// `linear` on the same body: `y[t][o] = bias[o] + sum_i x[t][i] * w[o][i]`,
+// `nn.Linear`'s layout, as `[rows, in_c] x [out_c, in_c]^T` with the rows
+// as the positions and `k = 1`, exact. This replaced a thread-per-output
+// kernel that read each weight row down a column of the warp, thirty-two
+// lines a load, and lost to the tile at every row count including one.
+#define LINEAR_TILED_ENTRY(NAME, TX, OCT)                                               \
+    extern "C" __global__ __launch_bounds__(8 * TX) void NAME(                          \
+        const float* __restrict__ x, const float* __restrict__ w,                       \
+        const float* __restrict__ bias, float* __restrict__ out,                        \
+        int rows, int in_c, int out_c)                                                  \
+    {                                                                                   \
+        conv1d_tiled_body<TX, OCT, true>(x, w, bias, out, in_c, rows, out_c, 1, 0, 1,   \
+                                         rows);                                         \
+    }
+LINEAR_TILED_ENTRY(linear_tiled, 32, 4)
+LINEAR_TILED_ENTRY(linear_tiled_64, 16, 4)
+LINEAR_TILED_ENTRY(linear_tiled_32, 8, 4)
+LINEAR_TILED_ENTRY(linear_tiled_w, 32, 8)
+LINEAR_TILED_ENTRY(linear_tiled_w64, 16, 8)
+LINEAR_TILED_ENTRY(linear_tiled_w32, 8, 8)
 
 // The grouped convolution on the same body, a group a `blockIdx.z`: each
 // group is an ordinary convolution over its own slice of the channels, so
@@ -2942,24 +3003,6 @@ __global__ void transposed_conv1d(
 }
 
 // -------------------------------------------------------------------- dense
-
-// y[t][o] = bias[o] + sum_i x[t][i] * w[o][i]. PyTorch's nn.Linear layout.
-__global__ void linear(
-    const float* __restrict__ x, const float* __restrict__ w,
-    const float* __restrict__ bias, float* __restrict__ out,
-    int rows, int in_c, int out_c)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * out_c) return;
-    int r = idx / out_c;
-    int o = idx - r * out_c;
-
-    float acc = bias ? bias[o] : 0.0f;
-    const float* xr = x + (size_t)r * in_c;
-    const float* wo = w + (size_t)o * in_c;
-    for (int i = 0; i < in_c; ++i) acc = fmaf(xr[i], wo[i], acc);
-    out[idx] = acc;
-}
 
 // -------------------------------------------------------------- normalisation
 
