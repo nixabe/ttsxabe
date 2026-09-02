@@ -379,6 +379,16 @@ impl Flow {
         }
         self.gpu.silu(&mut te, d)?;
 
+        // The modulation vectors depend on the timestep alone, so they are
+        // projected once an evaluation and read by both batch rows: 23
+        // mat-vecs rather than 46, each over a `[6 d, d]` weight.
+        let mods_all = self
+            .blocks
+            .iter()
+            .map(|blk| self.linear(&te, &blk.attn_norm, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fin_mods = self.linear(&te, &self.norm_out, 1)?;
+
         let mut out = vec![0.0f32; 2 * m * n];
         for b in 0..2 {
             // `[4 * mel_dim, n]` on the host, transposed into `[n, 4 * mel_dim]`.
@@ -459,12 +469,11 @@ impl Flow {
             for (bi, blk) in self.blocks.iter().enumerate() {
                 // The six modulation vectors, from the timestep: shift, scale
                 // and gate for the attention, then the same three for the
-                // feed-forward, each `d` wide. Each block has its own
-                // projection, so this is per block and not hoisted.
-                let mods = self.linear(&te, &blk.attn_norm, 1)?;
+                // feed-forward, each `d` wide.
+                let mods = &mods_all[bi];
 
                 // Attention, modulated in.
-                let xin = self.gpu.layer_norm_mod(&h, n, d, &mods, 0, d, eps)?;
+                let xin = self.gpu.layer_norm_mod(&h, n, d, mods, 0, d, eps)?;
 
                 let mut q = self.linear(&xin, &blk.q, n)?;
                 let mut k = self.linear(&xin, &blk.k, n)?;
@@ -521,17 +530,15 @@ impl Flow {
                 )?;
                 let ctx = self.gpu.merge_heads(&ctx, n, heads, hd)?;
                 let attn = self.linear(&ctx, &blk.o, n)?;
-                self.gpu.gate_add(&mut h, &attn, &mods, 2 * d, n, d)?;
+                self.gpu.gate_add(&mut h, &attn, mods, 2 * d, n, d)?;
 
                 // Feed-forward, modulated in the same way.
-                let fin = self
-                    .gpu
-                    .layer_norm_mod(&h, n, d, &mods, 3 * d, 4 * d, eps)?;
+                let fin = self.gpu.layer_norm_mod(&h, n, d, mods, 3 * d, 4 * d, eps)?;
                 let mut ff = self.linear(&fin, &blk.ff_in, n)?;
                 // The tanh approximation, not the erf form.
                 self.gpu.gelu_tanh(&mut ff, n * d * self.cfg.ff_mult)?;
                 let ff = self.linear(&ff, &blk.ff_out, n)?;
-                self.gpu.gate_add(&mut h, &ff, &mods, 5 * d, n, d)?;
+                self.gpu.gate_add(&mut h, &ff, mods, 5 * d, n, d)?;
                 if b == 0
                     && matches!(bi, 0 | 1 | 7 | 14 | 21)
                     && let Some(taps) = taps.as_deref_mut()
@@ -543,8 +550,7 @@ impl Flow {
             // The final modulation chunks **(scale, shift)** - the reverse of
             // every other one in the file - so the shift is the second
             // segment here and the first everywhere above.
-            let fin = self.linear(&te, &self.norm_out, 1)?;
-            let last = self.gpu.layer_norm_mod(&h, n, d, &fin, d, 0, eps)?;
+            let last = self.gpu.layer_norm_mod(&h, n, d, &fin_mods, d, 0, eps)?;
             let y = self.gpu.download(&self.linear(&last, &self.proj_out, n)?)?;
 
             // Back to channel-major, which is what the solver works in.
