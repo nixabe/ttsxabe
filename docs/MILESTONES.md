@@ -92,7 +92,7 @@ turned out to be F16), and `xabe-dsp` gained a strided convolution.
 | 14 | The encoder matches a captured oracle, per layer | ✅ |
 | 15 | The decoder, with KV cache and cross-attention, matches per layer | ✅ |
 | 16 | Greedy decoding reproduces transcripts on held-out Taigi audio | ✅ |
-| 17 | CUDA ASR is faster than whisper-server, measured and interleaved | ❌ |
+| 17 | CUDA ASR is faster than whisper-server, measured and interleaved | ✅ |
 
 **Item 17 is not met, and it is now measured the way the item asks for.**
 Against a `whisper-server` built here with CUDA from the same checkpoint and
@@ -159,10 +159,21 @@ from 74.3 ms to 68.5 on ten tokens and the cache build from 15.3 to 13.5, and
 the interleaved row is now 190.3 against 189.0 on the 2.93 s clip, 227.2
 against 238.9 at 4.98 s, 252.0 against 264.6 at 7.28 s and 307.0 against 354.2
 at 9.95 s - **0.99x, 1.05x, 1.05x and 1.15x**. The 1.3 ms on the shortest clip
-is inside both engines' twenty-round spread, and the item stays ❌ because
-"faster" is the word in it and 0.99x is not that; it is not restated as
-"level" to make the mark. `docs/BENCHMARKS.md` has the round under "The
-decoder's round".
+was inside both engines' twenty-round spread, and the item stayed ❌ because
+"faster" is the word in it and 0.99x is not that; it was not restated as
+"level" to make the mark.
+
+**A second decoder round has since made it ✅, by 3.5 ms.** Thirteen launches
+a layer became eight - the three input projections one placed launch over a
+stacked weight, each closing projection carrying the residual add and the
+next layer norm in its tail - and the decode loop went from 68.8 ms to 64.3
+on ten tokens and 127 to 118 on twenty. Interleaved against `whisper-server`
+in one quiet sitting: 185.9 against 189.4 on the 2.93 s clip with the spreads
+184.4-187.1 and 186.8-190.9 not overlapping, then 220.8 against 239.8, 243.5
+against 266.6 and 291.8 against 353.8 - **1.02x, 1.09x, 1.09x and 1.21x**. The
+mark is given for that sitting and that margin; the encoder is still 20 ms
+behind and a clip shorter than nine tokens would still lose. `docs/BENCHMARKS.md`
+has both rounds under "The decoder's round".
 
 The filter bank is computed rather than shipped, and matches the capture *bit
 for bit*: both sides evaluate the same closed form in f64 and round once, with

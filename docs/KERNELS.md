@@ -48,6 +48,8 @@ exists.
 | mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
 | rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
 | mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `xabe_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `xabe-cuda` quant |
+| f16 mat-vec with the residual add and the next layer normalisation in its tail | ASR decode | the mat-vec, then `xabe_dsp::layer_norm_add` | `gemv_ln` | `xabe-cuda` kernels |
+| stacked q/k/v mat-vec, placed into the caches | ASR decode | `gemv_into` three times, in the test | `gemv_qkv_f16` | `xabe-cuda` kernels |
 
 ## Also implemented
 
@@ -1294,6 +1296,51 @@ with is covered - a `Q4_K` or `Q6_K` weight, one quantized activation row, a
 contraction that is whole super-blocks - and the wrapper refuses the rest by
 name rather than routing it to the chain, so a caller that asked for one
 launch and did not get it hears why.
+
+## The same two folds for the Whisper decoder, `gemv_ln` and `gemv_qkv_f16`
+
+The Whisper decoder at one row had the same shape of waste as the Llama
+stages after their round and one more of its own. Each of its three
+sub-layers - self-attention, cross-attention, the MLP - closes with a
+projection, a residual add and a layer normalisation, and each of the three
+normalisations was a launch reading five kilobytes. And the self-attention
+opened with three mat-vecs over one row - queries to a buffer, keys and
+values placed into the caches by `gemv`'s epilogue - each reading 3.3 MB of
+weight at a shape where the launch is a third of the time.
+
+`gemv_ln` is `gemv_norm` for an f16 weight with a bias and a *layer*
+normalisation. The structure is the same - every block adds its columns into
+`h`, the last block to arrive normalises the row - but the tail is not: a
+layer norm needs the mean and the variance about it, and the one-pass sum of
+squares an RMS norm can afford cancels catastrophically when a row's mean is
+large against its spread, which a residual stream's is. So the last block
+takes the two passes `layer_norm_impl` takes, mean then variance, over the
+settled row held in registers between them - four columns a thread, `GN_NL`
+of those, which caps the row at 4096 and the wrapper refuses past it. No
+partials are published at all: the row is 1280 floats and the last block
+reads it from the L2 in one trip. The block sums are a fixed tree, so the
+result does not depend on which block arrived last. `h` is held at exact
+equality against `gemv` then `layer_norm_add`, the normalised row within
+`1e-5` of the CPU twin, with and without a bias, and the odd contraction,
+the ragged row, the too-wide row and the short operand are each refused.
+
+`gemv_qkv_f16` is one launch over the three weights stacked `[3 d, d]`, each
+column placed where the attention reads it: the first third into the query
+row, the second into the head-major key cache at `pos`, the third into the
+transposed value cache at `pos` - `OutLayout::KeyCache` and `ValueCache`'s
+arithmetic, in the kernel rather than the wrapper. Each third keeps its own
+bias pointer, because the key projection has no bias in any Whisper
+checkpoint and a zero added is not always the bits of nothing added. The
+stack is a layout, not a copy: the three weights were three allocations and
+are one, and a prefix of several rows projects each third from its row
+offset through `gemm_batched_from`. The test holds the query row and both
+caches, prefilled, at exact equality against `gemv_into` three times.
+
+Both kernels share `dot_f16_row`, which is `gemv`'s f16 loop for an f32
+activation lifted out character for character, so that "bit for bit against
+the chain" is a property of the code rather than of a test that happened to
+pass. Thirteen launches a layer became eight. `docs/BENCHMARKS.md` has what
+that is worth under "The decoder's round".
 
 ## Measured and rejected: sixteen-byte loads on the f16 mat-vec
 

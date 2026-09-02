@@ -14,7 +14,7 @@
 //! error rather than failing to link, so this file compiles and runs on a
 //! machine with no CUDA at all.
 
-use xabe_cuda::{Batch, Gpu, Operand};
+use xabe_cuda::{Batch, GEMV_LN_MAX_N, Gpu, NormScratch, Operand, OutLayout};
 
 /// Absolute floor, for values near zero.
 const ATOL: f32 = 1e-5;
@@ -2872,5 +2872,246 @@ fn a_placed_matvec_is_the_matvec_and_the_placement_it_replaces() {
         )
         .is_err(),
         "a head width that does not divide the row"
+    );
+}
+
+/// `gemv_ln` is `gemv` with the bias, then `layer_norm_add`: the residual
+/// stream bit for bit, the normalised row within an ulp of the CPU twin,
+/// with and without a bias, twice through one scratch, and the refusals.
+#[test]
+fn the_layer_norm_fused_matvec_is_the_chain_it_replaces() {
+    let Some(g) = gpu() else { return };
+    // `k` even but its half not a multiple of the warp, so the loop has a
+    // tail; `n` a multiple of four and more than one block of columns.
+    let (k, n, eps) = (300usize, 100usize, 1e-5f32);
+    let a = seq(k, 40);
+    let w = seq(n * k, 41);
+    let b = seq(n, 42);
+    let h0 = seq(n, 43);
+    let lw: Vec<f32> = seq(n, 44).iter().map(|v| 1.0 + 0.25 * v).collect();
+    let lb = seq(n, 45);
+    let da = g.upload(&a).unwrap();
+    let dw = g.upload_f16(&w).unwrap();
+    let db = g.upload(&b).unwrap();
+    let dlw = g.upload(&lw).unwrap();
+    let dlb = g.upload(&lb).unwrap();
+    let mut scratch = NormScratch::new();
+    for (pass, bias) in [Some(&db), None, Some(&db)].into_iter().enumerate() {
+        let out = g
+            .gemm_batched(
+                Operand::F32(&da),
+                Operand::F16(&dw),
+                bias,
+                Batch::single(n),
+                1,
+                k,
+                n,
+            )
+            .expect("the chain's mat-vec");
+        let out = g.download(&out).unwrap();
+        let mut h_want = h0.clone();
+        let x_want = xabe_dsp::layer_norm_add(&mut h_want, &out, 1, n, &lw, &lb, eps);
+
+        let mut h = g.upload(&h0).unwrap();
+        let x = g
+            .gemv_ln(&da, &dw, bias, k, n, &mut h, &dlw, &dlb, eps, &mut scratch)
+            .expect("gemv_ln");
+        let h_got = g.download(&h).unwrap();
+        assert_eq!(h_want, h_got, "pass {pass}: the residual stream differs");
+        let x_got = g.download(&x).unwrap();
+        for i in 0..n {
+            assert!(
+                (x_want[i] - x_got[i]).abs() <= 1e-5 + 1e-5 * x_want[i].abs(),
+                "pass {pass}: x[{i}] is {} wanted {}",
+                x_got[i],
+                x_want[i]
+            );
+        }
+    }
+
+    let mut h = g.upload(&h0).unwrap();
+    let odd = g.upload_f16(&seq(n * (k + 1), 46)).unwrap();
+    let wide = g.upload(&seq(k + 1, 47)).unwrap();
+    assert!(
+        g.gemv_ln(
+            &wide,
+            &odd,
+            None,
+            k + 1,
+            n,
+            &mut h,
+            &dlw,
+            &dlb,
+            eps,
+            &mut scratch
+        )
+        .is_err(),
+        "an odd contraction must be refused"
+    );
+    assert!(
+        g.gemv_ln(
+            &da,
+            &dw,
+            None,
+            k,
+            n - 2,
+            &mut h,
+            &dlw,
+            &dlb,
+            eps,
+            &mut scratch
+        )
+        .is_err(),
+        "a row that is not a multiple of four must be refused"
+    );
+    let big = GEMV_LN_MAX_N + 4;
+    let tiny = g.upload(&seq(2, 48)).unwrap();
+    let bw = g.upload_f16(&seq(big * 2, 49)).unwrap();
+    let mut bh = g.upload(&seq(big, 50)).unwrap();
+    let bl = g.upload(&seq(big, 51)).unwrap();
+    assert!(
+        g.gemv_ln(
+            &tiny,
+            &bw,
+            None,
+            2,
+            big,
+            &mut bh,
+            &bl,
+            &bl,
+            eps,
+            &mut scratch
+        )
+        .is_err(),
+        "a row the last block cannot hold must be refused"
+    );
+    assert!(
+        g.gemv_ln(&da, &dw, None, k, n, &mut h, &dlw, &tiny, eps, &mut scratch)
+            .is_err(),
+        "a short shift must be refused"
+    );
+}
+
+/// `gemv_qkv_f16` is `gemv_into` three times - a row, a key cache placement
+/// and a value cache placement - over the stacked weight, bit for bit, with
+/// the rest of both caches untouched.
+#[test]
+fn the_stacked_projection_places_what_three_placed_products_do() {
+    let Some(g) = gpu() else { return };
+    let (k, d, hd, cap, pos) = (96usize, 64usize, 16usize, 5usize, 2usize);
+    let a = seq(k, 60);
+    let wq = seq(d * k, 61);
+    let wk = seq(d * k, 62);
+    let wv = seq(d * k, 63);
+    let bq = seq(d, 64);
+    let bv = seq(d, 65);
+    let kc0 = seq(d * cap, 66);
+    let vc0 = seq(d * cap, 67);
+    let da = g.upload(&a).unwrap();
+    let dbq = g.upload(&bq).unwrap();
+    let dbv = g.upload(&bv).unwrap();
+
+    // The chain.
+    let (dwq, dwk, dwv) = (
+        g.upload_f16(&wq).unwrap(),
+        g.upload_f16(&wk).unwrap(),
+        g.upload_f16(&wv).unwrap(),
+    );
+    let mut q_want = g.upload(&seq(d, 68)).unwrap();
+    let mut kc_want = g.upload(&kc0).unwrap();
+    let mut vc_want = g.upload(&vc0).unwrap();
+    g.gemv_into(
+        &da,
+        Operand::F16(&dwq),
+        Some(&dbq),
+        k,
+        d,
+        false,
+        OutLayout::Row,
+        &mut q_want,
+    )
+    .unwrap();
+    g.gemv_into(
+        &da,
+        Operand::F16(&dwk),
+        None,
+        k,
+        d,
+        false,
+        OutLayout::KeyCache {
+            head_dim: hd,
+            cap,
+            pos,
+        },
+        &mut kc_want,
+    )
+    .unwrap();
+    g.gemv_into(
+        &da,
+        Operand::F16(&dwv),
+        Some(&dbv),
+        k,
+        d,
+        false,
+        OutLayout::ValueCache { cap, pos },
+        &mut vc_want,
+    )
+    .unwrap();
+
+    // The stack.
+    let mut stacked = wq.clone();
+    stacked.extend_from_slice(&wk);
+    stacked.extend_from_slice(&wv);
+    let dw = g.upload_f16(&stacked).unwrap();
+    let mut q = g.upload(&seq(d, 68)).unwrap();
+    let mut kc = g.upload(&kc0).unwrap();
+    let mut vc = g.upload(&vc0).unwrap();
+    g.gemv_qkv_f16(
+        &da,
+        &dw,
+        [Some(&dbq), None, Some(&dbv)],
+        k,
+        d,
+        hd,
+        cap,
+        pos,
+        &mut q,
+        &mut kc,
+        &mut vc,
+    )
+    .expect("gemv_qkv_f16");
+    assert_eq!(
+        g.download(&q_want).unwrap(),
+        g.download(&q).unwrap(),
+        "queries"
+    );
+    assert_eq!(
+        g.download(&kc_want).unwrap(),
+        g.download(&kc).unwrap(),
+        "the key cache"
+    );
+    assert_eq!(
+        g.download(&vc_want).unwrap(),
+        g.download(&vc).unwrap(),
+        "the value cache"
+    );
+
+    let bias = [Some(&dbq), None, Some(&dbv)];
+    assert!(
+        g.gemv_qkv_f16(&da, &dw, bias, k, d, hd, cap, cap, &mut q, &mut kc, &mut vc)
+            .is_err(),
+        "a position past the capacity must be refused"
+    );
+    assert!(
+        g.gemv_qkv_f16(&da, &dw, bias, k, d, 24, cap, pos, &mut q, &mut kc, &mut vc)
+            .is_err(),
+        "a head that does not divide the width must be refused"
+    );
+    assert!(
+        g.gemv_qkv_f16(
+            &da, &dwq, bias, k, d, hd, cap, pos, &mut q, &mut kc, &mut vc
+        )
+        .is_err(),
+        "a weight that is not the whole stack must be refused"
     );
 }

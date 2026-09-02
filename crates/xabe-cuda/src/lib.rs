@@ -27,7 +27,8 @@ mod kernels;
 
 pub use cudarc::driver::CudaSlice;
 pub use device::{
-    Batch, DecodeScratch, GEMV_MAX_M, Gpu, NormScratch, Operand, OutLayout, Q8, Quant, ksplit_for,
+    Batch, DecodeScratch, GEMV_LN_MAX_N, GEMV_MAX_M, Gpu, NormScratch, Operand, OutLayout, Q8,
+    Quant, ksplit_for,
 };
 pub use error::CudaError;
 pub use kernels::SOURCE;

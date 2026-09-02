@@ -52,6 +52,7 @@ pub const SOURCE: &str = r#"
 #define AD_CH 64
 #define AD_GMAX 4
 #define AD_CMAX 256
+#define GN_NL 4
 
 #define GEMM_WARPS 8
 #define GEMM_MT    128
@@ -4815,6 +4816,186 @@ AD_ENTRY(attn_decode_h64,       64,  true,  64,  unsigned short, 8)
 AD_ENTRY(attn_decode_f64,       64,  false, 64,  float,          8)
 
 
+// ------------------------------------------ the f16 mat-vec with a layer norm
+//
+// `gemv_norm` for the Whisper decoder: an f16 weight with a bias, the residual
+// add, and a *layer* normalisation - mean and variance, scale and shift - in
+// the tail. At one row the decoder closes each of its three sub-layers with a
+// projection, an add and a normalisation, and each normalisation was a launch
+// that read five kilobytes and cost what a launch costs. The column product is
+// `gemv`'s f16 path for an f32 activation, character for character, so `h`
+// lands bit for bit as `gemv` then `layer_norm_add` would leave it.
+//
+// The normalisation is two passes over the settled row, as `layer_norm_impl`
+// takes them - the mean first, then the variance about it - rather than the
+// one-pass sum of squares an RMS norm can afford: the one-pass form cancels
+// catastrophically when the mean is large against the spread, and the row is
+// small enough that the last block holds it in registers between the passes.
+// The block sums are a fixed tree, so the result is the same run to run; they
+// are not associated as `ln_block_sum` associates, so the row can differ from
+// `layer_norm_add` by an ulp, and both are held to the CPU twin.
+
+// `gemv`'s f16 loop for an f32 activation: the same products in the same
+// per-lane order, then the same reduction. `kh` is `k / 2`, and `k` is even -
+// the wrapper checks. Every lane of the warp must call; lane 0 holds the sum.
+__device__ __forceinline__ float dot_f16_row(
+    const float* __restrict__ af, const unsigned* __restrict__ wv, int kh)
+{
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < kh; i += 32) {
+        float lo, hi;
+        gemm_unpack(wv[i], lo, hi);
+        acc += af[2 * i] * lo + af[2 * i + 1] * hi;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    return acc;
+}
+
+// A fixed-order sum over the block's `GEMV_WARPS * 32` threads. `tree` is
+// that many floats of shared memory, and every thread must call.
+__device__ __forceinline__ float gn_block_sum(float v, float* tree) {
+    constexpr int T = GEMV_WARPS * 32;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    tree[tid] = v;
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tree[tid] += tree[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float r = tree[0];
+    __syncthreads();
+    return r;
+}
+
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_ln(
+    const float* __restrict__ a,
+    const unsigned* __restrict__ w,
+    const float* __restrict__ bias,
+    int k, int n,
+    float* h,
+    const float* __restrict__ weight, const float* __restrict__ shift, float eps,
+    float* __restrict__ x,
+    unsigned* __restrict__ ctr)
+{
+    constexpr int T = GEMV_WARPS * 32;
+    __shared__ float tree[T];
+    __shared__ int last;
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int col = blockIdx.x * GEMV_WARPS + warp;
+    const int kh = k >> 1;
+
+    // The residual element, fetched before the contraction so its round trip
+    // hides under the weight stream.
+    const float h0 = (lane == 0 && col < n) ? h[col] : 0.0f;
+    float acc = 0.0f;
+    if (col < n) {
+        acc = dot_f16_row(a, w + (size_t)col * kh, kh);
+    }
+    if (lane == 0 && col < n) {
+        h[col] = h0 + (acc + (bias ? bias[col] : 0.0f));
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = (atomicAdd(ctr, 1u) == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // The settled row, four columns a thread and `GN_NL` of those, loaded once
+    // through the L2 - other blocks wrote it - and held for both passes and
+    // the store. `n` is a multiple of four and at most `4 * GN_NL * T`, which
+    // the wrapper refuses past.
+    const int n4 = n >> 2;
+    float4 hv[GN_NL];
+    float s = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < GN_NL; ++e) {
+        const int i = tid + e * T;
+        hv[e] = (i < n4) ? ld_cg4(h + (i << 2)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        s += (hv[e].x + hv[e].y) + (hv[e].z + hv[e].w);
+    }
+    const float mean = gn_block_sum(s, tree) / (float)n;
+    float sq = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < GN_NL; ++e) {
+        const int i = tid + e * T;
+        if (i < n4) {
+            const float p = hv[e].x - mean, q = hv[e].y - mean;
+            const float r = hv[e].z - mean, t = hv[e].w - mean;
+            sq += (p * p + q * q) + (r * r + t * t);
+        }
+    }
+    // The biased variance, matching torch.nn.LayerNorm.
+    const float inv = rsqrtf(gn_block_sum(sq, tree) / (float)n + eps);
+    #pragma unroll
+    for (int e = 0; e < GN_NL; ++e) {
+        const int i = tid + e * T;
+        if (i < n4) {
+            const float4 wv = *((const float4*)weight + i);
+            const float4 bv = *((const float4*)shift + i);
+            float4 y;
+            y.x = (hv[e].x - mean) * inv * wv.x + bv.x;
+            y.y = (hv[e].y - mean) * inv * wv.y + bv.y;
+            y.z = (hv[e].z - mean) * inv * wv.z + bv.z;
+            y.w = (hv[e].w - mean) * inv * wv.w + bv.w;
+            *((float4*)x + i) = y;
+        }
+    }
+    if (tid == 0) {
+        *ctr = 0u;
+    }
+}
+
+// ------------------------------------------ the stacked attention projection
+//
+// The three attention projections of one decoded row as one launch, each
+// column placed where the attention will read it: the query into a row, the
+// key into the head-major key cache at `pos`, the value into the transposed
+// value cache at `pos`. The weight is the three `[d, k]` weights stacked into
+// `[3 d, k]`, and each third keeps its own bias, because the key has none in
+// any Whisper checkpoint and a zero bias added is not always the same bits as
+// no bias. The placements are `gemv`'s `OutLayout::KeyCache` and
+// `ValueCache` arithmetic and the column product is `dot_f16_row`, so every
+// value lands bit for bit where `gemv_into` three times would have put it.
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_qkv_f16(
+    const float* __restrict__ a,
+    const unsigned* __restrict__ w,
+    const float* __restrict__ qb,
+    const float* __restrict__ kb,
+    const float* __restrict__ vb,
+    int k, int d, int head_dim, int cap, int pos,
+    float* __restrict__ q, float* __restrict__ kc, float* __restrict__ vc)
+{
+    const int col = blockIdx.x * GEMV_WARPS + threadIdx.y;
+    if (col >= 3 * d) {
+        return;
+    }
+    const int kh = k >> 1;
+    const float acc = dot_f16_row(a, w + (size_t)col * kh, kh);
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const int part = col / d, c = col - part * d;
+    if (part == 0) {
+        q[c] = acc + (qb ? qb[c] : 0.0f);
+    } else if (part == 1) {
+        const int hh = c / head_dim, j = c - hh * head_dim;
+        kc[((size_t)hh * cap + pos) * head_dim + j] = acc + (kb ? kb[c] : 0.0f);
+    } else {
+        vc[(size_t)c * cap + pos] = acc + (vb ? vb[c] : 0.0f);
+    }
+}
+
 // ------------------------------------------------- the mat-vec with a norm
 //
 // The mat-vec that closes a sub-layer, with the residual add and the next
@@ -5109,3 +5290,6 @@ pub const GEMM_I8_NT: u32 = define("GEMM_I8_NT");
 pub const AD_CH: u32 = define("AD_CH");
 /// Query heads a key-value head may serve in `attn_decode`.
 pub const AD_GMAX: u32 = define("AD_GMAX");
+/// Float4 a thread the norm-fused f16 mat-vec holds of its row; the row is
+/// at most `4 * GN_NL * GEMV_WARPS * 32` wide.
+pub const GN_NL: u32 = define("GN_NL");

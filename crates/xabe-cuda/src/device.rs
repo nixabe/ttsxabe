@@ -246,6 +246,10 @@ impl std::fmt::Debug for Gpu {
 /// know which side of it a shape falls on.
 pub const GEMV_MAX_M: usize = 4;
 
+/// The widest row [`Gpu::gemv_ln`] normalises: its last block holds the row
+/// in registers, `GN_NL` float4 a thread.
+pub const GEMV_LN_MAX_N: usize = 4 * kernels::GN_NL as usize * kernels::GEMV_WARPS as usize * 32;
+
 /// A block-quantized weight format, by its ggml type id.
 ///
 /// This mirrors `xabe_gguf::GgmlType`'s quantized half and deliberately does
@@ -557,6 +561,8 @@ const NAMES: &[&str] = &[
     "flash_attn_64",
     "gemv",
     "gemv_norm",
+    "gemv_ln",
+    "gemv_qkv_f16",
     "gemv_rows",
     "cache_append_f16",
     "cache_append_t_f16",
@@ -2872,6 +2878,211 @@ impl Gpu {
         // lands at or before `last`, which is checked against `out` above.
         launched("gemv", unsafe { lb.launch(cfg) })
     }
+    /// The counter the norm-fused mat-vecs arrive on, allocated on first use.
+    fn norm_counter<'s>(
+        &self,
+        scratch: &'s mut NormScratch,
+    ) -> Result<&'s mut CudaSlice<u32>, CudaError> {
+        if scratch.ctr.is_none() {
+            scratch.ctr =
+                Some(
+                    self.stream
+                        .alloc_zeros::<u32>(1)
+                        .map_err(|source| CudaError::Driver {
+                            what: "allocating",
+                            source,
+                        })?,
+                );
+        }
+        Ok(scratch.ctr.as_mut().expect("allocated above"))
+    }
+
+    /// [`Self::gemv_norm`] for an f16 weight and a layer normalisation: the
+    /// product of `a` with `w` plus `bias` is added into `h`, and `h` is then
+    /// normalised - mean and variance - with `weight` and `shift` into the
+    /// returned row. Exactly `gemv` then `layer_norm_add`, with `h` bit for
+    /// bit and the row within an ulp; see `gemv_ln` in the kernels.
+    ///
+    /// Refuses an odd `k`, an `n` that is not a multiple of four or is longer
+    /// than [`GEMV_LN_MAX_N`] - the last block holds the row in registers -
+    /// and every operand shorter than its shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_ln(
+        &self,
+        a: &CudaSlice<f32>,
+        w: &CudaSlice<u16>,
+        bias: Option<&CudaSlice<f32>>,
+        k: usize,
+        n: usize,
+        h: &mut CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        shift: &CudaSlice<f32>,
+        eps: f32,
+        scratch: &mut NormScratch,
+    ) -> Result<CudaSlice<f32>, CudaError> {
+        if !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        if !n.is_multiple_of(4) {
+            return Err(CudaError::RaggedBlock { k: n, block: 4 });
+        }
+        if n > GEMV_LN_MAX_N {
+            return Err(CudaError::NormFusion {
+                what: "a row longer than the last block can hold",
+            });
+        }
+        if a.len() < k {
+            return Err(CudaError::SliceOverrun {
+                at: k,
+                len: a.len(),
+            });
+        }
+        if w.len() < n * k {
+            return Err(CudaError::SliceOverrun {
+                at: n * k,
+                len: w.len(),
+            });
+        }
+        let short = [
+            h.len(),
+            weight.len(),
+            shift.len(),
+            bias.map_or(n, |b| b.len()),
+        ]
+        .into_iter()
+        .min()
+        .expect("four lengths");
+        if short < n {
+            return Err(CudaError::SliceOverrun { at: n, len: short });
+        }
+        let ctr = self.norm_counter(scratch)?;
+        // SAFETY: the last block writes every one of the `n` outputs.
+        let mut x = unsafe { self.uninit(n) }?;
+        let null: u64 = 0;
+        let (ki, ni) = (k as i32, n as i32);
+        let f = self.func("gemv_ln");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(w);
+        match bias {
+            Some(b) => lb.arg(b),
+            None => lb.arg(&null),
+        };
+        lb.arg(&ki)
+            .arg(&ni)
+            .arg(h)
+            .arg(weight)
+            .arg(shift)
+            .arg(&eps)
+            .arg(&mut x)
+            .arg(ctr);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n.div_ceil(kernels::GEMV_WARPS as usize) as u32, 1, 1),
+            block_dim: (32, kernels::GEMV_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one warp a column, columns past `n` return before storing;
+        // the last block reads and writes `n` elements of `h`, `weight`,
+        // `shift` and `x`, all checked above; the counter is one word and is
+        // reset by the last block.
+        launched("gemv_ln", unsafe { lb.launch(cfg) })?;
+        Ok(x)
+    }
+
+    /// The three attention projections of one row in one launch, each placed
+    /// where the attention reads it: the queries into `q`, the keys into `kc`
+    /// at `pos` of a head-major cache laid out for `cap` positions, the values
+    /// into `vc` at `pos` of the transposed one. `w` is the three `[d, k]`
+    /// weights stacked into `[3 d, k]` and `bias` their three biases, each
+    /// optional. What [`Self::gemv_into`] three times would produce, bit for
+    /// bit; see `gemv_qkv_f16` in the kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_qkv_f16(
+        &self,
+        a: &CudaSlice<f32>,
+        w: &CudaSlice<u16>,
+        bias: [Option<&CudaSlice<f32>>; 3],
+        k: usize,
+        d: usize,
+        head_dim: usize,
+        cap: usize,
+        pos: usize,
+        q: &mut CudaSlice<f32>,
+        kc: &mut CudaSlice<f32>,
+        vc: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
+        if !k.is_multiple_of(2) {
+            return Err(CudaError::RaggedContraction { k });
+        }
+        if head_dim == 0 || !d.is_multiple_of(head_dim) {
+            return Err(CudaError::RaggedBlock {
+                k: d,
+                block: head_dim,
+            });
+        }
+        if pos >= cap {
+            return Err(CudaError::CacheOverrun { at: pos + 1, cap });
+        }
+        if a.len() < k {
+            return Err(CudaError::SliceOverrun {
+                at: k,
+                len: a.len(),
+            });
+        }
+        if w.len() < 3 * d * k {
+            return Err(CudaError::SliceOverrun {
+                at: 3 * d * k,
+                len: w.len(),
+            });
+        }
+        if q.len() < d {
+            return Err(CudaError::SliceOverrun {
+                at: d,
+                len: q.len(),
+            });
+        }
+        if kc.len() < d * cap || vc.len() < d * cap {
+            return Err(CudaError::SliceOverrun {
+                at: d * cap,
+                len: kc.len().min(vc.len()),
+            });
+        }
+        for b in bias.into_iter().flatten() {
+            if b.len() < d {
+                return Err(CudaError::SliceOverrun {
+                    at: d,
+                    len: b.len(),
+                });
+            }
+        }
+        let null: u64 = 0;
+        let (ki, di, hd, ca, ps) = (k as i32, d as i32, head_dim as i32, cap as i32, pos as i32);
+        let f = self.func("gemv_qkv_f16");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(w);
+        for b in bias {
+            match b {
+                Some(b) => lb.arg(b),
+                None => lb.arg(&null),
+            };
+        }
+        lb.arg(&ki)
+            .arg(&di)
+            .arg(&hd)
+            .arg(&ca)
+            .arg(&ps)
+            .arg(q)
+            .arg(kc)
+            .arg(vc);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((3 * d).div_ceil(kernels::GEMV_WARPS as usize) as u32, 1, 1),
+            block_dim: (32, kernels::GEMV_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one warp a column, columns past `3 d` return; each store
+        // lands inside `q`, or at position `pos < cap` of a cache of `d * cap`
+        // elements, all checked above.
+        launched("gemv_qkv_f16", unsafe { lb.launch(cfg) })
+    }
 
     /// A single-row packed mat-vec whose tail is the residual add and the
     /// next normalisation: `h += w · a`, then `x = rms_norm(h) * weight` and
@@ -2930,17 +3141,7 @@ impl Gpu {
             });
         }
         let blocks = n.div_ceil(kernels::GEMV_WARPS as usize);
-        if scratch.ctr.is_none() {
-            scratch.ctr =
-                Some(
-                    self.stream
-                        .alloc_zeros::<u32>(1)
-                        .map_err(|source| CudaError::Driver {
-                            what: "allocating",
-                            source,
-                        })?,
-                );
-        }
+        self.norm_counter(scratch)?;
         if scratch.blocks < blocks || scratch.part.is_none() {
             // SAFETY: every partial is written by its block before the last
             // block reads it, and only `blocks` of them are read.

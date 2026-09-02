@@ -114,16 +114,17 @@ starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **0.99x** against `whisper-server` on three seconds of
-speech and **1.05x to 1.15x** from five seconds up — ahead on every clip but
-the briefest, and level on that one by 1.3 ms, which is less than either
-engine moves between its own rounds. It is still recorded against the
-milestone as level rather than won, because the milestone asks for the short
-end and "faster" is not what 0.99x says. The two engines have opposite cost
-structures: the encoder is a fixed 30-second window for both and ours is about
-19 ms slower at it, so every transcription starts that far behind, while the
-decode is about 2 ms a token cheaper here and pays it off at about eleven
-tokens — one more than the shortest clip produces.
+medians. The ASR is **1.02x** against `whisper-server` on three seconds of
+speech and **1.09x to 1.21x** from five seconds up — ahead on every clip,
+and on the briefest by 3.5 ms with the two engines' twenty-round spreads not
+overlapping, which is the first sitting that has been true. It was 0.99x on
+that clip for two rounds and recorded as level rather than won, because the
+milestone asks for the short end and "faster" is not what 0.99x says; it is
+recorded as won now, by that margin and no more. The two engines have
+opposite cost structures: the encoder is a fixed 30-second window for both
+and ours is about 20 ms slower at it, so every transcription starts that far
+behind, while the decode is about 2.5 ms a token cheaper here and pays it off
+at about nine tokens — one fewer than the shortest clip produces.
 
 That comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
@@ -137,13 +138,19 @@ The last 8 ms did not come from the encoder, and the accounting that said the
 shortest clip was out of reach had missed them for a reason worth carrying:
 it had set the decoder aside as *level* with `whisper.cpp` and level is not
 the same as done. The decoder was spending twenty-two launches a layer on a
-single token; it spends thirteen now — each attention is one kernel reading
-its caches in place with the query scale folded in, the key and value
-projections land in the cache from the mat-vec's epilogue, and the GELU rides
-the same epilogue — and that took the
-decode loop from 74 ms to 68 on ten tokens and the cross-attention cache build
-from 15 to 13.5. `docs/BENCHMARKS.md` has the round under "The decoder's
-round" and `docs/KERNELS.md` has the kernel.
+single token; it spent thirteen after one round — each attention is one
+kernel reading its caches in place with the query scale folded in, the key
+and value projections land in the cache from the mat-vec's epilogue, and the
+GELU rides the same epilogue — and that took the decode loop from 74 ms to 68
+on ten tokens and the cross-attention cache build from 15 to 13.5. It spends
+**eight** now, after a second round that applied the Llama stages' rule to
+it: the three input projections are one launch over a stacked weight that
+places keys and values in the caches, and each closing projection carries
+the residual add and the next layer norm in its tail. That took the decode
+loop from 68.8 ms to 64.3 on ten tokens and 127 to 118 on twenty, at 2.8
+microseconds a launch removed, and moved the shortest clip from 0.99x to
+1.02x. `docs/BENCHMARKS.md` has both rounds under "The decoder's round" and
+`docs/KERNELS.md` has the kernels.
 
 Do not read that as "the encoder is the gemm". It was read that way for three
 rounds and it was wrong by half: `whisper.cpp` does the encoder's 2256 GFLOP in

@@ -2,7 +2,9 @@
 
 use crate::AsrError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, Operand, OutLayout};
+use xabe_cuda::{
+    Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, NormScratch, Operand, OutLayout,
+};
 use xabe_st::StSet;
 use xabe_whisper::{
     Attention, Conv1d, DecoderLayer, EncoderLayer, Frontend, GenerationConfig, LayerNorm, Linear,
@@ -43,6 +45,28 @@ struct GAttention {
     out: GLinear,
 }
 
+/// A decoder layer's self-attention: the three input projections stacked
+/// into one `[3 d, d]` f16 weight, so a decoded row's queries, keys and
+/// values are one launch that places each where the attention reads it -
+/// `Gpu::gemv_qkv_f16` - and a prefix's are three products read from row
+/// offsets of the same allocation - `Gpu::gemm_batched_from`. The biases stay
+/// apart because the key has none, and the bytes on the card are exactly the
+/// three weights' bytes: the stack is a layout, not a copy.
+struct GSelfAttention {
+    qkv: CudaSlice<u16>,
+    q_b: Option<CudaSlice<f32>>,
+    k_b: Option<CudaSlice<f32>>,
+    v_b: Option<CudaSlice<f32>>,
+    out: GLinear,
+}
+
+impl GSelfAttention {
+    /// The bias of one third: the queries, the keys, the values.
+    fn bias(&self, part: usize) -> Option<&CudaSlice<f32>> {
+        [&self.q_b, &self.k_b, &self.v_b][part].as_ref()
+    }
+}
+
 /// A decoder block's cross-attention: the two projections that run per step.
 ///
 /// The key and value projections are not here. They read the encoder's
@@ -67,7 +91,7 @@ struct GEncoderLayer {
 /// One decoder block, on the device.
 struct GDecoderLayer {
     attn_ln: GNorm,
-    attn: GAttention,
+    attn: GSelfAttention,
     cross_ln: GNorm,
     cross: GCrossAttention,
     ffn_ln: GNorm,
@@ -176,6 +200,9 @@ pub struct Cache {
     /// that may overlap. See `Gpu::attn_decode`.
     self_scratch: DecodeScratch,
     cross_scratch: DecodeScratch,
+    /// The norm-fused projections' counter; see `Gpu::gemv_ln`. Per cache
+    /// for the same reason.
+    norm_scratch: NormScratch,
 }
 
 impl Cache {
@@ -222,6 +249,22 @@ impl AsrModel {
                 q: lin(&a.q)?,
                 k: lin(&a.k)?,
                 v: lin(&a.v)?,
+                out: lin(&a.out)?,
+            })
+        };
+        // The three weights are each `[d_model, d_model]` - `WhisperWeights`
+        // refused the checkpoint otherwise - so stacking them is one
+        // concatenation and the row offset of each third is `d_model`.
+        let stack = |a: &Attention| -> Result<GSelfAttention, AsrError> {
+            let mut w = Vec::with_capacity(3 * a.q.weight.len());
+            w.extend_from_slice(a.q.weight);
+            w.extend_from_slice(a.k.weight);
+            w.extend_from_slice(a.v.weight);
+            Ok(GSelfAttention {
+                qkv: up16(&w)?,
+                q_b: a.q.bias.map(up).transpose()?,
+                k_b: a.k.bias.map(up).transpose()?,
+                v_b: a.v.bias.map(up).transpose()?,
                 out: lin(&a.out)?,
             })
         };
@@ -289,7 +332,7 @@ impl AsrModel {
             cross_v_bias_all.extend_from_slice(vb);
             dec_layers.push(GDecoderLayer {
                 attn_ln: nrm(attn_ln)?,
-                attn: att(attn)?,
+                attn: stack(attn)?,
                 cross_ln: nrm(cross_ln)?,
                 cross: GCrossAttention {
                     q: lin(&cross.q)?,
@@ -369,6 +412,54 @@ impl AsrModel {
             rows,
             l.in_dim,
             l.out_dim,
+        )?)
+    }
+
+    /// One third of a stacked self-attention projection - the queries, the
+    /// keys or the values - for a prefix of rows, read from its row offset.
+    fn project_part(
+        &self,
+        x: Operand<'_>,
+        s: &GSelfAttention,
+        part: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, AsrError> {
+        let d = self.cfg.d_model;
+        Ok(self.gpu.gemm_batched_from(
+            x,
+            Operand::F16(&s.qkv),
+            part * d,
+            s.bias(part),
+            Batch::single(rows * d),
+            rows,
+            d,
+            d,
+        )?)
+    }
+
+    /// A projection that closes a sub-layer, at one row, with the residual
+    /// add and the normalisation that opens the next in its tail: `h` is
+    /// updated in place and the normalised row is returned. One launch where
+    /// [`Self::project`] then [`Self::norm_add`] were two. See `Gpu::gemv_ln`.
+    fn close(
+        &self,
+        x: &CudaSlice<f32>,
+        l: &GLinear,
+        h: &mut CudaSlice<f32>,
+        next: &GNorm,
+        scratch: &mut NormScratch,
+    ) -> Result<CudaSlice<f32>, AsrError> {
+        Ok(self.gpu.gemv_ln(
+            x,
+            &l.w,
+            l.b.as_ref(),
+            l.in_dim,
+            l.out_dim,
+            h,
+            &next.w,
+            &next.b,
+            EPS,
+            scratch,
         )?)
     }
 
@@ -549,8 +640,19 @@ impl AsrModel {
         t: usize,
         heads: usize,
     ) -> Result<CudaSlice<f32>, AsrError> {
+        let q = self.project(x, q_proj, t)?;
+        self.queries_from(q, t, heads)
+    }
+
+    /// The scale and the split of [`Self::queries`], over queries already
+    /// projected.
+    fn queries_from(
+        &self,
+        mut q: CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+    ) -> Result<CudaSlice<f32>, AsrError> {
         let hd = self.cfg.d_model / heads;
-        let mut q = self.project(x, q_proj, t)?;
         self.gpu
             .scale_inplace(&mut q, t * self.cfg.d_model, (hd as f32).powf(-0.5))?;
         // One row is already `[head][1][hd]`, so the split has nothing to do.
@@ -819,6 +921,7 @@ impl AsrModel {
             cap,
             self_scratch: DecodeScratch::new(),
             cross_scratch: DecodeScratch::new(),
+            norm_scratch: NormScratch::new(),
         })
     }
 
@@ -864,20 +967,121 @@ impl AsrModel {
         // normalisation to add it, so a decode step spends three launches a
         // layer rather than six on what is one pass either way.
         let mut res: Option<CudaSlice<f32>> = None;
+        // The next normalised row, when the projection that closed the last
+        // sub-layer produced it in its tail - which at one row every closing
+        // projection does, see `Self::close`. Then `res` is `None` and `h`
+        // is already settled.
+        let mut pending: Option<CudaSlice<f32>> = None;
         // One row takes the fused single-query attention for both halves of
         // a layer: the query is projected and handed over unscaled, because
         // the kernel scales it on the way in exactly as `scale_inplace` did,
         // and the scores, the softmax and the context are one launch rather
         // than three. Eight launches a layer became two. A prefix of several
         // rows keeps the chain, which is what `attend` is.
+        //
+        // The rest of a one-row layer is folded the same way: the three
+        // input projections are one launch that places its keys and values
+        // in the caches, and each of the three closing projections carries
+        // the residual add and the next normalisation in its tail. Thirteen
+        // launches a layer became eight; every one of the eight moves a few
+        // kilobytes and costs what a launch costs.
         let fused = n == 1 && hd == 64;
         let scale = (hd as f32).powf(-0.5);
         for (i, l) in self.dec_layers.iter().enumerate() {
-            let x = self.normed(&mut h, res.take().as_ref(), &l.attn_ln, n)?;
-            let q = match fused {
-                true => self.project(Operand::F32(&x), &l.attn.q, n)?,
-                false => self.queries(Operand::F32(&x), &l.attn.q, n, heads)?,
+            let x = match pending.take() {
+                Some(x) => x,
+                None => self.normed(&mut h, res.take().as_ref(), &l.attn_ln, n)?,
             };
+            if fused {
+                let cap = cache.cap;
+                // SAFETY: `gemv_qkv_f16` writes every one of the `d` queries.
+                let mut q = unsafe { self.gpu.uninit(d) }?;
+                self.gpu.gemv_qkv_f16(
+                    &x,
+                    &l.attn.qkv,
+                    [l.attn.bias(0), l.attn.bias(1), l.attn.bias(2)],
+                    d,
+                    d,
+                    hd,
+                    cap,
+                    past,
+                    &mut q,
+                    &mut cache.self_k[i],
+                    &mut cache.self_v[i],
+                )?;
+                let ctx = self.gpu.attn_decode(
+                    &q,
+                    &cache.self_k[i],
+                    &cache.self_v[i],
+                    heads,
+                    heads,
+                    hd,
+                    past + 1,
+                    cap,
+                    scale,
+                    true,
+                    &mut cache.self_scratch,
+                )?;
+                let x = self.close(
+                    &ctx,
+                    &l.attn.out,
+                    &mut h,
+                    &l.cross_ln,
+                    &mut cache.norm_scratch,
+                )?;
+                let q = self.project(Operand::F32(&x), &l.cross.q, 1)?;
+                let ctx = self.gpu.attn_decode_f16(
+                    &q,
+                    &cache.cross_k[i],
+                    &cache.cross_v[i],
+                    heads,
+                    heads,
+                    hd,
+                    enc_t,
+                    enc_t,
+                    scale,
+                    true,
+                    &mut cache.cross_scratch,
+                )?;
+                let x = self.close(
+                    &ctx,
+                    &l.cross.out,
+                    &mut h,
+                    &l.ffn_ln,
+                    &mut cache.norm_scratch,
+                )?;
+                // The activation in the projection's epilogue: one launch.
+                // SAFETY: `gemv_into` writes every one of the `out_dim` columns.
+                let mut inner = unsafe { self.gpu.uninit(l.fc1.out_dim) }?;
+                self.gpu.gemv_into(
+                    &x,
+                    Operand::F16(&l.fc1.w),
+                    l.fc1.b.as_ref(),
+                    l.fc1.in_dim,
+                    l.fc1.out_dim,
+                    true,
+                    OutLayout::Row,
+                    &mut inner,
+                )?;
+                // The next layer's first normalisation, or the decoder's
+                // final one after the last layer.
+                let next = self
+                    .dec_layers
+                    .get(i + 1)
+                    .map_or(&self.dec_ln, |nl| &nl.attn_ln);
+                pending =
+                    Some(self.close(&inner, &l.fc2, &mut h, next, &mut cache.norm_scratch)?);
+                if i < taps {
+                    // `h` is settled: the block's output is in it.
+                    tapped.push(self.gpu.download(&h)?);
+                }
+                continue;
+            }
+            let q = self.queries_from(
+                self.project_part(Operand::F32(&x), &l.attn, 0, n)?,
+                n,
+                heads,
+            )?;
             // Scattered straight into the layout attention reads, in a buffer
             // that already has room for the whole utterance. This used to
             // allocate a larger pair, copy the whole cache into it and then
@@ -889,34 +1093,9 @@ impl AsrModel {
             // projection itself does the scattering - `Gpu::gemv_into` - so
             // the append is not a launch at all.
             let cap = cache.cap;
-            if fused {
-                self.gpu.gemv_into(
-                    &x,
-                    Operand::F16(&l.attn.k.w),
-                    l.attn.k.b.as_ref(),
-                    d,
-                    d,
-                    false,
-                    OutLayout::KeyCache {
-                        head_dim: hd,
-                        cap,
-                        pos: past,
-                    },
-                    &mut cache.self_k[i],
-                )?;
-                self.gpu.gemv_into(
-                    &x,
-                    Operand::F16(&l.attn.v.w),
-                    l.attn.v.b.as_ref(),
-                    d,
-                    d,
-                    false,
-                    OutLayout::ValueCache { cap, pos: past },
-                    &mut cache.self_v[i],
-                )?;
-            } else {
-                let k_new = self.project(Operand::F32(&x), &l.attn.k, n)?;
-                let v_new = self.project(Operand::F32(&x), &l.attn.v, n)?;
+            {
+                let k_new = self.project_part(Operand::F32(&x), &l.attn, 1, n)?;
+                let v_new = self.project_part(Operand::F32(&x), &l.attn, 2, n)?;
                 self.gpu.cache_append(
                     &k_new,
                     0,
@@ -941,68 +1120,33 @@ impl AsrModel {
                 )?;
             }
             let tk = past + n;
-            let ctx = match fused {
-                true => self.gpu.attn_decode(
-                    &q,
-                    &cache.self_k[i],
-                    &cache.self_v[i],
-                    heads,
-                    heads,
-                    hd,
-                    tk,
-                    cap,
-                    scale,
-                    true,
-                    &mut cache.self_scratch,
-                )?,
-                false => self.attend(
-                    Operand::F32(&q),
-                    Operand::F32(&cache.self_k[i]),
-                    Operand::F32(&cache.self_v[i]),
-                    n,
-                    tk,
-                    cap,
-                    heads,
-                    true,
-                )?,
-            };
+            let ctx = self.attend(
+                Operand::F32(&q),
+                Operand::F32(&cache.self_k[i]),
+                Operand::F32(&cache.self_v[i]),
+                n,
+                tk,
+                cap,
+                heads,
+                true,
+            )?;
             let out = self.project(Operand::F32(&ctx), &l.attn.out, n)?;
 
             // Cross-attention. Only the queries come from the decoder; the
             // keys and values were built once from the encoder's output, which
             // is what makes a decode step cheap.
             let x = self.norm_add(&mut h, &out, &l.cross_ln, n)?;
-            let ctx = match fused {
-                true => {
-                    let q = self.project(Operand::F32(&x), &l.cross.q, n)?;
-                    self.gpu.attn_decode_f16(
-                        &q,
-                        &cache.cross_k[i],
-                        &cache.cross_v[i],
-                        heads,
-                        heads,
-                        hd,
-                        enc_t,
-                        enc_t,
-                        scale,
-                        true,
-                        &mut cache.cross_scratch,
-                    )?
-                }
-                false => {
-                    let q = self.queries(Operand::F32(&x), &l.cross.q, n, heads)?;
-                    self.attend(
-                        Operand::F32(&q),
-                        Operand::F16(&cache.cross_k[i]),
-                        Operand::F16(&cache.cross_v[i]),
-                        n,
-                        enc_t,
-                        enc_t,
-                        heads,
-                        false,
-                    )?
-                }
-            };
+            let q = self.queries(Operand::F32(&x), &l.cross.q, n, heads)?;
+            let ctx = self.attend(
+                Operand::F32(&q),
+                Operand::F16(&cache.cross_k[i]),
+                Operand::F16(&cache.cross_v[i]),
+                n,
+                enc_t,
+                enc_t,
+                heads,
+                false,
+            )?;
             let out = self.project(Operand::F32(&ctx), &l.cross.out, n)?;
             res = Some(self.feed_forward(&mut h, &out, &l.ffn_ln, &l.fc1, &l.fc2, n)?);
             if i < taps {
@@ -1015,7 +1159,12 @@ impl AsrModel {
         }
         cache.len = past + n;
 
-        let h = self.normed(&mut h, res.take().as_ref(), &self.dec_ln, n)?;
+        // The final normalisation, unless the last layer's closing projection
+        // already produced it.
+        let h = match pending.take() {
+            Some(x) => x,
+            None => self.normed(&mut h, res.take().as_ref(), &self.dec_ln, n)?,
+        };
         if taps > 0 {
             // The decoder's final normalisation, tapped under its own name so
             // a test can tell "the last block is wrong" from "the last norm

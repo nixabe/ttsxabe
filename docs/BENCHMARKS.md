@@ -60,17 +60,20 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
-| 2.93 s | 190.3 ms | 189.0 ms | 0.99x | identical |
-| 4.98 s | 227.2 ms | 238.9 ms | **1.05x** | identical |
-| 7.28 s | 252.0 ms | 264.6 ms | **1.05x** | differ |
-| 9.95 s | 307.0 ms | 354.2 ms | **1.15x** | differ |
+| 2.93 s | 185.9 ms | 189.4 ms | **1.02x** | identical |
+| 4.98 s | 220.8 ms | 239.8 ms | **1.09x** | identical |
+| 7.28 s | 243.5 ms | 266.6 ms | **1.09x** | differ |
+| 9.95 s | 291.8 ms | 353.8 ms | **1.21x** | differ |
 
-The row before this one was 0.94x / 1.00x / 0.99x / 1.08x, and what moved it
-is in "The decoder's round" below: the decode loop went from 74.3 ms to 68.5 on
-ten tokens and the cross-attention cache from 15.3 to 13.5, none of it in the
-encoder and none of it changing a single output bit. On the 2.93 s clip the
-twenty rounds spread 188.2 to 191.8 ms here against 183.6 to 190.0 there, so
-the 1.3 ms between the medians is inside both.
+The row before this one was 0.99x / 1.05x / 1.05x / 1.15x, and the one before
+that 0.94x / 1.00x / 0.99x / 1.08x; both moved from the decoder and neither
+from the encoder, and what moved this one is in "Eight launches a layer"
+below: the decode loop went from 68.8 ms to 64.3 on ten tokens and from 127.0
+to 118.0 on twenty. On the 2.93 s clip the twenty rounds spread 184.4 to
+187.1 ms here against 186.8 to 190.9 there, so the 3.5 ms between the medians
+is outside both - the first time the shortest clip has been. The
+`whisper-server` column is within 1 ms of the previous sitting's on every
+clip, which is the check that the sitting was quiet.
 
 `whisper-server` is started `-nf -bo 1 -bs -1` as well as without `--vad`, so
 both sides are strictly single-pass greedy with no temperature fallback -
@@ -646,6 +649,50 @@ clocks are not the same - a cache build at 13.5 ms, and a decoder that spends
 thirteen launches a layer where it spent twenty-two. The shortest clip is 1.3 ms
 behind with both engines' spreads overlapping, and the next 1.3 ms is in none
 of the three places this section names.
+
+### Eight launches a layer: the decoder's second round, and the shortest clip
+
+The next 1.3 ms was in the decoder again, and the paragraph above had named
+it without noticing: thirteen launches a layer at one token, and the rule the
+Llama stages' round had established - under about ten microseconds a kernel
+is mostly its own floor, and the floor is paid per grid - had not yet been
+applied here. Five of the thirteen were seams. The three input projections
+of the self-attention were three mat-vecs over one row, each already placing
+its output where the attention reads it; they are one launch over the three
+weights stacked, `gemv_qkv_f16`, with the same placements in its epilogue.
+And each of the three sub-layers closed with a projection followed by a
+layer normalisation that was a launch reading five kilobytes; each of those
+projections now carries the residual add and the normalisation in its tail,
+`gemv_ln`, which is `gemv_norm`'s design with a two-pass mean-and-variance
+tail because a layer norm's one-pass form cancels on a residual stream.
+`docs/KERNELS.md` has both. Nothing else changed: the encoder, the cache
+build and the prefix path are the same code, and `nsys` counts a decode
+step at 267 launches - 32 layers of 8, and 11 outside them - where it was
+427.
+
+Two clips, `xabe-asr-bench --stages`, nine-round medians, both binaries
+alternated twice in one sitting with the box held quiet by the other
+sessions; both pairs of both clips agree to 0.2 ms, so one of each is given:
+
+| stage | 2.93 s, 10 tokens, before | after | 7.28 s, 20 tokens, before | after |
+| --- | ---: | ---: | ---: | ---: |
+| encoder | 103.2 ms | 103.6 | 104.3 | 104.3 |
+| cross-attention KV | 13.3 | 13.3 | 13.5 | 13.4 |
+| decode loop | 68.8 | **64.3** | 126.9 | **118.0** |
+
+That is 0.45 ms a token on both clips, for 160 launches a token removed:
+2.8 microseconds a launch, which is the per-grid floor the Llama round
+measured, on a different model with different kernels. The transcripts are
+the ones the previous sitting produced, token for token: `h` lands bit for
+bit and the normalised rows differ from the old kernel's by an ulp, which the
+argmax never saw.
+
+Against `whisper-server`, twenty rounds interleaved in the same sitting, the
+table at the top: 185.9 against 189.4 ms on the 2.93 s clip, with the spreads
+184.4-187.1 and 186.8-190.9 not overlapping. The other three clips moved by
+the same decode saving and read 1.09x, 1.09x and 1.21x. The encoder is still
+about 20 ms behind `whisper.cpp`'s, so the decoder is still paying that off -
+now in about nine tokens rather than eleven, and the shortest clip has ten.
 
 ### Translator
 
