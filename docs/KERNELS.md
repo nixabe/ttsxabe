@@ -108,7 +108,12 @@ Two entries deserve a note:
   each input contributes to `k` outputs - and the kernel gathers, because a
   scatter needs atomics. They are an inverse pair rather than one algorithm
   written twice, and the inversion is where the off-by-ones live. That is what
-  its differential test is really checking.
+  its differential test is really checking. The gather is a thread per eight
+  consecutive windows of one channel at one phase, because samples a stride
+  apart share every tap: a thread per sample read each weight once per sample
+  and ran at 0.6 TFLOP/s on WaveGlow's upsample, and this reads it once per
+  eight, bit for bit the same sums - 4.6 ms to 0.97, and 1.085x on a VITS
+  synthesis whose decoder is four of these.
 - **`act_gelu` uses the device's `erff`,** which is IEEE-accurate, while the CPU
   twin carries Cody's rational approximation because Rust has no `erf`. Their
   test compares two different implementations of the same function, so

@@ -28,7 +28,10 @@ Twenty timed synthesis calls after five warm-up, medians, alternated in pairs.
 **1.24x faster than PyTorch** per second of audio, stable to within 0.2 across
 three interleaved rounds. The utterance lengths differ because both sample
 their own durations, which is why the comparison is made on time per second of
-audio rather than on the raw medians.
+audio rather than on the raw medians. The engine has since gained 1.085x on
+this shape from the transposed convolution alone - 46.25 ms to 42.64, 61x
+realtime - measured against its own previous binary and not against PyTorch
+again; see "The transposed convolution" under Tacotron2.
 
 Where that time goes, measured with `xabe-tts-bench --stages`:
 
@@ -2751,6 +2754,40 @@ the reason was hoisted and measured as nothing; the kernel is read-bound
 on a weight each thread walks 320 elements of, and the fix is threads
 that share the walk. The postnet's five convolutions are 2.1 ms at 1.3
 TFLOP/s through the direct kernel.
+
+### The transposed convolution: a thread per eight windows, 1.04x on Tacotron2 and 1.085x on VITS
+
+The mel upsample was 4.6 ms for 2.7 GFLOP, 0.6 TFLOP/s, and the paragraph
+above had just found that the integer division per tap per channel was
+not why. The kernel was a thread per output sample walking 320 weights -
+80 channels, four taps - and every sample in a window of 256 read a
+different 320, so the weight was read once per sample: 5.5 GB an
+utterance through L2 for a 26 MB tensor. The taps that touch a sample
+are fixed by its phase within the stride, so samples one stride apart
+share every tap. A thread now carries eight consecutive windows of one
+channel at one phase, reads each weight once for the eight, and each
+output's sum is still channel by channel and taps ascending - the same
+to the bit, held to the scatter form by the existing test, and both
+synthesisers' audio compared sample for sample against the previous
+commit's engine.
+
+The upsample is 0.97 ms. The same kernel is the VITS decoder's four
+upsamplers, which the stage split put at 72% of a synthesis, and the
+decoder stage went from 32.4 ms to 28.7 there.
+
+Same sitting, alternated in pairs, the worse pair on each side:
+
+| Text | Frames | Before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `Tâi-lâm ū chiok chē hó-chia̍h--ê,` | 206 | 110.2 ms | 106.5 ms | 1.035x |
+| `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` | 397 | 196.9 ms | 189.2 ms | 1.04x |
+| `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` | 513 | 252.8 ms | 243.5 ms | 1.04x |
+
+And `xabe-tts-bench` on `mms-tts-nan`, three alternated pairs of twenty
+runs, worst on each side: **46.25 ms to 42.64**, 56.4x realtime to 61.1x,
+**1.085x**. The PyTorch comparison at the top of this file was not
+re-run; the 1.24x there is against the engine as it was, and this is
+1.085x on top of that engine, not a new ratio against the reference.
 
 ### A measurement trap in the harness itself
 

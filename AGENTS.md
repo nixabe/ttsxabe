@@ -126,7 +126,12 @@ zeroed allocations are not zeroed. The finding to carry is in the matmul's
 store: an accumulating epilogue written as load-add-store per element ran
 at twice the plain kernel, because a store to the output may alias the next
 load and the compiler serialised them; two passes, loads then stores, is
-the form. CosyVoice3 has since had
+the form. The transposed convolution then went from a thread per sample to
+a thread per eight windows sharing every weight read, bit-identical, for
+1.04x more on Tacotron2 and **1.085x on VITS**, whose decoder is four of
+them - so the synthesiser's 1.24x against PyTorch above is now against an
+engine that is 1.085x faster than the one measured, and the ratio has not
+been re-taken. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

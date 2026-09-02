@@ -1356,7 +1356,9 @@ impl Gpu {
         padding: usize,
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
         let out_t = (t - 1) * stride + k - 2 * padding;
-        let mut out = self.zeros(out_ch * out_t)?;
+        // SAFETY: every sample below `out_t` of every channel is written by
+        // exactly one thread - see the store loop in the kernel.
+        let mut out = unsafe { self.uninit(out_ch * out_t) }?;
         let (a, b_, c, d, e, g, h) = (
             in_ch as i32,
             t as i32,
@@ -1366,6 +1368,9 @@ impl Gpu {
             padding as i32,
             out_t as i32,
         );
+        // A thread per `TC_Q` windows of one channel at one phase; see the
+        // kernel.
+        let threads = out_ch * stride * out_t.div_ceil(stride).div_ceil(8);
         let null: u64 = 0;
         let f = self.func("transposed_conv1d");
         let mut lb = self.stream.launch_builder(f);
@@ -1383,7 +1388,7 @@ impl Gpu {
             .arg(&g)
             .arg(&h);
         launched("transposed_conv1d", unsafe {
-            lb.launch(Self::flat(out_ch * out_t))
+            lb.launch(Self::flat(threads))
         })?;
         Ok((out, out_t))
     }

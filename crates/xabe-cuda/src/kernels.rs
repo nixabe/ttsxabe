@@ -2696,37 +2696,61 @@ __global__ void depthwise_conv1d(
 // index for such a tap is `(p + pad - tap) / stride`.
 //
 // `w` is [in_ch, out_ch, k]; the bias is per *output* channel.
+// A thread carries `TC_Q` consecutive windows of one output channel at one
+// phase: samples `(m0 + q) * stride + r`. Those share every tap - the taps
+// that touch a sample are `first + j * stride` with `first` fixed by the
+// phase - so each weight is read once for eight outputs where a thread per
+// sample read it once for one. That read was the kernel: at WaveGlow's 80
+// channels and four taps a sample walked 320 weights, 5.5 GB of traffic an
+// utterance for 2.7 GFLOP, and ran at 0.6 TFLOP/s. Each output's sum is
+// still channel by channel and taps ascending, so it is the same to the
+// bit as the thread-per-sample form, and the test holds it to the scatter.
+#define TC_Q 8
 __global__ void transposed_conv1d(
     const float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ bias, float* __restrict__ out,
     int in_ch, int t, int out_ch, int k, int stride, int pad, int out_t)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= out_ch * out_t) return;
-    int o = idx / out_t;
-    int p = idx - o * out_t;
+    const int windows = (out_t + stride - 1) / stride;
+    const int groups = (windows + TC_Q - 1) / TC_Q;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= out_ch * stride * groups) return;
+    // Phase fastest, so a warp's stores are consecutive samples.
+    const int r = idx % stride;
+    const int rest = idx / stride;
+    const int wg = rest % groups;
+    const int o = rest / groups;
+    const int m0 = wg * TC_Q;
 
-    float acc = bias ? bias[o] : 0.0f;
-    // The taps that touch this sample are `first + j * stride`, from input
-    // position `n0 - j`: one division here rather than one per tap per
-    // channel, which at WaveGlow's 80 channels and four taps was 320 integer
-    // divisions a sample and the whole cost of the kernel - 4.6 ms for
-    // 2.7 GFLOP. The order of the sums is unchanged, channel by channel and
-    // taps ascending, so the result is the same to the bit.
-    const int shifted = p + pad;
-    const int n0 = shifted / stride;
-    const int first = shifted - n0 * stride;
+    // Sample `m * stride + r` sits at `m * stride + r + pad` after the
+    // padding; the taps that touch it are `first + j * stride` from input
+    // position `m + nb - j`.
+    const int rp = r + pad;
+    const int nb = rp / stride;
+    const int first = rp - nb * stride;
     const int taps = (k - first + stride - 1) / stride;
+
+    float acc[TC_Q];
+    const float b = bias ? bias[o] : 0.0f;
+    #pragma unroll
+    for (int q = 0; q < TC_Q; ++q) acc[q] = b;
     for (int i = 0; i < in_ch; ++i) {
         const float* xi = x + (size_t)i * t;
         const float* wi = w + ((size_t)i * out_ch + o) * k;
         for (int j = 0; j < taps; ++j) {
-            const int n = n0 - j;
-            if (n < 0 || n >= t) continue;
-            acc = fmaf(xi[n], wi[first + j * stride], acc);
+            const float wv = wi[first + j * stride];
+            #pragma unroll
+            for (int q = 0; q < TC_Q; ++q) {
+                const int n = m0 + q + nb - j;
+                if (n >= 0 && n < t) acc[q] = fmaf(xi[n], wv, acc[q]);
+            }
         }
     }
-    out[idx] = acc;
+    #pragma unroll
+    for (int q = 0; q < TC_Q; ++q) {
+        const int p = (m0 + q) * stride + r;
+        if (p < out_t) out[(size_t)o * out_t + p] = acc[q];
+    }
 }
 
 // -------------------------------------------------------------------- dense
