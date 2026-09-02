@@ -113,7 +113,13 @@ trained under AMP and every LSTM weight in it is **exactly representable in
 f16**, so the half-width form was the same numbers at half the bytes, and
 two thirds of the card's time had been spent streaming zeros in the low
 mantissa. Before spending bandwidth on an f32 tensor, check whether it is
-f16-exact; `docs/BENCHMARKS.md` has the round. CosyVoice3 has since had
+f16-exact; `docs/BENCHMARKS.md` has the round. A round after that took the
+frame to sixteen launches with no allocation, for **1.03x**, and measured a
+CUDA-graph replay of the frame as level with issuing it launch by launch:
+the launch floor here is the card's front end, which hides a launch only
+behind a long kernel, and not the CPU as the previous round had diagnosed.
+`docs/BENCHMARKS.md` has the trace and the vocoder accounting that is the
+next round. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

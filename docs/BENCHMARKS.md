@@ -2580,6 +2580,98 @@ data-dependent on the frame index, so that is the kernels taking their
 position from device memory rather than the wrapper - a design change
 rather than a fold, and where the next round would start.
 
+### Sixteen launches and no allocation: 1.03x, and a graph that bought nothing
+
+The paragraph above ends by naming the CPU as what was left and a CUDA
+graph as the lever. This is the round that pulled it, and the diagnosis
+was wrong in a way worth recording.
+
+**The graph was built, and it measured as nothing.** The frame was
+captured once and replayed - `Gpu::capture` around the same launches,
+every offset that depends on the frame index read from a device-side
+counter so the recording is the frame - and the first replay was 124.5
+against 122.7 ms on the shortest line. `nsys` at node level said why: the
+frame allocated eleven temporaries, a capture turns each into a memory
+node, and a graph holding memory nodes replays at about the cost of
+issuing it. So the frame was made allocation-free - `conv1d_into`, the
+mat-vec's `gemv_into`, a caller-owned scratch for the attention's
+energies, every temporary a field of one state - and replayed again: 184
+µs a frame under `nsys` against **166 issued launch by launch**, and on
+the bench, alternated three times, 119.0 against 119.5 ms. Level. The
+graph is not in the tree.
+
+**What the trace showed instead is the card's front end.** One frame,
+both modes, the gap before each kernel:
+
+| Kernel | Runs | Gap before, replayed | Gap before, issued |
+| --- | ---: | ---: | ---: |
+| `gemv` (prenet) | 2.1 µs | 7.9 µs | 7.7 µs |
+| `relu_mask` | 1.3 µs | 1.9 µs | 2.9 µs |
+| `gemv` (attention cell, input side) | 12.9 µs | 3.9 µs | 4.2 µs |
+| `gemv` (recurrent side) | 16.4 µs | 0.5 µs | 0.6 µs |
+| `lstm_gates` | 1.9 µs | 0.6 µs | 0.5 µs |
+| `conv1d_short` (location) | 15.6 µs | 7.6 µs | 8.1 µs |
+| `gemv` (query) | 2.9 µs | 0.5 µs | 0.5 µs |
+| `taco_energies` | 6.8 µs | 0.5 µs | 0.5 µs |
+| `taco_context` | 5.6 µs | 0.5 µs | 0.5 µs |
+| `gemv` (decoder cell, input side) | 23.3 µs | 8.3 µs | 8.5 µs |
+| `gemv` (projection) | 3.9 µs | 7.0 µs | 8.3 µs |
+
+After a kernel that runs fifteen microseconds the next several launches
+start half a microsecond apart, whatever they are; after a run of short
+ones, each launch costs three to eight. Two idempotent kernels inserted
+after `relu_mask` cost 7.1 and 3.6 µs of gap, and one inserted after the
+15 µs convolution cost 0.5, so it is the run-ahead of the card's launch
+pipeline that hides the cost and not anything about the kernels. The
+same pattern, the same places, in both modes. The 5.4 µs
+`cuLaunchKernel` median the previous round read as the CPU falling
+behind was `nsys` inflating the API it was tracing, and the chat model's
+step - the peer session's decode is a graph, and reports the same floor
+inside it - never showed the gaps because its kernels are long.
+
+**So the lever is the launch count, and the frame is sixteen now.** The
+three `concat2` launches are gone by layout: each LSTM's hidden state
+lives at the head of the buffer the next projection reads, the prenet's
+last layer writes into the head of the attention cell's input, and
+`taco_context` writes the context after all three, at their offsets, in
+the pass that computes it. The two copies and the counter step that ended
+a frame are one `taco_emit`, and the copy of the frame into the next
+step's input is gone because the prenet reads the projection's output
+where it lies. The same kernels do the same arithmetic on the same
+numbers, the stop lands on the same frame of every line, and the tests
+that hold the batched gate read and the half-width decoder to their
+references pass unchanged; the mel was not diffed against the previous
+binary.
+
+Same sitting, alternated in pairs, the previous binary against this one,
+the worse pair on each side:
+
+| Text | Frames | Before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `Tâi-lâm ū chiok chē hó-chia̍h--ê,` | 206 | 123.4 ms | 119.9 ms | 1.03x |
+| `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` | 397 | 224.6 ms | 218.9 ms | 1.03x |
+| `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` | 513 | 287.3 ms | 279.1 ms | 1.03x |
+
+The better pair reads 122.6 → 119.1, 223.5 → 217.9 and 286.6 → 277.8.
+**1.03x**, about 20 µs a frame, which is what six launches cost at this
+floor.
+
+**Where the utterance is now, and why the loop stops here.** The decoder
+is 206 frames at about 165 µs, some 34 ms of the 119; the card is busy
+for 105 of each frame's 166. What follows the decoder is 99 ms of wall
+and 87 of kernel time, and by kernel: `gemm` 51.6 ms - the dilated
+convolutions 24.1 at 21 TFLOP/s, the conditioning 16.6 at 25, and the
+residual and skip projections **10.6 as two `n = 256` products a layer at
+16 TFLOP/s and 106 blocks on a card with 144 slots** - then the
+conditioning add 6.9, `im2col` 6.1, the residual and skip adds 6.1, 445
+`memset`s 5.0, the mel upsample 4.6 at 0.6 TFLOP/s, the gated activation
+3.6, and the postnet's five convolutions 2.1 at 1.3 TFLOP/s. Every one of
+those but the first two is a fold or a shape: the add into the
+activation that reads its sum, the two projections as one, the adds into
+the projection's epilogue, the `memset`s under outputs the kernel writes
+whole. That is the next round, and it is worth several times what the
+loop has left.
+
 ### A measurement trap in the harness itself
 
 The per-stage breakdown attributed 23.9 ms to `coupling_inverse`, a kernel that

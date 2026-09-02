@@ -3248,21 +3248,6 @@ __global__ void copy_from_into(
     if (i < n) dst[doff + i] = src[soff + i];
 }
 
-// Two rows end to end: `dst[0..na] = a`, `dst[na..na + nb] = b`. What a memset
-// and two `copy_into` did, at one launch instead of three; a decoder that
-// concatenates three pairs a frame was spending nine launches on it.
-__global__ void concat2(
-    float* __restrict__ dst, const float* __restrict__ a, int na,
-    const float* __restrict__ b, int nb)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < na) {
-        dst[i] = a[i];
-    } else if (i < na + nb) {
-        dst[i] = b[i - na];
-    }
-}
-
 // `act_relu` then `mul_inplace` against `mask[off..]`, in one pass: the
 // prenet's dropout, which Tacotron2 keeps on at inference, with the masks
 // for a whole utterance drawn up front and read from one buffer. The
@@ -3273,18 +3258,19 @@ __global__ void relu_mask(float* __restrict__ y, const float* __restrict__ mask,
     if (i < n) y[i] = fmaxf(y[i], 0.0f) * mask[off + i];
 }
 
-// The location attention's running weights, `[alignment; cumulative]` of
-// `t` each: the new alignment replaces the first half and adds into the
-// second. `copy_range`, `add_inplace` and two `copy_into` were four launches
-// a frame for this.
-__global__ void attn_weights_update(
-    float* __restrict__ cat, const float* __restrict__ alignment, int t)
+// The end of a Tacotron2 decoder frame in one launch: the frame
+// `next[0..mel]` to row `frame` of `out` and its gate logit `next[mel]` to
+// `gates[frame]`. One block. This was two copies and a third of the frame
+// into the next step's input, each about a microsecond of work and several
+// of floor; the third is gone because the prenet reads `next` itself.
+__global__ void taco_emit(
+    float* __restrict__ out, float* __restrict__ gates, int frame,
+    const float* __restrict__ next, int mel)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < t) {
-        cat[i] = alignment[i];
-        cat[t + i] += alignment[i];
+    for (int i = threadIdx.x; i < mel; i += blockDim.x) {
+        out[(size_t)frame * mel + i] = next[i];
     }
+    if (threadIdx.x == 0) gates[frame] = next[mel];
 }
 
 // Tacotron2's location-sensitive attention, in two launches where it was
@@ -3327,10 +3313,17 @@ extern "C" __global__ void taco_energies(
 // `softmax_rows`'s - the max, `__expf` about it, the sum - held in shared
 // memory; then every thread owns output channels of the context, summing
 // the alignment against the memory `[t, e]` down its column, and the first
-// `t` threads update the running weights as `attn_weights_update` does.
+// `t` threads update the running weights: the new alignment replaces the
+// first half of `cat` and adds into the second.
+//
+// The context lands at `c0 + o0` and, when they are not null, at `c1 + o1`
+// and `c2 + o2` as well. The decoder feeds it to three projections, each
+// concatenated after something else, and writing it into each of those
+// buffers here is what removed the three `concat2` launches a frame.
 extern "C" __global__ void taco_context(
     const float* __restrict__ score, const float* __restrict__ memory,
-    float* __restrict__ context, float* __restrict__ cat, int t, int e)
+    float* __restrict__ c0, long o0, float* __restrict__ c1, long o1,
+    float* __restrict__ c2, long o2, float* __restrict__ cat, int t, int e)
 {
     extern __shared__ float al[];   // t alignments, then blockDim.x scratch
     float* red = al + t;
@@ -3374,7 +3367,9 @@ extern "C" __global__ void taco_context(
         for (int i = 0; i < t; ++i) {
             c = fmaf(al[i], memory[(size_t)i * e + j], c);
         }
-        context[j] = c;
+        c0[o0 + j] = c;
+        if (c1) c1[o1 + j] = c;
+        if (c2) c2[o2 + j] = c;
     }
     for (int i = u; i < t; i += n) {
         cat[i] = al[i];

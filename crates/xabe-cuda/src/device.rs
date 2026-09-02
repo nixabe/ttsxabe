@@ -604,9 +604,8 @@ const NAMES: &[&str] = &[
     "copy_range",
     "copy_into",
     "copy_from_into",
-    "concat2",
     "relu_mask",
-    "attn_weights_update",
+    "taco_emit",
     "taco_energies",
     "taco_context",
     "transpose",
@@ -1201,6 +1200,44 @@ impl Gpu {
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
         let span = dilation * (k - 1) + 1;
         let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+        // SAFETY: the kernel writes every `[out_ch, out_t]` position - the
+        // tail of a tile past `out_t` is skipped, not left - so nothing
+        // reads a byte it did not store.
+        let mut out = unsafe { self.uninit(out_ch * out_t) }?;
+        self.conv1d_into(
+            x, w, bias, in_ch, t, out_ch, k, pad_left, pad_right, dilation, &mut out,
+        )?;
+        Ok((out, out_t))
+    }
+
+    /// [`Self::conv1d`] into a buffer the caller owns, returning the output
+    /// length. The same launch; what differs is that a loop can run it every
+    /// frame without an allocation, which Tacotron2's decoder does.
+    ///
+    /// Refuses an `out` shorter than `[out_ch, out_t]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_into(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        in_ch: usize,
+        t: usize,
+        out_ch: usize,
+        k: usize,
+        pad_left: usize,
+        pad_right: usize,
+        dilation: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<usize, CudaError> {
+        let span = dilation * (k - 1) + 1;
+        let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+        if out.len() < out_ch * out_t {
+            return Err(CudaError::SliceOverrun {
+                at: out_ch * out_t,
+                len: out.len(),
+            });
+        }
         // Which specialisation: the four-deep time tile pays for itself only
         // when the sequence can fill it. Below that the short kernel wins,
         // because three quarters of every thread's arithmetic would otherwise
@@ -1213,7 +1250,6 @@ impl Gpu {
             (out_t as u32).next_multiple_of(32).clamp(32, CONV_BLOCK)
         };
         let per_block = threads * t_reg;
-        let mut out = self.zeros(out_ch * out_t)?;
         let (a, b_, c, d, e, g, h) = (
             in_ch as i32,
             t as i32,
@@ -1231,7 +1267,7 @@ impl Gpu {
             Some(v) => lb.arg(v),
             None => lb.arg(&null),
         };
-        lb.arg(&mut out)
+        lb.arg(out)
             .arg(&a)
             .arg(&b_)
             .arg(&c)
@@ -1253,7 +1289,7 @@ impl Gpu {
             shared_mem_bytes: (tile * 4) as u32,
         };
         launched("conv1d", unsafe { lb.launch(cfg) })?;
-        Ok((out, out_t))
+        Ok(out_t)
     }
 
     /// Depthwise convolution. Mirrors `xabe_dsp::depthwise_conv1d`.
@@ -2890,30 +2926,6 @@ impl Gpu {
         launched("copy_from_into", unsafe { lb.launch(Self::flat(n)) })
     }
 
-    /// `dst[0..na] = a[0..na]` and `dst[na..na + nb] = b[0..nb]` in one
-    /// launch; see `concat2` in the kernels.
-    pub fn concat2(
-        &self,
-        dst: &mut CudaSlice<f32>,
-        a: &CudaSlice<f32>,
-        na: usize,
-        b: &CudaSlice<f32>,
-        nb: usize,
-    ) -> Result<(), CudaError> {
-        if dst.len() < na + nb || a.len() < na || b.len() < nb {
-            return Err(CudaError::SliceOverrun {
-                at: na + nb,
-                len: dst.len().min(a.len() + nb).min(b.len() + na),
-            });
-        }
-        let (nai, nbi) = (na as i32, nb as i32);
-        let f = self.func("concat2");
-        let mut lb = self.stream.launch_builder(f);
-        lb.arg(dst).arg(a).arg(&nai).arg(b).arg(&nbi);
-        // SAFETY: every range is checked above and the grid covers `na + nb`.
-        launched("concat2", unsafe { lb.launch(Self::flat(na + nb)) })
-    }
-
     /// `y = relu(y) * mask[off..off + n]`, the prenet's dropout in one pass;
     /// exactly `relu` then `mul_inplace`. See `relu_mask` in the kernels.
     pub fn relu_mask(
@@ -2937,27 +2949,36 @@ impl Gpu {
         launched("relu_mask", unsafe { lb.launch(Self::flat(n)) })
     }
 
-    /// The location attention's `[alignment; cumulative]` of `t` each,
-    /// updated with a new alignment: the first half replaced, the second
-    /// added to. See `attn_weights_update` in the kernels.
-    pub fn attn_weights_update(
+    /// The end of a Tacotron2 decoder frame: `next[..mel]` to row `frame`
+    /// of `out`, and `next[mel]` to `gates[frame]`. One launch where the
+    /// argument forms are `copy_into` and `copy_from_into`; the test holds
+    /// it to them. Refuses a row or a logit that does not fit.
+    pub fn taco_emit(
         &self,
-        cat: &mut CudaSlice<f32>,
-        alignment: &CudaSlice<f32>,
-        t: usize,
+        out: &mut CudaSlice<f32>,
+        gates: &mut CudaSlice<f32>,
+        frame: usize,
+        next: &CudaSlice<f32>,
+        mel: usize,
     ) -> Result<(), CudaError> {
-        if cat.len() < 2 * t || alignment.len() < t {
+        if (frame + 1) * mel > out.len() || frame >= gates.len() || next.len() < mel + 1 {
             return Err(CudaError::SliceOverrun {
-                at: 2 * t,
-                len: cat.len().min(2 * alignment.len()),
+                at: ((frame + 1) * mel).max(mel + 1),
+                len: out.len().min(gates.len()).min(next.len()),
             });
         }
-        let ti = t as i32;
-        let f = self.func("attn_weights_update");
+        let (fi, m) = (frame as i32, mel as i32);
+        let f = self.func("taco_emit");
         let mut lb = self.stream.launch_builder(f);
-        lb.arg(cat).arg(alignment).arg(&ti);
-        // SAFETY: `cat` holds `2 t` and `alignment` `t`, checked above.
-        launched("attn_weights_update", unsafe { lb.launch(Self::flat(t)) })
+        lb.arg(out).arg(gates).arg(&fi).arg(next).arg(&m);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one block; row `frame` of `mel` was checked to fit `out`
+        // and logit `frame` to fit `gates`.
+        launched("taco_emit", unsafe { lb.launch(cfg) })
     }
 
     /// Tacotron2's location-sensitive attention for one decoder step, in two
@@ -2972,6 +2993,16 @@ impl Gpu {
     ///
     /// `a` is a thread count and must be a power of two up to 1024; `t` and
     /// `e` are bounded by shared memory and the block, at 4096 and 1024.
+    ///
+    /// `score` is `t` floats of scratch the caller owns - the alignment
+    /// energies between the two launches - so that a frame running this
+    /// every step allocates nothing.
+    ///
+    /// The context is written at `context[ctx_off..]` and, for each of
+    /// `copies` that is `Some`, at that buffer's offset as well. The decoder
+    /// feeds the context to three projections, each after something else in
+    /// one buffer, and placing it there directly is what removed three
+    /// concatenations a frame.
     #[allow(clippy::too_many_arguments)]
     pub fn taco_attention(
         &self,
@@ -2985,8 +3016,11 @@ impl Gpu {
         f: usize,
         a: usize,
         e: usize,
+        score: &mut CudaSlice<f32>,
         cat: &mut CudaSlice<f32>,
         context: &mut CudaSlice<f32>,
+        ctx_off: usize,
+        copies: [Option<(&mut CudaSlice<f32>, usize)>; 2],
     ) -> Result<(), CudaError> {
         if a == 0 || !a.is_power_of_two() || a > 1024 || t == 0 || t > 4096 || e > 1024 {
             return Err(CudaError::UnsupportedAttention {
@@ -3002,16 +3036,23 @@ impl Gpu {
             (processed.len(), t * a),
             (v.len(), a),
             (memory.len(), t * e),
+            (score.len(), t),
             (cat.len(), 2 * t),
-            (context.len(), e),
+            (context.len(), ctx_off + e),
         ];
         for (len, need) in checks {
             if len < need {
                 return Err(CudaError::SliceOverrun { at: need, len });
             }
         }
-        // SAFETY: every score is written by its block below.
-        let mut score = unsafe { self.uninit(t) }?;
+        for c in copies.iter().flatten() {
+            if c.0.len() < c.1 + e {
+                return Err(CudaError::SliceOverrun {
+                    at: c.1 + e,
+                    len: c.0.len(),
+                });
+            }
+        }
         let (ti, fi, ai, ei) = (t as i32, f as i32, a as i32, e as i32);
         let fun = self.func("taco_energies");
         let mut lb = self.stream.launch_builder(fun);
@@ -3020,7 +3061,7 @@ impl Gpu {
             .arg(query)
             .arg(processed)
             .arg(v)
-            .arg(&mut score)
+            .arg(&mut *score)
             .arg(&ti)
             .arg(&fi)
             .arg(&ai);
@@ -3036,12 +3077,24 @@ impl Gpu {
         let n = e.max(t.min(1024)).max(32).next_power_of_two().min(1024);
         let fun = self.func("taco_context");
         let mut lb = self.stream.launch_builder(fun);
-        lb.arg(&score)
-            .arg(memory)
-            .arg(context)
-            .arg(cat)
-            .arg(&ti)
-            .arg(&ei);
+        let null: u64 = 0;
+        let o0 = ctx_off as i64;
+        let [c1, c2] = copies;
+        let (o1, o2) = (
+            c1.as_ref().map_or(0i64, |c| c.1 as i64),
+            c2.as_ref().map_or(0i64, |c| c.1 as i64),
+        );
+        lb.arg(&*score).arg(memory).arg(context).arg(&o0);
+        match c1 {
+            Some((b, _)) => lb.arg(b),
+            None => lb.arg(&null),
+        };
+        lb.arg(&o1);
+        match c2 {
+            Some((b, _)) => lb.arg(b),
+            None => lb.arg(&null),
+        };
+        lb.arg(&o2).arg(cat).arg(&ti).arg(&ei);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (n as u32, 1, 1),

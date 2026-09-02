@@ -30,39 +30,50 @@
 use crate::clock::Clock;
 use crate::weights::{Lstm, Taco2};
 use crate::{Config, TacoError};
-use xabe_cuda::{Batch, CudaSlice, Gpu, Operand};
+use xabe_cuda::{CudaSlice, Gpu, Operand, OutLayout};
 
 /// An LSTM's carried state.
 pub(crate) struct Cell {
     c: CudaSlice<f32>,
+    /// `[hidden + extra]`: the hidden state, then whatever the projection
+    /// that reads it wants concatenated after - the attention context, for
+    /// both of the decoder's cells. The gates write the first `hidden`; the
+    /// attention writes the rest in place, so no launch concatenates.
     h: CudaSlice<f32>,
+    /// The recurrent side of the gates, `[4 * hidden]`, kept so a step
+    /// allocates nothing; see `synthesize`.
+    gh: CudaSlice<f32>,
 }
 
 impl Cell {
-    fn zeros(gpu: &Gpu, hidden: usize) -> Result<Self, TacoError> {
+    fn zeros(gpu: &Gpu, hidden: usize, extra: usize) -> Result<Self, TacoError> {
         Ok(Self {
             c: gpu.zeros(hidden)?,
-            h: gpu.zeros(hidden)?,
+            h: gpu.zeros(hidden + extra)?,
+            // SAFETY: written whole by the mat-vec before the gates read it.
+            gh: unsafe { gpu.uninit(4 * hidden) }?,
         })
     }
 }
 
 /// Advances one LSTM step. `gi` is the input side, bias already in it.
-fn step(gpu: &Gpu, w: &Lstm, gi: &CudaSlice<f32>, st: &mut Cell) -> Result<(), TacoError> {
-    // `gemm_batched` rather than `linear`: with one row it dispatches to the
-    // `gemv` kernel, which keeps the activation f32 end to end and reads the
-    // weight at whichever width it was bound - see `Lstm`.
+fn step_cell(gpu: &Gpu, w: &Lstm, gi: &CudaSlice<f32>, st: &mut Cell) -> Result<(), TacoError> {
+    // `gemv_into` rather than `linear`: one row is the `gemv` kernel, which
+    // keeps the activation f32 end to end and reads the weight at whichever
+    // width it was bound - see `Lstm` - and the into-form writes the gates
+    // into the cell's own buffer rather than a fresh one.
     let g = 4 * w.hidden;
-    let gh = gpu.gemm_batched(
-        Operand::F32(&st.h),
+    gpu.gemv_into(
+        &st.h,
         w.w_hh.operand(),
         Some(&w.b_hh),
-        Batch::single(g),
-        1,
         w.hidden,
         g,
+        false,
+        OutLayout::Row,
+        &mut st.gh,
     )?;
-    gpu.lstm_gates(gi, &gh, &mut st.c, &mut st.h, w.hidden)?;
+    gpu.lstm_gates(gi, &st.gh, &mut st.c, &mut st.h, w.hidden)?;
     Ok(())
 }
 
@@ -166,11 +177,11 @@ pub(crate) fn encode(
     let mut memory = gpu.zeros(t * 2 * h)?;
     for (lstm, offset) in [(&w.enc_fwd, 0), (&w.enc_rev, h)] {
         let gi_all = gpu.linear(&seq, lstm.w_ih.full(), Some(&lstm.b_ih), t, e, 4 * h)?;
-        let mut st = Cell::zeros(gpu, h)?;
+        let mut st = Cell::zeros(gpu, h, 0)?;
         for i in 0..t {
             let at = if offset == 0 { i } else { t - 1 - i };
             let gi = gpu.copy_range(&gi_all, at * 4 * h, 4 * h)?;
-            step(gpu, lstm, &gi, &mut st)?;
+            step_cell(gpu, lstm, &gi, &mut st)?;
             // Written straight into the concatenated output, so the forward and
             // backward passes never need a buffer of their own.
             gpu.copy_into(&mut memory, &st.h, at * 2 * h + offset, h)?;
@@ -182,6 +193,33 @@ pub(crate) fn encode(
 /// Frames decoded between reads of the stop gate. See the loop in
 /// [`synthesize`].
 pub(crate) const GATE_LOOKAHEAD: usize = 8;
+
+/// What one decoder frame reads and writes, held across the frames so the
+/// frame allocates nothing: the two cells, each carrying the context after
+/// its state; the running attention weights; the output and gate buffers
+/// the frame writes at its index; the prenet's input buffer; and the
+/// frame's temporaries.
+struct FrameState {
+    att: Cell,
+    dec: Cell,
+    weights_cat: CudaSlice<f32>,
+    out: CudaSlice<f32>,
+    gates: CudaSlice<f32>,
+    /// `[prenet_dim + e]`: the prenet's output, then the context.
+    cell_in: CudaSlice<f32>,
+    /// The frame's temporaries, one buffer each, so that a frame allocates
+    /// nothing: the prenet's layer outputs but the last, which is the head
+    /// of `cell_in`; the two input-side gate vectors; the location
+    /// features; the query; the alignment energies; and the stacked
+    /// projection-and-gate row, which is also the next frame's input.
+    pre: Vec<CudaSlice<f32>>,
+    gi_att: CudaSlice<f32>,
+    gi_dec: CudaSlice<f32>,
+    loc: CudaSlice<f32>,
+    query: CudaSlice<f32>,
+    score: CudaSlice<f32>,
+    next: CudaSlice<f32>,
+}
 
 /// Runs the encoder and then the decode loop.
 ///
@@ -205,14 +243,16 @@ pub(crate) fn synthesize(
 
     let processed = gpu.linear(&memory, &w.memory.w, None, t, e, c.attention_dim)?;
 
-    // Decoder state. The go frame is zeros, and so is everything else.
-    let mut att = Cell::zeros(gpu, c.attention_rnn_dim)?;
-    let mut dec = Cell::zeros(gpu, c.decoder_rnn_dim)?;
-    let mut context = gpu.zeros(e)?;
-    let mut weights_cat = gpu.zeros(2 * t)?;
-    let mut frame = gpu.zeros(mel)?;
+    // Decoder state. The go frame is zeros, and so is everything else -
+    // including the context halves of the three concatenated buffers, which
+    // the first frame reads before the attention has written them.
+    let att = Cell::zeros(gpu, c.attention_rnn_dim, e)?;
+    let dec = Cell::zeros(gpu, c.decoder_rnn_dim, e)?;
+    let weights_cat = gpu.zeros(2 * t)?;
+    let cell_in = gpu.zeros(c.prenet_dim + e)?;
+    let next = gpu.zeros(mel + 1)?;
 
-    let mut out = gpu.zeros(c.max_decoder_steps * mel)?;
+    let out = gpu.zeros(c.max_decoder_steps * mel)?;
     let dhac = c.decoder_rnn_dim + e;
     let lpad = c.location_kernel / 2;
     // `sigmoid(x) > p` without the sigmoid.
@@ -234,51 +274,113 @@ pub(crate) fn synthesize(
     let masks = gpu.upload(&mask_table)?;
     drop(mask_table);
 
-    // The three concatenations a frame feeds its projections, allocated once
-    // and written whole every frame.
-    // SAFETY: each is filled by `concat2` before any kernel reads it.
-    let mut cell_in = unsafe { gpu.uninit(c.prenet_dim + e) }?;
-    let mut dec_in = unsafe { gpu.uninit(c.attention_rnn_dim + e) }?;
-    let mut both = unsafe { gpu.uninit(dhac) }?;
-    // Every frame's stop logit, read back `GATE_LOOKAHEAD` frames at a time.
-    let mut gates = gpu.zeros(c.max_decoder_steps)?;
+    let gates = gpu.zeros(c.max_decoder_steps)?;
+    let steps = c.max_decoder_steps;
 
-    let mut frames = 0usize;
-    let mut checked = 0usize;
-    let mut stopped = false;
-    while frames < c.max_decoder_steps {
+    // The frame's temporaries. Every one is written whole by the launch that
+    // produces it before the launch that consumes it, which is what lets
+    // them be uninitialised and reused.
+    // SAFETY: as above.
+    let last = w.prenet.len().saturating_sub(1);
+    let pre = w.prenet[..last]
+        .iter()
+        .map(|l| unsafe { gpu.uninit(l.out_c) })
+        .collect::<Result<Vec<_>, _>>()?;
+    let gi_att = unsafe { gpu.uninit(4 * c.attention_rnn_dim) }?;
+    let gi_dec = unsafe { gpu.uninit(4 * c.decoder_rnn_dim) }?;
+    let loc = unsafe { gpu.uninit(c.location_filters * t) }?;
+    let query = unsafe { gpu.uninit(c.attention_dim) }?;
+    let score = unsafe { gpu.uninit(t) }?;
+
+    // Everything a frame reads and writes, in one place so the frame can be
+    // a function of it: the buffers persist and the frame index lives on the
+    // device, which is what lets the frame be recorded once and replayed.
+    let mut st = FrameState {
+        att,
+        dec,
+        weights_cat,
+        out,
+        gates,
+        cell_in,
+        pre,
+        gi_att,
+        gi_dec,
+        loc,
+        query,
+        score,
+        next,
+    };
+
+    // One decoder frame, sixteen launches, and no allocation: every
+    // temporary is a field of `st`, written whole each frame.
+    //
+    // Two things about its shape are measured rather than chosen, and both
+    // are in docs/BENCHMARKS.md. The frame was recorded as a CUDA graph and
+    // replayed, and that bought nothing: with its allocations it replayed
+    // at the cost of issuing it, and without them the card still left
+    // three to eight microseconds between kernels that finish in one or
+    // two, exactly as it does when they are issued one by one. So what a
+    // frame costs is its launch count, and every buffer here is laid out so
+    // that nothing has to be concatenated.
+    let step = |gpu: &Gpu,
+                st: &mut FrameState,
+                frame: usize,
+                clock: &mut Clock|
+     -> Result<(), TacoError> {
         let at = clock.start();
-        // Prenet, dropout included: the activation and this frame's mask in
-        // one pass.
-        let mut p = frame;
-        let mut mask_off = frames * mask_w;
-        for layer in &w.prenet {
-            let mut y = gpu.gemm(&p, &layer.w, None, 1, layer.in_c, layer.out_c)?;
-            gpu.relu_mask(&mut y, &masks, mask_off, layer.out_c)?;
-            mask_off += layer.out_c;
-            p = y;
+        // The single-row projections are `gemv_into`: one row is the `gemv`
+        // kernel, a warp per output column and a shuffle reduction, where
+        // `linear` gives one *thread* per output element. The gate is the
+        // extreme case: `n` of one is one thread walking 1536 weights while
+        // the rest of the card idles.
+        //
+        // The prenet reads the last frame where `taco_emit` left it and its
+        // last layer lands at the head of `cell_in`, ahead of the context.
+        let mut base = 0usize;
+        for (i, layer) in w.prenet.iter().enumerate() {
+            let (done, rest) = st.pre.split_at_mut(i);
+            let x = if i == 0 { &st.next } else { &done[i - 1] };
+            let y = if i == last {
+                &mut st.cell_in
+            } else {
+                &mut rest[0]
+            };
+            gpu.gemv_into(
+                x,
+                Operand::F32(&layer.w),
+                None,
+                layer.in_c,
+                layer.out_c,
+                false,
+                OutLayout::Row,
+                y,
+            )?;
+            gpu.relu_mask(y, &masks, frame * mask_w + base, layer.out_c)?;
+            base += layer.out_c;
         }
-
+        if w.prenet.is_empty() {
+            gpu.copy_into(&mut st.cell_in, &st.next, 0, mel)?;
+        }
         clock.stop(gpu, "  prenet", at)?;
 
         let at = clock.start();
-        gpu.concat2(&mut cell_in, &p, c.prenet_dim, &context, e)?;
-        let gi = gpu.gemm_batched(
-            Operand::F32(&cell_in),
+        gpu.gemv_into(
+            &st.cell_in,
             w.attention_rnn.w_ih.operand(),
             Some(&w.attention_rnn.b_ih),
-            Batch::single(4 * c.attention_rnn_dim),
-            1,
             c.prenet_dim + e,
             4 * c.attention_rnn_dim,
+            false,
+            OutLayout::Row,
+            &mut st.gi_att,
         )?;
-        step(gpu, &w.attention_rnn, &gi, &mut att)?;
+        step_cell(gpu, &w.attention_rnn, &st.gi_att, &mut st.att)?;
         clock.stop(gpu, "  attention_rnn", at)?;
 
         let at = clock.start();
         // Location-sensitive attention.
-        let (loc, _) = gpu.conv1d(
-            &weights_cat,
+        gpu.conv1d_into(
+            &st.weights_cat,
             w.location_conv.w.full(),
             None,
             2,
@@ -288,28 +390,29 @@ pub(crate) fn synthesize(
             lpad,
             lpad,
             1,
+            &mut st.loc,
         )?;
-        // `gemm` and not `linear` for the single-row projections. Both keep
-        // f32 - one row dispatches to `gemv`, which is a warp per output column
-        // and a shuffle reduction - where `linear` gives one *thread* per output
-        // element. The gate is the extreme case: `n` of one is one thread
-        // walking 1536 weights while the rest of the card idles.
-        let query = gpu.gemm(
-            &att.h,
-            &w.query.w,
+        gpu.gemv_into(
+            &st.att.h,
+            Operand::F32(&w.query.w),
             None,
-            1,
             c.attention_rnn_dim,
             c.attention_dim,
+            false,
+            OutLayout::Row,
+            &mut st.query,
         )?;
         // The energies, the scores, the softmax, the context and the running
         // weights - the query riding in as the bias of the energies - in two
         // launches. See `Gpu::taco_attention`; it was seven launches and a
-        // transpose, each mostly its own floor at these sizes.
+        // transpose, each mostly its own floor at these sizes. The context
+        // lands after the prenet output, after the attention cell's state
+        // and after the decoder cell's state, which is where the three
+        // projections that read it want it.
         gpu.taco_attention(
-            &loc,
+            &st.loc,
             &w.location_dense.w,
-            &query,
+            &st.query,
             &processed,
             &w.v.w,
             &memory,
@@ -317,56 +420,65 @@ pub(crate) fn synthesize(
             c.location_filters,
             c.attention_dim,
             e,
-            &mut weights_cat,
-            &mut context,
+            &mut st.score,
+            &mut st.weights_cat,
+            &mut st.cell_in,
+            c.prenet_dim,
+            [
+                Some((&mut st.att.h, c.attention_rnn_dim)),
+                Some((&mut st.dec.h, c.decoder_rnn_dim)),
+            ],
         )?;
-
         clock.stop(gpu, "  attention", at)?;
 
         let at = clock.start();
-        gpu.concat2(&mut dec_in, &att.h, c.attention_rnn_dim, &context, e)?;
-        let gi = gpu.gemm_batched(
-            Operand::F32(&dec_in),
+        gpu.gemv_into(
+            &st.att.h,
             w.decoder_rnn.w_ih.operand(),
             Some(&w.decoder_rnn.b_ih),
-            Batch::single(4 * c.decoder_rnn_dim),
-            1,
             c.attention_rnn_dim + e,
             4 * c.decoder_rnn_dim,
+            false,
+            OutLayout::Row,
+            &mut st.gi_dec,
         )?;
-        step(gpu, &w.decoder_rnn, &gi, &mut dec)?;
-
+        step_cell(gpu, &w.decoder_rnn, &st.gi_dec, &mut st.dec)?;
         clock.stop(gpu, "  decoder_rnn", at)?;
 
         let at = clock.start();
-        gpu.concat2(&mut both, &dec.h, c.decoder_rnn_dim, &context, e)?;
-
-        // The frame and its stop logit from one stacked mat-vec: the first
-        // `mel` outputs are the frame, the last is the gate.
-        let next = gpu.gemm(
-            &both,
-            &w.proj_gate.w,
+        // The projection and the gate as one stacked mat-vec: `[mel + 1]`,
+        // the frame then its logit. `taco_emit` places the frame at its row
+        // of the output and the logit at its position of the gate buffer;
+        // the frame stays in `next` for the next step's prenet.
+        gpu.gemv_into(
+            &st.dec.h,
+            Operand::F32(&w.proj_gate.w),
             w.proj_gate.bias.as_ref(),
-            1,
             dhac,
             mel + 1,
+            false,
+            OutLayout::Row,
+            &mut st.next,
         )?;
-        gpu.copy_into(&mut out, &next, frames * mel, mel)?;
-        gpu.copy_from_into(&mut gates, frames, &next, mel, 1)?;
-        frames += 1;
+        gpu.taco_emit(&mut st.out, &mut st.gates, frame, &st.next, mel)?;
         clock.stop(gpu, "  projection", at)?;
+        Ok(())
+    };
 
-        // The host round trip, once every `GATE_LOOKAHEAD` frames rather than
-        // every frame. Reading the gate every frame drained the stream once a
-        // frame, so each of a frame's launches paid its full latency and the
-        // card sat idle more than half the loop. Reading it in batches keeps
-        // the queue full, at the cost of at most `lookahead - 1` frames
-        // computed past the stop and discarded. The frames up to the stop are
-        // the frames the frame-by-frame read produced, bit for bit; the test
-        // holds the two apart.
-        if frames.is_multiple_of(lookahead) || frames == c.max_decoder_steps {
+    let mut frames = 0usize;
+    let mut checked = 0usize;
+    let mut stopped = false;
+    while frames < steps {
+        step(gpu, &mut st, frames, clock)?;
+        frames += 1;
+
+        // The stop gate, read in batches: a download is a synchronisation
+        // and the loop is otherwise free of them. Reading every eighth frame
+        // decodes at most seven frames past the stop, which the frame count
+        // then discards; the frames themselves are unaffected.
+        if frames.is_multiple_of(lookahead) || frames == steps {
             let at = clock.start();
-            let logits = gpu.download(&gates)?;
+            let logits = gpu.download(&st.gates)?;
             clock.stop(gpu, "  gate sync", at)?;
             if let Some(i) = logits[checked..frames].iter().position(|&g| g > gate_logit) {
                 frames = checked + i + 1;
@@ -375,9 +487,8 @@ pub(crate) fn synthesize(
             }
             checked = frames;
         }
-        // The next frame's prenet reads the first `mel` of the stacked row.
-        frame = next;
     }
+    let out = st.out;
 
     if !stopped {
         tracing::warn!(frames, "the decoder hit its step limit without a stop");

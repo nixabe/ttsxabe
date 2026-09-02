@@ -130,10 +130,10 @@ to reason about is not a reference.
 | --- | --- | --- | --- |
 | `gemm` | encoder and decoder projections | `xabe_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
 | `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
-| `taco_energies`, `taco_context` | Tacotron2's location attention, one frame | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
+| `taco_energies`, `taco_context` | Tacotron2's location attention, one frame; the context written into the three buffers that read it | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
 | `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `xabe_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
 | `embed_scaled_f16` | the speech LLM's tables at f16 | `embed_scaled` on the table rounded on the host, exactly | a 544 MB table read a few rows at a time |
-| `relu_mask`, `concat2`, `attn_weights_update`, `copy_from_into` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
+| `relu_mask`, `taco_emit` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
 
 `Gpu::gemm` dispatches between them on `m`, at `GEMV_MAX_M = 16`. The two do
 not have the same precision, which is why the constant is public: a test that
@@ -1423,7 +1423,7 @@ rounding boundary. With the roundings matched the flow's estimator is bit
 for bit what it was, which is the test; with them contracted it was a 0.45
 difference in the mel that no tolerance could tell from a bug.
 
-## The Tacotron2 decode loop in nineteen launches
+## The Tacotron2 decode loop in sixteen launches
 
 The decoder produces one 80-channel mel frame a step through two LSTMs, a
 location-sensitive attention and a projection, and the profile of that
@@ -1433,15 +1433,30 @@ here is under ten microseconds and mostly its own floor, so the unit that
 matters is the launch, and a seam that puts two bodies under one grid is
 free.
 
-Four of the new kernels are bookkeeping and say what they are:
-`relu_mask` is the prenet's ReLU and its dropout mask in one pass, reading
-the mask from a table drawn once for the whole line rather than uploaded
-every frame; `concat2` builds the cell's input from two vectors where two
-`copy_into`s did; `attn_weights_update` replaces the current attention row
-and grows the cumulative one in one pass; `copy_from_into` moves the gate
-logit into a per-line buffer so the stop can be read every eighth frame
-instead of every frame. Each is held against the copies it replaces at
-exact equality.
+Two of the kernels are bookkeeping and say what they are: `relu_mask`
+is the prenet's ReLU and its dropout mask in one pass, reading the mask
+from a table drawn once for the whole line rather than uploaded every
+frame; `taco_emit` is the end of a frame - the projection's row into the
+output at the frame's index and its gate logit into a per-line buffer, so
+the stop can be read every eighth frame instead of every frame. Each is
+held against the copies it replaces at exact equality. Two more that the
+round before this one added are gone: `concat2` built a cell's input
+from two vectors, and it is not launched because the buffers are laid
+out so that nothing is concatenated - each LSTM's hidden state sits at
+the head of the buffer the next projection reads, the prenet's last
+layer writes into the head of the attention cell's input, and
+`taco_context` writes the context after all three, at their offsets, as
+it computes it. `attn_weights_update` had been folded into
+`taco_context` a round earlier and was still in the inventory.
+
+The frame allocates nothing. `conv1d_into` and `gemv_into` write into
+buffers the loop owns, the attention takes a caller-owned scratch for its
+energies, and every temporary is a field of one state. That was done for
+a CUDA-graph replay of the frame, which then measured level with issuing
+it - the reason is the card's launch front end, not the CPU, and
+`docs/BENCHMARKS.md` has the trace - so the graph is not in the tree and
+the allocation-free frame is what remains of it, at sixteen launches
+from twenty-two.
 
 The location attention is the fold worth describing. It was a transpose,
 a `linear` with the query as its bias, an `add_inplace`, a `tanh`, a second

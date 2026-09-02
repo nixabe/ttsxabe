@@ -3243,28 +3243,13 @@ fn the_decode_attention_into_a_row_is_the_decode_attention() {
     );
 }
 
-/// The four small kernels the Tacotron2 decoder folds its bookkeeping into
-/// are each the composition they replace, at exact equality, and refuse a
+/// The small kernels the Tacotron2 decoder folds its bookkeeping into are
+/// each the composition they replace, at exact equality, and refuse a
 /// short buffer.
 #[test]
 fn the_decoder_bookkeeping_kernels_are_the_copies_they_replace() {
     let Some(g) = gpu() else { return };
-    let (na, nb, t) = (37usize, 21usize, 19usize);
-    let a = seq(na, 90);
-    let b = seq(nb, 91);
-
-    let mut dst = g.upload(&seq(na + nb + 5, 92)).unwrap();
-    g.concat2(&mut dst, &a_up(&g, &a), na, &a_up(&g, &b), nb)
-        .unwrap();
-    let got = g.download(&dst).unwrap();
-    let mut want = a.clone();
-    want.extend_from_slice(&b);
-    assert_eq!(&got[..na + nb], &want[..], "concat2");
-    let mut short = g.upload(&seq(na, 93)).unwrap();
-    assert!(
-        g.concat2(&mut short, &a_up(&g, &a), na, &a_up(&g, &b), nb)
-            .is_err()
-    );
+    let na = 37usize;
 
     let mut d2 = g.upload(&seq(50, 94)).unwrap();
     let src = seq(40, 95);
@@ -3289,19 +3274,6 @@ fn the_decoder_bookkeeping_kernels_are_the_copies_they_replace() {
         .collect();
     assert_eq!(got, want, "relu_mask");
     assert!(g.relu_mask(&mut y, &a_up(&g, &mask), 3 * na, na).is_err());
-
-    let cat0 = seq(2 * t, 98);
-    let al = seq(t, 99);
-    let mut cat = g.upload(&cat0).unwrap();
-    g.attn_weights_update(&mut cat, &a_up(&g, &al), t).unwrap();
-    let got = g.download(&cat).unwrap();
-    let mut want = al.clone();
-    want.extend(cat0[t..].iter().zip(&al).map(|(c, a)| c + a));
-    assert_eq!(got, want, "attn_weights_update");
-    assert!(
-        g.attn_weights_update(&mut cat, &a_up(&g, &al), t + 1)
-            .is_err()
-    );
 }
 
 fn a_up(g: &Gpu, v: &[f32]) -> xabe_cuda::CudaSlice<f32> {
@@ -3350,6 +3322,13 @@ fn the_fused_location_attention_is_the_chain_it_replaces() {
 
     let mut cat = g.upload(&cat0).unwrap();
     let mut ctx = g.upload(&seq(e, 108)).unwrap();
+    let mut scratch = g.zeros(t).unwrap();
+    // Two more homes for the context, at offsets, to check the copies land
+    // where they are asked and touch nothing else.
+    let c1_0 = seq(e + 10, 110);
+    let c2_0 = seq(2 * e, 111);
+    let mut c1 = g.upload(&c1_0).unwrap();
+    let mut c2 = g.upload(&c2_0).unwrap();
     g.taco_attention(
         &a_up(&g, &loc),
         &a_up(&g, &wl),
@@ -3361,12 +3340,21 @@ fn the_fused_location_attention_is_the_chain_it_replaces() {
         f,
         a,
         e,
+        &mut scratch,
         &mut cat,
         &mut ctx,
+        0,
+        [Some((&mut c1, 10)), Some((&mut c2, e))],
     )
     .expect("the fused attention");
     let cat_got = g.download(&cat).unwrap();
     let ctx_got = g.download(&ctx).unwrap();
+    let c1_got = g.download(&c1).unwrap();
+    let c2_got = g.download(&c2).unwrap();
+    assert_eq!(&c1_got[10..], &ctx_got[..], "the first copy");
+    assert_eq!(&c1_got[..10], &c1_0[..10], "the first copy's neighbours");
+    assert_eq!(&c2_got[e..], &ctx_got[..], "the second copy");
+    assert_eq!(&c2_got[..e], &c2_0[..e], "the second copy's neighbours");
     for i in 0..2 * t {
         assert!(
             (cat_got[i] - cat_want[i]).abs() <= 1e-5 + 1e-4 * cat_want[i].abs(),
@@ -3396,8 +3384,11 @@ fn the_fused_location_attention_is_the_chain_it_replaces() {
             f,
             a,
             e,
+            &mut scratch,
             &mut short,
             &mut ctx,
+            0,
+            [None, None],
         )
         .is_err(),
         "short running weights must be refused"
@@ -3414,8 +3405,11 @@ fn the_fused_location_attention_is_the_chain_it_replaces() {
             f,
             96,
             e,
+            &mut scratch,
             &mut cat,
             &mut ctx,
+            0,
+            [None, None],
         )
         .is_err(),
         "a unit count that is not a power of two must be refused"
@@ -3516,5 +3510,42 @@ fn the_f16_embedding_gather_is_the_f32_one_on_the_rounded_table() {
         g.embed_scaled_f16(&half_table, &idd, ids.len() + 1, ch, 1.0)
             .is_err(),
         "more positions than ids must be refused"
+    );
+}
+
+/// The end of a decoder frame through `taco_emit` against its argument
+/// forms, `copy_into` for the row and `copy_from_into` for the logit.
+#[test]
+fn the_frame_end_is_its_two_copies() {
+    let Some(g) = gpu() else { return };
+    let (cap, n) = (5usize, 80usize);
+    let mut out = g.zeros(cap * n).unwrap();
+    let mut gates = g.zeros(cap).unwrap();
+    let rows: Vec<Vec<f32>> = (0..3).map(|i| seq(n + 1, 401 + i)).collect();
+    for (f, r) in rows.iter().enumerate() {
+        g.taco_emit(&mut out, &mut gates, f, &a_up(&g, r), n)
+            .unwrap();
+    }
+    let mut want_out = g.zeros(cap * n).unwrap();
+    let mut want_gates = g.zeros(cap).unwrap();
+    for (f, r) in rows.iter().enumerate() {
+        g.copy_into(&mut want_out, &a_up(&g, r), f * n, n).unwrap();
+        g.copy_from_into(&mut want_gates, f, &a_up(&g, r), n, 1)
+            .unwrap();
+    }
+    assert_eq!(
+        g.download(&out).unwrap(),
+        g.download(&want_out).unwrap(),
+        "taco_emit rows"
+    );
+    assert_eq!(
+        g.download(&gates).unwrap(),
+        g.download(&want_gates).unwrap(),
+        "taco_emit gates"
+    );
+    assert!(
+        g.taco_emit(&mut out, &mut gates, cap, &a_up(&g, &rows[0]), n)
+            .is_err(),
+        "a row that does not fit must be refused"
     );
 }
