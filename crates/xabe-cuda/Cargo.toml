@@ -30,3 +30,7 @@ path = "src/bin/bench_gemm.rs"
 [[bin]]
 name = "bench-attn"
 path = "src/bin/bench_attn.rs"
+
+[[bin]]
+name = "bench-gemv"
+path = "src/bin/bench_gemv.rs"

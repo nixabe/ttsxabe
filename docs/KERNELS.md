@@ -1295,6 +1295,33 @@ contraction that is whole super-blocks - and the wrapper refuses the rest by
 name rather than routing it to the chain, so a caller that asked for one
 launch and did not get it hears why.
 
+## Measured and rejected: sixteen-byte loads on the f16 mat-vec
+
+The packed mat-vec's finding - a lane loading sixteen bytes reaches 578 GB/s
+where four bytes reach 440 - was tried on the f16 weight path, where a lane
+still loads one word a trip, because the Whisper decoder streams 1.47 GB of
+f16 weights a token in 6.9 ms and that is 35% of the card. `bench-gemv`
+(`cargo run --release -p xabe-cuda --bin bench-gemv`, medians of 200 launches
+each followed by a synchronise, so every row carries the same round-trip
+floor):
+
+| shape | word loads | `uint4`, two in flight | `uint4`, four in flight |
+| --- | ---: | ---: | ---: |
+| 1280 x 1280 | 15.9 us | 16.0 | 16.6 |
+| 1280 x 5120 | 33.0 | 34.1 | 34.9 |
+| 5120 x 1280 | 33.3 | 34.6 | 34.8 |
+| 4096 x 4096 | 66.9 | 68.9 | 68.4 |
+| 4096 x 128 256 | 1 741.9 | 1 741.5 | 1 741.5 |
+
+Level or a shade slower on every row, and the last row is the reason: at a
+gigabyte the word loop already reaches 603 GB/s, so the body was never
+load-width bound the way the packed one was - a packed lane has header
+decoding between its loads, an f16 lane has two conversions. What the small
+rows are short of is the per-grid floor, about three microseconds of ramp
+and tail that a 3.3 MB launch cannot amortise, and no change inside the body
+touches that. The wide code was removed; the bench stays, because the next
+person will want to try the same thing.
+
 ## A weight read from a row, `gemm_batched_from`
 
 Not a kernel: the same kernels, handed the weight from row `w_first` of its
