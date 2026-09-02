@@ -272,9 +272,27 @@ fn translations_from_the_gguf_match_the_captured_ones() {
 
     let mut checked = 0;
     for (src, tgt, want) in [
-        ("今天天氣很好", "POJ", "kin-á-ji̍t thiⁿ-khì chin hó"),
+        // What `llama-server` answers on the same checkpoint at the same
+        // settings, checked against it directly. Two of these moved when the
+        // newline stopped being exempt from the repeat penalty - `chin hó`
+        // to `chiâⁿ hó`, and 你食飽未 gaining the question mark that the
+        // reference always put there and this engine used to drop.
+        ("今天天氣很好", "POJ", "kin-á-ji̍t thiⁿ-khì chiâⁿ hó"),
         ("我要去市場買東西", "HAN", "我欲來去菜市仔買物件。"),
-        ("你食飽未", "HAN", "你食飽未"),
+        ("你食飽未", "HAN", "你食飽未？"),
+        // The regression this file exists to catch now: a clause whose
+        // second half was dropped entirely while the newline was exempt
+        // from the repeat penalty. The engine answered
+        // `Góa ē-tàng kā lí chhōe chhut hù-kīn ê chhan-thiaⁿ,` - a comma,
+        // and then its closing tag - where `llama-server` on the same file
+        // at the same settings said the whole sentence. What is pinned is
+        // this engine's own answer; what matters about it is that it
+        // reaches the end of the source.
+        (
+            "我可以幫你找到附近的餐廳或提供營養建議。",
+            "POJ",
+            "Góa ē-tàng kā lí chhōe chhut hù-kīn ê chhan-thiaⁿ, iah sī thê-kiong êng-ióng kiàn-gī.",
+        ),
     ] {
         let got = m
             .translate(src, tgt, 256, Translator::REPEAT_PENALTY)
@@ -283,5 +301,5 @@ fn translations_from_the_gguf_match_the_captured_ones() {
         assert_eq!(got, want, "{src} [{tgt}] from the GGUF");
         checked += 1;
     }
-    assert_eq!(checked, 3);
+    assert_eq!(checked, 4);
 }

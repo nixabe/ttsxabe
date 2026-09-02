@@ -1350,17 +1350,17 @@ impl Translator {
             // would make an already-unlikely token more likely.
             let seen = prompt.iter().chain(out);
             let start = (prompt.len() + out.len()).saturating_sub(Self::REPEAT_LAST_N);
-            // The newline is exempt. That is llama.cpp's `penalize_nl`,
-            // which defaults to false - "consider newlines as a repeatable
-            // token" - and it is not cosmetic here: this prompt template is
-            // four lines, so a penalised newline is a newline the model has
-            // already seen three times, and it answers by reaching for
-            // punctuation instead of ending the line.
-            let newline = self.tokenizer.byte_id(b'\n');
+            // The newline is penalised like any other token. It was exempt
+            // here for a while, after llama.cpp's `penalize_nl` - but that
+            // option was removed upstream and the `llama-server` this is
+            // compared against has no trace of it, so the exemption was a
+            // deviation rather than a match. It is not a cosmetic one: this
+            // template is four lines, so the reference divides the newline's
+            // logit by the penalty and this did not, and a translation that
+            // reaches for a newline reaches for its closing tag. That ended
+            // 我可以幫你找到附近的餐廳或提供營養建議。 at the comma; see
+            // docs/BENCHMARKS.md.
             for &id in seen.skip(start) {
-                if Some(id) == newline {
-                    continue;
-                }
                 let v = &mut row[id as usize];
                 *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
             }

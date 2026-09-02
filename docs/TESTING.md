@@ -506,6 +506,50 @@ and a capacity that doubles from a floor means the interesting path opens at one
 specific length. Any test whose input sits below a threshold is not testing what
 happens above it, however exactly it agrees.
 
+## A sampler option the reference had removed, and a clause it cut in half
+
+A reported reply stopped mid-sentence: `我可以幫你找到附近的餐廳或提供營養建議。`
+came back as `Góa ē-tàng kā lí chhōe chhut hù-kīn ê chhan-thiaⁿ,` - a comma,
+and then the model's own `[/POJ]`. The second half of the source was never
+translated. It was not the batched decoder: the same clause truncates
+identically through `Translator::translate` alone, so the several-clauses
+path was ruled out first and is not involved.
+
+`Translator::pick` exempted the newline from the repeat penalty. The comment
+said that was llama.cpp's `penalize_nl`, which defaults to false. It was,
+once. **The option has since been removed upstream**, and the `llama-server`
+this stage is compared against has no trace of it: `penalize_nl` appears
+nowhere in the checkout. So the reference divides the newline's logit by the
+penalty and this engine did not.
+
+That is not cosmetic on this template. `[TRANS]\n{src}\n[/TRANS]\n[{tgt}]\n`
+is four lines, so a newline is always inside the 64-token penalty window, and
+an un-penalised newline is a cheap newline. The token after a newline here is
+`[`, and `[/POJ]` is how the answer ends. The engine reached for the ending.
+
+Put to a live `llama-server` on the same GGUF at the pipeline's own settings -
+temperature 0, `repeat_penalty` 1.1, the request body
+`tools/oracle/capture_llama_server.py` sends - the reference answered the whole
+sentence. With the exemption removed this engine answers the whole sentence
+too, and agreement with the reference went *up*: 8 of 12 clauses identical
+where it had been 5, including `你食飽未 [HAN]`, which `oracle.rs` had
+recorded as a standing trailing-character disagreement and which is now exact.
+
+Two consequences worth keeping.
+
+**The pinned translations in `gguf_source.rs` moved toward the reference, not
+away from it.** `今天天氣很好` went from `chin hó` to `chiâⁿ hó` and `你食飽未`
+gained its question mark - both now what `llama-server` says. A pinned value
+that changes is a claim to check against the reference, not a test to relax.
+
+**The oracle test that should have caught this does not run here.**
+`translations_match_the_llama_server_the_pipeline_runs_today` needs the
+safetensors checkpoint, which is absent on this box, so it skips - and a skip
+is not a pass. What ran, and what caught the fix, is the GGUF test, which now
+pins the offending clause as a regression case. If a sampler question comes up
+again, ask the running `llama-server` directly rather than the capture: it
+takes a minute and it answers about the configuration in front of you.
+
 ## CosyVoice: two things that cannot be bit-exact, and how each is bounded
 
 Most of this workspace is tested against a captured oracle to within float32
