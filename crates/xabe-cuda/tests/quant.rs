@@ -17,7 +17,7 @@
 //!
 //! Skips when there is no device, like every other GPU test here.
 
-use xabe_cuda::{Batch, GEMV_MAX_M, Gpu, Operand, Quant};
+use xabe_cuda::{Batch, GEMV_MAX_M, Gpu, NormScratch, Operand, Quant};
 use xabe_gguf::GgmlType;
 
 /// Relative tolerance for the accumulated products.
@@ -753,4 +753,234 @@ fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
         g.embed_packed(&table, Quant::Q4K, &dids, 1, 300, 1.0)
             .is_err()
     );
+}
+
+/// The norm-fused mat-vec is the mat-vec, the add and the normalisation it
+/// replaces: `h` bit for bit, the row and its twin to the CPU twin's tolerance.
+#[test]
+fn the_norm_fused_matvec_is_the_chain_it_replaces() {
+    let Some(g) = gpu() else { return };
+    let (k, n, eps) = (1024usize, 96usize, 1e-5f32);
+    for q in [Quant::Q4K, Quant::Q6K] {
+        let raw = blocks(q, n * k / q.block_size(), 31);
+        let a = seq(k, 32);
+        let h0 = seq(n, 33);
+        let nw: Vec<f32> = seq(n, 34).iter().map(|v| 1.0 + 0.25 * v).collect();
+
+        let da = g.upload(&a).unwrap();
+        let aq = g.quantize_activation(&da, 1, k).unwrap();
+        let dw = g.upload_quant(q, &raw).unwrap();
+        let dnw = g.upload(&nw).unwrap();
+
+        // The chain: the same packed mat-vec on the same twin, then the add
+        // and the normalisation.
+        let out = g
+            .gemm_batched(
+                Operand::F32Q { data: &da, q8: &aq },
+                Operand::Q { data: &dw, ty: q },
+                None,
+                Batch::single(n),
+                1,
+                k,
+                n,
+            )
+            .expect("the chain's mat-vec");
+        let out = g.download(&out).unwrap();
+        let h_want: Vec<f32> = h0.iter().zip(&out).map(|(h, o)| h + o).collect();
+        let x_want = xabe_dsp::rms_norm(&h_want, 1, n, &nw, eps);
+        let (codes_want, scales_want) = xabe_dsp::quantize_q8(&x_want);
+
+        let mut h = g.upload(&h0).unwrap();
+        let mut scratch = NormScratch::new();
+        // Twice through one scratch: the counter must come back to zero.
+        for pass in 0..2 {
+            let mut h_pass = g.upload(&h0).unwrap();
+            let (x, xq) = g
+                .gemv_norm(
+                    Operand::Q { data: &dw, ty: q },
+                    &aq,
+                    k,
+                    n,
+                    &mut h_pass,
+                    &dnw,
+                    eps,
+                    &mut scratch,
+                )
+                .expect("gemv_norm");
+            let h_got = g.download(&h_pass).unwrap();
+            assert_eq!(
+                h_want, h_got,
+                "{q:?} pass {pass}: the residual stream differs"
+            );
+            let x_got = g.download(&x).unwrap();
+            for i in 0..n {
+                assert!(
+                    (x_want[i] - x_got[i]).abs() <= 1e-5 + 1e-5 * x_want[i].abs(),
+                    "{q:?} pass {pass}: x[{i}] is {} wanted {}",
+                    x_got[i],
+                    x_want[i]
+                );
+            }
+            let (codes_got, scales_got) = g.q8_parts_for_test(&xq).unwrap();
+            for gi in 0..n / 32 {
+                assert!(
+                    (scales_want[gi] - scales_got[gi]).abs() <= 1e-6 + 1e-5 * scales_want[gi],
+                    "{q:?} pass {pass}: scale {gi} is {} wanted {}",
+                    scales_got[gi],
+                    scales_want[gi]
+                );
+            }
+            for i in 0..n {
+                // A value an ulp from a rounding boundary may round the other
+                // way; a code two apart is a different number.
+                assert!(
+                    (codes_want[i] as i32 - codes_got[i] as i32).abs() <= 1,
+                    "{q:?} pass {pass}: code {i} is {} wanted {}",
+                    codes_got[i],
+                    codes_want[i]
+                );
+            }
+            h = h_pass;
+        }
+        drop(h);
+
+        // Refusals: a ragged `n`, and a twin of the wrong length.
+        let mut hh = g.upload(&h0).unwrap();
+        assert!(
+            g.gemv_norm(
+                Operand::Q { data: &dw, ty: q },
+                &aq,
+                k,
+                n - 1,
+                &mut hh,
+                &dnw,
+                eps,
+                &mut scratch
+            )
+            .is_err()
+        );
+        let short = g
+            .quantize_activation(&g.upload(&seq(512, 35)).unwrap(), 1, 512)
+            .unwrap();
+        assert!(
+            g.gemv_norm(
+                Operand::Q { data: &dw, ty: q },
+                &short,
+                k,
+                n,
+                &mut hh,
+                &dnw,
+                eps,
+                &mut scratch
+            )
+            .is_err()
+        );
+    }
+}
+
+/// A product read from row `w_first` of a weight is the product of the rows
+/// from there, bit for bit, on every path the offset can take.
+///
+/// One row goes through the mat-vec, many through the tiled kernels - the
+/// integer one for the K-quant, the f16 one otherwise - and the f16 weight
+/// is offset in elements where the packed one is offset in whole blocks. The
+/// refusal is the offset that is not whole blocks.
+#[test]
+fn a_product_from_an_offset_row_is_the_product_of_the_rows_from_there() {
+    let Some(g) = gpu() else { return };
+    let (k, n_all, first, n) = (1024usize, 96usize, 40usize, 24usize);
+    for m in [1usize, 64] {
+        let a = seq(m * k, 71);
+        let da = g.upload(&a).unwrap();
+        // Packed.
+        let raw = blocks(Quant::Q4K, n_all * k / 256, 72);
+        let dw = g.upload_quant(Quant::Q4K, &raw).unwrap();
+        let bpr = k / 256 * Quant::Q4K.type_size();
+        let part = g
+            .upload_quant(Quant::Q4K, &raw[first * bpr..(first + n) * bpr])
+            .unwrap();
+        let want = g
+            .gemm_batched(
+                Operand::F32(&da),
+                Operand::Q {
+                    data: &part,
+                    ty: Quant::Q4K,
+                },
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap();
+        let got = g
+            .gemm_batched_from(
+                Operand::F32(&da),
+                Operand::Q {
+                    data: &dw,
+                    ty: Quant::Q4K,
+                },
+                first,
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap();
+        assert_eq!(
+            g.download(&want).unwrap(),
+            g.download(&got).unwrap(),
+            "packed, m {m}"
+        );
+        // f16.
+        let wf = seq(n_all * k, 73);
+        let dh = g.upload_f16(&wf).unwrap();
+        let ph = g.upload_f16(&wf[first * k..(first + n) * k]).unwrap();
+        let want = g
+            .gemm_batched(
+                Operand::F32(&da),
+                Operand::F16(&ph),
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap();
+        let got = g
+            .gemm_batched_from(
+                Operand::F32(&da),
+                Operand::F16(&dh),
+                first,
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap();
+        assert_eq!(
+            g.download(&want).unwrap(),
+            g.download(&got).unwrap(),
+            "f16, m {m}"
+        );
+        // An offset past the rows there are.
+        assert!(
+            g.gemm_batched_from(
+                Operand::F32(&da),
+                Operand::Q {
+                    data: &dw,
+                    ty: Quant::Q4K
+                },
+                n_all - n + 1,
+                None,
+                Batch::single(m * n),
+                m,
+                k,
+                n
+            )
+            .is_err()
+        );
+    }
 }

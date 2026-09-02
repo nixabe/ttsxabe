@@ -2,7 +2,7 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, Operand, Q8, Quant};
+use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, NormScratch, Operand, Q8, Quant};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -326,6 +326,9 @@ pub struct Cache {
     /// `Gpu::attn_decode_f16`. Per cache, so two sequences decoding by turns
     /// never share a counter.
     scratch: DecodeScratch,
+    /// The norm-fused mat-vec's partials and counter; see
+    /// `Gpu::gemv_norm`. Per cache for the same reason.
+    norm_scratch: NormScratch,
 }
 
 impl Cache {
@@ -543,6 +546,7 @@ impl Translator {
             cap: 0,
             len: 0,
             scratch: DecodeScratch::new(),
+            norm_scratch: NormScratch::new(),
         }
     }
 
@@ -694,6 +698,11 @@ impl Translator {
         // it is set. The residual add and the normalisation read the same row,
         // so they are one pass.
         let mut residual: Option<CudaSlice<f32>> = None;
+        // The next normalised row and its twin, when the projection that
+        // closed the last sub-layer produced them in its tail - which at
+        // one row it does, see `Gpu::gemv_norm`. Then `residual` is `None`
+        // and `h` is already settled.
+        let mut pending: Option<(CudaSlice<f32>, Q8)> = None;
         let first = cache.k.is_empty();
         if cache.cap < past + n {
             let want = (past + n).next_power_of_two().max(256);
@@ -719,7 +728,10 @@ impl Translator {
         for (i, l) in self.layers.iter().enumerate() {
             // One int8 twin for three projections, taken by the normalisation
             // that produced the activation.
-            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.attn_norm)?;
+            let (x, xq) = match pending.take() {
+                Some((x, q)) => (x, Some(q)),
+                None => self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.attn_norm)?,
+            };
             let xo = Self::operand(&x, xq.as_ref());
             // One product per group rather than one per projection. Each
             // element of a batched product writes a contiguous block of the
@@ -758,53 +770,73 @@ impl Translator {
             // Rotated before caching, because the position is absolute: a key
             // stored unrotated would be rotated again by the wrong offset on
             // every later step.
-            self.gpu.rope(
-                &mut proj[qg],
-                q_off,
-                n,
-                heads,
-                hd,
-                self.cfg.rope_theta,
-                past,
-            )?;
-            self.gpu.rope(
-                &mut proj[kg],
-                k_off,
-                n,
-                heads,
-                hd,
-                self.cfg.rope_theta,
-                past,
-            )?;
-
             // Scattered straight into the layout attention reads.
             if first {
                 cache.k.push(self.gpu.zeros_f16(cache.cap * h_dim)?);
                 cache.v.push(self.gpu.zeros_f16(cache.cap * h_dim)?);
             }
             let cap = cache.cap;
-            self.gpu.cache_append_f16(
-                &proj[kg],
-                k_off,
-                &mut cache.k[i],
-                n,
-                heads,
-                hd,
-                cap,
-                past,
-                false,
-            )?;
-            self.gpu.cache_append_f16(
-                &proj[vg],
-                v_off,
-                &mut cache.v[i],
-                n,
-                heads,
-                hd,
-                cap,
-                past,
-                true,
-            )?;
+            if n == 1 {
+                // One decoded position: the two rotations and the two appends
+                // are one launch, and the rotated key goes straight to the
+                // cache. See `Gpu::rope_cache_f16`.
+                self.gpu.rope_cache_f16(
+                    &mut proj,
+                    (qg, q_off),
+                    (kg, k_off),
+                    (vg, v_off),
+                    None,
+                    heads,
+                    heads,
+                    hd,
+                    self.cfg.rope_theta,
+                    past,
+                    &mut cache.k[i],
+                    &mut cache.v[i],
+                    cap,
+                )?;
+            } else {
+                self.gpu.rope(
+                    &mut proj[qg],
+                    q_off,
+                    n,
+                    heads,
+                    hd,
+                    self.cfg.rope_theta,
+                    past,
+                )?;
+                self.gpu.rope(
+                    &mut proj[kg],
+                    k_off,
+                    n,
+                    heads,
+                    hd,
+                    self.cfg.rope_theta,
+                    past,
+                )?;
+                self.gpu.cache_append_f16(
+                    &proj[kg],
+                    k_off,
+                    &mut cache.k[i],
+                    n,
+                    heads,
+                    hd,
+                    cap,
+                    past,
+                    false,
+                )?;
+                self.gpu.cache_append_f16(
+                    &proj[vg],
+                    v_off,
+                    &mut cache.v[i],
+                    n,
+                    heads,
+                    hd,
+                    cap,
+                    past,
+                    true,
+                )?;
+            }
             let tk = past + n;
 
             // A single step's queries are already `[head][1][d]`; only a
@@ -822,7 +854,10 @@ impl Translator {
             // geometry neither kernel covers, which this checkpoint's never
             // is.
             if n == 1 && (hd == 128 || hd == 64) {
-                let ctx = self.gpu.attn_decode_f16(
+                // The context and its int8 twin in one pass; the projection
+                // that reads the twin is packed in every checkpoint here, and
+                // an unpacked one ignores it.
+                let (ctx, cq) = self.gpu.attn_decode_f16_q(
                     q,
                     &cache.k[i],
                     &cache.v[i],
@@ -835,8 +870,37 @@ impl Translator {
                     false,
                     &mut cache.scratch,
                 )?;
-                let out = self.project(Operand::F32(&ctx), &l.o, 1)?;
-                residual = Some(out);
+                match l.o.w {
+                    GWeight::Packed {
+                        ty: Quant::Q4K | Quant::Q6K,
+                        ..
+                    } => {
+                        // The output projection with the residual add and the
+                        // MLP's normalisation in its tail: one launch where
+                        // there were three.
+                        pending = Some(self.gpu.gemv_norm(
+                            l.o.operand(),
+                            &cq,
+                            l.o.in_dim,
+                            l.o.out_dim,
+                            &mut h,
+                            &l.ffn_norm,
+                            self.cfg.rms_norm_eps,
+                            &mut cache.norm_scratch,
+                        )?);
+                    }
+                    _ => {
+                        let out = self.project(
+                            Operand::F32Q {
+                                data: &ctx,
+                                q8: &cq,
+                            },
+                            &l.o,
+                            1,
+                        )?;
+                        residual = Some(out);
+                    }
+                }
             } else if n > 1 && hd == 128 {
                 let ctx = self.gpu.flash_attn_f16(
                     q,
@@ -923,7 +987,10 @@ impl Translator {
                 residual = Some(out);
             }
 
-            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?;
+            let (x, xq) = match pending.take() {
+                Some((x, q)) => (x, Some(q)),
+                None => self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?,
+            };
             let xo = Self::operand(&x, xq.as_ref());
             let inter = self.cfg.intermediate_size;
             // One product over both halves where the checkpoint allows it, and
@@ -954,8 +1021,38 @@ impl Translator {
                     None
                 }
             };
-            let down = self.project(Self::operand(&gate, gq.as_ref()), &l.down, n)?;
-            residual = Some(down);
+            let down_kq = matches!(
+                l.down.w,
+                GWeight::Packed {
+                    ty: Quant::Q4K | Quant::Q6K,
+                    ..
+                }
+            );
+            match (n, &gq, down_kq) {
+                (1, Some(q), true) => {
+                    // The down projection with the residual add and the *next*
+                    // normalisation in its tail - the next layer's, or the
+                    // model's final one after the last layer.
+                    let next = self
+                        .layers
+                        .get(i + 1)
+                        .map_or(&self.norm, |nl| &nl.attn_norm);
+                    pending = Some(self.gpu.gemv_norm(
+                        l.down.operand(),
+                        q,
+                        l.down.in_dim,
+                        l.down.out_dim,
+                        &mut h,
+                        next,
+                        self.cfg.rms_norm_eps,
+                        &mut cache.norm_scratch,
+                    )?);
+                }
+                _ => {
+                    let down = self.project(Self::operand(&gate, gq.as_ref()), &l.down, n)?;
+                    residual = Some(down);
+                }
+            }
 
             // A tap is the block's output, so the pending add has to be settled
             // before it is read.
@@ -971,9 +1068,16 @@ impl Translator {
         if let Some(r) = residual.take() {
             self.gpu.add_inplace(&mut h, &r, n * h_dim)?;
         }
-        let h = self
-            .gpu
-            .rms_norm(&h, n, h_dim, &self.norm, self.cfg.rms_norm_eps)?;
+        // The final normalisation, unless the last layer's down projection
+        // already produced it - with a twin the head's packed mat-vec reads.
+        let (h, hq) = match pending.take() {
+            Some((x, q)) => (x, Some(q)),
+            None => (
+                self.gpu
+                    .rms_norm(&h, n, h_dim, &self.norm, self.cfg.rms_norm_eps)?,
+                None,
+            ),
+        };
         if taps > 0 {
             tapped.push(self.gpu.download(&h)?);
         }
@@ -987,7 +1091,7 @@ impl Translator {
         };
         Ok((
             self.gpu.gemm_batched(
-                Operand::F32(&h),
+                Self::operand(&h, hq.as_ref()),
                 self.lm_head.operand(),
                 None,
                 Batch::single(rows * self.cfg.vocab_size),

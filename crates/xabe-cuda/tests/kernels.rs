@@ -1746,6 +1746,226 @@ fn cache_append_reads_its_own_block_of_a_batched_projection() {
     }
 }
 
+/// The fused rotate-and-cache is the four launches it replaces, bit for bit.
+///
+/// Both caches are pre-filled with a pattern rather than zeros, so a write
+/// that lands at the wrong position or in the wrong head is a difference and
+/// not a coincidence; and `q` and `k` are placed in one buffer at offsets for
+/// the translator's layout, `v` in another for the chat model's, so both
+/// addressing shapes are exercised in one run.
+#[test]
+fn the_fused_rotate_and_cache_is_the_chain_it_replaces() {
+    let Some(g) = gpu() else { return };
+    let (heads, kv_heads, hd, cap) = (6usize, 2usize, 16usize, 32usize);
+    let half = hd / 2;
+    let div: Vec<f32> = (0..half).map(|i| if i < 5 { 1.0 } else { 8.0 }).collect();
+    let d_dev = g.upload(&div).expect("upload div");
+    let theta = 500_000.0f32;
+
+    for (pos, scaled) in [(0usize, true), (7, false), (31, true)] {
+        let qk = seq(heads * hd + kv_heads * hd + 5, 17);
+        let vv = seq(kv_heads * hd + 3, 23);
+        let (q_off, k_off, v_off) = (0usize, heads * hd + 5, 3usize);
+        let kfill = seq(cap * kv_heads * hd, 5);
+        let vfill = seq(cap * kv_heads * hd, 9);
+        let div_arg = scaled.then_some(&d_dev);
+
+        // The chain: two rotations, two appends.
+        let mut chain_qk = g.upload(&qk).expect("upload");
+        let chain_v = g.upload(&vv).expect("upload");
+        let mut chain_k = g.upload_f16(&kfill).expect("cache");
+        let mut chain_vc = g.upload_f16(&vfill).expect("cache");
+        g.rope_scaled(&mut chain_qk, q_off, div_arg, 1, heads, hd, theta, pos)
+            .expect("rope q");
+        g.rope_scaled(&mut chain_qk, k_off, div_arg, 1, kv_heads, hd, theta, pos)
+            .expect("rope k");
+        g.cache_append_f16(
+            &chain_qk,
+            k_off,
+            &mut chain_k,
+            1,
+            kv_heads,
+            hd,
+            cap,
+            pos,
+            false,
+        )
+        .expect("append k");
+        g.cache_append_f16(
+            &chain_v,
+            v_off,
+            &mut chain_vc,
+            1,
+            kv_heads,
+            hd,
+            cap,
+            pos,
+            true,
+        )
+        .expect("append v");
+
+        // The fusion.
+        let mut proj = vec![
+            g.upload(&qk).expect("upload"),
+            g.upload(&vv).expect("upload"),
+        ];
+        let mut fused_k = g.upload_f16(&kfill).expect("cache");
+        let mut fused_vc = g.upload_f16(&vfill).expect("cache");
+        g.rope_cache_f16(
+            &mut proj,
+            (0, q_off),
+            (0, k_off),
+            (1, v_off),
+            div_arg,
+            heads,
+            kv_heads,
+            hd,
+            theta,
+            pos,
+            &mut fused_k,
+            &mut fused_vc,
+            cap,
+        )
+        .expect("rope_cache_f16");
+
+        let chain_q = g.download(&chain_qk).expect("download");
+        let fused_q = g.download(&proj[0]).expect("download");
+        // The query block is rotated identically; the key block in the
+        // projection buffer is left as it was, because nothing reads it.
+        assert_eq!(
+            chain_q[..heads * hd],
+            fused_q[..heads * hd],
+            "pos={pos} scaled={scaled}: the query rotation differs"
+        );
+        assert_eq!(
+            qk[k_off..],
+            fused_q[k_off..],
+            "pos={pos} scaled={scaled}: the key was written back to the projection"
+        );
+        assert_eq!(
+            g.download_u16(&chain_k).expect("download"),
+            g.download_u16(&fused_k).expect("download"),
+            "pos={pos} scaled={scaled}: the key cache differs"
+        );
+        assert_eq!(
+            g.download_u16(&chain_vc).expect("download"),
+            g.download_u16(&fused_vc).expect("download"),
+            "pos={pos} scaled={scaled}: the value cache differs"
+        );
+    }
+
+    // Refusals: a position past the capacity, and a range past its buffer.
+    let mut proj = vec![
+        g.zeros(heads * hd + kv_heads * hd).expect("z"),
+        g.zeros(kv_heads * hd).expect("z"),
+    ];
+    let mut kc = g.zeros_f16(cap * kv_heads * hd).expect("cache");
+    let mut vc = g.zeros_f16(cap * kv_heads * hd).expect("cache");
+    assert!(
+        g.rope_cache_f16(
+            &mut proj,
+            (0, 0),
+            (0, heads * hd),
+            (1, 0),
+            None,
+            heads,
+            kv_heads,
+            hd,
+            theta,
+            cap,
+            &mut kc,
+            &mut vc,
+            cap
+        )
+        .is_err()
+    );
+    assert!(
+        g.rope_cache_f16(
+            &mut proj,
+            (0, 0),
+            (0, heads * hd + 1),
+            (1, 0),
+            None,
+            heads,
+            kv_heads,
+            hd,
+            theta,
+            0,
+            &mut kc,
+            &mut vc,
+            cap
+        )
+        .is_err()
+    );
+}
+
+/// The decode attention's int8 twin is `quantize_q8` over its own output.
+///
+/// Both paths that write the context take the twin, one chunk written direct
+/// and many chunks merged, so a short and a long context are both here, and
+/// each is held at exact equality: the group maximum is a maximum, which
+/// associates exactly, so there is no rounding to allow for.
+#[test]
+fn the_decode_attention_twin_is_the_quantiser_over_its_output() {
+    let Some(g) = gpu() else { return };
+    let mut scratch = xabe_cuda::DecodeScratch::new();
+    for &(heads, kv, hd, tk, cap) in &[
+        (8usize, 2usize, 128usize, 40usize, 64usize),
+        (8, 2, 128, 1000, 1024),
+        (4, 4, 64, 300, 512),
+    ] {
+        let q = seq(heads * hd, 61);
+        let k = seq(kv * cap * hd, 62);
+        let v = seq(kv * cap * hd, 63);
+        let dq = g.upload(&q).expect("upload");
+        let dk = g.upload_f16(&k).expect("upload");
+        let dv = g.upload_f16(&v).expect("upload");
+        let scale = (hd as f32).powf(-0.5);
+        let plain = g
+            .attn_decode_f16(
+                &dq,
+                &dk,
+                &dv,
+                heads,
+                kv,
+                hd,
+                tk,
+                cap,
+                scale,
+                true,
+                &mut scratch,
+            )
+            .expect("attn_decode_f16");
+        let (out, twin) = g
+            .attn_decode_f16_q(
+                &dq,
+                &dk,
+                &dv,
+                heads,
+                kv,
+                hd,
+                tk,
+                cap,
+                scale,
+                true,
+                &mut scratch,
+            )
+            .expect("attn_decode_f16_q");
+        let name = format!("heads {heads} kv {kv} hd {hd} tk {tk}");
+        assert_eq!(
+            g.download(&plain).expect("download"),
+            g.download(&out).expect("download"),
+            "{name}: the context differs with the twin asked for"
+        );
+        let (want_c, want_s) = g
+            .quantize_q8_for_test(&out, heads * hd, 1)
+            .expect("quantise");
+        let (got_c, got_s) = g.q8_parts_for_test(&twin).expect("twin");
+        assert_eq!(want_c, got_c, "{name}: codes");
+        assert_eq!(want_s, got_s, "{name}: scales");
+    }
+}
+
 /// Growing a cache leaves every head reading what it read before.
 ///
 /// The bug this is here for: `cap` is the stride between heads in both cache

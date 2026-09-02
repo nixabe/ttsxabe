@@ -3976,6 +3976,67 @@ extern "C" __global__ void cache_append_t_f16(
         f32_to_f16(src[(size_t)src_off + i]);
 }
 
+// One launch for everything between the attention projections and the
+// attention itself, at a single decoded position: the query rotated in place,
+// the key rotated and stored, the value stored - into the f16 caches at `pos`.
+//
+// At one row these were four launches a layer - `rope` twice, `cache_append_f16`
+// and its transpose - each moving a few kilobytes, so each costing what a
+// launch costs and nothing else. The arithmetic is theirs character for
+// character: the same `powf` and `sincosf`, the same pairing of `j` with
+// `j + half`, the same `f32_to_f16`. The rotated key is never written back to
+// the projection buffer, because at one row nothing reads it from there: the
+// attention reads the cache.
+//
+// `q`, `k` and `v` may be three offsets into one allocation - the translator
+// issues its projections as one batched product - or three allocations, so
+// none of them is `__restrict__`. The ranges they name never overlap.
+extern "C" __global__ void rope_cache_f16(
+    float* q, long q_off,
+    const float* k, long k_off,
+    const float* v, long v_off,
+    const float* __restrict__ freq_div, int has_div,
+    int heads, int kv_heads, int head_dim, float theta, int pos,
+    unsigned short* __restrict__ kc, unsigned short* __restrict__ vc, int cap)
+{
+    const int half = head_dim >> 1;
+    const int nq = heads * half;
+    const int nk = kv_heads * half;
+    const int nv = kv_heads * head_dim;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nq + nk) {
+        const bool is_q = i < nq;
+        const int e = is_q ? i : i - nq;
+        const int j = e % half;
+        const int h = e / half;
+        float inv = powf(theta, -2.0f * (float)j / (float)head_dim);
+        if (has_div) {
+            inv /= freq_div[j];
+        }
+        float sn, cs;
+        sincosf((float)pos * inv, &sn, &cs);
+        if (is_q) {
+            const size_t base = (size_t)q_off + (size_t)h * head_dim + j;
+            const float a = q[base];
+            const float b = q[base + half];
+            q[base]        = a * cs - b * sn;
+            q[base + half] = b * cs + a * sn;
+        } else {
+            const size_t base = (size_t)k_off + (size_t)h * head_dim + j;
+            const float a = k[base];
+            const float b = k[base + half];
+            unsigned short* d = kc + ((size_t)h * cap + pos) * head_dim;
+            d[j]        = f32_to_f16(a * cs - b * sn);
+            d[j + half] = f32_to_f16(b * cs + a * sn);
+        }
+    } else if (i < nq + nk + nv) {
+        const int e = i - nq - nk;
+        const int h = e / head_dim;
+        const int j = e % head_dim;
+        vc[((size_t)h * head_dim + j) * cap + pos] = f32_to_f16(v[(size_t)v_off + e]);
+    }
+}
+
 // Re-strides a head-major cache into a larger one.
 //
 // `cap` is a *stride* in both cache layouts, not only a length: keys are
@@ -4339,8 +4400,39 @@ __device__ __forceinline__ float ld_cg(const float* p) {
     asm volatile("ld.global.cg.f32 %0, [%1];" : "=f"(v) : "l"(p));
     return v;
 }
+__device__ __forceinline__ float4 ld_cg4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
+    return v;
+}
 
-template <int HD, bool KVH>
+// One output element of the context, and its int8 code when a twin was asked
+// for. The `HD` threads of a block own `HD` consecutive elements of one head,
+// so a warp is exactly one scale group of 32 and the group maximum is five
+// shuffles - `quantize_q8`'s arithmetic on the row this block just produced,
+// which saves the launch that would re-read it.
+__device__ __forceinline__ void ad_emit(
+    float* __restrict__ out, signed char* __restrict__ qa, float* __restrict__ asc,
+    size_t idx, float y)
+{
+    out[idx] = y;
+    if (qa) {
+        float mx = fabsf(y);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        }
+        const float d = mx * (1.0f / 127.0f);
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        qa[idx] = (signed char)__float2int_rn(y * inv);
+        if ((threadIdx.x & 31) == 0) {
+            asc[idx >> 5] = d;
+        }
+    }
+}
+
+template <int HD, bool KVH, int CH>
 __device__ __forceinline__ void attn_decode_impl(
     const float* __restrict__ q,
     const unsigned* __restrict__ kc,
@@ -4348,31 +4440,33 @@ __device__ __forceinline__ void attn_decode_impl(
     float* __restrict__ out,
     float* __restrict__ part,
     unsigned* __restrict__ ctr,
-    int tk, int group, int cap, float scale, int scale_q, int chunks)
+    int tk, int group, int cap, float scale, int scale_q, int chunks,
+    signed char* __restrict__ qa, int asc_off)
 {
+    float* asc = qa ? (float*)(qa + asc_off) : (float*)0;
     constexpr int T    = HD;                    // threads a block
     constexpr int W    = KVH ? HD / 2 : HD;     // words in a key row
     constexpr int LPK  = W / 4;                 // lanes a key, 16 bytes each
     constexpr int KPW  = 32 / LPK;              // keys a warp a trip
     constexpr int WARPS = T / 32;
-    constexpr int KPWARP = AD_CH / WARPS;       // keys a warp covers
+    constexpr int KPWARP = CH / WARPS;       // keys a warp covers
     constexpr int KTRIPS = KPWARP / KPW;
     constexpr int EPL  = KVH ? 8 : 4;           // elements a lane a trip
-    constexpr int VW   = KVH ? AD_CH / 2 : AD_CH; // words in a value row's chunk
+    constexpr int VW   = KVH ? CH / 2 : CH; // words in a value row's chunk
     static_assert(LPK * KPW == 32, "a key is a whole number of lanes and a warp of keys");
     static_assert(KPWARP % KPW == 0, "a warp's keys are whole trips");
     static_assert(W % 4 == 0, "a key row is whole 16-byte loads");
 
     __shared__ float qs[AD_GMAX * HD];
-    __shared__ float sc[AD_GMAX * AD_CH];
+    __shared__ float sc[AD_GMAX * CH];
     __shared__ float m_s[AD_GMAX], l_s[AD_GMAX];
     __shared__ int last;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int h = blockIdx.y;
     const int c = blockIdx.x;
-    const int kv0 = c * AD_CH;
-    const int nk = min(AD_CH, tk - kv0);
+    const int kv0 = c * CH;
+    const int nk = min(CH, tk - kv0);
     const float ninf = __int_as_float(0xff800000);
 
     // Every key load a lane will make, issued before anything waits on one.
@@ -4451,7 +4545,7 @@ __device__ __forceinline__ void attn_decode_impl(
             #pragma unroll
             for (int g = 0; g < AD_GMAX; ++g) {
                 if (g < group) {
-                    sc[g * AD_CH + r] = (r < nk) ? acc[g] * sf : ninf;
+                    sc[g * CH + r] = (r < nk) ? acc[g] * sf : ninf;
                 }
             }
         }
@@ -4496,27 +4590,40 @@ __device__ __forceinline__ void attn_decode_impl(
     }
     __syncthreads();
 
-    // The softmax over the chunk, by warp 0.
+    // The softmax over the chunk, by warp 0: `SPL` scores a lane, 32 apart.
+    constexpr int SPL = CH / 32;
+    static_assert(SPL >= 1 && CH % 32 == 0, "a chunk is whole warps of scores");
     if (tid < 32) {
         #pragma unroll
         for (int g = 0; g < AD_GMAX; ++g) {
             if (g < group) {
-                float* row = sc + g * AD_CH;
-                float v0 = row[lane], v1 = row[lane + 32];
-                float m = fmaxf(v0, v1);
+                float* row = sc + g * CH;
+                float v[SPL], p[SPL];
+                float m = row[lane];
+                v[0] = m;
+                #pragma unroll
+                for (int e = 1; e < SPL; ++e) {
+                    v[e] = row[lane + 32 * e];
+                    m = fmaxf(m, v[e]);
+                }
                 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) {
                     m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
                 }
-                const float p0 = (lane < nk) ? __expf(v0 - m) : 0.0f;
-                const float p1 = (lane + 32 < nk) ? __expf(v1 - m) : 0.0f;
-                float l = p0 + p1;
+                float l = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < SPL; ++e) {
+                    p[e] = (lane + 32 * e < nk) ? __expf(v[e] - m) : 0.0f;
+                    l += p[e];
+                }
                 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) {
                     l += __shfl_xor_sync(0xffffffff, l, o);
                 }
-                row[lane] = p0;
-                row[lane + 32] = p1;
+                #pragma unroll
+                for (int e = 0; e < SPL; ++e) {
+                    row[lane + 32 * e] = p[e];
+                }
                 if (lane == 0) {
                     m_s[g] = m;
                     l_s[g] = l;
@@ -4541,7 +4648,7 @@ __device__ __forceinline__ void attn_decode_impl(
             #pragma unroll
             for (int g = 0; g < AD_GMAX; ++g) {
                 if (g < group) {
-                    o[g] += sc[g * AD_CH + 2 * w] * lo + sc[g * AD_CH + 2 * w + 1] * hi;
+                    o[g] += sc[g * CH + 2 * w] * lo + sc[g * CH + 2 * w + 1] * hi;
                 }
             }
         } else {
@@ -4549,7 +4656,7 @@ __device__ __forceinline__ void attn_decode_impl(
             #pragma unroll
             for (int g = 0; g < AD_GMAX; ++g) {
                 if (g < group) {
-                    o[g] += sc[g * AD_CH + w] * v;
+                    o[g] += sc[g * CH + w] * v;
                 }
             }
         }
@@ -4559,7 +4666,7 @@ __device__ __forceinline__ void attn_decode_impl(
         #pragma unroll
         for (int g = 0; g < AD_GMAX; ++g) {
             if (g < group) {
-                out[((size_t)h * group + g) * HD + tid] = o[g] / l_s[g];
+                ad_emit(out, qa, asc, ((size_t)h * group + g) * HD + tid, o[g] / l_s[g]);
             }
         }
         return;
@@ -4653,7 +4760,7 @@ __device__ __forceinline__ void attn_decode_impl(
         #pragma unroll
         for (int g = 0; g < AD_GMAX; ++g) {
             if (g < group) {
-                out[((size_t)h * group + g) * HD + tid] = acc[g] / L_s[g];
+                ad_emit(out, qa, asc, ((size_t)h * group + g) * HD + tid, acc[g] / L_s[g]);
             }
         }
     } else {
@@ -4671,7 +4778,7 @@ __device__ __forceinline__ void attn_decode_impl(
                     l += ld_cg(pc + HD + 1) * f;
                     acc += ld_cg(pc + tid) * f;
                 }
-                out[((size_t)h * group + g) * HD + tid] = acc / l;
+                ad_emit(out, qa, asc, ((size_t)h * group + g) * HD + tid, acc / l);
             }
         }
     }
@@ -4680,37 +4787,221 @@ __device__ __forceinline__ void attn_decode_impl(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 4) void attn_decode_h128(
-    const float* __restrict__ q,
-    const unsigned short* __restrict__ kc,
-    const unsigned short* __restrict__ vc,
-    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
-    int tk, int group, int cap, float scale, int scale_q, int chunks)
-{
-    attn_decode_impl<128, true>(q, (const unsigned*)kc, (const unsigned*)vc, out,
-                                part, ctr, tk, group, cap, scale, scale_q, chunks);
+// The chunk width is the one knob measured to matter across contexts, and no
+// single value wins: 32 keys is ahead at short contexts and for a
+// multi-head model, where the merge over many chunks is cheap against the
+// work each does; 64 is ahead in the middle for a grouped-query model; 128
+// is ahead at 2048 positions, where the merge of thirty-three partials had
+// become the critical path. `docs/BENCHMARKS.md` has the sweep. Each width
+// is an instantiation, and `Gpu::attn_decode` picks by the context.
+#define AD_ENTRY(NAME, HD, KVH, CH, KT, LB)                                    \
+extern "C" __global__ __launch_bounds__(HD, LB) void NAME(                     \
+    const float* __restrict__ q,                                               \
+    const KT* __restrict__ kc,                                                 \
+    const KT* __restrict__ vc,                                                 \
+    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr, \
+    int tk, int group, int cap, float scale, int scale_q, int chunks,         \
+    signed char* __restrict__ qa, int asc_off)                                 \
+{                                                                              \
+    attn_decode_impl<HD, KVH, CH>(q, (const unsigned*)kc, (const unsigned*)vc, \
+                                  out, part, ctr, tk, group, cap, scale,       \
+                                  scale_q, chunks, qa, asc_off);               \
 }
 
-extern "C" __global__ __launch_bounds__(64, 8) void attn_decode_h64(
-    const float* __restrict__ q,
-    const unsigned short* __restrict__ kc,
-    const unsigned short* __restrict__ vc,
-    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
-    int tk, int group, int cap, float scale, int scale_q, int chunks)
-{
-    attn_decode_impl<64, true>(q, (const unsigned*)kc, (const unsigned*)vc, out,
-                               part, ctr, tk, group, cap, scale, scale_q, chunks);
-}
+AD_ENTRY(attn_decode_h128_c32,  128, true,  32,  unsigned short, 4)
+AD_ENTRY(attn_decode_h128,      128, true,  64,  unsigned short, 4)
+AD_ENTRY(attn_decode_h128_c128, 128, true,  128, unsigned short, 4)
+AD_ENTRY(attn_decode_h64,       64,  true,  64,  unsigned short, 8)
+AD_ENTRY(attn_decode_f64,       64,  false, 64,  float,          8)
 
-extern "C" __global__ __launch_bounds__(64, 8) void attn_decode_f64(
-    const float* __restrict__ q,
-    const float* __restrict__ kc,
-    const float* __restrict__ vc,
-    float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr,
-    int tk, int group, int cap, float scale, int scale_q, int chunks)
+
+// ------------------------------------------------- the mat-vec with a norm
+//
+// The mat-vec that closes a sub-layer, with the residual add and the next
+// normalisation in its tail.
+//
+// At one row the two projections that close a block - the attention output
+// and the MLP down - are each followed by a normalisation that reads the row
+// they wrote plus the residual stream, and writes the row the next projections
+// read plus its int8 twin: two more launches a layer, each under four
+// microseconds and each mostly its own floor. This kernel is `gemv`'s packed
+// K-quant path with that tail in it. Every block adds its columns into `h`
+// and publishes the sum of their squares; the last block to finish sums the
+// partials in a fixed order - so the reduction is the same run to run, which
+// an atomic float sum would not be - and then normalises the whole row.
+//
+// The sum is not associated the way `rms_norm` associates it, so the scale
+// can differ from that kernel's by an ulp; both are held to the CPU twin at
+// the same tolerance. `h` is read back by the last block through the L2 -
+// `ld_cg` - because other blocks wrote it, and each block fences its writes
+// before its arrival is counted. The column product is `gemv`'s, character
+// for character, and lands in `h` bit for bit as `gemv` then `add` would.
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm(
+    const unsigned char* __restrict__ w, int w_quant, int q_ts,
+    const signed char* __restrict__ qa, int asc_off,
+    int k, int n,
+    float* h,
+    const float* __restrict__ weight, float eps,
+    float* __restrict__ x,
+    signed char* __restrict__ xq, int xasc_off,
+    float* __restrict__ part, unsigned* __restrict__ ctr)
 {
-    attn_decode_impl<64, false>(q, (const unsigned*)kc, (const unsigned*)vc, out,
-                                part, ctr, tk, group, cap, scale, scale_q, chunks);
+    constexpr int T = GEMV_WARPS * 32;
+    __shared__ float red[GEMV_WARPS];
+    __shared__ float tree[T];
+    __shared__ int last;
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int col = blockIdx.x * GEMV_WARPS + warp;
+    const int nb = k >> 8;
+    const float* asc = (const float*)(qa + asc_off);
+
+    // The residual element this warp will add to, fetched before the
+    // contraction so its round trip hides under the weight stream rather
+    // than following the reduction.
+    const float h0 = (lane == 0 && col < n) ? h[col] : 0.0f;
+    float acc = 0.0f;
+    if (col < n) {
+        const unsigned char* wc = w + (size_t)col * nb * (size_t)q_ts;
+        const int sub = lane >> 3, slot = lane & 7;
+        if (w_quant == QT_Q4_K) {
+            const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
+            const int q0 = jlo >> 5;
+            for (int b = 0; b < nb; b += 4) {
+                if (b + sub < nb) {
+                    acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                    qa, asc, slot, jlo, q0, ((b + sub) << 8) + jlo);
+                }
+            }
+        } else {
+            const int pp = slot >> 1, hh = slot & 1;
+            const int qlo = (pp << 5) + (hh << 4);
+            const int qho = 128 + (pp << 4) + (hh << 3);
+            const int sc_lo = (pp << 2) + hh;
+            const int jlo = (pp << 6) + (hh << 4);
+            for (int b = 0; b < nb; b += 4) {
+                if (b + sub < nb) {
+                    acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                    qa, asc, qlo, qho, sc_lo,
+                                    ((b + sub) << 8) + jlo);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    // The residual add, and this column's share of the sum of squares.
+    float sq = 0.0f;
+    if (lane == 0 && col < n) {
+        const float s = h0 + acc;
+        h[col] = s;
+        sq = s * s;
+    }
+    if (lane == 0) {
+        red[warp] = sq;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GEMV_WARPS; ++i) {
+            s += red[i];
+        }
+        part[blockIdx.x] = s;
+        __threadfence();
+        last = (atomicAdd(ctr, 1u) == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // Thread `t` owns partials `t, t + T, ...` and the tree over the threads
+    // is fixed, so the total does not depend on which block arrived last.
+    // Every load below is issued before anything waits on one: this block
+    // runs alone at the end of the launch, so its critical path is the
+    // launch's tail, and a loop of dependent round trips here measured as
+    // ten microseconds a launch - more than the kernel it replaced.
+    float s = 0.0f;
+    {
+        constexpr int PL = 4;
+        for (int i0 = tid; i0 < (int)gridDim.x; i0 += PL * T) {
+            float pv[PL];
+            #pragma unroll
+            for (int e = 0; e < PL; ++e) {
+                const int i = i0 + e * T;
+                pv[e] = (i < (int)gridDim.x) ? ld_cg(part + i) : 0.0f;
+            }
+            #pragma unroll
+            for (int e = 0; e < PL; ++e) {
+                s += pv[e];
+            }
+        }
+    }
+    tree[tid] = s;
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tree[tid] += tree[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(tree[0] / (float)n + eps);
+
+    // The normalised row and its int8 twin, four columns a thread so that a
+    // scale group of 32 is eight lanes and three shuffles - `rms_norm`'s
+    // mapping - and `NL` groups of four a thread loaded before any is used.
+    // `n` is a multiple of 32, so a group never straddles a warp.
+    float* xasc = (float*)(xq + xasc_off);
+    const int n4 = n >> 2;
+    constexpr int NL = 4;
+    for (int i0 = tid; i0 < n4; i0 += NL * T) {
+        float4 hv[NL], wv[NL];
+        #pragma unroll
+        for (int e = 0; e < NL; ++e) {
+            const int i = i0 + e * T;
+            if (i < n4) {
+                hv[e] = ld_cg4(h + (i << 2));
+                wv[e] = *((const float4*)weight + i);
+            }
+        }
+        #pragma unroll
+        for (int e = 0; e < NL; ++e) {
+            const int i = i0 + e * T;
+            float4 y = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (i < n4) {
+                y.x = hv[e].x * scale * wv[e].x;
+                y.y = hv[e].y * scale * wv[e].y;
+                y.z = hv[e].z * scale * wv[e].z;
+                y.w = hv[e].w * scale * wv[e].w;
+                *((float4*)x + i) = y;
+            }
+            float mx = fmaxf(fmaxf(fabsf(y.x), fabsf(y.y)), fmaxf(fabsf(y.z), fabsf(y.w)));
+            #pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            }
+            const float d = mx * (1.0f / 127.0f);
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            if (i < n4) {
+                char4 c;
+                c.x = (signed char)__float2int_rn(y.x * inv);
+                c.y = (signed char)__float2int_rn(y.y * inv);
+                c.z = (signed char)__float2int_rn(y.z * inv);
+                c.w = (signed char)__float2int_rn(y.w * inv);
+                *(char4*)(xq + (i << 2)) = c;
+                if ((lane & 7) == 0) {
+                    xasc[i >> 3] = d;
+                }
+            }
+        }
+    }
+    if (tid == 0) {
+        *ctr = 0u;
+    }
 }
 
 // Gathers rows of a block-quantized embedding table, unpacking as it goes.

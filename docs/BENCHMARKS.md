@@ -1534,6 +1534,90 @@ equality against the CPU dequantizer. This is residency and not speed: one row
 of a few kilobytes a token is not where a step's time goes, and the timing
 tables above were measured with it in place.
 
+## A decode step in 243 launches, not 469
+
+The round after the fused attention was about launch count, and the rule it
+ran on was the one the sibling engine's session had already measured and
+said out loud: at one token, any kernel under about ten microseconds is
+mostly its own floor, and the floor is paid per grid, not per body. So a
+seam in `blockIdx` that puts two bodies under one grid is free and bit for
+bit the same, and anything that adds work to a body is not. Every fold below
+that removed a grid paid; the one that added a tail to a body came out level
+on kernel time and paid only in the launches it removed.
+
+`nsys` on the chat model's decode step at a 1024-token context, sixteen
+steps averaged, before this round and after it:
+
+| | launches a step | kernel time | gaps between launches | span |
+| --- | ---: | ---: | ---: | ---: |
+| before | 469 | 9 669 us | 411 us | 10 080 us |
+| after | 243 | 9 384 us | 240 us | 9 624 us |
+
+What the 226 launches were, and what took each:
+
+- **Four to one after the projections.** `rope` on q, `rope` on k, the key
+  append and the value append were four launches of a few kilobytes each;
+  `rope_cache_f16` is the four under one grid, and the rotated key goes
+  straight to the cache. Bit for bit the chain's output.
+- **The normalisation into the tail of the projection before it.** The
+  attention output and the MLP down are each followed by a norm that reads
+  the row they wrote plus the residual stream; `gemv_norm` does the add,
+  publishes a partial sum of squares a block, and the last block to arrive
+  sums the partials in a fixed order and normalises the row with its int8
+  twin. The first tail walked the row a scalar at a time behind L2 loads and
+  cost ten microseconds a launch - more than the kernel it replaced;
+  widened to four columns a thread with the loads issued ahead, it costs
+  about three over the plain mat-vec, which is what the norm kernel cost on
+  its own. So the kernel time is level and the two launches and their gaps
+  are the gain. The reduction is deterministic on purpose: an atomic float
+  sum would have made every step's arithmetic a function of scheduling.
+- **The attention writes its own twin.** The output projection used to spend
+  a launch quantising the context on its way in; the decode attention now
+  takes `quantize_q8`'s five shuffles over the row it has in registers. The
+  attention kernel is 1.4 us longer for it and the launch is gone.
+- **q, k and v under one grid.** The chat model's k and v were two launches
+  of 128 blocks each at about 430 GB/s; with the three projections held as
+  one `[6144, 4096]` stack they are one launch of 768 blocks at 26.7 us
+  against 19.0 + 11.1 apart. Where `attn_v` is `Q6_K` the stack is `[q; k]`
+  and v stays its own launch. A prompt still runs them one at a time, from
+  each projection's first row, because its rows have to come out `[n, out]`.
+- **The chunk width by context.** `attn_decode`'s 64-key chunk was the right
+  width in the middle of the range and the wrong one at both ends; the
+  kernel is now instantiated at 32, 64 and 128 and the launcher picks by the
+  context. `docs/KERNELS.md` has the sweep. About 1% of a step at each end.
+
+End to end, nine-round medians, both binaries alternated in one sitting with
+the box quiet, decode in ms a token:
+
+| stage | context | before | after | |
+| --- | ---: | ---: | ---: | ---: |
+| chat | 128 | 9.67 | **9.20** | -4.9% |
+| chat | 1024 | 10.24 | **9.64** | -5.9% |
+| chat | 2048 | 10.83 | **10.07** | -7.0% |
+| translator | 128 | 15.93 | **15.34** | -3.7% |
+| translator | 1024 | 17.77 | **17.20** | -3.2% |
+
+Prefill did not move on any row - 49.3 against 49.8 ms at 128 tokens, 332
+against 335 at 1024, 705 against 707 at 2048 on the chat model, 89.3 against
+89.0 and 617 against 619 on the translator - because none of this touches a
+prompt: a prompt takes the tiled kernels, and the folds are all at one row.
+The context slope on the chat model is 0.46 ms per 1024 tokens now, from
+0.62. The ASR's decode loop is 69.2 ms against the same baseline's 73.7 on
+the 2.93 s clip, which is the previous round's figure again: nothing in this
+round touches it.
+
+The llama.cpp columns were **not** re-measured in this sitting, so the
+"level or ahead on every row" table above stands as it was and this round's
+decode figures are against this engine's own previous binary only.
+
+What is left of the step at 1024, from the same profile: the mat-vecs are
+8 436 us of the 9 384 - 3 635 in gate/up at 585 GB/s, 3 245 in the two
+norm-fused projections, 762 in the head, 794 in q/k/v at 528 GB/s - the
+attention 635, and everything else under 200. The weight stream is 4.92 GB
+in about 8.4 ms, which is 585 GB/s against the card's 672, and the next
+lever there is the 4096-wide projections' launch floor, not any kernel's
+body.
+
 ## Decode at a context length worth having
 
 Every decode figure above was taken at a 128-token prompt, and that is the

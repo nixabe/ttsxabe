@@ -43,9 +43,11 @@ exists.
 | split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
 | KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
 | fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
-| single-row decode attention | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test) | `attn_decode_h128`, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
+| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
 | packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
 | mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
+| rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
+| mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `xabe_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `xabe-cuda` quant |
 
 ## Also implemented
 
@@ -1120,6 +1122,56 @@ chunks and an odd tail - the odd tail being the case where a packed value row's
 last word holds a position the softmax must have zeroed - and runs each twice
 through one scratch, because a counter left dirty merges too early or never.
 
+### The chunk width is chosen by the context
+
+The kernel is a template on the chunk width as well as the head width, and
+`Gpu::attn_decode_f16` picks 32, 64 or 128 keys a block by the context it is
+given. No single width wins, and `bench-attn` (thirty-two layers of one
+step, ms) says where each does:
+
+| shape | context | 32 keys | 64 keys | 128 keys |
+| --- | ---: | ---: | ---: | ---: |
+| chat, 32 heads over 8 | 128 | **0.337** | 0.425 | 0.456 |
+| chat | 256 | **0.370** | 0.416 | 0.589 |
+| chat | 512 | 0.505 | **0.444** | 0.596 |
+| chat | 1024 | 0.778 | **0.597** | 0.632 |
+| chat | 2048 | 1.155 | 1.170 | **1.065** |
+| translator, 40 over 40 | 128 | **0.297** | 0.346 | 0.432 |
+| translator | 1024 | **1.568** | 1.599 | 1.902 |
+| whisper cross, 20 of 64 | 1500 | 0.794 | **0.756** | 0.821 |
+
+The shape of that table is the kernel's critical path. A narrow chunk means
+more blocks and less work in each, which wins while the context is short and
+the merge is over a handful of partials; a wide chunk means fewer partials
+for the last block to merge, which wins once that merge - a pass over every
+chunk's context, alone, at the end - is what the launch waits on. A model
+without query groups has less work a block at every width, so it stays on
+the narrow chunk throughout. The rule in the launcher is those three lines:
+32 below 256 positions or when `heads == kv_heads`, 128 from 2048 up, 64
+between, and only at head width 128 - the 64-wide instantiations stay at 64,
+which is where the Whisper decoder measured best. What that is worth end to
+end is about 1% of a chat step at each end of the context range and nothing
+in the middle; `docs/BENCHMARKS.md` has it.
+
+The first sweep of this was run with a softmax that assumed 64 keys - two
+scores a lane, hard-coded - and the 32- and 128-key rows were wrong in the
+kernel's output while being about right in its timing. The differential test
+caught it at one key, where the second score a lane read the next group's
+row. The softmax now takes `CH / 32` scores a lane and the test drives every
+width the launcher can choose.
+
+### The context's twin
+
+`attn_decode_f16_q` writes the context's int8 twin in the same pass. The `HD`
+threads of a block own `HD` consecutive elements of one head's row, so a warp
+is exactly one scale group of 32 and the group maximum is five shuffles over
+a value the thread has just computed - `quantize_q8`'s arithmetic, on a row
+that never leaves the register it was produced in. That is the launch the
+output projection used to spend quantising the context on its way in, and
+the test holds the twin at exact equality with `quantize_q8` run over the
+same output, because a maximum associates exactly and there is no rounding to
+allow for.
+
 ## The mat-vec's epilogue, `gemv_into`
 
 A decode step's projections used to be followed by launches that did nothing
@@ -1182,6 +1234,84 @@ a few thousand elements, so the per-element header decode costs nothing that
 can be measured and buys every block format at once. The numbers are the same
 as before to the bit: the blocks decode to exactly the f32 that used to be
 uploaded, and the test says so against the container crate's own decoder.
+
+## One launch after the projections, `rope_cache_f16`
+
+At one decoded position, what stands between the attention projections and
+the attention is the query rotated in place, the key rotated and stored, and
+the value stored. That was four launches a layer - `rope` twice,
+`cache_append_f16` and its transpose - each moving a few kilobytes, so each
+costing what a launch costs and nothing else. `rope_cache_f16` is the four in
+one grid: the first `heads * hd / 2` threads rotate query pairs, the next
+`kv_heads * hd / 2` rotate key pairs and write them to the cache as f16, the
+last `kv_heads * hd` convert and scatter the value. The arithmetic is the four
+kernels' character for character - the same `powf` and `sincosf`, the same
+pairing of `j` with `j + half`, the same `f32_to_f16` - and the test holds
+the caches and the query at exact equality with the chain, with both caches
+pre-filled so a write at the wrong position is a difference and not a
+coincidence.
+
+The rotated key is never written back to the projection buffer, because at
+one row nothing reads it from there: the attention reads the cache. The
+three inputs are named as (buffer, offset) pairs into the projections' output
+buffers rather than as three slices, because the translator issues q, k and v
+as one batched product and they are then three offsets into one allocation -
+which a `&mut` and a `&` could not both name.
+
+## The mat-vec with the normalisation in its tail, `gemv_norm`
+
+The two projections that close a sub-layer - the attention output and the
+MLP's down - are each followed at one row by a normalisation that reads the
+row they wrote plus the residual stream and writes the row the next
+projections read plus its int8 twin. Two more launches a layer, under four
+microseconds each and each mostly its own floor. `gemv_norm` is the packed
+K-quant mat-vec with that tail in it: every block adds its columns into `h`
+and publishes the sum of their squares; the last block to arrive sums the
+partials and normalises the whole row.
+
+Two things about that tail were measured rather than assumed. The reduction
+is deterministic: partials go to a slot a block, the last block reads them
+in a fixed order and reduces through a fixed tree, so the scale does not
+depend on which block arrived last - an atomic float sum would have made
+every decode step's arithmetic a function of scheduling. And the tail is on
+the launch's critical path, because the last block runs it alone: the first
+version walked the row a scalar at a time behind `ld.global.cg` loads and
+cost ten microseconds a launch, more than the kernel it replaced. It now
+loads four columns a thread with every load issued before any is used, which
+is `rms_norm`'s mapping, and the residual element each warp adds to is
+fetched before the contraction so its round trip hides under the weight
+stream. What is left is about three microseconds a launch over the plain
+mat-vec, which is the tail's own latency and the launch it removes; the
+kernel time of a chat step is level with the chain's and the launch count is
+what fell.
+
+The column product is `gemv`'s and lands in `h` bit for bit as `gemv` then an
+add would; the test holds `h` at exact equality against exactly that, and
+the normalised row and its twin against the CPU twin at the tolerance
+`rms_norm` is held to, with a code allowed to differ by one where a value
+sits an ulp from a rounding boundary. Only the shape the Llama stages decode
+with is covered - a `Q4_K` or `Q6_K` weight, one quantized activation row, a
+contraction that is whole super-blocks - and the wrapper refuses the rest by
+name rather than routing it to the chain, so a caller that asked for one
+launch and did not get it hears why.
+
+## A weight read from a row, `gemm_batched_from`
+
+Not a kernel: the same kernels, handed the weight from row `w_first` of its
+allocation. What it is for is stacking. The chat model's q, k and v have one
+width and, in most layers, one block format, so they are held as one
+`[4096 + 1024 + 1024, 4096]` allocation - `[q; k]` and `[v]` where `attn_v`
+is the `Q6_K` odd one out - and a decode step projects the whole stack in one
+launch of 768 blocks where k and v used to be two launches of 128, each at
+about 430 GB/s against the 585 a launch this card fills reaches. A prompt
+cannot take that product, because its rows have to come out `[n, out]` a
+projection and a `[n, 6144]` output is the wrong shape for everything
+downstream; so a prompt runs the members one at a time, each from its first
+row. The offset counts rows, which is whole blocks for a packed weight and
+whole elements otherwise, and the wrapper checks that the rows asked for are
+there. The test holds a product from an offset at exact equality with the
+product of the rows copied out from there, on the mat-vec, the f16 tile and
+the integer tile.
 
 ## `silu_mul_pair`, and why a launch is the unit that matters
 

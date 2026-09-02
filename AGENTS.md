@@ -202,11 +202,23 @@ grouped-query attention and it is in `docs/BENCHMARKS.md`.
 
 A fourth caution has since been added: every decode figure in that table is
 taken at a 128-token prompt, and decode is **context-sensitive** - it costs
-0.42 ms more per 1024 tokens of context, because the KV cache is re-read in
-full for every token. A conversation carries a system prompt and a history, so
-the row a listener actually waits on is the 1024- or 2048-token one.
+about 0.46 ms more per 1024 tokens of context, because the KV cache is re-read
+in full for every token. A conversation carries a system prompt and a history,
+so the row a listener actually waits on is the 1024- or 2048-token one.
 Those numbers and every other comparison belong in `docs/BENCHMARKS.md` and
 nowhere else.
+
+The decode step has since had a round on launch count alone, and the rule it
+ran on is worth carrying: at one token any kernel under about ten
+microseconds is mostly its own floor, the floor is paid per grid, and a seam
+that puts two bodies under one grid is free while anything that adds work to
+a body is not. A chat step at 1024 context is 243 launches now, from 469 -
+the rotation and both cache writes as one kernel, the rms norm in the tail
+of the projection before it with a fixed-order last-block reduction, the
+attention writing its own int8 twin, q/k/v projected as one stacked
+allocation - and that is 5.9% off the step at 1024 and 7.0% at 2048, against
+this engine's own previous binary and not re-measured against llama.cpp.
+`docs/BENCHMARKS.md` has the round under "A decode step in 243 launches".
 
 One correctness note that is easy to get backwards. The chat model was recorded
 as disagreeing with llama-server at 10 of 105 teacher-forced decisions. **The

@@ -28,6 +28,19 @@ pub enum CudaError {
     /// that division cross into the previous row's last block: in bounds, and
     /// wrong. GGUF guarantees the fastest-varying dimension is a whole number
     /// of blocks, and this refuses the shape rather than trusting it.
+    /// A norm-fused mat-vec asked for on operands it does not cover.
+    ///
+    /// `Gpu::gemv_norm` is the two K-quant mat-vec paths with a tail, and
+    /// nothing else: an unpacked weight, another block format or an
+    /// activation that is not one quantized row would need a path that is
+    /// not there. Refused by name rather than routed to the plain chain, so
+    /// a caller that expected one launch and got three hears why.
+    #[error("the norm-fused mat-vec was handed {what}")]
+    NormFusion {
+        /// What was handed over.
+        what: &'static str,
+    },
+
     #[error("contraction length {k} is not a multiple of the {block}-element block")]
     RaggedBlock {
         /// The length asked for.
@@ -109,6 +122,20 @@ pub enum CudaError {
     OddCacheCapacity {
         /// Positions the buffer has room for.
         cap: usize,
+    },
+
+    /// A rotary head whose width is odd.
+    ///
+    /// RoPE pairs dimension `j` with `j + head_dim / 2`, so an odd width has
+    /// one dimension with no partner. The kernel would rotate the first
+    /// `head_dim / 2` pairs and leave the last dimension of every head
+    /// untouched, which is a model that is nearly right - the failure this
+    /// workspace exists to refuse. No checkpoint here has one; the check is
+    /// what makes that a fact rather than an assumption.
+    #[error("a rotary head of odd width {head_dim}")]
+    OddHeadDim {
+        /// The head width asked for.
+        head_dim: usize,
     },
 
     /// A row stride asked for on an operand that has no rows to stride.

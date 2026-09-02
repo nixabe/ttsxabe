@@ -373,6 +373,18 @@ llama.cpp makes, and the number is here so that it is not assumed to be small.
 tokens one at a time - both this engine, no oracle - fork on 5 of 179 argmaxes.
 A greedy comparison of an 8 B model is measuring chaos alongside correctness.
 
+The translator has the same thing in a smaller test, and it is currently
+red. `tests/gguf_source.rs::translations_from_the_gguf_match_the_captured_ones`
+holds three greedy translations from the packed checkpoint at string equality
+with captures, and one of them now reads `chiâⁿ hó` where the capture has
+`chin hó` - a synonym for "very", flipped at a margin. It fails identically at
+the commit before the decode-attention round and after every round since, so
+none of those rounds moved it; whether it passed before the int8 activation
+landed was not checked, and that is the likely cause given the table above.
+It is recorded here rather than loosened: the fix is a capture taken from the
+path the engine actually runs, or an assertion that measures the margin, and
+either is a decision about what the test is for.
+
 ### Where that disagreement lives, and where it does not
 
 This is the analysis that was done while the **10 of 105 teacher-forced
