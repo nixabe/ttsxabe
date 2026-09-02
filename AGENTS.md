@@ -146,7 +146,15 @@ agrees with the f32 build at every teacher-forced position. Its residency
 is 2 157 MiB from 3 469, and the second number is a trap worth knowing:
 the memory pool keeps its pages, so a loader that uploads f32 and converts
 on the card leaves the f32 peak in what `nvidia-smi` reports - convert on
-the host. This paragraph
+the host. The flow then had a second round with no kernel in it: both
+classifier-free rows through the DiT as one 600-row activation, q, k
+and v one stacked product, the attention the Whisper encoder's fused
+kernel - 409 ms to 276, **1.48x**, oracle tests unchanged. And the
+speech LLM's sampler was found sorting the whole 6761-way head for the
+first 25 of it, 198 µs a token on the host, a tenth of the step: a
+partial selection under the same comparator is the same draw to the
+bit, and the step is 2.61 to 2.49 ms a token for it. The utterance is
+832 ms to 675 across those rounds, 7.8x realtime. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

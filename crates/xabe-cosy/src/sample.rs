@@ -80,11 +80,15 @@ fn draw(probs: &[(u32, f32)], rng: &mut Rng) -> u32 {
     probs.last().map_or(0, |&(id, _)| id)
 }
 
-/// Softmax over log-probabilities, returned sorted by descending probability.
-///
-/// Ties break by id so that a seed means one thing. Left to the sort's own
+/// The order the candidates are drawn in: descending probability, and ties
+/// by ascending id so that a seed means one thing. Left to the sort's own
 /// order, two runs with the same seed could draw differently.
-fn sorted_probs(logits: &[f32]) -> Vec<(u32, f32)> {
+fn by_prob(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+}
+
+/// Softmax over log-probabilities, unordered.
+fn probs(logits: &[f32]) -> Vec<(u32, f32)> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut p: Vec<(u32, f32)> = logits
         .iter()
@@ -95,7 +99,32 @@ fn sorted_probs(logits: &[f32]) -> Vec<(u32, f32)> {
     for x in &mut p {
         x.1 /= sum;
     }
-    p.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    p
+}
+
+/// [`probs`] sorted whole, in [`by_prob`] order.
+fn sorted_probs(logits: &[f32]) -> Vec<(u32, f32)> {
+    let mut p = probs(logits);
+    p.sort_unstable_by(by_prob);
+    p
+}
+
+/// The first `k` of [`sorted_probs`] - the same candidates in the same order
+/// - without sorting the rest.
+///
+/// The nucleus never reads past `top_k`, and sorting a 6761-way head to
+/// take 25 of it was 198 microseconds a token on the host, three times what
+/// the selection costs and a tenth of the decode step. A partial selection
+/// under the same comparator, with the prefix then sorted, is exactly the
+/// full sort's prefix: the draw is bit for bit what it was.
+fn top_probs(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut p = probs(logits);
+    let k = k.min(p.len());
+    if k > 0 && k < p.len() {
+        p.select_nth_unstable_by(k - 1, by_prob);
+        p.truncate(k);
+    }
+    p.sort_unstable_by(by_prob);
     p
 }
 
@@ -123,8 +152,10 @@ pub fn nucleus(sorted: &[(u32, f32)], top_p: f32, top_k: usize) -> Vec<(u32, f32
 /// `recent` is the tail of what has already been produced; only the last
 /// `win_size` of it is looked at.
 pub fn ras_sample(logits: &[f32], recent: &[u32], cfg: &RasConfig, rng: &mut Rng) -> u32 {
-    let sorted = sorted_probs(logits);
-    let top = draw(&nucleus(&sorted, cfg.top_p, cfg.top_k), rng);
+    let top = draw(
+        &nucleus(&top_probs(logits, cfg.top_k), cfg.top_p, cfg.top_k),
+        rng,
+    );
 
     let window = &recent[recent.len().saturating_sub(cfg.win_size)..];
     let repeats = window.iter().filter(|&&t| t == top).count();
@@ -140,7 +171,11 @@ pub fn ras_sample(logits: &[f32], recent: &[u32], cfg: &RasConfig, rng: &mut Rng
     // Rejected. The redraw is over the **whole** distribution, not the
     // nucleus - upstream's `random_sampling` ignores `top_p` and `top_k`
     // entirely, which is what lets it escape a mode the nucleus is stuck in.
-    let rest: Vec<(u32, f32)> = sorted.into_iter().filter(|&(id, _)| id != top).collect();
+    // Only this path sorts the whole head, and a rejection is rare.
+    let rest: Vec<(u32, f32)> = sorted_probs(logits)
+        .into_iter()
+        .filter(|&(id, _)| id != top)
+        .collect();
     draw(&rest, rng)
 }
 
@@ -198,6 +233,26 @@ mod tests {
         recent.extend(std::iter::repeat_n(1u32, cfg.win_size));
         let mut rng = Rng::new(1);
         assert_eq!(ras_sample(&l, &recent, &cfg, &mut rng), 0);
+    }
+
+    #[test]
+    fn the_selected_prefix_is_the_full_sort_s_prefix() {
+        // A head of the real width with many exact ties, which is where a
+        // selection and a sort could legitimately disagree on order.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let logits: Vec<f32> = (0..6761)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) % 64) as f32 * 0.25
+            })
+            .collect();
+        for k in [1, 25, 300] {
+            let want = &sorted_probs(&logits)[..k];
+            assert_eq!(top_probs(&logits, k), want, "k = {k}");
+        }
+        assert_eq!(top_probs(&logits, 10_000), sorted_probs(&logits));
     }
 
     #[test]

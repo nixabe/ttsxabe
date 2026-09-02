@@ -3137,6 +3137,42 @@ This change was written by the earlier process of this session, which
 was still running after the conversation was resumed; it was tested,
 measured and committed by the later one.
 
+### The speech LLM's sampler was a tenth of the step
+
+A decode step of the speech LLM was 273 launches and 2.87 ms on the
+trace, 2.31 of them the card busy, and the largest single gap was on the
+host: 270 µs between the logits coming down and the next token's
+embedding going up. The sampler was sorting the whole 6761-way head to
+take the first 25 of it - measured alone at 198 µs a token - because
+upstream's `ras_sampling` reads the nucleus off a full sort. A partial
+selection under the same comparator, with the prefix then sorted, is
+exactly the full sort's prefix, 46 µs, and the draw is bit for bit what
+it was: the token sequence of the utterance below is identical between
+the two builds, hash and all. The full sort remains on the rejection
+path, which redraws over the whole distribution and is rare. Two
+launches a token went with it: the logits row was copied out before it
+was downloaded, and the residual copy was zeroed before it was written.
+
+Same sitting as the flow's table above, the stages example's warm
+runs and, for the step itself, a harness that runs only `speech_tokens`
+nine times a process, two alternated pairs, worst median on each side:
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| speech LLM step, harness median | 2.61 ms/token | 2.49 ms/token | 1.05x |
+| speech LLM stage, 131 tokens | 342 ms | 324 ms | 1.06x |
+| utterance, 5.24 s of audio, all stages | 832 ms | 675 ms | 1.23x |
+
+The utterance row carries the flow's round and the tiled convolution's
+as well as this one; the step row is this change alone.
+
+What is left in the step is the card: eleven launches a layer at one
+token, four of them the two closing projections' residual adds and
+normalisations, and a decode attention at 18 µs over 131 positions that
+is mostly its own floor. The chat model folds those four into the
+projections' tails with `gemv_norm`, which exists only for packed
+weights; the f16 twin is the next round.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

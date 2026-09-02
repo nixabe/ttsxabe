@@ -409,7 +409,9 @@ impl SpeechLlm {
         }
         let cap = cache.cap;
 
-        let mut h = self.gpu.zeros(n * h_dim)?;
+        // The residual stream, a copy of the input because it is added to
+        // in place. SAFETY: `copy_into` writes all `n * h_dim` of it.
+        let mut h = unsafe { self.gpu.uninit(n * h_dim) }?;
         self.gpu.copy_into(&mut h, x, 0, n * h_dim)?;
 
         for (i, l) in self.layers.iter().enumerate() {

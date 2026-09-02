@@ -183,11 +183,18 @@ impl Cosy {
         let mut out: Vec<u32> = Vec::new();
 
         for i in 0..max_len {
-            let row = self
-                .llm
-                .gpu()
-                .copy_range(&logits, (at - 1) * vocab, vocab)?;
-            let mut row = self.llm.gpu().download(&row)?;
+            // The last row of the logits. After the prompt there is only
+            // ever one, and it is downloaded where it lies rather than
+            // through a copy - two launches a token for nothing.
+            let mut row = if at == 1 {
+                self.llm.gpu().download(&logits)?
+            } else {
+                let row = self
+                    .llm
+                    .gpu()
+                    .copy_range(&logits, (at - 1) * vocab, vocab)?;
+                self.llm.gpu().download(&row)?
+            };
 
             // Below the floor the end token is *masked*, not penalised: the
             // model is not allowed to stop, and the mask lifts the moment the
