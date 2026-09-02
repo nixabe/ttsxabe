@@ -1404,7 +1404,8 @@ impl Translator {
     /// Translates one sentence into `target`.
     ///
     /// `target` is the model card's language code: `ZH`, `EN`, `POJ`, `HL` or
-    /// `HAN`. The answer is cut at the stop strings; see [`Self::STOPS`].
+    /// `HAN`. The answer is cut at the first of the two stop strings `[/`
+    /// and a newline followed by `[`, which are `gateway.py`'s.
     pub fn translate(
         &self,
         source: &str,

@@ -10,7 +10,7 @@
 //! A **state dict** needs none of it. It is a mapping of strings to tensors,
 //! and the only three things its stream ever names are `collections.OrderedDict`,
 //! `torch._utils._rebuild_tensor_v2` and a storage class. This machine
-//! implements those three and refuses every other [`Opcode::Global`] by name,
+//! implements those three and refuses every other [`Value::Global`] by name,
 //! so a checkpoint that would need real code execution fails with a sentence
 //! instead of being half-read.
 //!
