@@ -33,4 +33,35 @@ pub enum TranslateError {
         /// The last one that exists.
         max: usize,
     },
+
+    /// A batched step was given more rows than the multi-row mat-vec carries.
+    ///
+    /// The kernel shares one weight stream across a fixed few rows, and a
+    /// larger batch would have to be split rather than run wrong.
+    #[error("{rows} rows in one decode step, and the mat-vec carries {max}")]
+    TooManyRows {
+        /// Rows asked for.
+        rows: usize,
+        /// The most a step takes.
+        max: usize,
+    },
+
+    /// A batched step was given a token count and a cache count that differ.
+    #[error("{ids} tokens for {caches} caches in one decode step")]
+    RowsMismatch {
+        /// Tokens given, one a row.
+        ids: usize,
+        /// Caches given, one a row.
+        caches: usize,
+    },
+
+    /// A batched step was given a cache nothing has been run through.
+    ///
+    /// A decode row extends a sequence; the prompt that starts it takes the
+    /// single-sequence path, which is where the cache's buffers are made.
+    #[error("row {row} of a decode step has an empty cache; run its prompt first")]
+    NotPrefilled {
+        /// Which row.
+        row: usize,
+    },
 }

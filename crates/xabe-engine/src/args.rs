@@ -240,6 +240,15 @@ pub struct Args {
     #[arg(long, env = "XABE_MIN_CHUNK", default_value_t = 6)]
     pub min_chunk: usize,
 
+    /// Whether later clauses are translated while an earlier one is still
+    /// being spoken: `0` translates them one at a time, in step with the
+    /// synthesiser; `1` hands every clause to the translator as it arrives,
+    /// and the translator decodes them together. Chosen by device when not
+    /// given - ahead when the translator and the synthesiser are on different
+    /// cards - which is the measured default; see docs/BENCHMARKS.md.
+    #[arg(long, env = "XABE_TRANSLATE_AHEAD", value_name = "0|1")]
+    pub translate_ahead: Option<usize>,
+
     /// Minimum characters before the first chunk is synthesised.
     ///
     /// Lower than --min-chunk on purpose: getting the voice started is worth

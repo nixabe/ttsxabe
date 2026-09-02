@@ -473,17 +473,25 @@ struct Ready {
     _permit: OwnedSemaphorePermit,
 }
 
-/// Drains the chunk queue, translating up to `ahead` chunks before the one
-/// being spoken.
+/// Clauses a turn may have in translation at once when `ahead` is not zero.
+/// A reply is a handful of clauses; this is a bound on a queue, not a policy.
+const MAX_AHEAD: usize = 64;
+
+/// Drains the chunk queue, translating chunks ahead of the one being spoken
+/// when `ahead` allows it.
 ///
 /// Two stages rather than one, because translation and synthesis are different
-/// models: given different cards, chunk N+1 can be translated while chunk N is
-/// still becoming a waveform, and translation is four times the cost of
-/// synthesis so the overlap hides all of the latter after the first chunk.
+/// models: chunk N+1 can be translated while chunk N is still becoming a
+/// waveform, and translation is four times the cost of synthesis so the
+/// overlap hides all of the latter after the first chunk. With `ahead` not
+/// zero, every chunk after a turn's first is handed to the translator as it
+/// is cut, and a local translator decodes them together over one weight
+/// stream; the first is translated alone, because it is what the listener is
+/// waiting through and a clause decoding beside it slows its every step.
 ///
-/// `ahead` of zero runs them one after the other, which is what sharing a card
-/// wants - see [`crate::config::GatewayConfig::translate_ahead`], which is the
-/// measurement for why.
+/// `ahead` of zero runs the stages one after the other - see
+/// [`crate::config::GatewayConfig::translate_ahead`] for the measurements
+/// either way.
 ///
 /// Synthesis stays a single ordered consumer either way. Audio has to reach the
 /// browser in the order it will be played, and a second synthesiser would
@@ -496,56 +504,104 @@ async fn synthesis_worker(
     mut jobs: mpsc::Receiver<String>,
     audio: mpsc::Sender<TtsChunk>,
 ) -> Result<(), ServeError> {
+    // `ahead` of zero keeps the stages in step: one permit, taken before a
+    // clause is translated and held until it has been spoken. Anything else
+    // hands every clause to the translator the moment it arrives - the local
+    // translator decodes them together over one weight stream, and a remote
+    // one takes them as it likes - so the permits are as good as unbounded
+    // and only the order is kept, by a queue of one slot a clause.
+    let in_flight = Arc::new(Semaphore::new(if ahead == 0 { 1 } else { MAX_AHEAD }));
     let (ready_tx, mut ready) = mpsc::channel::<Ready>(ahead + 1);
-    let in_flight = Arc::new(Semaphore::new(ahead + 1));
-    let permits = in_flight.clone();
-    let translating = tokio::spawn(async move {
-        while let Some(chunk) = jobs.recv().await {
-            // Taken before the work, not before the send, so that with `ahead`
-            // at zero nothing is translated until the previous clause has
-            // finished being spoken.
-            let Ok(permit) = permits.clone().acquire_owned().await else {
-                break;
-            };
-            // Timed per chunk because the two stages are bound by different
-            // things and only measurement says which one a listener is waiting
-            // on. Reported once per chunk at info, by the stage below.
-            let queued = Instant::now();
-            let chars = chunk.chars().count();
-            // A translator in front of the synthesiser is optional. With
-            // --direct-taigi the chat model has already answered in Taigi Han,
-            // and this hop is skipped entirely - measured 3.8 s -> 1.6 s.
-            let (text, taigi) = match &translator {
-                None => (chunk, String::new()),
-                Some(t) => match t.translate(&chunk, &target).await {
-                    Ok(out) if !out.is_empty() => (out.clone(), out),
-                    Ok(_) => (chunk, String::new()),
-                    Err(e) => {
-                        // Speaking the untranslated Mandarin is wrong but
-                        // audible; silence is wrong and looks like a crash.
-                        tracing::warn!(%e, "translator failed, speaking the source text");
-                        (chunk, String::new())
-                    }
-                },
-            };
-            let ready = Ready {
-                text,
-                taigi,
-                chars,
-                translate_ms: queued.elapsed().as_millis() as u64,
-                _permit: permit,
+    let (slot_tx, mut slots) = mpsc::channel::<tokio::sync::oneshot::Receiver<Ready>>(MAX_AHEAD);
+    // Translations finish in whatever order they finish; the slots hand them
+    // on in the order the clauses were cut.
+    let ordering = tokio::spawn(async move {
+        while let Some(slot) = slots.recv().await {
+            let Ok(ready) = slot.await else {
+                continue;
             };
             if ready_tx.send(ready).await.is_err() {
                 break;
             }
         }
     });
+    let permits = in_flight.clone();
+    let translating = tokio::spawn(async move {
+        // The first clause of a turn is translated on its own, and every
+        // later one is handed over the moment it arrives. A clause decoding
+        // beside the first slows the first's every step, and the first is
+        // what the listener is waiting through; the later ones share a
+        // stream among themselves and finish about when the longest of them
+        // would have alone. Measured on a three-clause turn in
+        // docs/BENCHMARKS.md, which is where the policy comes from.
+        let mut first: Option<tokio::sync::oneshot::Receiver<()>> = None;
+        let mut clauses = 0usize;
+        while let Some(chunk) = jobs.recv().await {
+            if clauses == 1
+                && let Some(gate) = first.take()
+            {
+                let _ = gate.await;
+            }
+            // Taken before the work, not before the send, so that with `ahead`
+            // at zero nothing is translated until the previous clause has
+            // finished being spoken.
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            if slot_tx.send(done_rx).await.is_err() {
+                break;
+            }
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+            if clauses == 0 {
+                first = Some(gate_rx);
+            }
+            clauses += 1;
+            let translator = translator.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                // Timed per chunk because the two stages are bound by
+                // different things and only measurement says which one a
+                // listener is waiting on. Reported once per chunk at info,
+                // by the stage below.
+                let queued = Instant::now();
+                let chars = chunk.chars().count();
+                // A translator in front of the synthesiser is optional. With
+                // --direct-taigi the chat model has already answered in Taigi
+                // Han, and this hop is skipped entirely - measured 3.8 s ->
+                // 1.6 s.
+                let (text, taigi) = match &translator {
+                    None => (chunk, String::new()),
+                    Some(t) => match t.translate(&chunk, &target).await {
+                        Ok(out) if !out.is_empty() => (out.clone(), out),
+                        Ok(_) => (chunk, String::new()),
+                        Err(e) => {
+                            // Speaking the untranslated Mandarin is wrong but
+                            // audible; silence is wrong and looks like a
+                            // crash.
+                            tracing::warn!(%e, "translator failed, speaking the source text");
+                            (chunk, String::new())
+                        }
+                    },
+                };
+                let _ = gate_tx.send(());
+                let _ = done_tx.send(Ready {
+                    text,
+                    taigi,
+                    chars,
+                    translate_ms: queued.elapsed().as_millis() as u64,
+                    _permit: permit,
+                });
+            });
+        }
+    });
 
     let result = speak_in_order(&backend, &audio, &mut ready).await;
-    // The receiver is dropped by now either way, so the stage above has been
-    // told to stop; this only waits for it to notice.
+    // The receiver is dropped by now either way, so the stages above have
+    // been told to stop; this only waits for them to notice.
     drop(ready);
     let _ = translating.await;
+    let _ = ordering.await;
     result
 }
 

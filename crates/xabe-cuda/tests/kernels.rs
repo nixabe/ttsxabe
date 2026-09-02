@@ -3115,3 +3115,130 @@ fn the_stacked_projection_places_what_three_placed_products_do() {
         "a weight that is not the whole stack must be refused"
     );
 }
+
+/// The row destination of the decode attention is the same attention: the
+/// query read from an offset, the context and its twin landing in one row
+/// of a shared buffer, the other rows untouched, bit for bit against the
+/// single-row call.
+#[test]
+fn the_decode_attention_into_a_row_is_the_decode_attention() {
+    let Some(g) = gpu() else { return };
+    let (heads, kv, hd, tk, cap) = (8usize, 8usize, 128usize, 37usize, 64usize);
+    let n = heads * hd;
+    let rows = 3usize;
+    let qs = seq(rows * n, 81);
+    let k = seq(kv * cap * hd, 82);
+    let v = seq(kv * cap * hd, 83);
+    let dq = g.upload(&qs).unwrap();
+    let dk = g.upload_f16(&k).unwrap();
+    let dv = g.upload_f16(&v).unwrap();
+    let mut scratch = xabe_cuda::DecodeScratch::new();
+    let row = 1usize;
+    let one = g.upload(&qs[row * n..(row + 1) * n]).unwrap();
+    let (want, want_q) = g
+        .attn_decode_f16_q(
+            &one,
+            &dk,
+            &dv,
+            heads,
+            kv,
+            hd,
+            tk,
+            cap,
+            0.1,
+            false,
+            &mut scratch,
+        )
+        .expect("single row");
+    let want = g.download(&want).unwrap();
+    let (wc, ws) = g.q8_parts_for_test(&want_q).unwrap();
+
+    let mut out = g.upload(&seq(rows * n, 84)).unwrap();
+    let before = g.download(&out).unwrap();
+    let mut twin = g.q8_zeros(rows, n).unwrap();
+    g.attn_decode_f16_q_row(
+        &dq,
+        row * n,
+        &dk,
+        &dv,
+        heads,
+        kv,
+        hd,
+        tk,
+        cap,
+        0.1,
+        false,
+        &mut scratch,
+        &mut out,
+        &mut twin,
+        row,
+    )
+    .expect("into a row");
+    let got = g.download(&out).unwrap();
+    assert_eq!(&got[row * n..(row + 1) * n], &want[..], "the row");
+    assert_eq!(
+        &got[..row * n],
+        &before[..row * n],
+        "the row before is untouched"
+    );
+    assert_eq!(
+        &got[(row + 1) * n..],
+        &before[(row + 1) * n..],
+        "the row after is untouched"
+    );
+    let (gc, gs) = g.q8_parts_for_test(&twin).unwrap();
+    assert_eq!(&gc[row * n..(row + 1) * n], &wc[..], "the twin's codes");
+    assert_eq!(
+        &gs[row * n / 32..(row + 1) * n / 32],
+        &ws[..],
+        "the twin's scales"
+    );
+    assert!(
+        gc[..row * n].iter().all(|&c| c == 0),
+        "the codes before are untouched"
+    );
+
+    assert!(
+        g.attn_decode_f16_q_row(
+            &dq,
+            row * n,
+            &dk,
+            &dv,
+            heads,
+            kv,
+            hd,
+            tk,
+            cap,
+            0.1,
+            false,
+            &mut scratch,
+            &mut out,
+            &mut twin,
+            rows,
+        )
+        .is_err(),
+        "a row past the buffer must be refused"
+    );
+    let mut short = g.q8_zeros(1, n).unwrap();
+    assert!(
+        g.attn_decode_f16_q_row(
+            &dq,
+            row * n,
+            &dk,
+            &dv,
+            heads,
+            kv,
+            hd,
+            tk,
+            cap,
+            0.1,
+            false,
+            &mut scratch,
+            &mut out,
+            &mut short,
+            row,
+        )
+        .is_err(),
+        "a twin with too few rows must be refused"
+    );
+}

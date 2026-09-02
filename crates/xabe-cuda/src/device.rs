@@ -561,6 +561,9 @@ const NAMES: &[&str] = &[
     "flash_attn_64",
     "gemv",
     "gemv_norm",
+    "gemv_q_rows2",
+    "gemv_q_rows3",
+    "gemv_q_rows4",
     "gemv_ln",
     "gemv_qkv_f16",
     "gemv_rows",
@@ -924,6 +927,23 @@ impl Gpu {
     ///
     /// Rejects a shape the packed mat-vec would not use anyway, rather than
     /// silently producing codes nothing reads.
+    /// An int8 twin of `rows` rows of `k`, zeroed, for a kernel that writes
+    /// it a row at a time - [`Self::attn_decode_f16_q_row`]. `k` must be a
+    /// multiple of 32, one scale a group.
+    pub fn q8_zeros(&self, rows: usize, k: usize) -> Result<Q8, CudaError> {
+        if !k.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock { k, block: 32 });
+        }
+        let buf = self
+            .stream
+            .alloc_zeros::<i8>(rows * k + rows * (k / 32) * 4)
+            .map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
+        Ok(Q8 { buf, rows, k })
+    }
+
     pub fn quantize_activation(
         &self,
         a: &CudaSlice<f32>,
@@ -1782,6 +1802,58 @@ impl Gpu {
             // walks rows 0..m inside, `out` is batch*m*n elements, and every
             // read is bounds checked against k and n.
             launched("gemv_rows", unsafe { lb.launch(cfg) })?;
+            return Ok(out);
+        }
+
+        // Several rows against a *packed* weight share its stream too. This
+        // is what several sequences decoding together come to: each row is
+        // one token of one sequence, the weight is the whole traffic, and
+        // `gemv` at `blockIdx.y` would stream it once a row. See
+        // `gemv_q_rows`, whose rows are `gemv`'s bit for bit.
+        if small && m > 1 && wide {
+            debug_assert!(m <= kernels::GEMV_Q_ROWS as usize, "gemv_q_rows is bounded");
+            let q = q8.expect("`wide` implies the activation was quantized");
+            let off = q.scale_offset() as i32;
+            let name = match m {
+                2 => "gemv_q_rows2",
+                3 => "gemv_q_rows3",
+                _ => "gemv_q_rows4",
+            };
+            let mut lb = self.stream.launch_builder(self.func(name));
+            let wq_view;
+            match w {
+                Operand::Q { data, ty } if w_first > 0 => {
+                    wq_view = data.slice(w_skip / ty.block_size() * ty.device_stride()..);
+                    lb.arg(&wq_view)
+                }
+                Operand::Q { data, .. } => lb.arg(data),
+                _ => unreachable!("`wide` implies a packed weight"),
+            };
+            lb.arg(&w_quant)
+                .arg(&q_ts)
+                .arg(&q.buf)
+                .arg(&off)
+                .arg(&a_rows);
+            match bias {
+                Some(v) => lb.arg(v),
+                None => lb.arg(&null),
+            };
+            lb.arg(&mut out)
+                .arg(&mi)
+                .arg(&ki)
+                .arg(&ni)
+                .arg(&sw)
+                .arg(&so);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (n.div_ceil(8) as u32, 1, batch.count as u32),
+                block_dim: (32, kernels::GEMV_WARPS, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the grid covers every (batch, n) once and the kernel
+            // writes rows 0..m of each column; `out` is batch*m*n elements,
+            // the codes were taken at `(q_rows, k)` above, and the weight's
+            // blocks are bounds checked against n and k.
+            launched(name, unsafe { lb.launch(cfg) })?;
             return Ok(out);
         }
 
@@ -4354,6 +4426,83 @@ impl Gpu {
         Ok((out, q8.expect("asked for the twin")))
     }
 
+    /// [`Self::attn_decode_f16_q`] for one of several sequences decoding
+    /// together: the query is read from element `q_off` of `q`, and the
+    /// context and its twin are written to row `row` of `out` and `twin`,
+    /// which are `[rows, heads * head_dim]` shared by the batch and filled a
+    /// row at a time - `twin` from [`Self::q8_zeros`]. The same kernel and
+    /// the same arithmetic as the single-row call, which is what the test
+    /// holds it to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_f16_q_row(
+        &self,
+        q: &CudaSlice<f32>,
+        q_off: usize,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+        scale: f32,
+        scale_q: bool,
+        scratch: &mut DecodeScratch,
+        out: &mut CudaSlice<f32>,
+        twin: &mut Q8,
+        row: usize,
+    ) -> Result<(), CudaError> {
+        let name = Self::attn_decode_f16_name(heads, kv_heads, head_dim, tk, cap)?;
+        let n = heads * head_dim;
+        self.attn_decode_launch(
+            name,
+            q,
+            q_off,
+            KvCache::F16(k, v),
+            heads,
+            kv_heads,
+            head_dim,
+            tk,
+            cap,
+            scale,
+            scale_q,
+            scratch,
+            out,
+            row * n,
+            Some(twin),
+        )
+    }
+
+    /// The f16 decode kernel for a shape, by head width and context.
+    fn attn_decode_f16_name(
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+    ) -> Result<&'static str, CudaError> {
+        if !cap.is_multiple_of(2) {
+            return Err(CudaError::OddCacheCapacity { cap });
+        }
+        // The chunk width by context, from the sweep in `docs/BENCHMARKS.md`:
+        // narrow chunks win while the context is short or the model has no
+        // query groups to share a head's reads, wide ones once the merge over
+        // many partials is what the last block waits on.
+        Ok(match head_dim {
+            128 if tk <= 256 || heads == kv_heads => "attn_decode_h128_c32",
+            128 if tk >= 2048 => "attn_decode_h128_c128",
+            128 => "attn_decode_h128",
+            64 => "attn_decode_h64",
+            _ => {
+                return Err(CudaError::UnsupportedAttention {
+                    head_dim,
+                    heads,
+                    kv_heads,
+                });
+            }
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attn_decode_f16_inner(
         &self,
@@ -4370,26 +4519,7 @@ impl Gpu {
         scratch: &mut DecodeScratch,
         twin: bool,
     ) -> Result<(CudaSlice<f32>, Option<Q8>), CudaError> {
-        if !cap.is_multiple_of(2) {
-            return Err(CudaError::OddCacheCapacity { cap });
-        }
-        // The chunk width by context, from the sweep in `docs/BENCHMARKS.md`:
-        // narrow chunks win while the context is short or the model has no
-        // query groups to share a head's reads, wide ones once the merge over
-        // many partials is what the last block waits on.
-        let name = match head_dim {
-            128 if tk <= 256 || heads == kv_heads => "attn_decode_h128_c32",
-            128 if tk >= 2048 => "attn_decode_h128_c128",
-            128 => "attn_decode_h128",
-            64 => "attn_decode_h64",
-            _ => {
-                return Err(CudaError::UnsupportedAttention {
-                    head_dim,
-                    heads,
-                    kv_heads,
-                });
-            }
-        };
+        let name = Self::attn_decode_f16_name(heads, kv_heads, head_dim, tk, cap)?;
         self.attn_decode_inner(
             name,
             q,
@@ -4464,6 +4594,62 @@ impl Gpu {
         scratch: &mut DecodeScratch,
         twin: bool,
     ) -> Result<(CudaSlice<f32>, Option<Q8>), CudaError> {
+        let n = heads * head_dim;
+        // SAFETY: every element is written by exactly one thread - of the only
+        // block when there is one chunk, of the merging block otherwise.
+        let mut out = unsafe { self.uninit(n) }?;
+        // SAFETY: the same thread writes the code, and its warp's first lane
+        // the scale, for every element and every group.
+        let mut q8 = match twin {
+            true => Some(Q8 {
+                buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
+                rows: 1,
+                k: n,
+            }),
+            false => None,
+        };
+        self.attn_decode_launch(
+            name,
+            q,
+            0,
+            kv,
+            heads,
+            kv_heads,
+            head_dim,
+            tk,
+            cap,
+            scale,
+            scale_q,
+            scratch,
+            &mut out,
+            0,
+            q8.as_mut(),
+        )?;
+        Ok((out, q8))
+    }
+
+    /// The checks and the launch behind every decode attention: the query
+    /// from `q_off`, the context to `out_off` of `out`, and its twin to the
+    /// same row of `twin` when there is one.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_decode_launch(
+        &self,
+        name: &'static str,
+        q: &CudaSlice<f32>,
+        q_off: usize,
+        kv: KvCache<'_>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tk: usize,
+        cap: usize,
+        scale: f32,
+        scale_q: bool,
+        scratch: &mut DecodeScratch,
+        out: &mut CudaSlice<f32>,
+        out_off: usize,
+        twin: Option<&mut Q8>,
+    ) -> Result<(), CudaError> {
         // The kernel carries at most `AD_GMAX` query rows a key-value head,
         // and a group of zero is a division by it.
         if kv_heads == 0
@@ -4500,11 +4686,37 @@ impl Gpu {
                 len: klen.min(vlen),
             });
         }
-        if q.len() < heads * head_dim {
+        let n = heads * head_dim;
+        if q.len() < q_off + n {
             return Err(CudaError::SliceOverrun {
-                at: heads * head_dim,
+                at: q_off + n,
                 len: q.len(),
             });
+        }
+        if out.len() < out_off + n {
+            return Err(CudaError::SliceOverrun {
+                at: out_off + n,
+                len: out.len(),
+            });
+        }
+        // The twin's scales are one a group of 32, so a row must start on a
+        // group; every head width here is a multiple of 32.
+        if !out_off.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock {
+                k: out_off,
+                block: 32,
+            });
+        }
+        if let Some(t) = &twin {
+            let (rows, k) = t.shape();
+            if k != n || rows * k < out_off + n {
+                return Err(CudaError::MismatchedQ8 {
+                    rows,
+                    k,
+                    want_rows: out_off / n + 1,
+                    want_k: n,
+                });
+            }
         }
         let group = heads / kv_heads;
         let ch = match name {
@@ -4543,22 +4755,10 @@ impl Gpu {
         let part = scratch.part.as_mut().expect("allocated above");
         let ctr = scratch.ctr.as_mut().expect("allocated above");
 
-        // SAFETY: every element is written by exactly one thread - of the only
-        // block when there is one chunk, of the merging block otherwise.
-        let mut out = unsafe { self.uninit(heads * head_dim) }?;
-        // SAFETY: the same thread writes the code, and its warp's first lane
-        // the scale, for every element and every group.
-        let n = heads * head_dim;
-        let mut q8 = match twin {
-            true => Some(Q8 {
-                buf: unsafe { self.uninit_i8(n + (n / 32) * 4) }?,
-                rows: 1,
-                k: n,
-            }),
-            false => None,
-        };
         let null: u64 = 0;
+        let mut q8 = twin;
         let asc_off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
+        let (qo, oo) = (q_off as i64, out_off as i64);
         let (tki, gi, ci, sqi, chi) = (
             tk as i32,
             group as i32,
@@ -4577,7 +4777,7 @@ impl Gpu {
                 lb.arg(k).arg(v);
             }
         }
-        lb.arg(&mut out)
+        lb.arg(out)
             .arg(part)
             .arg(ctr)
             .arg(&tki)
@@ -4590,6 +4790,7 @@ impl Gpu {
             Some(q) => lb.arg(&mut q.buf).arg(&asc_off),
             None => lb.arg(&null).arg(&asc_off),
         };
+        lb.arg(&qo).arg(&oo);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (chunks as u32, kv_heads as u32, 1),
             block_dim: (head_dim as u32, 1, 1),
@@ -4597,10 +4798,10 @@ impl Gpu {
         };
         // SAFETY: the grid covers every (chunk, head) once; the caches are
         // checked above to hold `kv_heads * cap * head_dim`, the chunk's keys
-        // are bounded by `tk <= cap` inside the kernel, and the scratch holds
-        // `chunks` partials a head.
-        launched(name, unsafe { lb.launch(cfg) })?;
-        Ok((out, q8))
+        // are bounded by `tk <= cap` inside the kernel, the scratch holds
+        // `chunks` partials a head, and the query, the output row and the
+        // twin's row are bounds checked above.
+        launched(name, unsafe { lb.launch(cfg) })
     }
 
     /// The merge and the int8 twin of its output, in one pass.

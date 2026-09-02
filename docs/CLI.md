@@ -93,6 +93,7 @@ xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 | `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint: a 🤗 directory or a `.gguf` file |
 | `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
 | `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--translate-ahead` | `XABE_TRANSLATE_AHEAD` | by device | `0` translates clauses in step with the synthesiser; `1` translates a turn's first clause alone and every later one as it arrives, decoded together. Defaults to `1` when the translator and the synthesiser are on different cards; see docs/BENCHMARKS.md |
 | `--llm-model` | `XABE_LLM_MODEL` | — | chat model, as a `.gguf`; GGUF only, see above |
 | `--llm-url` | `XABE_LLM_URL` | — | delegate the chat model to a llama-server |
 | `--llm-device` | `XABE_LLM_DEVICE` | `0` | a CUDA device ordinal; `cpu` is refused |

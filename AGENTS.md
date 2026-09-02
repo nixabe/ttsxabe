@@ -194,6 +194,19 @@ stream is close to done. What is left is a seventh of the step in fifteen small
 kernels a layer that cost what a launch costs, and a prefill that used to
 compute 128 rows for a twenty-four-token prompt.
 
+The translator also decodes **several clauses at once** now, over one
+weight stream: `Translator::step_rows` and the batch session on top of it,
+with a packed mat-vec that spends each weight byte on up to four int8 rows and
+a decode attention that writes into a row of a shared operand. A step over
+three sequences costs 1.41x one, so the rows are 2.1x the throughput and each
+is 1.41x slower - which is the whole trade. On a spoken turn it is worth 18%
+of the whole turn with the translator on its own card and nothing measurable
+on one card, where the last clause is the critical path either way and the
+card is what synthesis and translation contend for; the engine's `card`
+module now has synthesis hold a shared card while the translator waits
+between steps. `docs/BENCHMARKS.md` has every one of those turns under
+"Several clauses, one weight stream", including the two policies that lost.
+
 Prefill was 0.29x once,
 then 0.75x, and has now been worked on four times. Three cautions: the
 llama.cpp column does not hold still across sittings, so the only comparison

@@ -2,7 +2,9 @@
 
 use crate::TranslateError;
 use std::path::Path;
-use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, NormScratch, Operand, Q8, Quant};
+use xabe_cuda::{
+    Batch, CudaSlice, DecodeScratch, GEMV_MAX_M, Gpu, NormScratch, Operand, Q8, Quant,
+};
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
@@ -632,6 +634,233 @@ impl Translator {
         )?)
     }
 
+    /// The token embeddings of `ids`, `[n, hidden]`.
+    fn embed(&self, ids: &[u32]) -> Result<CudaSlice<f32>, TranslateError> {
+        let (n, h_dim) = (ids.len(), self.cfg.hidden_size);
+        let ids64: Vec<i64> = ids.iter().map(|&i| i64::from(i)).collect();
+        // Llama does not scale its embeddings, unlike the models that do.
+        let dids = self.gpu.upload_i64(&ids64)?;
+        Ok(match &self.embed {
+            GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
+            GEmbed::Packed { data, ty } => {
+                self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?
+            }
+        })
+    }
+
+    /// Gives `cache` room for `need` positions, doubling.
+    fn grow(&self, cache: &mut Cache, need: usize) -> Result<(), TranslateError> {
+        if cache.cap >= need {
+            return Ok(());
+        }
+        let (h_dim, heads) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
+        let hd = self.cfg.head_dim();
+        let past = cache.len;
+        let want = need.next_power_of_two().max(256);
+        let was = cache.cap;
+        // Re-strided, not copied - the cache is head-major and `cap` is the
+        // stride between heads. See `Gpu::cache_grow`, and the chat model,
+        // which has the same growth and had the same bug.
+        let keys = cache.k.iter_mut().map(|s| (s, false));
+        let values = cache.v.iter_mut().map(|s| (s, true));
+        for (slot, transposed) in keys.chain(values) {
+            let mut grown = self.gpu.zeros_f16(want * h_dim)?;
+            // A fresh conversation grows from empty, and eighty zero-byte
+            // copies are still eighty launches.
+            if past > 0 {
+                self.gpu
+                    .cache_grow_f16(slot, &mut grown, heads, hd, was, want, past, transposed)?;
+            }
+            *slot = grown;
+        }
+        cache.cap = want;
+        Ok(())
+    }
+
+    /// The MLP's gated activation over `n` rows of `x`, and its int8 twin
+    /// when the down projection will read one.
+    fn gated(
+        &self,
+        xo: Operand<'_>,
+        l: &GLayer,
+        n: usize,
+    ) -> Result<(CudaSlice<f32>, Option<Q8>), TranslateError> {
+        let inter = self.cfg.intermediate_size;
+        // One product over both halves where the checkpoint allows it, and
+        // then the gate reads its own output; see `GMlp`. `pair` says which
+        // shape the SiLU below has to take, because the fused buffer holds
+        // `[2, n, inter]` and the split one holds two of `[n, inter]`.
+        let (mut gate, up) = match &l.mlp {
+            GMlp::Fused(g) => (self.project_group(xo, g, n)?, None),
+            GMlp::Split(gw, uw) => (self.project(xo, gw, n)?, Some(self.project(xo, uw, n)?)),
+        };
+        // The twin is taken at every row count, not only decode's: the
+        // tiled integer kernel reads the same codes the mat-vec does, and
+        // quantizing inside `project` instead re-reads the whole
+        // activation - 28 MB a layer at 512 tokens. Only for a packed
+        // `down`, because an f16 one would leave the codes unread.
+        let packed_down = matches!(l.down.w, GWeight::Packed { .. });
+        let want_q = packed_down && inter.is_multiple_of(256);
+        let gq = match (&up, want_q) {
+            (Some(u), true) => Some(self.gpu.silu_mul_q(&mut gate, u, n, inter)?),
+            (Some(u), false) => {
+                self.gpu.silu_mul(&mut gate, u, n * inter)?;
+                None
+            }
+            // Fused: the two operands are the two halves of `gate`.
+            (None, true) => Some(self.gpu.silu_mul_pair(&mut gate, n, inter)?),
+            (None, false) => {
+                self.gpu.silu_mul_halves(&mut gate, n * inter)?;
+                None
+            }
+        };
+        Ok((gate, gq))
+    }
+
+    /// One decode step for several sequences at once: token `ids[r]` appended
+    /// to `caches[r]`, and the logits `[rows, vocab]` of every row.
+    ///
+    /// The rows share every weight stream - each projection is one launch
+    /// over all of them, `Gpu::gemm_batched` handing the packed mat-vec the
+    /// rows to carry together - and keep their own caches, positions and
+    /// attention. So a step over three sequences costs the weight traffic of
+    /// one plus the small kernels of three, which on a model whose decode is
+    /// the weight traffic is most of the way to three for the price of one.
+    /// `docs/BENCHMARKS.md` has what it measures.
+    ///
+    /// At most [`GEMV_MAX_M`] rows, one token each, every cache already
+    /// holding its prompt: a prompt goes through [`Self::forward_last`] on
+    /// its own, which is also where a cache's buffers are made. The arithmetic
+    /// of a row is the single-sequence step's except for the normalisations,
+    /// which the single path folds into its mat-vecs' tails and this one
+    /// takes as a pass over the rows; the difference is an ulp of the
+    /// normalised row, and the test holds the logits to it.
+    pub fn step_rows(
+        &self,
+        ids: &[u32],
+        caches: &mut [&mut Cache],
+    ) -> Result<CudaSlice<f32>, TranslateError> {
+        let r = ids.len();
+        if r != caches.len() {
+            return Err(TranslateError::RowsMismatch {
+                ids: r,
+                caches: caches.len(),
+            });
+        }
+        if r == 0 || r > GEMV_MAX_M {
+            return Err(TranslateError::TooManyRows {
+                rows: r,
+                max: GEMV_MAX_M,
+            });
+        }
+        let (h_dim, heads) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
+        let hd = self.cfg.head_dim();
+        for (row, c) in caches.iter().enumerate() {
+            if c.k.is_empty() {
+                return Err(TranslateError::NotPrefilled { row });
+            }
+            if c.len + 1 > self.cfg.max_position_embeddings {
+                return Err(TranslateError::PastTheEnd {
+                    at: c.len + 1,
+                    max: self.cfg.max_position_embeddings,
+                });
+            }
+        }
+        for c in caches.iter_mut() {
+            self.grow(c, c.len + 1)?;
+        }
+
+        let mut h = self.embed(ids)?;
+        let mut residual: Option<CudaSlice<f32>> = None;
+        let scale = (hd as f32).powf(-0.5);
+        for (i, l) in self.layers.iter().enumerate() {
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), r, h_dim, &l.attn_norm)?;
+            let xo = Self::operand(&x, xq.as_ref());
+            let mut proj = Vec::with_capacity(l.attn.groups.len());
+            for g in &l.attn.groups {
+                proj.push(self.project_group(xo, g, r)?);
+            }
+            // Where projection `j` of row `row` sits: its group's buffer is
+            // `[count, rows, out]`.
+            let at = |j: usize, row: usize| -> (usize, usize) {
+                let (gi, ei) = l.attn.at[j];
+                let out = l.attn.groups[gi].w.out_dim;
+                (gi, (ei * r + row) * out)
+            };
+            // The contexts of every row in one `[rows, hidden]` buffer with
+            // one twin, filled a row at a time: each row rotates its query and
+            // key against its own position, caches them, and attends over its
+            // own cache.
+            // SAFETY: each row's attention writes its whole row, and every
+            // row is attended below.
+            let mut ctx = unsafe { self.gpu.uninit(r * h_dim) }?;
+            let mut cq = self.gpu.q8_zeros(r, h_dim)?;
+            for (row, c) in caches.iter_mut().enumerate() {
+                let (cap, pos) = (c.cap, c.len);
+                self.gpu.rope_cache_f16(
+                    &mut proj,
+                    at(0, row),
+                    at(1, row),
+                    at(2, row),
+                    None,
+                    heads,
+                    heads,
+                    hd,
+                    self.cfg.rope_theta,
+                    pos,
+                    &mut c.k[i],
+                    &mut c.v[i],
+                    cap,
+                )?;
+                let (qg, q_off) = at(0, row);
+                self.gpu.attn_decode_f16_q_row(
+                    &proj[qg],
+                    q_off,
+                    &c.k[i],
+                    &c.v[i],
+                    heads,
+                    heads,
+                    hd,
+                    pos + 1,
+                    cap,
+                    scale,
+                    false,
+                    &mut c.scratch,
+                    &mut ctx,
+                    &mut cq,
+                    row,
+                )?;
+            }
+            let out = self.project(
+                Operand::F32Q {
+                    data: &ctx,
+                    q8: &cq,
+                },
+                &l.o,
+                r,
+            )?;
+            residual = Some(out);
+
+            let (x, xq) = self.normed(&mut h, residual.take().as_ref(), r, h_dim, &l.ffn_norm)?;
+            let (gate, gq) = self.gated(Self::operand(&x, xq.as_ref()), l, r)?;
+            let down = self.project(Self::operand(&gate, gq.as_ref()), &l.down, r)?;
+            residual = Some(down);
+        }
+        for c in caches.iter_mut() {
+            c.len += 1;
+        }
+        let (h, hq) = self.normed(&mut h, residual.take().as_ref(), r, h_dim, &self.norm)?;
+        Ok(self.gpu.gemm_batched(
+            Self::operand(&h, hq.as_ref()),
+            self.lm_head.operand(),
+            None,
+            Batch::single(r * self.cfg.vocab_size),
+            r,
+            h_dim,
+            self.cfg.vocab_size,
+        )?)
+    }
+
     /// Runs `ids` through the model and returns the logits, `[n, vocab]`.
     pub fn forward(
         &self,
@@ -684,15 +913,7 @@ impl Translator {
             });
         }
 
-        let ids64: Vec<i64> = ids.iter().map(|&i| i64::from(i)).collect();
-        // Llama does not scale its embeddings, unlike the models that do.
-        let dids = self.gpu.upload_i64(&ids64)?;
-        let mut h = match &self.embed {
-            GEmbed::F32(t) => self.gpu.embed_scaled(t, &dids, n, h_dim, 1.0)?,
-            GEmbed::Packed { data, ty } => {
-                self.gpu.embed_packed(data, *ty, &dids, n, h_dim, 1.0)?
-            }
-        };
+        let mut h = self.embed(ids)?;
 
         // The block output the next normalisation still has to add; see where
         // it is set. The residual add and the normalisation read the same row,
@@ -704,26 +925,7 @@ impl Translator {
         // and `h` is already settled.
         let mut pending: Option<(CudaSlice<f32>, Q8)> = None;
         let first = cache.k.is_empty();
-        if cache.cap < past + n {
-            let want = (past + n).next_power_of_two().max(256);
-            let was = cache.cap;
-            // Re-strided, not copied - the cache is head-major and `cap` is the
-            // stride between heads. See `Gpu::cache_grow`, and the chat model,
-            // which has the same growth and had the same bug.
-            let keys = cache.k.iter_mut().map(|s| (s, false));
-            let values = cache.v.iter_mut().map(|s| (s, true));
-            for (slot, transposed) in keys.chain(values) {
-                let mut grown = self.gpu.zeros_f16(want * h_dim)?;
-                // A fresh conversation grows from empty, and eighty zero-byte
-                // copies are still eighty launches.
-                if past > 0 {
-                    self.gpu
-                        .cache_grow_f16(slot, &mut grown, heads, hd, was, want, past, transposed)?;
-                }
-                *slot = grown;
-            }
-            cache.cap = want;
-        }
+        self.grow(cache, past + n)?;
         let mut tapped = Vec::with_capacity(taps);
         for (i, l) in self.layers.iter().enumerate() {
             // One int8 twin for three projections, taken by the normalisation
@@ -992,35 +1194,7 @@ impl Translator {
                 None => self.normed(&mut h, residual.take().as_ref(), n, h_dim, &l.ffn_norm)?,
             };
             let xo = Self::operand(&x, xq.as_ref());
-            let inter = self.cfg.intermediate_size;
-            // One product over both halves where the checkpoint allows it, and
-            // then the gate reads its own output; see `GMlp`. `pair` says which
-            // shape the SiLU below has to take, because the fused buffer holds
-            // `[2, n, inter]` and the split one holds two of `[n, inter]`.
-            let (mut gate, up) = match &l.mlp {
-                GMlp::Fused(g) => (self.project_group(xo, g, n)?, None),
-                GMlp::Split(gw, uw) => (self.project(xo, gw, n)?, Some(self.project(xo, uw, n)?)),
-            };
-            // The twin is taken at every row count, not only decode's: the
-            // tiled integer kernel reads the same codes the mat-vec does, and
-            // quantizing inside `project` instead re-reads the whole
-            // activation - 28 MB a layer at 512 tokens. Only for a packed
-            // `down`, because an f16 one would leave the codes unread.
-            let packed_down = matches!(l.down.w, GWeight::Packed { .. });
-            let want_q = packed_down && inter.is_multiple_of(256);
-            let gq = match (&up, want_q) {
-                (Some(u), true) => Some(self.gpu.silu_mul_q(&mut gate, u, n, inter)?),
-                (Some(u), false) => {
-                    self.gpu.silu_mul(&mut gate, u, n * inter)?;
-                    None
-                }
-                // Fused: the two operands are the two halves of `gate`.
-                (None, true) => Some(self.gpu.silu_mul_pair(&mut gate, n, inter)?),
-                (None, false) => {
-                    self.gpu.silu_mul_halves(&mut gate, n * inter)?;
-                    None
-                }
-            };
+            let (gate, gq) = self.gated(xo, l, n)?;
             let down_kq = matches!(
                 l.down.w,
                 GWeight::Packed {
@@ -1150,34 +1324,7 @@ impl Translator {
         for _ in 0..max_new {
             let logits = self.forward_last(&pending, &mut cache)?;
             let mut row = self.gpu.download(&logits)?;
-            if penalty != 1.0 {
-                // llama.cpp's rule, and it is not the obvious one: a positive
-                // logit is *divided* by the penalty and a negative one
-                // multiplied, so that both move towards zero. Dividing both
-                // would make an already-unlikely token more likely.
-                let seen = ids.iter().chain(&out);
-                let start = (ids.len() + out.len()).saturating_sub(Self::REPEAT_LAST_N);
-                // The newline is exempt. That is llama.cpp's `penalize_nl`,
-                // which defaults to false - "consider newlines as a repeatable
-                // token" - and it is not cosmetic here: this prompt template is
-                // four lines, so a penalised newline is a newline the model has
-                // already seen three times, and it answers by reaching for
-                // punctuation instead of ending the line.
-                let newline = self.tokenizer.byte_id(b'\n');
-                for &id in seen.skip(start) {
-                    if Some(id) == newline {
-                        continue;
-                    }
-                    let v = &mut row[id as usize];
-                    *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
-                }
-            }
-            let next = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).expect("logits are finite"))
-                .map(|(i, _)| i as u32)
-                .expect("the vocabulary is not empty");
+            let next = self.pick(&mut row, ids, &out, penalty);
             if stop.contains(&next) {
                 break;
             }
@@ -1193,13 +1340,71 @@ impl Translator {
         Ok(out)
     }
 
+    /// The greedy choice over one row of logits, with the repetition penalty
+    /// applied over the last [`Self::REPEAT_LAST_N`] of `prompt` then `out`.
+    fn pick(&self, row: &mut [f32], prompt: &[u32], out: &[u32], penalty: f32) -> u32 {
+        if penalty != 1.0 {
+            // llama.cpp's rule, and it is not the obvious one: a positive
+            // logit is *divided* by the penalty and a negative one
+            // multiplied, so that both move towards zero. Dividing both
+            // would make an already-unlikely token more likely.
+            let seen = prompt.iter().chain(out);
+            let start = (prompt.len() + out.len()).saturating_sub(Self::REPEAT_LAST_N);
+            // The newline is exempt. That is llama.cpp's `penalize_nl`,
+            // which defaults to false - "consider newlines as a repeatable
+            // token" - and it is not cosmetic here: this prompt template is
+            // four lines, so a penalised newline is a newline the model has
+            // already seen three times, and it answers by reaching for
+            // punctuation instead of ending the line.
+            let newline = self.tokenizer.byte_id(b'\n');
+            for &id in seen.skip(start) {
+                if Some(id) == newline {
+                    continue;
+                }
+                let v = &mut row[id as usize];
+                *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
+            }
+        }
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("logits are finite"))
+            .map(|(i, _)| i as u32)
+            .expect("the vocabulary is not empty")
+    }
+
+    /// The two stop strings a translation is cut at: `[/` or a newline
+    /// followed by `[`, which are `gateway.py`'s. The model is trained to
+    /// close its own tag and there is nothing useful after it. Both are
+    /// needed, not one - the model sometimes opens the next block instead of
+    /// closing this one.
+    const STOPS: [&'static str; 2] = ["[/", "\n["];
+
+    /// The token ids that end a translation: `</s>`, and `<pad>`, which is
+    /// this checkpoint's own convention from the model card - a decoder that
+    /// stops only on `</s>` runs to the token limit on every second
+    /// translation.
+    fn stop_ids(&self) -> [u32; 2] {
+        [
+            self.tokenizer.eos(),
+            self.tokenizer.special("<pad>").unwrap_or(u32::MAX),
+        ]
+    }
+
+    /// A translation's text from its tokens, cut at the first stop string.
+    fn cut(&self, out: &[u32]) -> String {
+        let text = self.tokenizer.decode(out, true);
+        let cut = Self::STOPS
+            .iter()
+            .filter_map(|s| text.find(s))
+            .min()
+            .unwrap_or(text.len());
+        text[..cut].trim().to_string()
+    }
+
     /// Translates one sentence into `target`.
     ///
     /// `target` is the model card's language code: `ZH`, `EN`, `POJ`, `HL` or
-    /// `HAN`. The answer is cut at `[/` or at a newline followed by `[`, which
-    /// are `gateway.py`'s two stop strings: the model is trained to close its
-    /// own tag and there is nothing useful after it. Both are needed, not one -
-    /// the model sometimes opens the next block instead of closing this one.
+    /// `HAN`. The answer is cut at the stop strings; see [`Self::STOPS`].
     pub fn translate(
         &self,
         source: &str,
@@ -1207,16 +1412,138 @@ impl Translator {
         max_new: usize,
         penalty: f32,
     ) -> Result<String, TranslateError> {
-        const STOPS: [&str; 2] = ["[/", "\n["];
         let ids = self.prompt_ids(source, target);
-        let out = self.generate(&ids, max_new, penalty, &STOPS)?;
-        let text = self.tokenizer.decode(&out, true);
-        let cut = STOPS
-            .iter()
-            .filter_map(|s| text.find(s))
-            .min()
-            .unwrap_or(text.len());
+        let out = self.generate(&ids, max_new, penalty, &Self::STOPS)?;
         tracing::debug!(tokens = out.len(), "translated");
-        Ok(text[..cut].trim().to_string())
+        Ok(self.cut(&out))
+    }
+
+    /// Several translations decoding together; see [`TranslationBatch`].
+    pub fn batch(&self, max_new: usize, penalty: f32) -> TranslationBatch<'_> {
+        TranslationBatch {
+            model: self,
+            rows: Vec::new(),
+            max_new,
+            penalty,
+            next_id: 0,
+        }
+    }
+}
+
+/// Several translations in flight at once, decoded one token each a step
+/// over one weight stream.
+///
+/// A reply is chunked into clauses as it streams, and the clauses arrive at
+/// the translator faster than it can answer them one at a time: the second is
+/// waiting before the first is half done. Decoding them together costs one
+/// weight stream a step for all of them - [`Translator::step_rows`] - so the
+/// second and third finish about when the first would have alone.
+///
+/// A sentence is [`Self::admit`]ted at any time, its prompt run on its own
+/// through the single-sequence path, and from then on it takes a token every
+/// [`Self::step`] until it stops; `step` returns the translations that
+/// finished. A batch of one steps through the single-sequence path, which
+/// has the folded normalisations, so a lone clause pays nothing for the
+/// machinery.
+pub struct TranslationBatch<'m> {
+    model: &'m Translator,
+    rows: Vec<Row>,
+    max_new: usize,
+    penalty: f32,
+    next_id: u64,
+}
+
+/// One sequence of a [`TranslationBatch`].
+struct Row {
+    id: u64,
+    prompt: Vec<u32>,
+    out: Vec<u32>,
+    cache: Cache,
+    /// The token chosen from the last step's logits, not yet appended.
+    next: u32,
+}
+
+impl TranslationBatch<'_> {
+    /// Adds a sentence to translate into `target`; see
+    /// [`Translator::translate`] for the codes. Runs its prompt now, on its
+    /// own. Returns the id [`Self::step`] will hand back with its text.
+    pub fn admit(&mut self, source: &str, target: &str) -> Result<u64, TranslateError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let prompt = self.model.prompt_ids(source, target);
+        let mut cache = self.model.cache();
+        let logits = self.model.forward_last(&prompt, &mut cache)?;
+        let mut row = self.model.gpu.download(&logits)?;
+        let next = self.model.pick(&mut row, &prompt, &[], self.penalty);
+        self.rows.push(Row {
+            id,
+            prompt,
+            out: Vec::new(),
+            cache,
+            next,
+        });
+        Ok(id)
+    }
+
+    /// Sequences still decoding.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether nothing is in flight.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The most sequences a step carries; past it, [`Self::step`] runs the
+    /// rows in groups of this many.
+    pub const WIDTH: usize = GEMV_MAX_M;
+
+    /// One token for every sequence in flight. Returns the translations that
+    /// ended at this step - on a stop token, a stop string or the token
+    /// limit - with their ids, in the order they were admitted.
+    pub fn step(&mut self) -> Result<Vec<(u64, String)>, TranslateError> {
+        let stop = self.model.stop_ids();
+        let mut done = Vec::new();
+        // Settle each row's chosen token: append it, or finish the row.
+        let mut live = Vec::with_capacity(self.rows.len());
+        for mut row in self.rows.drain(..) {
+            let finished = stop.contains(&row.next) || row.out.len() >= self.max_new || {
+                row.out.push(row.next);
+                let so_far = self.model.tokenizer.decode(&row.out, true);
+                Translator::STOPS.iter().any(|s| so_far.contains(s))
+            };
+            if finished {
+                tracing::debug!(id = row.id, tokens = row.out.len(), "translated");
+                done.push((row.id, self.model.cut(&row.out)));
+            } else {
+                live.push(row);
+            }
+        }
+        self.rows = live;
+        if self.rows.is_empty() {
+            return Ok(done);
+        }
+        // The rows in groups the mat-vec carries; one row takes the
+        // single-sequence path.
+        let vocab = self.model.cfg.vocab_size;
+        for group in self.rows.chunks_mut(Self::WIDTH) {
+            let logits = if group.len() == 1 {
+                let r = &mut group[0];
+                self.model.forward_last(&[r.next], &mut r.cache)?
+            } else {
+                let ids: Vec<u32> = group.iter().map(|r| r.next).collect();
+                let mut caches: Vec<&mut Cache> = group.iter_mut().map(|r| &mut r.cache).collect();
+                self.model.step_rows(&ids, &mut caches)?
+            };
+            let all = self.model.gpu.download(&logits)?;
+            for (r, row) in group.iter_mut().enumerate() {
+                let mut logits = all[r * vocab..(r + 1) * vocab].to_vec();
+                row.next = self
+                    .model
+                    .pick(&mut logits, &row.prompt, &row.out, self.penalty);
+            }
+        }
+        Ok(done)
     }
 }

@@ -13,6 +13,7 @@
 //! because the model is one utterance at a time by design, so a second would
 //! only queue on the same device.
 
+use crate::card::SharedCard;
 use crate::error::EngineError;
 use crate::stage::{Device, Stage, Stages};
 use crate::{Args, tts::Checkpoint};
@@ -104,7 +105,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         // same fallback a registered engine uses: with no local `--tts-model`
         // there is no stage to take the card from and `--tts-device` says it.
         // Anything not local to this process is not competing for its card.
-        translate_ahead: usize::from(
+        translate_ahead: args.translate_ahead.unwrap_or(usize::from(
             match (
                 stages.translator.device(),
                 stages
@@ -115,7 +116,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
                 (Some(translator), Some(tts)) => translator != tts,
                 _ => true,
             },
-        ),
+        )),
         ..GatewayConfig::default()
     };
 
@@ -134,6 +135,19 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         "system prompt",
     );
 
+    // The translator and the synthesiser on one device take turns on it;
+    // see `crate::card`. Decided here, before either is spawned, from the
+    // same devices the stages resolved to.
+    let tts_device = stages
+        .tts
+        .device()
+        .or_else(|| args.tts_device.as_deref().and_then(Device::parse));
+    let card = match (&stages.translator, tts_device) {
+        (Stage::Local { device, .. }, Some(tts)) if *device == tts => Some(SharedCard::new()),
+        _ => None,
+    };
+    tracing::info!(shared_card = card.is_some(), "translator and synthesiser");
+
     let asr = match &stages.asr {
         Stage::Remote { url } => Some(AsrBackend::Remote(Upstream::new(url)?)),
         Stage::Local { path, device } => Some(AsrBackend::Local(spawn_transcriber(path, *device)?)),
@@ -147,9 +161,11 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
     let translator = match (&stages.translator, args.direct_taigi) {
         (_, true) => None,
         (Stage::Remote { url }, _) => Some(TranslatorBackend::Remote(Upstream::new(url)?)),
-        (Stage::Local { path, device }, _) => {
-            Some(TranslatorBackend::Local(spawn_translator(path, *device)?))
-        }
+        (Stage::Local { path, device }, _) => Some(TranslatorBackend::Local(spawn_translator(
+            path,
+            *device,
+            card.clone(),
+        )?)),
         (Stage::Off, _) => None,
     };
 
@@ -180,7 +196,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         Stage::Local { path, device } => {
             // `--tts-model` takes either checkpoint; which one it is, is a
             // property of the directory rather than of a second flag.
-            let local = spawn_local(args, path, *device)?;
+            let local = spawn_local(args, path, *device, card.clone())?;
             tts.insert(
                 xabe_serve::LOCAL_ENGINE.to_string(),
                 TtsBackend::Local(local),
@@ -214,7 +230,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
                 .device()
                 .or_else(|| args.tts_device.as_deref().and_then(Device::parse))
                 .unwrap_or(Device::Cpu);
-            TtsBackend::Local(spawn_local(args, &dir, device)?)
+            TtsBackend::Local(spawn_local(args, &dir, device, card.clone())?)
         };
         tracing::info!(
             engine = name,
@@ -392,6 +408,7 @@ fn transcribe_one(
 fn spawn_translator(
     path: &std::path::Path,
     device: Device,
+    card: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<TranslateJob>, EngineError> {
     // `Kind::has_cpu` refuses `--translator-device cpu` at preflight: the 13 B
     // is 27 GB of weights and 26 GFLOP a token.
@@ -404,16 +421,69 @@ fn spawn_translator(
     std::thread::Builder::new()
         .name("xabe-translate".into())
         .spawn(move || {
-            while let Some(job) = rx.blocking_recv() {
-                let out = model
-                    .translate(
-                        &job.text,
-                        &job.target,
-                        TRANSLATE_MAX_NEW,
-                        xabe_translate::Translator::REPEAT_PENALTY,
-                    )
-                    .map_err(|e| e.to_string());
-                let _ = job.reply.send(out);
+            // Every clause waiting in the queue joins the batch, and the batch
+            // takes one token a step for all of them over one weight stream -
+            // see `xabe_translate::TranslationBatch`. A clause that arrives
+            // while the batch is running is admitted at the next step, so a
+            // reply's second and third clauses do not wait for its first.
+            let mut batch = model.batch(
+                TRANSLATE_MAX_NEW,
+                xabe_translate::Translator::REPEAT_PENALTY,
+            );
+            let mut waiting: BTreeMap<u64, tokio::sync::oneshot::Sender<Result<String, String>>> =
+                BTreeMap::new();
+            loop {
+                // Block only when idle; otherwise take what has arrived.
+                let job = if batch.is_empty() {
+                    match rx.blocking_recv() {
+                        Some(job) => Some(job),
+                        None => break,
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Ok(job) => Some(job),
+                        Err(mpsc::error::TryRecvError::Empty) => None,
+                        Err(mpsc::error::TryRecvError::Disconnected) => None,
+                    }
+                };
+                // On a shared card, not while a clause is being spoken.
+                if let Some(c) = &card {
+                    c.wait_free();
+                }
+                if let Some(job) = job {
+                    match batch.admit(&job.text, &job.target) {
+                        Ok(id) => {
+                            waiting.insert(id, job.reply);
+                        }
+                        Err(e) => {
+                            let _ = job.reply.send(Err(e.to_string()));
+                        }
+                    }
+                    // Admit everything queued before spending a step.
+                    continue;
+                }
+                match batch.step() {
+                    Ok(done) => {
+                        for (id, text) in done {
+                            if let Some(reply) = waiting.remove(&id) {
+                                let _ = reply.send(Ok(text));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // A failed step fails every clause in it; the batch
+                        // is started over rather than stepped again.
+                        let message = e.to_string();
+                        tracing::warn!(%message, "a batched translation step failed");
+                        for (_, reply) in std::mem::take(&mut waiting) {
+                            let _ = reply.send(Err(message.clone()));
+                        }
+                        batch = model.batch(
+                            TRANSLATE_MAX_NEW,
+                            xabe_translate::Translator::REPEAT_PENALTY,
+                        );
+                    }
+                }
             }
             tracing::debug!("translator thread stopping");
         })
@@ -483,6 +553,7 @@ fn spawn_synthesiser(
     args: &Args,
     path: &std::path::Path,
     device: Device,
+    card: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
     let ck = Checkpoint::locate(path, args.config.as_deref());
     let seed = args.seed;
@@ -526,6 +597,7 @@ fn spawn_synthesiser(
             // A blocking receive on a channel the async side writes to. The
             // thread exists only to keep a forward pass off the executor.
             while let Some(job) = rx.blocking_recv() {
+                let _held = card.as_ref().map(SharedCard::hold);
                 synthesise(&model, &job, rate, seed, coqui);
             }
             tracing::debug!("synthesiser thread stopping");
@@ -584,13 +656,14 @@ fn spawn_local(
     args: &Args,
     dir: &std::path::Path,
     device: Device,
+    card: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
     if is_cosyvoice(dir) {
-        spawn_cosy(args, dir, device)
+        spawn_cosy(args, dir, device, card)
     } else if is_tacotron(dir) {
-        spawn_taco(args, dir, device)
+        spawn_taco(args, dir, device, card)
     } else {
-        spawn_synthesiser(args, dir, device)
+        spawn_synthesiser(args, dir, device, card)
     }
 }
 
@@ -609,6 +682,7 @@ fn spawn_taco(
     args: &Args,
     dir: &std::path::Path,
     device: Device,
+    card: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
     let Device::Cuda(ordinal) = device else {
         return Err(EngineError::LocalOnly {
@@ -626,6 +700,7 @@ fn spawn_taco(
         .name("xabe-taco".into())
         .spawn(move || {
             while let Some(job) = rx.blocking_recv() {
+                let _held = card.as_ref().map(SharedCard::hold);
                 speak_taco(&taco, &job, rate);
             }
             tracing::debug!("tacotron2 thread stopping");
@@ -689,6 +764,7 @@ fn spawn_cosy(
     args: &Args,
     dir: &std::path::Path,
     device: Device,
+    card: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<SynthesisJob>, EngineError> {
     let Device::Cuda(ordinal) = device else {
         return Err(EngineError::LocalOnly {
@@ -710,6 +786,7 @@ fn spawn_cosy(
         .name("xabe-cosy".into())
         .spawn(move || {
             while let Some(job) = rx.blocking_recv() {
+                let _held = card.as_ref().map(SharedCard::hold);
                 speak_cosy(&cosy, &job, rate);
             }
             tracing::debug!("cosyvoice thread stopping");

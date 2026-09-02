@@ -25,15 +25,18 @@ pub struct GatewayConfig {
     pub min_chunk: usize,
     /// Minimum characters before the *first* chunk is synthesised.
     pub first_chunk: usize,
-    /// How many clauses may be translated ahead of the one being synthesised.
+    /// Whether clauses are translated ahead of the one being synthesised.
     ///
-    /// One overlaps the two stages; zero runs them one after the other. It is
-    /// worth one only when they are on **different cards**. Sharing a card,
-    /// the overlap is two jobs competing for the same SMs: measured on a
-    /// three-clause turn, synthesis went from 440 ms to about 950 and first
-    /// audio from 2659 ms to 2919 - the whole turn no faster and the part a
-    /// listener waits through slower. `xabe-engine` sets this by comparing the
-    /// translator's device with the synthesiser's.
+    /// Zero runs the two stages one after the other. Anything else translates
+    /// a turn's first clause alone and hands every later clause to the
+    /// translator as it is cut, which a local translator decodes together
+    /// over one weight stream - see "Several clauses, one weight stream" in
+    /// docs/BENCHMARKS.md for the turn that settled the policy. Before the
+    /// translator could batch, the overlap on a shared card was two jobs
+    /// competing for the same SMs: on a three-clause turn synthesis went from
+    /// 440 ms to about 950 and first audio from 2659 ms to 2919, the whole
+    /// turn no faster - which is why the device-derived default is still zero
+    /// on one card and `xabe-engine --translate-ahead` exists to override it.
     ///
     /// A stage reached over a URL is taken to be off this card, which is a
     /// guess: the URL may well be a `llama-server` on 127.0.0.1 holding the

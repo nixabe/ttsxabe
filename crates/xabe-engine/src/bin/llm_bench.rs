@@ -49,6 +49,12 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     rounds: usize,
 
+    /// Sequences decoded together, each with its own cache and its own
+    /// prompt: the translator's batched step. One is the single-sequence
+    /// path; more shares every weight stream. Translate only.
+    #[arg(long, default_value_t = 1)]
+    rows: usize,
+
     /// How a quantized checkpoint is held: `packed` or `f16`.
     ///
     /// The same weights either way. `packed` hands the matmul the file's own
@@ -162,20 +168,38 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let rows = args.rows.max(1);
             let (mut pres, mut decs) = (Vec::new(), Vec::new());
             for r in 0..args.rounds + 1 {
-                let mut cache = m.cache();
-                let t0 = Instant::now();
-                if m.forward_last(&ids, &mut cache).is_err() {
-                    eprintln!("prefill failed");
-                    return ExitCode::FAILURE;
+                // Every row its own cache and its own prompt, prefilled one
+                // at a time as the batch does; the prefill figure is the
+                // first row's.
+                let mut caches: Vec<xabe_translate::Cache> = Vec::with_capacity(rows);
+                let mut pre = 0.0;
+                for row in 0..rows {
+                    let mut cache = m.cache();
+                    let t0 = Instant::now();
+                    if m.forward_last(&ids, &mut cache).is_err() {
+                        eprintln!("prefill failed");
+                        return ExitCode::FAILURE;
+                    }
+                    m.gpu().synchronize().ok();
+                    if row == 0 {
+                        pre = t0.elapsed().as_secs_f64() * 1e3;
+                    }
+                    caches.push(cache);
                 }
-                m.gpu().synchronize().ok();
-                let pre = t0.elapsed().as_secs_f64() * 1e3;
 
                 let t0 = Instant::now();
                 for i in 0..args.decode {
-                    if let Err(why) = m.forward_last(&[1500 + i as u32 % 100], &mut cache) {
+                    let toks: Vec<u32> = (0..rows).map(|j| 1500 + (i + j) as u32 % 100).collect();
+                    let step = if rows == 1 {
+                        m.forward_last(&toks, &mut caches[0]).map(|_| ())
+                    } else {
+                        let mut refs: Vec<&mut xabe_translate::Cache> = caches.iter_mut().collect();
+                        m.step_rows(&toks, &mut refs).map(|_| ())
+                    };
+                    if let Err(why) = step {
                         eprintln!("decode failed: {why}");
                         return ExitCode::FAILURE;
                     }
@@ -187,15 +211,27 @@ fn main() -> ExitCode {
                     decs.push(dec);
                 }
             }
-            println!("translate {} [{}]", args.model.display(), args.packing);
+            println!(
+                "translate {} [{}] rows {rows}",
+                args.model.display(),
+                args.packing
+            );
+            let dec = median(decs);
             report(
                 "translate",
                 args.prompt,
                 args.decode,
                 median(pres),
-                median(decs),
+                dec,
                 bytes,
             );
+            if rows > 1 {
+                println!(
+                    "  {rows} rows: {:.2} ms/step, {:.1} tok/s across the rows",
+                    dec / args.decode as f64,
+                    (rows * args.decode) as f64 * 1e3 / dec
+                );
+            }
         }
         other => {
             eprintln!("--kind must be chat or translate, not {other}");

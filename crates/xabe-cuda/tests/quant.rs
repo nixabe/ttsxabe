@@ -984,3 +984,66 @@ fn a_product_from_an_offset_row_is_the_product_of_the_rows_from_there() {
         );
     }
 }
+
+/// `gemv_q_rows` - several int8 rows against one packed weight stream - is
+/// `gemv` a row at a time, bit for bit: two, three and four rows, both block
+/// formats, a contraction that is not a whole number of warp trips, a batch
+/// that shares its activation, and a bias.
+#[test]
+fn several_rows_against_a_packed_weight_are_the_rows_one_at_a_time() {
+    let Some(g) = gpu() else { return };
+    // Five super-blocks a row: the fourth trip of a warp has one lane's
+    // worth, so the `b + sub < nb` guard is exercised.
+    let (k, n) = (1280usize, 96usize);
+    for q in [Quant::Q4K, Quant::Q6K] {
+        let raw = blocks(q, n * k / q.block_size(), 71);
+        let dw = g.upload_quant(q, &raw).unwrap();
+        let bias = g.upload(&seq(n, 72)).unwrap();
+        for m in 2..=4usize {
+            for (count, shared) in [(1usize, false), (3, true)] {
+                let a = seq(if shared { m * k } else { count * m * k }, 73 + m as u64);
+                let da = g.upload(&a).unwrap();
+                let sa = if shared { 0 } else { m * k };
+                // The chain: one row at a time, the same weight.
+                let mut want = Vec::new();
+                for z in 0..count {
+                    for r in 0..m {
+                        let row = if shared { r * k } else { (z * m + r) * k };
+                        let one = g.upload(&a[row..row + k]).unwrap();
+                        let out = g
+                            .gemm_batched(
+                                Operand::F32(&one),
+                                Operand::Q { data: &dw, ty: q },
+                                Some(&bias),
+                                Batch::single(n),
+                                1,
+                                k,
+                                n,
+                            )
+                            .expect("one row");
+                        want.extend(g.download(&out).unwrap());
+                    }
+                }
+                let out = g
+                    .gemm_batched(
+                        Operand::F32(&da),
+                        Operand::Q { data: &dw, ty: q },
+                        Some(&bias),
+                        Batch {
+                            count,
+                            a: sa,
+                            w: 0,
+                            out: m * n,
+                            w_row: 0,
+                        },
+                        m,
+                        k,
+                        n,
+                    )
+                    .expect("several rows");
+                let got = g.download(&out).unwrap();
+                assert_eq!(want, got, "{q:?} m {m} count {count} shared {shared}");
+            }
+        }
+    }
+}

@@ -813,6 +813,137 @@ delta, or an "improved from X" narrative. The change story belongs in the commit
 message; durable reasoning belongs in WHY below, and measured rejections in
 WHY NOT.
 
+## Several clauses, one weight stream: the translator's batched decode
+
+A translation is the weight stream: 8 GB a token at 555 GB/s on the 13 B
+translator, 15.3 ms a token, and the section above says why that is close to
+done. What a spoken turn hands the translator, though, is not one sequence.
+The reply is chunked into clauses as it streams, and the second clause is
+waiting before the first is half translated; the third arrives while the
+second waits. Translating them one at a time streams the weights once a
+token *a clause*. Decoding them together streams the weights once a token
+for all of them.
+
+That is `Translator::step_rows`, one token for up to four sequences with
+their own caches, and under it `gemv_q_rows` - the packed mat-vec over
+several int8 rows with each weight byte fetched once, `docs/KERNELS.md` -
+and a query offset and destination row on the decode attention, so each
+sequence attends over its own cache into one shared operand. The rows are
+bit for bit what the single-row kernels produce; against the single path,
+which folds each normalisation into a mat-vec's tail, the batched step's
+logits differ by under 1% of their span over forty layers and the greedy
+choice is the same, and a batch of three sentences produced the three
+translations the single path produces, character for character.
+
+`xabe-llm-bench --kind translate --rows N`, 128-token prompts, 32 decoded
+tokens, nine-round medians, one card held quiet:
+
+| rows in the step | ms a step | tokens/s, one row | tokens/s across the rows |
+| ---: | ---: | ---: | ---: |
+| 1 | 15.3 | 65.3 | 65.3 |
+| 2 | 17.5 | 57.2 | 114.5 |
+| 3 | 21.5 | 46.5 | 139.4 |
+| 4 | 25.9 | 38.6 | 154.5 |
+
+Two rows for 1.14x the time of one, three for 1.41x, four for 1.69x. What
+the extra rows cost is inside the mat-vec, not around it: the profile puts
+the single step's mat-vecs at 14.4 ms and the three-row kernel at 18.1, with
+the per-row attentions, rotations and the unfused normalisations adding 1.7
+between them. The three-row kernel streams the same 8 GB at 442 GB/s where
+the single-row one reaches 555, and what has changed is the instructions
+between loads - two activation loads, two scales and eight `dp4a` a row for
+every sixteen bytes of weight - so this is an issue-rate cost on a kernel
+that was memory-bound at one row. Staging the activation once a block or
+precomputing the per-group code sums that the `-32` bias currently spends
+four of the eight `dp4a` on are the two things that would take it down, and
+neither has been tried; the trade-off for a turn is settled below without
+them.
+
+### What it is worth on a turn, and the policy that came out of it
+
+`tools/bench/turn_bench.py`, one typed turn over the WebSocket - the reply
+chunked as it streams, each clause translated then synthesised - on one
+card with the chat model, the translator, the ASR and Tacotron2 all
+resident. The reply is three clauses of 15, 12 and 30 characters, the same
+every run; four runs each, medians. `--translate-ahead 0` translates the
+clauses one at a time in step with the synthesiser, which is what the
+previous binary did and what the batched thread does with one clause in it;
+`--translate-ahead 1` hands every clause to the translator as it is cut.
+
+| | first audio | whole turn | clause 1 translated | clause 3 translated |
+| --- | ---: | ---: | ---: | ---: |
+| one at a time | **1 488 ms** | 3 880 ms | 866 ms | 1 172 ms |
+| every clause as it arrives | 1 654 ms | **3 613 ms** | 1 020 ms | 1 310 ms |
+
+The whole turn is 267 ms shorter and the first audio 166 ms later, and both
+for the same reason: the first clause was sharing its steps. Its translation
+went from 866 ms to 1 020 with the second and third clauses decoding beside
+it, and the first clause is the one the listener is waiting through. The
+third clause is the other half of the story - 30 characters, 1.2 s alone,
+and it arrives last, so its translation plus its synthesis is the tail of
+the turn whichever way the clauses are scheduled, and batching cannot
+shorten a single long clause. Synthesis of the short second clause also
+went from 129 ms to 380 with the translator decoding beside it on the same
+card, which is the contention `translate_ahead` was introduced to avoid,
+now off the critical path.
+
+So the first clause of a turn is translated alone, and every clause after
+it is handed over as it arrives. That was tried next, and it lost on both
+counts - first audio 1 918 ms, the whole turn 3 949 - for a reason the
+first attempt had hidden: with the first clause finished, the second and
+third decode *beside its synthesis*, and on one card two GPU jobs do not
+run in half the time. Clause 1's synthesis went from 380 ms to 780 with the
+translator streaming next to it, and every later stage paid the same.
+
+The card, not the translator, is the contended resource on one card. So a
+translator and a synthesiser on one device now take turns on it: synthesis
+holds the card while it runs, and the batched translator - which decodes
+several clauses a step and loses nothing by pausing a few hundred
+milliseconds between steps - steps only while it is free (`xabe-engine`'s
+`card` module; the synthesiser never waits, so there is nothing to
+deadlock). With that, the same turn and the same four-run medians, and then
+a five-clause reply of 84 tokens, three runs:
+
+| one card, synthesis holding it | first audio | whole turn |
+| --- | ---: | ---: |
+| three clauses, in step | 1 498 ms | 3 908 ms |
+| three clauses, first alone then batched | 1 563 ms | 3 781 ms |
+| five clauses, in step | 1 664 ms | 7 118 ms |
+| five clauses, first alone then batched | 1 527 ms | 7 128 ms |
+
+Inside the run-to-run spread on both counts, both replies. The reason is
+worth keeping: on one card the tail of a turn is the *last* clause, which
+is cut last and is often the longest, and its translation plus its
+synthesis is the critical path whichever way the earlier clauses are
+scheduled. Batching lengthens that clause's own steps by the 1.14-1.41x
+above and cannot start it any sooner, so what it gains on the earlier
+clauses it gives back on the last. The 84-token reply's last clause was 49
+characters: 1 954 ms alone, 2 788-3 063 ms batched behind three others.
+
+**With the translator on its own card it is a different turn.** Chat model,
+ASR and Tacotron2 on card 0, the translator on card 1, the three-clause
+reply, three runs each:
+
+| translator on card 1 | first audio | whole turn |
+| --- | ---: | ---: |
+| in step (`--translate-ahead 0`) | 1 136 ms | 3 445 ms |
+| first alone, then batched (`--translate-ahead 1`) | 1 145 ms | **2 816 ms** |
+
+18% off the whole turn and first audio unmoved, which is what the batch
+was built for: the second and third clauses decode together the moment the
+first is done, nothing is contending with synthesis, and the clause the
+listener is waiting on keeps its own steps. (The first clause also
+translates in 643 ms here against 855 on the shared card, where the chat
+model is still writing beside it.)
+
+So the defaults stand where they were - in step on one card, ahead on two -
+and what changed is what "ahead" does: every clause after the first is
+handed over as it is cut and decoded together, rather than one clause of
+overlap. `--translate-ahead` is an explicit flag as well as the
+device-derived default, for a shared card that turns out to have the room,
+and the shared-card priority applies whenever the two stages resolve to one
+device, whichever way the flag is set.
+
 ## First speech, with llama.cpp behind both Llama stages
 
 The table below says llama.cpp is ahead on both stages. This is what that is
@@ -2114,6 +2245,11 @@ Synthesis is a sixth to a quarter of a clause and runs at about twelve times
 realtime. Halving it would take roughly 200 ms off a turn; halving the
 translator would take nearly a second. The remaining lever on a turn is the
 13 B translator's decode rate, not Tacotron2.
+
+Since then the translator has learned to decode several clauses over one
+weight stream, which is the lever above applied to what a turn actually
+hands it; see "Several clauses, one weight stream" for what it bought and
+the policy it settled.
 
 ## Residency: the whole pipeline on one card
 

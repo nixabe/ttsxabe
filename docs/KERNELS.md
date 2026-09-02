@@ -50,6 +50,7 @@ exists.
 | mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `xabe_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `xabe-cuda` quant |
 | f16 mat-vec with the residual add and the next layer normalisation in its tail | ASR decode | the mat-vec, then `xabe_dsp::layer_norm_add` | `gemv_ln` | `xabe-cuda` kernels |
 | stacked q/k/v mat-vec, placed into the caches | ASR decode | `gemv_into` three times, in the test | `gemv_qkv_f16` | `xabe-cuda` kernels |
+| packed mat-vec over several int8 rows, one weight stream | the translator, batched decode | `gemv` a row at a time, in the test | `gemv_q_rows2`, `gemv_q_rows3`, `gemv_q_rows4` | `xabe-cuda` quant |
 
 ## Also implemented
 
@@ -1341,6 +1342,42 @@ activation lifted out character for character, so that "bit for bit against
 the chain" is a property of the code rather than of a test that happened to
 pass. Thirteen launches a layer became eight. `docs/BENCHMARKS.md` has what
 that is worth under "The decoder's round".
+
+## Several rows, one weight stream: `gemv_q_rows`
+
+A decode step at one row is the weight stream and nothing else - on the 13 B
+translator, 8 GB a token at close to the card's bandwidth - and `gemv` puts
+a second row at `blockIdx.y`, which streams the weight a second time. That
+is the right shape for a single conversation and the wrong one for what the
+translator actually receives: a reply chunked into clauses, the second
+waiting before the first is half done. `gemv_q_rows` is the packed K-quant
+mat-vec over up to `GEMV_Q_ROWS` int8 rows at once, each weight byte fetched
+once and spent on every row. `gemm_batched` routes any packed product of two
+to four rows to it, so the translator's batched step is the same call sites
+as its single step with a different row count.
+
+The per-row arithmetic is `q4k_wide` and `q6k_wide` character for character
+- the same words, the same `dp4a` order, the same two-term combine, the same
+warp reduction - only with the sixteen weight bytes, the header and the
+scales loaded once above a loop over the rows. So a row of this kernel's
+output is bit for bit a row of `gemv`'s, and the test holds it there at two,
+three and four rows, both block formats, a contraction that is not a whole
+number of warp trips, a batch that shares one activation, and a bias. The
+row count is a template parameter - `R` accumulators a lane - so the
+four-row instantiation is not paying for rows the two-row call does not
+have, and the wrapper picks the instantiation by `m`.
+
+What the rows share is the stream; what they do not share is attention,
+which each takes over its own cache. `attn_decode` therefore grew a query
+offset and a destination row - the query read from an element of the
+batched projection buffer, the context and its int8 twin written into one
+row of a `[rows, hidden]` buffer and one shared twin - so several sequences
+can each attend into the operand the shared output projection then
+multiplies. The twin's scales are one a group of 32, so a row must start on
+a group, which every head geometry here does. Same kernel, same arithmetic;
+the test holds the row against the single-row call bit for bit and the
+neighbouring rows untouched. `docs/BENCHMARKS.md` has what the batched step
+costs against the single one.
 
 ## Measured and rejected: sixteen-byte loads on the f16 mat-vec
 

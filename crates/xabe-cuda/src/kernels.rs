@@ -53,6 +53,7 @@ pub const SOURCE: &str = r#"
 #define AD_GMAX 4
 #define AD_CMAX 256
 #define GN_NL 4
+#define GEMV_Q_ROWS 4
 
 #define GEMM_WARPS 8
 #define GEMM_MT    128
@@ -4442,9 +4443,22 @@ __device__ __forceinline__ void attn_decode_impl(
     float* __restrict__ part,
     unsigned* __restrict__ ctr,
     int tk, int group, int cap, float scale, int scale_q, int chunks,
-    signed char* __restrict__ qa, int asc_off)
+    signed char* __restrict__ qa, int asc_off, long q_off, long out_off)
 {
-    float* asc = qa ? (float*)(qa + asc_off) : (float*)0;
+    // The query read from `q_off` and the context - and its twin - written
+    // from `out_off`, so that several sequences decoding together can each
+    // attend over their own cache into one row of a shared `[rows, n]`
+    // buffer and one shared twin. The scale of a group of 32 is at
+    // `idx >> 5`, so the twin's scales shift by a thirty-second of the
+    // offset; `out_off` is a whole number of groups, which the wrapper
+    // checks.
+    q += q_off;
+    out += out_off;
+    float* asc = (float*)0;
+    if (qa) {
+        asc = (float*)(qa + asc_off) + (out_off >> 5);
+        qa += out_off;
+    }
     constexpr int T    = HD;                    // threads a block
     constexpr int W    = KVH ? HD / 2 : HD;     // words in a key row
     constexpr int LPK  = W / 4;                 // lanes a key, 16 bytes each
@@ -4802,11 +4816,11 @@ extern "C" __global__ __launch_bounds__(HD, LB) void NAME(                     \
     const KT* __restrict__ vc,                                                 \
     float* __restrict__ out, float* __restrict__ part, unsigned* __restrict__ ctr, \
     int tk, int group, int cap, float scale, int scale_q, int chunks,         \
-    signed char* __restrict__ qa, int asc_off)                                 \
+    signed char* __restrict__ qa, int asc_off, long q_off, long out_off)       \
 {                                                                              \
     attn_decode_impl<HD, KVH, CH>(q, (const unsigned*)kc, (const unsigned*)vc, \
                                   out, part, ctr, tk, group, cap, scale,       \
-                                  scale_q, chunks, qa, asc_off);               \
+                                  scale_q, chunks, qa, asc_off, q_off, out_off); \
 }
 
 AD_ENTRY(attn_decode_h128_c32,  128, true,  32,  unsigned short, 4)
@@ -4815,6 +4829,183 @@ AD_ENTRY(attn_decode_h128_c128, 128, true,  128, unsigned short, 4)
 AD_ENTRY(attn_decode_h64,       64,  true,  64,  unsigned short, 8)
 AD_ENTRY(attn_decode_f64,       64,  false, 64,  float,          8)
 
+
+// ------------------------------------------- several rows, one weight stream
+//
+// `gemv`'s packed K-quant path over up to `GEMV_Q_ROWS` int8 rows at once,
+// each weight byte fetched once and spent on every row. At one row a decode
+// step is the weight stream and nothing else - 8 GB a token on the 13 B
+// translator - and `gemv` puts a second row at `blockIdx.y`, which streams
+// the weight a second time. Several sequences decoding together, which is
+// what a reply chunked into clauses gives the translator, want the rows to
+// share the stream: the arithmetic per row is a few hundred `dp4a` per lane
+// against a load that costs what the whole token costs.
+//
+// The per-row arithmetic is `q4k_wide` and `q6k_wide` character for
+// character - the same words, the same `dp4a` order, the same two-term
+// combine, the same warp reduction - so a row of this kernel's output is bit
+// for bit a row of `gemv`'s, and the test holds it there. Only the loads are
+// hoisted: the sixteen weight bytes, the header and the scales are read once
+// and the activation words once a row. `GEMV_Q_ROWS` is defined at the top of
+// the source with the other tunables.
+
+template <int R>
+__device__ __forceinline__ void q4k_wide_rows(
+    const unsigned char* blk, const signed char* xa, const float* asc,
+    int k, int slot, int jlo, int q0, int j0, float* acc)
+{
+    uint4 q = *(const uint4*)(blk + 16 + (slot << 4));
+    float d = q_f16(blk, 0), dmin = q_f16(blk, 2);
+    unsigned char s0, m0, s1, m1;
+    q_scale_min(blk + 4, q0, s0, m0);
+    q_scale_min(blk + 4, q0 + 1, s1, m1);
+    const unsigned* qw = (const unsigned*)&q;
+    const int groups = k >> 5;
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const signed char* xr = xa + (size_t)r * k;
+        uint4 xl = *(const uint4*)(xr + j0);
+        uint4 xh = *(const uint4*)(xr + j0 + 32);
+        const unsigned* xlw = (const unsigned*)&xl;
+        const unsigned* xhw = (const unsigned*)&xh;
+        int dot0 = 0, sum0 = 0, dot1 = 0, sum1 = 0;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            unsigned v = qw[w];
+            dot0 = __dp4a((int)(v & 0x0F0F0F0Fu), (int)xlw[w], dot0);
+            sum0 = __dp4a(0x01010101, (int)xlw[w], sum0);
+            dot1 = __dp4a((int)((v >> 4) & 0x0F0F0F0Fu), (int)xhw[w], dot1);
+            sum1 = __dp4a(0x01010101, (int)xhw[w], sum1);
+        }
+        const float* ar = asc + (size_t)r * groups;
+        float a0 = ar[j0 >> 5], a1 = ar[(j0 + 32) >> 5];
+        acc[r] += a0 * (d * (float)s0 * (float)dot0 - dmin * (float)m0 * (float)sum0)
+                + a1 * (d * (float)s1 * (float)dot1 - dmin * (float)m1 * (float)sum1);
+    }
+}
+
+template <int R>
+__device__ __forceinline__ void q6k_wide_rows(
+    const unsigned char* blk, const signed char* xa, const float* asc,
+    int k, int qlo, int qho, int sc_lo, int j0, float* acc)
+{
+    uint4 v = *(const uint4*)(blk + qlo);
+    uint2 u = *(const uint2*)(blk + qho);
+    float d = q_f16(blk, 208);
+    const signed char* sc = (const signed char*)(blk + 192);
+    float slo = (float)sc[sc_lo], shi = (float)sc[sc_lo + 2];
+    const unsigned* vw = (const unsigned*)&v;
+    const int groups = k >> 5;
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const signed char* xr = xa + (size_t)r * k;
+        uint4 xl = *(const uint4*)(xr + j0);
+        uint4 xh = *(const uint4*)(xr + j0 + 32);
+        const unsigned* xlw = (const unsigned*)&xl;
+        const unsigned* xhw = (const unsigned*)&xh;
+        int dot0 = 0, sum0 = 0, dot1 = 0, sum1 = 0;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            unsigned lo = (vw[w] & 0x0F0F0F0Fu)
+                        | (((u.x >> (w << 1)) & 0x03030303u) << 4);
+            unsigned hi = ((vw[w] >> 4) & 0x0F0F0F0Fu)
+                        | (((u.y >> (w << 1)) & 0x03030303u) << 4);
+            dot0 = __dp4a((int)lo, (int)xlw[w], dot0);
+            sum0 = __dp4a(0x01010101, (int)xlw[w], sum0);
+            dot1 = __dp4a((int)hi, (int)xhw[w], dot1);
+            sum1 = __dp4a(0x01010101, (int)xhw[w], sum1);
+        }
+        const float* ar = asc + (size_t)r * groups;
+        float a0 = ar[j0 >> 5], a1 = ar[(j0 + 32) >> 5];
+        acc[r] += a0 * d * slo * (float)(dot0 - 32 * sum0)
+                + a1 * d * shi * (float)(dot1 - 32 * sum1);
+    }
+}
+
+// One warp a column, `m` rows of it. `R` is the compile-time row count the
+// registers are laid out for and `m <= R` the rows that exist; the codes
+// are dense `[batch, a_rows, k]` as `gemv` reads them, with `a_rows` zero
+// for a batch that shares one activation.
+template <int R>
+__device__ __forceinline__ void gemv_q_rows_impl(
+    const unsigned char* __restrict__ w, int w_quant, int q_ts,
+    const signed char* __restrict__ qa, int asc_off, int a_rows,
+    const float* __restrict__ bias, float* __restrict__ out,
+    int m, int k, int n, long sw, long so)
+{
+    const int lane = threadIdx.x;
+    const int col = blockIdx.x * GEMV_WARPS + threadIdx.y;
+    if (col >= n) {
+        return;
+    }
+    const int nb = k >> 8;
+    const unsigned char* wc = w
+        + (size_t)blockIdx.z * (size_t)(sw >> 8) * (size_t)q_ts
+        + (size_t)col * nb * (size_t)q_ts;
+    const size_t r0 = (size_t)blockIdx.z * (size_t)a_rows;
+    const signed char* xa = qa + r0 * k;
+    const float* xs = (const float*)(qa + asc_off) + r0 * (k >> 5);
+    const int sub = lane >> 3, slot = lane & 7;
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        acc[r] = 0.0f;
+    }
+    if (w_quant == QT_Q4_K) {
+        const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
+        const int q0 = jlo >> 5;
+        for (int b = 0; b < nb; b += 4) {
+            if (b + sub < nb) {
+                q4k_wide_rows<R>(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                 xa, xs, k, slot, jlo, q0, ((b + sub) << 8) + jlo, acc);
+            }
+        }
+    } else {
+        const int pp = slot >> 1, hh = slot & 1;
+        const int qlo = (pp << 5) + (hh << 4);
+        const int qho = 128 + (pp << 4) + (hh << 3);
+        const int sc_lo = (pp << 2) + hh;
+        const int jlo = (pp << 6) + (hh << 4);
+        for (int b = 0; b < nb; b += 4) {
+            if (b + sub < nb) {
+                q6k_wide_rows<R>(wc + (size_t)(b + sub) * (size_t)q_ts,
+                                 xa, xs, k, qlo, qho, sc_lo, ((b + sub) << 8) + jlo, acc);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
+        }
+    }
+    if (lane == 0) {
+        float* o = out + (size_t)blockIdx.z * so + col;
+        const float b = bias ? bias[col] : 0.0f;
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r < m) {
+                o[(size_t)r * n] = acc[r] + b;
+            }
+        }
+    }
+}
+
+#define GEMV_Q_ROWS_ENTRY(NAME, R)                                            \
+extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void NAME(           \
+    const unsigned char* __restrict__ w, int w_quant, int q_ts,               \
+    const signed char* __restrict__ qa, int asc_off, int a_rows,              \
+    const float* __restrict__ bias, float* __restrict__ out,                  \
+    int m, int k, int n, long sw, long so)                                    \
+{                                                                              \
+    gemv_q_rows_impl<R>(w, w_quant, q_ts, qa, asc_off, a_rows, bias, out,     \
+                        m, k, n, sw, so);                                      \
+}
+
+GEMV_Q_ROWS_ENTRY(gemv_q_rows2, 2)
+GEMV_Q_ROWS_ENTRY(gemv_q_rows3, 3)
+GEMV_Q_ROWS_ENTRY(gemv_q_rows4, 4)
 
 // ------------------------------------------ the f16 mat-vec with a layer norm
 //
@@ -5269,6 +5460,9 @@ const fn define(key: &str) -> u32 {
 pub const GEMM_WARPS: u32 = define("GEMM_WARPS");
 /// Warps in a `gemv` or `gemv_rows` block; one output column each.
 pub const GEMV_WARPS: u32 = define("GEMV_WARPS");
+/// Rows the packed multi-row mat-vec carries in one warp. `GEMV_MAX_M`
+/// must not exceed it.
+pub const GEMV_Q_ROWS: u32 = define("GEMV_Q_ROWS");
 /// Rows of the activation one `gemm` block covers; the grid's `y` step.
 pub const GEMM_MT: u32 = define("GEMM_MT");
 /// Rows of the weight one `gemm` block covers; the grid's `x` step.
