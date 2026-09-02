@@ -2266,15 +2266,17 @@ would answer a different question and give a smaller number.
 | ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 499 |
 | chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 267 |
 | translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | 16 045 |
-| CosyVoice3, LM + flow + vocoder | safetensors → f16 where read as f16 | 2 157 | **18 202** |
+| CosyVoice3, LM + flow + vocoder | safetensors → f16 where read as f16 | 1 958 | **18 005** |
 
-**18 202 MiB — 17.8 GiB of a 48 GiB card**, 37% of it, leaving 30 944 MiB for
+**18 005 MiB — 17.6 GiB of a 48 GiB card**, 37% of it, leaving 31 141 MiB for
 KV caches and activations. Without CosyVoice, which is the alternative
-synthesiser rather than a second stage, the four remaining are 16 045 MiB.
+synthesiser rather than a second stage, the four remaining are 16 047 MiB.
 The CosyVoice row stood at 3 266 MiB, and then at 3 469 when it was measured
 again after the speech LLM's weights were halved - which is the trap
-described under "CosyVoice3's residency" below, and the row here is from
-after it was closed; the other rows are as measured before it.
+described under "CosyVoice3's residency" below. The whole table was
+re-measured in one process after it was closed, which is where these
+figures are from; CosyVoice alone, with the context charged to it, is
+2 157 MiB.
 This table stood at 21 771 MiB until the embedding tables were held packed -
 "One launch for a decode step's attention, and the embedding held packed"
 above - which is 1 632 MiB on the chat row and 830 on the translator's against
@@ -2289,16 +2291,20 @@ stage was forgotten.
 ### The same card with Tacotron2 as the only synthesiser
 
 Neither VITS nor CosyVoice, which is the configuration to read if the reply
-path is Han text through Tacotron2:
+path is Han text through Tacotron2. The Tacotron2 row read 489 when it was
+measured with its weights converted on the card and 459 on the day the
+loader was changed to convert on the host, which is the same trap as
+CosyVoice's below at a smaller scale; it is 427 now, and the rows after
+it are carried from the earlier measurement:
 
 | stage | container | delta MiB | cumulative |
 | --- | --- | --- | --- |
-| Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 | 489 | 489 |
-| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 691 |
-| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 459 |
+| Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 on the host | 427 | 427 |
+| ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 629 |
+| chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 397 |
 | translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | **16 237** |
 
-**16 237 MiB — 15.9 GiB**, leaving 32 909 MiB. Tacotron2 costs 192 MiB more
+**16 175 MiB — 15.8 GiB**, leaving 32 977 MiB. Tacotron2 costs 130 MiB more
 than VITS did in the row above, which is the two models' parameter counts and
 not the context; dropping CosyVoice is what saves the 3 266 MiB.
 
@@ -2814,6 +2820,7 @@ survive them.
 | | before | after |
 | --- | ---: | ---: |
 | `xabe-vram`, CosyVoice3 alone | 3 469 MiB | **2 157 MiB** |
+| `xabe-vram`, CosyVoice3 after the four other stages | 3 266 MiB | **1 958 MiB** |
 | speech LLM, a token | 2.63-2.65 ms | 2.61 ms |
 | flow, 262 frames | 443 ms (240 frames) | 424 ms |
 

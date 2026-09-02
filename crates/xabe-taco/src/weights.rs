@@ -66,10 +66,13 @@ pub(crate) struct Conv {
 /// The contraction is `in_ch * k`; the tiled kernel stages two elements at a
 /// time and refuses an odd one, which is why WaveGlow's three-channel start
 /// projection stays full width.
+///
+/// The rounding happens on the host, so the f32 form is never resident: the
+/// memory pool keeps its pages, and a conversion on the card would leave the
+/// wider copy's peak in what the card reports. Same bits either way.
 fn upload_weight(gpu: &Gpu, w: &[f32], in_ch: usize, k: usize) -> Result<Weight, TacoError> {
     if (in_ch * k).is_multiple_of(2) {
-        let f32s = gpu.upload(w)?;
-        Ok(Weight::Half(gpu.to_f16(&f32s, w.len())?))
+        Ok(Weight::Half(gpu.upload_f16(w)?))
     } else {
         Ok(Weight::Full(gpu.upload(w)?))
     }
