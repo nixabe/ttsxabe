@@ -555,6 +555,9 @@ const NAMES: &[&str] = &[
     "conv1d_tiled",
     "conv1d_tiled_64",
     "conv1d_tiled_32",
+    "grouped_conv1d_tiled",
+    "grouped_conv1d_tiled_64",
+    "grouped_conv1d_tiled_32",
     "conv1d_short",
     "depthwise_conv1d",
     "transposed_conv1d",
@@ -4029,8 +4032,25 @@ impl Gpu {
         groups: usize,
         pad_left: usize,
     ) -> Result<(CudaSlice<f32>, usize), CudaError> {
+        if groups == 0 || !in_ch.is_multiple_of(groups) || !out_ch.is_multiple_of(groups) {
+            return Err(CudaError::RaggedBlock {
+                k: in_ch.max(out_ch),
+                block: groups,
+            });
+        }
         let out_t = (t + pad_left).saturating_sub(k) + 1;
-        let mut out = self.zeros(out_ch * out_t)?;
+        let need = in_ch * t;
+        if x.len() < need || w.len() < out_ch * (in_ch / groups) * k || bias.len() < out_ch {
+            return Err(CudaError::SliceOverrun {
+                at: need.max(out_ch * (in_ch / groups) * k),
+                len: x.len().min(w.len()),
+            });
+        }
+        // Every element is written by either kernel.
+        // SAFETY: the direct kernel writes one element a thread over
+        // `out_ch * out_t` and the tiled one every element of its tile
+        // that is inside `(out_per, out_t)`, group by group.
+        let mut out = unsafe { self.uninit(out_ch * out_t) }?;
         let (a, b, c, d, e, g, h) = (
             in_ch as i32,
             t as i32,
@@ -4040,7 +4060,22 @@ impl Gpu {
             pad_left as i32,
             out_t as i32,
         );
-        let f = self.func("grouped_conv1d");
+        // The same choice `conv1d` makes: from 32 positions the implicit
+        // matmul, in the widest tile that still fills the card, counting
+        // a group's channel tiles times the groups.
+        let oc_blocks = ((out_ch / groups) as u32).div_ceil(CONV_TILE_OC);
+        let blocks_at = |w: u32| oc_blocks * (out_t as u32).div_ceil(w) * groups as u32;
+        let tile = [128u32, 64, 32]
+            .into_iter()
+            .find(|&w| out_t as u32 >= w && blocks_at(w) >= 144)
+            .or_else(|| [32u32, 64, 128].into_iter().find(|&w| out_t as u32 >= w));
+        let name = match tile {
+            Some(128) => "grouped_conv1d_tiled",
+            Some(64) => "grouped_conv1d_tiled_64",
+            Some(_) => "grouped_conv1d_tiled_32",
+            None => "grouped_conv1d",
+        };
+        let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x)
             .arg(w)
@@ -4053,9 +4088,19 @@ impl Gpu {
             .arg(&e)
             .arg(&g)
             .arg(&h);
-        launched("grouped_conv1d", unsafe {
-            lb.launch(Self::flat(out_ch * out_t))
-        })?;
+        let cfg = match tile {
+            Some(width) => LaunchConfig {
+                grid_dim: (oc_blocks, (out_t as u32).div_ceil(width), groups as u32),
+                block_dim: (width * 2, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            None => Self::flat(out_ch * out_t),
+        };
+        // SAFETY: a block owns 32 of one group's channels by `width`
+        // positions and every read and write inside is bounds checked
+        // against the group's `t`, `out_per`, `out_t` and `in_per * k`; the
+        // direct kernel returns past `out_ch * out_t`.
+        launched(name, unsafe { lb.launch(cfg) })?;
         Ok((out, out_t))
     }
 

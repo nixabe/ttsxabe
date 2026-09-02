@@ -186,3 +186,47 @@ pub fn transposed_conv1d(
     }
     out
 }
+
+/// A grouped convolution with left padding only: `groups` independent
+/// [`conv1d`]s over consecutive channel slices, the weight `[out_c, in_c /
+/// groups, k]` with its second axis the channel *within* the group.
+///
+/// CosyVoice3's DiT positional embedding is the one caller: 16 groups over
+/// 1024 channels, a kernel of 31, padded `k - 1` on the left so the output
+/// keeps the input's length. The reference is `Conv1d(groups=16)`; here it
+/// is the sum a direct kernel takes - bias first, then the group's channels
+/// ascending and the taps ascending within each - so the CUDA twins can be
+/// held to it exactly.
+// Shapes are arguments, not types - see the crate essay.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_conv1d(
+    x: &[f32],
+    in_c: usize,
+    t: usize,
+    w: &[f32],
+    bias: &[f32],
+    out_c: usize,
+    k: usize,
+    groups: usize,
+    pad_left: usize,
+) -> Vec<f32> {
+    assert!(in_c.is_multiple_of(groups) && out_c.is_multiple_of(groups));
+    let (in_per, out_per) = (in_c / groups, out_c / groups);
+    let out_t = (t + pad_left).saturating_sub(k) + 1;
+    let mut out = Vec::with_capacity(out_c * out_t);
+    for g in 0..groups {
+        out.extend(conv1d(
+            &x[g * in_per * t..(g + 1) * in_per * t],
+            in_per,
+            t,
+            &w[g * out_per * in_per * k..(g + 1) * out_per * in_per * k],
+            Some(&bias[g * out_per..(g + 1) * out_per]),
+            out_per,
+            k,
+            pad_left,
+            0,
+            1,
+        ));
+    }
+    out
+}

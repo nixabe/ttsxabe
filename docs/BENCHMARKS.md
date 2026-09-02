@@ -3199,6 +3199,33 @@ over the two rounds together. What is left: the decode attention at
 about 18 µs a layer over 131 positions, which is a fixed cost the chunk
 width does not reach, and the weight stream itself at 1.2 ms a token.
 
+### The flow's positional convolution as a tiled matmul: 275 ms to 250
+
+With both rows batched the flow was 263 ms of kernels in a 273 ms span,
+and the profile's largest entry that was not a matmul was the input
+embedding's grouped convolution: 16 groups of 64 channels, a kernel of
+31, 886 µs a call at 1.8 TFLOP/s and four calls an evaluation, 32 ms an
+utterance. The kernel was a thread per output element walking 1984
+weights. It is now `conv1d_tiled`'s implicit-matmul body a group a
+`blockIdx.z` - the same staging, the same `fmaf` chain in the same
+order - at 327 µs a call, and the flow's mel is byte for byte what it was.
+
+The stages example on GPU 2, the same utterance, the cca2d71 build
+against this one alternated in two pairs of four runs, the first run of
+each set aside, worst of the rest on each side:
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| flow, 262 frames | 275 ms | 251 ms | 1.10x |
+| utterance, 5.24 s of audio | 656 ms | 633 ms | 1.04x |
+
+The utterance is 8.3x realtime now. The flow's remaining entries are the
+products - the stacked q, k and v at 282 µs, the feed-forward pair at
+about 150 each, the per-row output projection at 69 - the fused
+attention at 47 µs a row, and then small things: the five copies a block
+that an offset rope would remove, the gated residual adds that the
+matmul's epilogue could carry, the modulation projections read at f32.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

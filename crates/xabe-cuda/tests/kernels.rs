@@ -189,6 +189,61 @@ fn conv1d_matches_at_every_awkward_shape() {
 }
 
 #[test]
+fn grouped_conv1d_matches_on_both_kernels() {
+    let Some(g) = gpu() else { return };
+    // The DiT's shape scaled down and up, with the direct kernel below 32
+    // positions and each of the three tiles above it; ragged channel
+    // counts within a group, and a group count of one.
+    for &(in_ch, t, out_ch, k, groups, pad) in &[
+        (32usize, 20usize, 32usize, 31usize, 4usize, 30usize),
+        (64, 45, 64, 7, 2, 6),
+        (96, 100, 48, 5, 3, 4),
+        (1024, 394, 1024, 31, 16, 30),
+        (40, 300, 72, 3, 8, 2),
+        (12, 129, 12, 4, 1, 0),
+    ] {
+        let x = seq(in_ch * t, 11);
+        let w = seq(out_ch * (in_ch / groups) * k, 12);
+        let b = seq(out_ch, 13);
+        let want = xabe_dsp::grouped_conv1d(&x, in_ch, t, &w, &b, out_ch, k, groups, pad);
+        let (out, out_t) = g
+            .grouped_conv1d(
+                &g.upload(&x).unwrap(),
+                &g.upload(&w).unwrap(),
+                &g.upload(&b).unwrap(),
+                in_ch,
+                t,
+                out_ch,
+                k,
+                groups,
+                pad,
+            )
+            .unwrap();
+        assert_eq!(out_t * out_ch, want.len());
+        assert_close(
+            &format!("grouped_conv1d {in_ch}x{t} -> {out_ch}, k{k} g{groups} pad{pad}"),
+            &want,
+            &g.download(&out).unwrap(),
+        );
+    }
+    // A channel count the groups do not divide is refused.
+    assert!(
+        g.grouped_conv1d(
+            &g.upload(&seq(30, 1)).unwrap(),
+            &g.upload(&seq(30, 1)).unwrap(),
+            &g.upload(&seq(6, 1)).unwrap(),
+            3,
+            10,
+            6,
+            1,
+            2,
+            0,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn depthwise_conv1d_matches() {
     let Some(g) = gpu() else { return };
     for &(ch, t, k, dilation) in &[

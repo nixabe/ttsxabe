@@ -157,8 +157,10 @@ bit, and the step is 2.61 to 2.49 ms a token for it; its two closing
 projections then took their residual adds and norms into their tails
 through an f16 twin of the chat model's `gemv_norm`, seven launches a
 layer from eleven, for 2.32 ms a token with the token sequence unchanged.
-The utterance is 832 ms to 675 across the first two of those rounds,
-7.8x realtime, and not re-taken after the third. This paragraph
+The flow's grouped positional convolution, 886 µs a call as a thread per
+element, is the tiled convolution's body a group a block now, 327 µs,
+mel byte-identical, for 275 ms to 250 on the flow. The utterance is
+832 ms to 633 across those rounds, 8.3x realtime. This paragraph
 said "CosyVoice is scoped and not started" long after phase 6 had closed; the
 one thing still outside the engine is deriving a **new** CosyVoice voice, which
 runs two ONNX models once through `tools/make_cosyvoice_voice.py`.

@@ -2785,6 +2785,28 @@ CONV_TILED_ENTRY(conv1d_tiled, 32)
 CONV_TILED_ENTRY(conv1d_tiled_64, 16)
 CONV_TILED_ENTRY(conv1d_tiled_32, 8)
 
+// The grouped convolution on the same body, a group a `blockIdx.z`: each
+// group is an ordinary convolution over its own slice of the channels, so
+// the tile runs on the slice's pointers with the group's channel counts.
+// `bias` is never null here - the caller has one - and the sum is the direct
+// `grouped_conv1d`'s: bias, the group's channels ascending, taps ascending.
+#define GCONV_TILED_ENTRY(NAME, TX)                                                     \
+    extern "C" __global__ __launch_bounds__(8 * TX) void NAME(                          \
+        const float* __restrict__ x, const float* __restrict__ w,                       \
+        const float* __restrict__ bias, float* __restrict__ out,                        \
+        int in_ch, int t, int out_ch, int k, int groups, int pad_left, int out_t)       \
+    {                                                                                   \
+        const int g = blockIdx.z;                                                       \
+        const int in_per = in_ch / groups, out_per = out_ch / groups;                   \
+        conv1d_tiled_body<TX>(x + (size_t)g * in_per * t,                               \
+                              w + (size_t)g * out_per * in_per * k,                     \
+                              bias + g * out_per, out + (size_t)g * out_per * out_t,    \
+                              in_per, t, out_per, k, pad_left, 1, out_t);               \
+    }
+GCONV_TILED_ENTRY(grouped_conv1d_tiled, 32)
+GCONV_TILED_ENTRY(grouped_conv1d_tiled_64, 16)
+GCONV_TILED_ENTRY(grouped_conv1d_tiled_32, 8)
+
 // For sequences too short to fill a four-deep time tile. The text encoder runs
 // over 69 symbols and the flow over a couple of hundred frames; at T_REG = 4
 // three quarters of every thread's arithmetic would fall past the end.

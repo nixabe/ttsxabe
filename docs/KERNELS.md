@@ -16,6 +16,7 @@ exists.
 | conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths) | `xabe-cuda` conv1d |
 | depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` | `depthwise_conv1d` | `xabe-tts` duration |
 | transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` | `transposed_conv1d` | `xabe-tts` decoder |
+| grouped conv1d, left-padded | CosyVoice3 DiT positional embedding | `xabe_dsp::grouped_conv1d` | `grouped_conv1d`, `grouped_conv1d_tiled` | `xabe-cuda` kernels |
 | leaky ReLU | decoder | `xabe_dsp::leaky_relu` | `act_leaky_relu` | `xabe-tts` decoder |
 | WaveNet residual block | flow coupling, posterior | `xabe-tts` flow::wavenet | `gated_activation` + `conv1d` | `xabe-tts` flow |
 | affine coupling | flow | `xabe-tts` flow_reverse | `sub_inplace` | `xabe-tts` flow |
@@ -127,6 +128,16 @@ Two entries deserve a note:
   every axis, and both synthesisers' audio was byte-identical across the
   change. 1.48x on a VITS synthesis and 1.03x on Tacotron2; see
   `docs/BENCHMARKS.md`.
+- **`grouped_conv1d_tiled` is `conv1d_tiled`'s body a group a `blockIdx.z`.**
+  A grouped convolution is `groups` ordinary ones over consecutive channel
+  slices, so the tile runs on the slice's pointers with the group's channel
+  counts and nothing else changes; the wrapper picks the tile the way
+  `conv1d` does, counting a group's channel tiles times the groups, and
+  the 64-wide tile wins the DiT's shape - 224 blocks at 327 µs against the
+  128-wide's 128 blocks at 368, measured - where the direct kernel took
+  886. The direct kernel had no CPU twin and no test until this round;
+  both kernels are now held to `xabe_dsp::grouped_conv1d` at the DiT's
+  shape and five others, and the flow's mel is byte for byte what it was.
 - **`act_gelu` uses the device's `erff`,** which is IEEE-accurate, while the CPU
   twin carries Cody's rational approximation because Rust has no `erf`. Their
   test compares two different implementations of the same function, so

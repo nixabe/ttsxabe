@@ -33,7 +33,9 @@ mod weight_norm;
 
 pub use activation::{elu, gelu_tanh, leaky_relu, mish, relu, snake, softmax_rows};
 pub use attention::self_attention;
-pub use conv::{conv1d, conv1d_strided, depthwise_conv1d, same_padding, transposed_conv1d};
+pub use conv::{
+    conv1d, conv1d_strided, depthwise_conv1d, grouped_conv1d, same_padding, transposed_conv1d,
+};
 pub use erf::{erf, gelu};
 pub use fft::{Fft, Scratch, dft, hann_periodic, istft, stft};
 pub use flow::coupling_inverse;
