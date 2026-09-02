@@ -1286,6 +1286,100 @@ impl Gpu {
                 len: out.len(),
             });
         }
+        self.conv1d_launch(
+            x, w, bias, in_ch, t, out_ch, k, pad_left, dilation, out_t, None, None, out,
+        )?;
+        Ok(out_t)
+    }
+
+    /// [`Self::conv1d`] with the VITS decoder's residual layer folded
+    /// around it: the input passed through leaky ReLU at `slope` as it is
+    /// read, and `residual` added to the output as it is written. Both are
+    /// exactly the separate kernels' numbers - `act_leaky_relu`'s formula
+    /// on the same values, `add_inplace`'s sum in its order - so a layer
+    /// that was copy, activation, convolution, activation, convolution,
+    /// add is two launches and reads its input once. Below 32 positions,
+    /// where the direct kernel runs, the wrapper issues those separate
+    /// kernels itself; the caller gets the same numbers either way.
+    ///
+    /// Refuses a `residual` shorter than the output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_act_res(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        in_ch: usize,
+        t: usize,
+        out_ch: usize,
+        k: usize,
+        pad_left: usize,
+        pad_right: usize,
+        dilation: usize,
+        slope: Option<f32>,
+        residual: Option<&CudaSlice<f32>>,
+    ) -> Result<(CudaSlice<f32>, usize), CudaError> {
+        let span = dilation * (k - 1) + 1;
+        let out_t = (t + pad_left + pad_right).saturating_sub(span) + 1;
+        if let Some(r) = residual
+            && r.len() < out_ch * out_t
+        {
+            return Err(CudaError::SliceOverrun {
+                at: out_ch * out_t,
+                len: r.len(),
+            });
+        }
+        // SAFETY: as in `conv1d` - every output position is written.
+        let mut out = unsafe { self.uninit(out_ch * out_t) }?;
+        if Self::conv_tile(out_ch, out_t).2.is_some() {
+            self.conv1d_launch(
+                x, w, bias, in_ch, t, out_ch, k, pad_left, dilation, out_t, slope, residual,
+                &mut out,
+            )?;
+            return Ok((out, out_t));
+        }
+        let activated;
+        let x = match slope {
+            Some(slope) => {
+                activated = {
+                    let mut a = self.copy_range(x, 0, in_ch * t)?;
+                    self.leaky_relu(&mut a, in_ch * t, slope)?;
+                    a
+                };
+                &activated
+            }
+            None => x,
+        };
+        self.conv1d_launch(
+            x, w, bias, in_ch, t, out_ch, k, pad_left, dilation, out_t, None, None, &mut out,
+        )?;
+        if let Some(r) = residual {
+            self.add_inplace(&mut out, r, out_ch * out_t)?;
+        }
+        Ok((out, out_t))
+    }
+
+    /// The launch behind the convolutions: picks the kernel and issues it
+    /// into `out`, which is already sized. `slope` and `residual` reach
+    /// only the tiled kernels; the callers above arrange that they are
+    /// `None` when a direct kernel is chosen.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_launch(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        in_ch: usize,
+        t: usize,
+        out_ch: usize,
+        k: usize,
+        pad_left: usize,
+        dilation: usize,
+        out_t: usize,
+        slope: Option<f32>,
+        residual: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
         // Which specialisation: the four-deep time tile pays for itself only
         // when the sequence can fill it. Below that the short kernel wins,
         // because three quarters of every thread's arithmetic would otherwise
@@ -1342,6 +1436,13 @@ impl Gpu {
             .arg(&g)
             .arg(&h);
         if let Some(width) = tile {
+            let act: i32 = slope.is_some().into();
+            let slope = slope.unwrap_or(0.0);
+            lb.arg(&act).arg(&slope);
+            match residual {
+                Some(r) => lb.arg(r),
+                None => lb.arg(&null),
+            };
             let cfg = LaunchConfig {
                 grid_dim: (oc_blocks, (out_t as u32).div_ceil(width), 1),
                 block_dim: (width * 2, 1, 1),
@@ -1350,9 +1451,10 @@ impl Gpu {
             // SAFETY: a block owns 32 channels by `width` positions with
             // `width / 4` lanes by eight, and every global read and write
             // inside is bounds checked against `t`, `out_ch`, `out_t` and
-            // `in_ch * k`.
+            // `in_ch * k`; the residual is checked against the output's
+            // length by the caller.
             launched("conv1d_tiled", unsafe { lb.launch(cfg) })?;
-            return Ok(out_t);
+            return Ok(());
         }
         // The tiled kernel's launch shape: one block per (output-channel tile,
         // time tile), with the input window in dynamic shared memory.
@@ -1368,7 +1470,7 @@ impl Gpu {
             shared_mem_bytes: (tile * 4) as u32,
         };
         launched("conv1d", unsafe { lb.launch(cfg) })?;
-        Ok(out_t)
+        Ok(())
     }
 
     /// Depthwise convolution. Mirrors `xabe_dsp::depthwise_conv1d`.

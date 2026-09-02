@@ -2695,11 +2695,21 @@ extern "C" __global__ void conv1d(
 // input tile is read a row at a time along its channels, coalesced, and
 // stored transposed the way the weights are, into a row padded by four so
 // the transposed stores spread over the banks.
+//
+// Two seams for the VITS decoder's residual layers, which run leaky ReLU,
+// convolution, leaky ReLU, convolution, add: with `act` the input is
+// passed through `x < 0 ? x * slope : x` as it is staged, which is
+// `act_leaky_relu`'s formula on the same values and so the same numbers
+// without the in-place pass or the copy that pass forced; with `res` the
+// store adds `res` at the output's own index, `acc + res`, which is
+// `add_inplace`'s sum in `add_inplace`'s order. Padding stages as zero
+// before or after the activation alike, since the activation fixes zero.
 template <int TX, int OCT, bool ROWMAJOR = false>
 __device__ __forceinline__ void conv1d_tiled_body(
     const float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ bias, float* __restrict__ out,
-    int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)
+    int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t,
+    int act, float slope, const float* __restrict__ res)
 {
     constexpr int CT_T = 4 * TX;
     constexpr int THREADS = 8 * TX;
@@ -2771,8 +2781,10 @@ __device__ __forceinline__ void conv1d_tiled_body(
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int src = base + j;
-                xv[h][j] = 0.0f;
-                if (kk < K && src >= 0 && src < t) xv[h][j] = xr[src];
+                float v = 0.0f;
+                if (kk < K && src >= 0 && src < t) v = xr[src];
+                if (act && v < 0.0f) v *= slope;
+                xv[h][j] = v;
             }
         }
     };
@@ -2823,10 +2835,10 @@ __device__ __forceinline__ void conv1d_tiled_body(
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             if (tt + j >= out_t) break;
-            float* orow = out + (size_t)(tt + j) * out_ch + oc;
+            const size_t o = (size_t)(tt + j) * out_ch + oc;
             #pragma unroll
             for (int a = 0; a < OCT; ++a) {
-                if (oc + a < out_ch) orow[a] = acc[a][j];
+                if (oc + a < out_ch) out[o + a] = res ? acc[a][j] + res[o + a] : acc[a][j];
             }
         }
         return;
@@ -2834,10 +2846,10 @@ __device__ __forceinline__ void conv1d_tiled_body(
     #pragma unroll
     for (int a = 0; a < OCT; ++a) {
         if (oc + a >= out_ch) break;
-        float* orow = out + (size_t)(oc + a) * out_t;
+        const size_t o = (size_t)(oc + a) * out_t + tt;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            if (tt + j < out_t) orow[tt + j] = acc[a][j];
+            if (tt + j < out_t) out[o + j] = res ? acc[a][j] + res[o + j] : acc[a][j];
         }
     }
 }
@@ -2846,10 +2858,11 @@ __device__ __forceinline__ void conv1d_tiled_body(
     extern "C" __global__ __launch_bounds__(8 * TX) void NAME(                          \
         const float* __restrict__ x, const float* __restrict__ w,                       \
         const float* __restrict__ bias, float* __restrict__ out,                        \
-        int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t)     \
+        int in_ch, int t, int out_ch, int k, int pad_left, int dilation, int out_t,     \
+        int act, float slope, const float* __restrict__ res)                            \
     {                                                                                   \
         conv1d_tiled_body<TX, OCT>(x, w, bias, out, in_ch, t, out_ch, k, pad_left,      \
-                                   dilation, out_t);                                    \
+                                   dilation, out_t, act, slope, res);                   \
     }
 CONV_TILED_ENTRY(conv1d_tiled, 32, 4)
 CONV_TILED_ENTRY(conv1d_tiled_64, 16, 4)
@@ -2872,7 +2885,7 @@ CONV_TILED_ENTRY(conv1d_tiled_w32, 8, 8)
         int rows, int in_c, int out_c)                                                  \
     {                                                                                   \
         conv1d_tiled_body<TX, OCT, true>(x, w, bias, out, in_c, rows, out_c, 1, 0, 1,   \
-                                         rows);                                         \
+                                         rows, 0, 0.0f, nullptr);                       \
     }
 LINEAR_TILED_ENTRY(linear_tiled, 32, 4)
 LINEAR_TILED_ENTRY(linear_tiled_64, 16, 4)
@@ -2897,7 +2910,8 @@ LINEAR_TILED_ENTRY(linear_tiled_w32, 8, 8)
         conv1d_tiled_body<TX, 4>(x + (size_t)g * in_per * t,                            \
                                  w + (size_t)g * out_per * in_per * k,                  \
                                  bias + g * out_per, out + (size_t)g * out_per * out_t, \
-                                 in_per, t, out_per, k, pad_left, 1, out_t);            \
+                                 in_per, t, out_per, k, pad_left, 1, out_t,             \
+                                 0, 0.0f, nullptr);                                     \
     }
 GCONV_TILED_ENTRY(grouped_conv1d_tiled, 32)
 GCONV_TILED_ENTRY(grouped_conv1d_tiled_64, 16)

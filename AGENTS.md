@@ -144,7 +144,15 @@ work. The text encoder's projections then went from a thread per output
 to that same tiled body over `nn.Linear`'s layout, exact, 79 µs a call to
 15, for **1.06x** more on VITS, 24.8 ms to 23.3, and Tacotron2's encoder
 2.2 ms to 1.5; the tile won at every row count down to one, so the old
-kernel is deleted rather than kept for short rows. CosyVoice3 has since had
+kernel is deleted rather than kept for short rows. The decoder's
+thirty-six residual layers then stopped writing their own inputs: the
+tile applies the leaky ReLU as it stages a value and adds the residual as
+it stores one, the same numbers by the same formulas, so a layer is two
+launches rather than six and a synthesis is 654 of them rather than 858 -
+**1.12x** more, 23.5 ms to 20.9, WAVs still byte-identical. The finding
+to carry is the shape of it: the convolutions themselves got 0.9 ms
+*slower*, because staging a value now compares it, and the four
+memory-bound passes that went away were worth 3.3. CosyVoice3 has since had
 its first round too, and the largest single result in this file: its flow
 was moving the DiT's residual stream through host memory twice a block, and
 holding it on the card took an utterance from 3.4 s to 1.1 s with a

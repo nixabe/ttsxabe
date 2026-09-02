@@ -3308,6 +3308,34 @@ to 23.30**, **1.06x**. Tacotron2's encoder on the same three lines is
 2.19, 2.96 and 3.06 ms to 1.45, 1.99 and 2.05, and its synthesis is level
 inside the pairs' spread - the encoder was 2% of it.
 
+### The residual layer's seams folded into the tile: 1.12x on VITS
+
+After the text encoder's round a VITS synthesis was 23.9 ms in 858
+launches, and the ones that were not convolutions were worth reading
+together: 103 residual adds, 77 leaky ReLUs, 87 copies and 208 memsets,
+3.3 ms between them, most of it in the decoder's thirty-six residual
+layers. Each ran copy, leaky ReLU, convolution, leaky ReLU, convolution,
+add - the copy because the activation was in place and the input was
+also the residual - and at the 32-channel stage every one of those
+passes is 5.5 MB read and written.
+
+The tiled convolution now takes both seams. With a slope it applies
+`x < 0 ? x * slope : x` to each input value as it stages it, which is
+`act_leaky_relu`'s formula on the same values; with a residual its store
+writes `acc + res`, which is `add_inplace`'s sum in `add_inplace`'s
+order. So a layer is two launches, the input is read once and never
+written, and the numbers are the same: the test holds the fused launch
+bit for bit to the separate kernels on the card, and both synthesisers'
+WAVs are byte for byte the previous engine's on a long text and a
+three-syllable one.
+
+`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+twenty runs against the 56b9f97 bench, worst on each side: **23.51 ms
+to 20.90**, **1.12x**. The run is 654 launches from 858 and 19.3 ms of
+card time from 21.7; the convolutions themselves cost 0.9 ms more,
+because staging a value now compares it, and the passes that went away
+were worth 3.3. Tacotron2 does not run this layer and is level.
+
 ## The baseline to beat
 
 Measured on the pipeline this project exists to replace, on the target hardware,

@@ -142,6 +142,18 @@ Two entries deserve a note:
   block an SM, the narrow one otherwise. The 256-channel stage at 1344
   positions is short of blocks in either and sits at 4.6 TFLOP/s; a
   split of the contraction is the thing not tried.
+- **`conv1d_tiled` folds the residual layer's seams.** The VITS decoder's
+  thirty-six residual layers each ran copy, leaky ReLU, convolution, leaky
+  ReLU, convolution, add - six launches, four of them memory-bound passes
+  over a tensor up to 5.5 MB. With `act` the tile applies `x < 0 ? x *
+  slope : x` to each input value as it stages it, `act_leaky_relu`'s
+  formula on the same values, so the input is never written and is its own
+  residual; with `res` the store writes `acc + res` at the output's own
+  index, `add_inplace`'s sum in its order. `Gpu::conv1d_act_res` is the
+  wrapper, two launches a layer, and below the tile line it issues the
+  separate kernels itself. The test composes the CPU twins the long way
+  and also holds the fused launch bit for bit to the separate kernels on
+  the card; both synthesisers' audio is byte-identical across the change.
 - **`linear_tiled` is `conv1d_tiled`'s body over `nn.Linear`'s layout.** The
   same template with a flag: `x` is `[rows, in]` rather than `[in, t]`, so
   the input tile is read a row at a time along its channels and stored

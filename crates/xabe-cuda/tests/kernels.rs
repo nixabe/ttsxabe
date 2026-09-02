@@ -309,6 +309,83 @@ fn transposed_conv1d_matches_the_scatter_form() {
 /// off every tile edge: the text encoder's projections (70 rows of 192),
 /// the Tacotron2 encoder's input gates (206 rows, 512 to 4096), a handful
 /// of rows and a single one in a tile that is mostly padding, and odd ones.
+/// The residual layer's seams, tiled and direct: the fused launch against
+/// the CPU twin composed the long way, and bit for bit against the
+/// separate kernels on the card, at the decoder's shapes (a 64-wide tile,
+/// a 32-wide one, the wide channel tile) and one below the tile line.
+#[test]
+fn the_folded_activation_and_residual_are_the_separate_kernels() {
+    let Some(g) = gpu() else { return };
+    let slope = 0.1f32;
+    for (ch, t, k, d) in [
+        (32usize, 1500usize, 3usize, 1usize),
+        (128, 300, 11, 5),
+        (64, 200, 7, 3),
+        (16, 20, 3, 1),
+    ] {
+        let x = seq(ch * t, 40);
+        let w = seq(ch * ch * k, 41);
+        let b = seq(ch, 42);
+        let r = seq(ch * t, 43);
+        let pad = (k * d - d) / 2;
+
+        let mut xa = x.clone();
+        xabe_dsp::leaky_relu(&mut xa, slope);
+        let mut want = xabe_dsp::conv1d(&xa, ch, t, &w, Some(&b), ch, k, pad, pad, d);
+        for (o, r) in want.iter_mut().zip(&r) {
+            *o += r;
+        }
+
+        let dx = g.upload(&x).unwrap();
+        let dw = g.upload(&w).unwrap();
+        let db = g.upload(&b).unwrap();
+        let dr = g.upload(&r).unwrap();
+        let (fused, _) = g
+            .conv1d_act_res(
+                &dx,
+                &dw,
+                Some(&db),
+                ch,
+                t,
+                ch,
+                k,
+                pad,
+                pad,
+                d,
+                Some(slope),
+                Some(&dr),
+            )
+            .unwrap();
+        let fused = g.download(&fused).unwrap();
+        let name = format!("conv1d_act_res {ch}x{t} k{k} d{d}");
+        assert_close(&name, &want, &fused);
+
+        let mut xa = g.copy_range(&dx, 0, ch * t).unwrap();
+        g.leaky_relu(&mut xa, ch * t, slope).unwrap();
+        let (mut chain, _) = g
+            .conv1d(&xa, &dw, Some(&db), ch, t, ch, k, pad, pad, d)
+            .unwrap();
+        g.add_inplace(&mut chain, &dr, ch * t).unwrap();
+        let chain = g.download(&chain).unwrap();
+        assert!(
+            fused
+                .iter()
+                .zip(&chain)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{name}: fused differs from the separate kernels"
+        );
+    }
+
+    let dx = g.upload(&seq(64, 1)).unwrap();
+    let dw = g.upload(&seq(64 * 3, 2)).unwrap();
+    let short = g.upload(&seq(8, 3)).unwrap();
+    assert!(
+        g.conv1d_act_res(&dx, &dw, None, 8, 8, 8, 3, 1, 1, 1, None, Some(&short))
+            .is_err(),
+        "a residual shorter than the output must be refused"
+    );
+}
+
 #[test]
 fn linear_matches() {
     let Some(g) = gpu() else { return };

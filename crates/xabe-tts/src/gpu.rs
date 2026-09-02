@@ -807,15 +807,20 @@ impl GpuModel {
         dilations: &[usize],
     ) -> Result<CudaSlice<f32>, SynthesisError> {
         let g = &self.gpu;
-        let mut h = g.copy_range(x, 0, ch * t)?;
+        let slope = Some(self.cfg.leaky_relu_slope);
+        // Each layer is two launches: the activation is applied as the
+        // convolution reads its input and the residual added as the second
+        // one writes, so the input is never touched in place and is its own
+        // residual. The numbers are the separate kernels' - see
+        // `Gpu::conv1d_act_res`.
+        let mut h: Option<CudaSlice<f32>> = None;
         for (i, dilation) in dilations.iter().copied().enumerate() {
-            let residual = g.copy_range(&h, 0, ch * t)?;
+            let input = h.as_ref().unwrap_or(x);
 
             let c1 = &block.convs1[i];
-            g.leaky_relu(&mut h, ch * t, self.cfg.leaky_relu_slope)?;
             let pad = (c1.k * dilation - dilation) / 2;
-            let (y, _) = g.conv1d(
-                &h,
+            let (y, _) = g.conv1d_act_res(
+                input,
                 &c1.w,
                 c1.b.as_ref(),
                 ch,
@@ -825,18 +830,32 @@ impl GpuModel {
                 pad,
                 pad,
                 dilation,
+                slope,
+                None,
             )?;
-            h = y;
 
             let c2 = &block.convs2[i];
-            g.leaky_relu(&mut h, ch * t, self.cfg.leaky_relu_slope)?;
             let pad = (c2.k - 1) / 2;
-            let (y, _) = g.conv1d(&h, &c2.w, c2.b.as_ref(), ch, t, ch, c2.k, pad, pad, 1)?;
-            h = y;
-
-            g.add_inplace(&mut h, &residual, ch * t)?;
+            let (y, _) = g.conv1d_act_res(
+                &y,
+                &c2.w,
+                c2.b.as_ref(),
+                ch,
+                t,
+                ch,
+                c2.k,
+                pad,
+                pad,
+                1,
+                slope,
+                Some(input),
+            )?;
+            h = Some(y);
         }
-        Ok(h)
+        match h {
+            Some(h) => Ok(h),
+            None => Ok(g.copy_range(x, 0, ch * t)?),
+        }
     }
 }
 
