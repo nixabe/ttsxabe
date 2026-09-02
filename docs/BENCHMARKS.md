@@ -2302,7 +2302,7 @@ it are carried from the earlier measurement:
 | Tacotron2 + WaveGlow 116 M, + the CUDA context | safetensors → f16 on the host | 427 | 427 |
 | ASR, Whisper large-v2 1.54 B | safetensors → f16 | 3 202 | 3 629 |
 | chat, Breeze2 8 B | GGUF `Q4_K_M`, packed | 4 768 | 8 397 |
-| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | **16 237** |
+| translator, Llama-2 13 B | GGUF `Q4_K_M`, packed | 7 778 | **16 175** |
 
 **16 175 MiB — 15.8 GiB**, leaving 32 977 MiB. Tacotron2 costs 130 MiB more
 than VITS did in the row above, which is the two models' parameter counts and
