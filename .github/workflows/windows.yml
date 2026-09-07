@@ -1,0 +1,61 @@
+# Native Windows build and CPU tests. Hosted runners have no CUDA device or
+# checkpoints, so this does not establish Windows GPU inference correctness.
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native:
+    name: Native Windows build and tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the repository toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the engine
+        run: cargo build --locked --release -p xabe-engine --bin xabe-engine
+      - name: Run the native executable
+        run: ./target/release/xabe-engine.exe --help
+      - name: Workspace tests
+        run: cargo test --locked --workspace --release -- --nocapture 2>&1 | tee windows-tests.log
+      - name: Report coverage limits and skips
+        if: always()
+        run: |
+          {
+            echo '### Native Windows coverage'
+            echo 'This job builds and starts the Windows executable and runs workspace tests.'
+            echo 'CUDA inference and checkpoint-dependent tests require a separate GPU machine.'
+            if [ -f windows-tests.log ]; then
+              echo '```text'
+              grep -o 'SKIP:.*' windows-tests.log | sort | uniq -c | sort -rn || true
+              echo '```'
+            else
+              echo 'Tests did not produce a log; inspect the build steps.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: windows-tests.log
+          if-no-files-found: ignore
