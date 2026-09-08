@@ -32,6 +32,7 @@ pub mod action;
 pub mod args;
 pub mod card;
 pub mod error;
+pub mod memory;
 pub mod serve;
 pub mod stage;
 pub mod tts;
@@ -48,6 +49,9 @@ pub use stage::{Device, Kind, Requested, Stage, StageError, Stages};
 /// anything. A flag combination that cannot mean anything costs a millisecond
 /// to reject rather than six gigabytes of weights.
 pub fn run(args: &Args) -> Result<(), EngineError> {
+    if let Some(bytes) = args.max_system_ram {
+        memory::verify(bytes)?;
+    }
     // 1: which stages this process owns.
     let stages = args.stages()?;
 

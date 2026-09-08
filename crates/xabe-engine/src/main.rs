@@ -23,7 +23,7 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    match run(&args) {
+    match xabe_engine::memory::launch(args.max_system_ram).and_then(|()| run(&args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");

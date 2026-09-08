@@ -5,6 +5,38 @@ The workspace builds two binaries: `xabe-engine`, the engine itself, and
 
 ## `xabe-engine`
 
+### System RAM budget
+
+Add `--max-system-ram 32GiB` (or `XABE_MAX_SYSTEM_RAM=32GiB`) to cap the
+engine's system memory. Sizes are positive integer bytes, or integers followed
+by `KiB`, `MiB`, `GiB` or `TiB`. Omitting it preserves the existing unlimited
+behavior. Choose a budget below the machine's RAM, leaving room for other
+processes; this does not reserve memory against those processes.
+
+On Linux, the CLI enters a transient `systemd-run --user --scope` with
+`MemoryMax` set to the budget and `MemorySwapMax=0`. It preserves the current
+directory, environment, arguments and standard IO. This requires cgroup v2,
+systemd-run and a running user manager with the memory controller delegated.
+The engine checks `memory.max` and `memory.swap.max` before loading models;
+failure to establish the cap is fatal, never an unrestricted fallback. An
+existing cgroup with an equal or tighter RAM cap and zero swap is accepted.
+Library callers using `run` must enter such a cgroup themselves.
+
+The budget covers memory charged to that cgroup, including anonymous memory
+and charged file-cache pages, rather than virtual address space. Linux reclaims
+eligible pages under pressure; if the live working set cannot fit, a cgroup
+OOM can terminate the engine. This is a containment limit, not automatic model
+unloading or a guarantee that a request will finish. It excludes separately
+running HTTP backends and GPU VRAM. See
+[systemd's resource controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
+
+CUDA buffers already return to the device's reusable allocation pool when
+dropped. Keeping that pool cached does not permit allocations beyond available
+VRAM: allocation failures propagate as CUDA errors. Live weights and buffers
+must still fit; the engine does not offload them automatically.
+
+### Stage selection
+
 Every stage is satisfied one of two ways, and the symmetry is the whole design:
 
 | | |

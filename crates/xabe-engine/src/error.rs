@@ -6,6 +6,10 @@ use thiserror::Error;
 /// A run that could not proceed, named at the point it stopped.
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// A requested RAM cap could not be enforced before loading models.
+    #[error("--max-system-ram: {0}")]
+    MemoryLimit(String),
+
     /// The stage flags do not describe a valid process.
     #[error(transparent)]
     Stage(#[from] crate::stage::StageError),

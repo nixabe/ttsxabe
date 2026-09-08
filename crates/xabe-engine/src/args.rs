@@ -20,6 +20,12 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "xabe-engine", version, about, long_about = None)]
 pub struct Args {
+    /// Hard system RAM limit, e.g. 32GiB or 512MiB (bare numbers are bytes).
+    /// Requires Linux cgroup v2 and systemd --user; disables swap for this run.
+    /// Linux may kill the engine if reclaim cannot keep it within the limit.
+    #[arg(long, env = "XABE_MAX_SYSTEM_RAM", value_name = "SIZE", value_parser = crate::memory::parse_bytes)]
+    pub max_system_ram: Option<u64>,
+
     /// Serve HTTP on this address. Without it the run is one-shot.
     #[arg(long, env = "XABE_SERVE", value_name = "ADDR")]
     pub serve: Option<String>,
