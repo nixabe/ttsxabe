@@ -5,6 +5,9 @@ use thiserror::Error;
 /// A failure in the serving layer.
 #[derive(Debug, Error)]
 pub enum ServeError {
+    /// An explicit override must contain instructions rather than whitespace.
+    #[error("system_prompt must not be empty")]
+    EmptySystemPrompt,
     /// A stage this process delegates to failed.
     ///
     /// Carries the stage name because a turn touches four services and "HTTP

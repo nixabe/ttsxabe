@@ -432,3 +432,46 @@ fn the_frames_that_proved_speech_was_starting_count_towards_the_turn() {
     feed(&mut e, 0.2, 3);
     assert_eq!(e.turn_ms(), 96, "all three onset frames belong to the turn");
 }
+
+#[test]
+fn request_prompt_replaces_startup_without_leaking_to_later_turns() {
+    let startup = xabe_serve::GatewayConfig {
+        system_prompt: "startup instructions".into(),
+        ..Default::default()
+    };
+    let history = vec![(xabe_serve::Role::User, "previous question".into())];
+    let request = startup
+        .with_system_prompt(Some(" dynamic instructions "))
+        .unwrap();
+    let prompt = request.build_prompt(&history, "current question");
+    assert!(prompt.starts_with("dynamic instructions\n"));
+    assert!(!prompt.contains("startup instructions"));
+    assert!(prompt.contains("previous question"));
+    assert!(prompt.contains("current question"));
+    assert!(
+        startup
+            .with_system_prompt(None)
+            .unwrap()
+            .build_prompt(&[], "next")
+            .starts_with("startup instructions\n")
+    );
+    assert!(startup.with_system_prompt(Some(" \n\t")).is_err());
+}
+
+#[test]
+fn websocket_audio_and_text_accept_optional_prompt_overrides() {
+    for kind in ["text", "audio"] {
+        for value in [serde_json::Value::Null, serde_json::json!("dynamic")] {
+            let frame = serde_json::json!({"type": kind, "content": "hello", "pcm": "", "system_prompt": value});
+            let decoded: xabe_serve::ClientMessage = serde_json::from_value(frame).unwrap();
+            let prompt = match decoded {
+                xabe_serve::ClientMessage::Text { system_prompt, .. }
+                | xabe_serve::ClientMessage::Audio { system_prompt, .. } => system_prompt,
+                _ => panic!("wrong turn type"),
+            };
+            assert_eq!(prompt.as_deref(), value.as_str());
+        }
+        let frame = serde_json::json!({"type": kind, "content": "hello", "pcm": ""});
+        assert!(serde_json::from_value::<xabe_serve::ClientMessage>(frame).is_ok());
+    }
+}

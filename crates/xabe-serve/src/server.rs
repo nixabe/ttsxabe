@@ -114,6 +114,9 @@ async fn inference(State(state): State<AppState>, mut form: Multipart) -> Respon
                     language = v;
                 }
             }
+            // Accepted for clients sharing request fields with /ws. ASR has
+            // no chat LLM and must not use this as a transcription hint.
+            "system_prompt" => {}
             // `temperature` and `response_format` are accepted and ignored: the
             // pipeline sends them, and rejecting a field a caller sends is a
             // worse compatibility break than not acting on it.
@@ -283,4 +286,59 @@ fn upstream_error(e: crate::error::ServeError) -> Response {
         axum::Json(serde_json::json!({"error": e.to_string()})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GatewayConfig, Inner};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn synthesis_endpoints_ignore_system_prompt_and_only_send_text() {
+        let (tx, mut rx) = mpsc::channel::<SynthesisJob>(2);
+        let state = AppState(Arc::new(Inner {
+            config: GatewayConfig::default(),
+            asr: None,
+            vad: None,
+            llm: None,
+            translator: None,
+            translator_target: "POJ".into(),
+            tts_scripts: Default::default(),
+            tts: [("mms".into(), TtsBackend::Local(tx))].into(),
+            page: "",
+        }));
+        let worker = tokio::spawn(async move {
+            for _ in 0..2 {
+                let job = rx.recv().await.unwrap();
+                assert_eq!(job.text, "hello");
+                job.reply
+                    .send(TtsChunk {
+                        seq: 1,
+                        wav: B64.encode(xabe_audio::wav_bytes(&[0.25; 16], 16_000)),
+                        taigi: String::new(),
+                        roman: String::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        for streaming in [false, true] {
+            let req: TtsRequest = serde_json::from_value(serde_json::json!({
+                "text": "hello", "system_prompt": "DO NOT SYNTHESIZE THESE INSTRUCTIONS"
+            }))
+            .unwrap();
+            let response = if streaming {
+                tts_stream(State(state.clone()), axum::Json(req)).await
+            } else {
+                tts(State(state.clone()), axum::Json(req)).await
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(!body.is_empty());
+        }
+        worker.await.unwrap();
+    }
 }

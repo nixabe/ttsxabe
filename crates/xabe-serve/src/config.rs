@@ -120,6 +120,20 @@ pub fn mandarin_prompt(person: &str, bot: &str) -> String {
 }
 
 impl GatewayConfig {
+    /// Resolves a request's chat configuration without changing shared state.
+    /// Omitted overrides keep the startup prompt; explicit blank prompts fail.
+    pub fn with_system_prompt(&self, prompt: Option<&str>) -> Result<Self, crate::ServeError> {
+        let mut config = self.clone();
+        if let Some(prompt) = prompt {
+            let prompt = prompt.trim();
+            if prompt.is_empty() {
+                return Err(crate::ServeError::EmptySystemPrompt);
+            }
+            config.system_prompt = prompt.to_string();
+        }
+        Ok(config)
+    }
+
     /// Builds the completion prompt for one turn.
     pub fn build_prompt(&self, history: &[(Role, String)], user_text: &str) -> String {
         let mut lines = vec![self.system_prompt.clone(), String::new()];

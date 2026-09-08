@@ -53,6 +53,8 @@ pub enum ClientMessage {
         rate: u32,
         /// Which TTS engine to answer with.
         engine: Option<String>,
+        /// Replaces the startup chat prompt for this turn only.
+        system_prompt: Option<String>,
     },
     /// A typed turn.
     Text {
@@ -60,6 +62,8 @@ pub enum ClientMessage {
         content: String,
         /// Which TTS engine to answer with.
         engine: Option<String>,
+        /// Replaces the startup chat prompt for this turn only.
+        system_prompt: Option<String>,
     },
     /// Forget the conversation.
     Reset,
@@ -170,6 +174,10 @@ pub struct TtsRequest {
     /// in the response to say so.
     #[serde(default)]
     pub engine: Option<String>,
+    /// Accepted for client compatibility, but unused: synthesis does not call
+    /// the chat LLM. Never forwarded to a synthesis backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// One `data:` line of `llama-server`'s streamed `POST /completion`.

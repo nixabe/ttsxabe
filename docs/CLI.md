@@ -448,6 +448,26 @@ keep its own copy of numbers that were tuned against real speech. They are
 defined and unit-tested in `xabe-serve::turntaking`; see `docs/MODEL.md` for
 what each one is a fix for.
 
+### Per-turn system prompts
+
+WebSocket `text` and `audio` messages accept an optional `system_prompt`:
+
+```json
+{"type":"text","content":"你好","system_prompt":"請用繁體中文簡短回答。"}
+```
+
+This replaces the startup system prompt for that turn's chat LLM call only.
+It retains conversation history and does not change the startup configuration
+or another connection. Send it on each turn that needs the override; omitting
+it or sending `null` uses the startup prompt again. Leading and trailing
+whitespace is trimmed, and an empty override returns a WebSocket `error`
+without processing the turn. The value must be a string or `null`.
+
+`POST /tts` and `POST /tts_stream` accept the same optional JSON field but
+ignore it. `POST /inference` accepts and ignores a `system_prompt` multipart
+field. These endpoints do not call the chat LLM. The override is never passed
+to ASR, the translator, or a synthesis backend as instructions.
+
 ## Turn-taking
 
 Every constant is a fix for an observed failure, not a round number:

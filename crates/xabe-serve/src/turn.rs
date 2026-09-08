@@ -85,6 +85,24 @@ pub async fn run(state: AppState, mut socket: WebSocket) {
         };
 
         let engine = engine_of(&msg);
+        let override_prompt = match &msg {
+            ClientMessage::Audio { system_prompt, .. }
+            | ClientMessage::Text { system_prompt, .. } => system_prompt.as_deref(),
+            _ => None,
+        };
+        let config = match state.config.with_system_prompt(override_prompt) {
+            Ok(config) => config,
+            Err(e) => {
+                let _ = send(
+                    &mut socket,
+                    ServerMessage::Error {
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
         let user_text = match handle(&state, &mut socket, &mut prefetch, msg).await {
             Turn::Continue => continue,
             Turn::Say(text) => text,
@@ -111,6 +129,7 @@ pub async fn run(state: AppState, mut socket: WebSocket) {
             &mut seq,
             &user_text,
             engine,
+            config,
         )
         .await
         {
@@ -327,6 +346,7 @@ async fn reply(
     seq: &mut u64,
     user_text: &str,
     engine: Option<String>,
+    config: crate::config::GatewayConfig,
 ) -> Result<(), ServeError> {
     let llm = state.llm.clone().ok_or(ServeError::NoStage("llm"))?;
     let backend = state
@@ -335,13 +355,12 @@ async fn reply(
         .clone();
 
     let t1 = Instant::now();
-    let prompt = state.config.build_prompt(history, user_text);
+    let prompt = config.build_prompt(history, user_text);
 
     let (piece_tx, mut piece_rx) = mpsc::channel::<String>(64);
     let (jobs_tx, jobs_rx) = mpsc::channel::<String>(8);
     let (audio_tx, mut audio_rx) = mpsc::channel::<TtsChunk>(AUDIO_BUFFER);
 
-    let config = state.config.clone();
     let llm_task = tokio::spawn(async move { llm.stream(prompt, &config, piece_tx).await });
     let worker = tokio::spawn(synthesis_worker(
         backend,
