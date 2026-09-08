@@ -1817,3 +1817,24 @@ transform.** `conv_post` emits 18 channels, which is magnitude and phase over
 the 9 bins of a 16-point transform with hop 4. Small enough that a direct DFT
 beats a radix-2 plan, and the differential test is against `xabe_dsp::istft`
 like every other kernel here.
+
+## Bounded host staging for packed weights
+
+Chat and translator packed GGUF loaders borrow checkpoint byte ranges instead
+of copying whole tensors into host vectors. Rotary permutation changes the
+order of borrowed rows; stacked Q/K/V projections concatenate those references.
+`Gpu::upload_quant_parts` allocates the final device buffer once and fills it
+through at most 1 MiB of host staging. It validates all block boundaries and
+checks the total size before allocation, and synchronizes each upload before
+reusing its host buffer. Q6_K retains the same 224-byte device block layout,
+including zero padding; no inference kernel or arithmetic changes.
+
+This removes the tensor-sized Q6_K repack buffer: a 14336-by-4096 matrix
+previously requested 51,380,224 host bytes just for that buffer. Checkpoint
+mapping, row-reference lists, driver allocations and unquantized loading still
+use system memory; 1 MiB is the packed upload staging bound, not a process RAM
+limit. This path is shared by Windows and Linux and requires no cgroup support.
+No startup speed or whole-process memory reduction is claimed without a
+measurement. The chunk-copy test checks reordered parts, multiple chunks,
+padding and a partial tail against the previous whole-buffer layout; existing
+packed-kernel and model differential tests check the resulting arithmetic.

@@ -295,7 +295,7 @@ impl ChatModel {
                 .flatten();
             let w = match packed {
                 Some(ty) => GWeight::Packed {
-                    data: gpu.upload_quant(ty, &Self::packed(&f, b, &cfg, ty)?)?,
+                    data: gpu.upload_quant_parts(ty, &Self::packed(&f, b, &cfg, ty)?)?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -322,7 +322,7 @@ impl ChatModel {
                         all.extend_from_slice(&Self::packed(&f, b, &cfg, ty)?);
                     }
                     GWeight::Packed {
-                        data: gpu.upload_quant(ty, &all)?,
+                        data: gpu.upload_quant_parts(ty, &all)?,
                         ty,
                     }
                 }
@@ -425,7 +425,7 @@ impl ChatModel {
             .flatten()
         {
             Some(ty) => GEmbed::Packed {
-                data: gpu.upload_quant(ty, &Self::packed(&f, &w.embed_tokens, &cfg, ty)?)?,
+                data: gpu.upload_quant_parts(ty, &Self::packed(&f, &w.embed_tokens, &cfg, ty)?)?,
                 ty,
             },
             None => GEmbed::F32(wide(&w.embed_tokens)?),
@@ -472,24 +472,30 @@ impl ChatModel {
         ))
     }
 
-    /// A tensor's blocks, byte for byte, with the rope permutation undone.
+    /// Borrowed block ranges in upload order, with the rope permutation undone.
     ///
     /// The sibling of [`Self::f16`] and it has to undo the same permutation,
     /// or `q` and `k` are shuffled within every head and the model is fluent
     /// and wrong - see `xabe_llama::gguf`. It can do so *without unpacking*
     /// only because that permutation moves whole rows: a quantized row is a
     /// whole number of blocks, so the same shuffle applies to byte ranges.
-    fn packed(f: &GgufFile, b: &Bound, cfg: &LlamaConfig, ty: Quant) -> Result<Vec<u8>, ChatError> {
+    /// Only row references are allocated; the tensor bytes remain mapped.
+    fn packed<'a>(
+        f: &'a GgufFile,
+        b: &Bound,
+        cfg: &LlamaConfig,
+        ty: Quant,
+    ) -> Result<Vec<&'a [u8]>, ChatError> {
         let raw = f.tensor_bytes(&b.name)?;
         if !xabe_llama::gguf::is_rope_permuted(&b.name) {
-            return Ok(raw.to_vec());
+            return Ok(vec![raw]);
         }
         let heads = if b.shape[0] == cfg.hidden_size {
             cfg.num_attention_heads
         } else {
             cfg.num_key_value_heads
         };
-        Ok(xabe_llama::gguf::unpermute_rope_bytes(
+        Ok(xabe_llama::gguf::unpermute_rope_rows(
             raw,
             b.shape[0],
             ty.bytes(b.shape[1]),

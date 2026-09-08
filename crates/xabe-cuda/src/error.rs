@@ -3,6 +3,9 @@
 /// Something went wrong talking to the device.
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
+    /// Packed upload sizes overflowed or bounded host staging could not be allocated.
+    #[error("preparing packed weight upload: {0}")]
+    PackedUpload(String),
     /// An odd contraction with an f16 weight, which packs two to a word.
     ///
     /// The F32 path takes any length - see the history in

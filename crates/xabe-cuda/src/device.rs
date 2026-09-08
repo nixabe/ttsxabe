@@ -1051,38 +1051,90 @@ impl Gpu {
             })
     }
 
-    /// Copies packed blocks to the device at [`Quant::device_stride`].
-    ///
-    /// The path every model loader takes. For all but Q6_K it is
-    /// [`Gpu::upload_u8`] with a length check; for Q6_K it re-strides *and*
-    /// re-packs the blocks on the way - see `Gpu::q6k_device_block` - which
-    /// is why the check is a rejection and not a `debug_assert`: a `bytes`
-    /// that is not a whole number of blocks would be rebuilt into garbage that
-    /// still decodes to plausible numbers.
+    /// Copies packed blocks with at most 1 MiB of host staging.
     pub fn upload_quant(&self, q: Quant, bytes: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
+        self.upload_quant_parts(q, &[bytes])
+    }
+
+    /// Concatenates borrowed block ranges on the device, repacking Q6_K in chunks.
+    ///
+    /// Parts may be tensor rows in an arbitrary order. Validate every part and
+    /// the final size before allocating; never assemble a whole tensor on the
+    /// host. Synchronize each copy before reusing its staging buffer.
+    pub fn upload_quant_parts(
+        &self,
+        q: Quant,
+        parts: &[&[u8]],
+    ) -> Result<CudaSlice<u8>, CudaError> {
         let ts = q.type_size();
-        if !bytes.len().is_multiple_of(ts) {
-            return Err(CudaError::RaggedBlockBytes {
-                len: bytes.len(),
-                ty: ts,
-            });
-        }
         let stride = q.device_stride();
-        if stride == ts {
-            return self.upload_u8(bytes);
+        let mut blocks = 0usize;
+        for part in parts {
+            if !part.len().is_multiple_of(ts) {
+                return Err(CudaError::RaggedBlockBytes {
+                    len: part.len(),
+                    ty: ts,
+                });
+            }
+            blocks = blocks
+                .checked_add(part.len() / ts)
+                .ok_or_else(|| CudaError::PackedUpload("block count overflow".into()))?;
         }
-        let blocks = bytes.len() / ts;
-        let mut wide = vec![0u8; blocks * stride];
-        for (b, src) in bytes.chunks_exact(ts).enumerate() {
-            let dst = &mut wide[b * stride..(b + 1) * stride];
-            match q {
-                Quant::Q6K => Self::q6k_device_block(src, dst),
-                // No other format is re-strided today; if one ever is, it gets
-                // a plain copy until its kernels ask for more.
-                _ => dst[..ts].copy_from_slice(src),
+        let total = blocks
+            .checked_mul(stride)
+            .ok_or_else(|| CudaError::PackedUpload("device byte count overflow".into()))?;
+        let chunk_blocks = (1024 * 1024 / stride).min(blocks);
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(chunk_blocks * stride)
+            .map_err(|e| CudaError::PackedUpload(e.to_string()))?;
+        staging.resize(chunk_blocks * stride, 0u8);
+        // Every byte is filled below before the allocation is returned.
+        let mut out =
+            unsafe { self.stream.alloc::<u8>(total) }.map_err(|source| CudaError::Driver {
+                what: "allocating packed weights",
+                source,
+            })?;
+        let mut filled = 0;
+        let mut offset = 0;
+        for part in parts {
+            for src in part.chunks_exact(ts) {
+                let dst = &mut staging[filled..filled + stride];
+                if q == Quant::Q6K {
+                    Self::q6k_device_block(src, dst);
+                } else {
+                    dst[..ts].copy_from_slice(src);
+                }
+                filled += stride;
+                if filled == staging.len() {
+                    self.stream
+                        .memcpy_htod(
+                            &staging[..filled],
+                            &mut out.slice_mut(offset..offset + filled),
+                        )
+                        .map_err(|source| CudaError::Driver {
+                            what: "uploading packed chunk",
+                            source,
+                        })?;
+                    self.synchronize()?;
+                    offset += filled;
+                    filled = 0;
+                }
             }
         }
-        self.upload_u8(&wide)
+        if filled != 0 {
+            self.stream
+                .memcpy_htod(
+                    &staging[..filled],
+                    &mut out.slice_mut(offset..offset + filled),
+                )
+                .map_err(|source| CudaError::Driver {
+                    what: "uploading packed tail",
+                    source,
+                })?;
+            self.synchronize()?;
+        }
+        Ok(out)
     }
 
     /// One Q6_K block, file layout to device layout.
@@ -5909,5 +5961,53 @@ impl Gpu {
             lb.launch(Self::flat(ch * frames))
         })?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn packed_chunks_preserve_parts_padding_and_tail() {
+        let ordinal = std::env::var("XABE_TEST_DEVICE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let g = match Gpu::open(ordinal) {
+            Ok(g) => g,
+            Err(CudaError::NoDevice(why)) => {
+                eprintln!("SKIP: {why}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        for q in [Quant::Q4K, Quant::Q6K] {
+            let ts = q.type_size();
+            let stride = q.device_stride();
+            // Two full staging chunks and a tail, with source-part boundaries
+            // deliberately different from the upload boundaries.
+            let blocks = 2 * (1024 * 1024 / stride) + 17;
+            let raw: Vec<u8> = (0..blocks * ts)
+                .map(|i| ((i * 31 + i / ts) % 251) as u8)
+                .collect();
+            let parts = [&raw[3 * ts..], &[][..], &raw[..3 * ts]];
+            let ordered = parts.concat();
+            let expected = if q == Quant::Q6K {
+                let mut old = vec![0u8; blocks * stride];
+                for (src, dst) in ordered.chunks_exact(ts).zip(old.chunks_exact_mut(stride)) {
+                    Gpu::q6k_device_block(src, dst);
+                }
+                old
+            } else {
+                ordered
+            };
+            let uploaded = g.upload_quant_parts(q, &parts).unwrap();
+            assert_eq!(g.stream.clone_dtoh(&uploaded).unwrap(), expected);
+            assert!(matches!(
+                g.upload_quant_parts(q, &[&raw[..ts], &raw[..1]]),
+                Err(CudaError::RaggedBlockBytes { .. })
+            ));
+        }
     }
 }

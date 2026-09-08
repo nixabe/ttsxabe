@@ -90,6 +90,26 @@ pub fn unpermute_rope_bytes(w: &[u8], rows: usize, row_bytes: usize, heads: usiz
     out
 }
 
+/// Borrows packed rows in the same order as [`unpermute_rope_bytes`].
+///
+/// Used by streaming uploads: only row references are allocated, never a
+/// tensor-sized copy. The caller has already validated the checkpoint geometry.
+pub fn unpermute_rope_rows(w: &[u8], rows: usize, row_bytes: usize, heads: usize) -> Vec<&[u8]> {
+    assert_eq!(w.len(), rows * row_bytes);
+    assert!(heads > 0 && rows.is_multiple_of(heads));
+    let head_dim = rows / heads;
+    assert!(head_dim > 0 && head_dim.is_multiple_of(2));
+    let half = head_dim / 2;
+    (0..rows)
+        .map(|dst| {
+            let h = dst / head_dim;
+            let within = dst % head_dim;
+            let src = h * head_dim + 2 * (within % half) + within / half;
+            &w[src * row_bytes..(src + 1) * row_bytes]
+        })
+        .collect()
+}
+
 /// Applies llama.cpp's rope permutation, the inverse of [`unpermute_rope`].
 ///
 /// Only the tests need this: it is what lets them start from the safetensors

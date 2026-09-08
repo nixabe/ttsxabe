@@ -96,18 +96,19 @@ impl Source {
         })
     }
 
-    /// One tensor's blocks, byte for byte, if it is stored in blocks at all.
+    /// Borrowed block ranges in upload order, if the tensor is stored in blocks.
     ///
     /// `None` for a safetensors checkpoint, which has no block formats, and
     /// for the unquantized GGUF widths. The rope permutation is undone here
     /// too and without unpacking, because it moves whole rows and a quantized
     /// row is a whole number of blocks - see
-    /// [`xabe_llama::gguf::unpermute_rope_bytes`].
-    fn packed(
-        &self,
+    /// [`xabe_llama::gguf::unpermute_rope_rows`]. Only row references are
+    /// allocated; even stacked attention projections borrow their tensor bytes.
+    fn packed<'a>(
+        &'a self,
         b: &Bound,
         cfg: &LlamaConfig,
-    ) -> Result<Option<(Vec<u8>, Quant)>, TranslateError> {
+    ) -> Result<Option<(Vec<&'a [u8]>, Quant)>, TranslateError> {
         let Self::Gguf(f) = self else {
             return Ok(None);
         };
@@ -121,9 +122,9 @@ impl Source {
             } else {
                 cfg.num_key_value_heads
             };
-            xabe_llama::gguf::unpermute_rope_bytes(raw, b.shape[0], ty.bytes(b.shape[1]), heads)
+            xabe_llama::gguf::unpermute_rope_rows(raw, b.shape[0], ty.bytes(b.shape[1]), heads)
         } else {
-            raw.to_vec()
+            vec![raw]
         };
         Ok(Some((bytes, ty)))
     }
@@ -389,7 +390,7 @@ impl Translator {
                 None
             } {
                 Some((bytes, ty)) => GWeight::Packed {
-                    data: gpu.upload_quant(ty, &bytes)?,
+                    data: gpu.upload_quant_parts(ty, &bytes)?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -419,7 +420,7 @@ impl Translator {
                         all.extend_from_slice(&bytes);
                     }
                     GWeight::Packed {
-                        data: gpu.upload_quant(ty, &all)?,
+                        data: gpu.upload_quant_parts(ty, &all)?,
                         ty,
                     }
                 }
@@ -501,7 +502,7 @@ impl Translator {
                 None
             } {
                 Some((bytes, ty)) => GEmbed::Packed {
-                    data: gpu.upload_quant(ty, &bytes)?,
+                    data: gpu.upload_quant_parts(ty, &bytes)?,
                     ty,
                 },
                 None => GEmbed::F32(wide(&w.embed_tokens)?),

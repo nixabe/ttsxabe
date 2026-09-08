@@ -211,6 +211,14 @@ fn unpermuting_bytes_agrees_with_unpermuting_elements() {
         let got = xabe_llama::gguf::unpermute_rope_bytes(&bytes, rows, cols * 2, heads);
 
         let want_bytes: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let borrowed = xabe_llama::gguf::unpermute_rope_rows(&bytes, rows, cols * 2, heads);
+        assert_eq!(borrowed.concat(), want_bytes);
+        for row in borrowed {
+            let start = row.as_ptr() as usize;
+            assert!(start >= bytes.as_ptr() as usize);
+            assert!(start + row.len() <= bytes.as_ptr() as usize + bytes.len());
+        }
+
         assert_eq!(
             got, want_bytes,
             "{rows}x{cols} over {heads} heads: the two permutations disagree",
