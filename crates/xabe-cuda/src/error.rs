@@ -3,6 +3,21 @@
 /// Something went wrong talking to the device.
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
+    /// An unsupported allocation policy must fail before loading any weights.
+    #[error("XABE_CUDA_UPLOAD_ALLOCATOR wants auto, pool or legacy, got `{0}`")]
+    UploadAllocator(String),
+    /// An upload device allocation still failed after reclaiming unused pool pages.
+    #[error("allocating {bytes} upload bytes on CUDA device {device}: {source}; {memory}")]
+    UploadOutOfMemory {
+        /// Requested device bytes, not host staging bytes.
+        bytes: usize,
+        /// Device ordinal receiving the weights.
+        device: usize,
+        /// Driver failure after the retry, or the initial failure if reclaim failed.
+        source: cudarc::driver::DriverError,
+        /// Best-effort memory diagnostics, with unavailable values explicitly named.
+        memory: String,
+    },
     /// Packed upload sizes overflowed or bounded host staging could not be allocated.
     #[error("preparing packed weight upload: {0}")]
     PackedUpload(String),

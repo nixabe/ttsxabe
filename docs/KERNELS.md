@@ -1838,3 +1838,43 @@ No startup speed or whole-process memory reduction is claimed without a
 measurement. The chunk-copy test checks reordered parts, multiple chunks,
 padding and a partial tail against the previous whole-buffer layout; existing
 packed-kernel and model differential tests check the resulting arithmetic.
+
+If a packed device allocation returns `CUDA_ERROR_OUT_OF_MEMORY`, the loader
+synchronizes its stream, asks CUDA to release unused default-pool pages, and
+retries once. Live weights are never evicted. Failure then reports the requested
+byte count, device ordinal, and CUDA free/total and pool reserved/used bytes
+before and after reclamation. Unavailable diagnostics are reported as such;
+they never replace the allocation error. This is best-effort recovery, not a
+promise that a model will fit. CUDA's free-memory figure alone also cannot
+establish the cause of a Windows WDDM allocation failure.
+
+### Windows upload allocation policy
+
+`Gpu` selects an allocation policy for host uploads before opening a model.
+Windows defaults to ordinary `cuMemAlloc`; Linux defaults to cudarc's
+`cuMemAllocAsync` pool. `XABE_CUDA_UPLOAD_ALLOCATOR=legacy|pool|auto` makes the
+choice explicit. Float, half, integer and packed uploads all follow it, while
+scratch allocation remains stream-ordered and pooled. Empty uploads retain
+cudarc's existing empty-allocation behavior. The packed host-staging bound and
+all numeric kernels are unchanged.
+
+The reason to separate the two lifetimes is concrete: model weights remain
+allocated for the life of the worker, so scratch-pool reuse does not help them.
+NVIDIA describes pool allocation as non-migratable/non-pageable, whereas the
+ordinary allocation path is subject to WDDM memory management. Ordinary
+uploads provide a compatibility path when the pool allocation is refused
+below physical VRAM capacity. This is not proof that a reported 16 GiB Windows
+failure was caused by the pool: system commit, residency budgets and driver
+behavior still need measurement on that machine. The default does not change
+Windows settings or claim a startup or inference speedup.
+
+Ownership passes to `CudaSlice` after ordinary allocation. A temporary guard
+frees the pointer if constructing cudarc's event bookkeeping unwinds. CUDA
+explicitly permits `cuMemFreeAsync` on a pointer from `cuMemAlloc`; cudarc
+orders the release after recorded uses, and memory is released when the stream
+synchronizes. See [NVIDIA's allocator interoperability documentation](https://developer.nvidia.com/blog/using-cuda-stream-ordered-memory-allocator-part-2/).
+
+Upload allocation failures now report the selected policy and Windows physical
+and process commit availability through `GlobalMemoryStatusEx`, in addition
+to the CUDA and pool measurements. Those snapshots are taken on failure;
+a Task Manager reading after process exit cannot substitute for them.

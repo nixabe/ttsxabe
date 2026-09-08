@@ -5,6 +5,7 @@
 //! fall back to the CPU path rather than being unable to start. Nothing in this
 //! crate is behind a feature flag.
 
+use crate::allocation::{UploadAllocator, host_memory_status};
 use crate::error::CudaError;
 use crate::kernels::{self, SOURCE};
 use cudarc::driver::PushKernelArg;
@@ -216,6 +217,7 @@ enum KvCache<'a> {
 
 /// An open CUDA device with the kernels compiled and loaded.
 pub struct Gpu {
+    upload_allocator: UploadAllocator,
     stream: Arc<CudaStream>,
     #[allow(dead_code)]
     module: Arc<CudaModule>,
@@ -670,6 +672,7 @@ const NAMES: &[&str] = &[
 impl Gpu {
     /// Opens device `ordinal` and compiles the kernels.
     pub fn open(ordinal: usize) -> Result<Self, CudaError> {
+        let upload_allocator = UploadAllocator::from_env()?;
         let ctx = Self::context(ordinal)?;
         let stream = ctx.default_stream();
 
@@ -734,7 +737,15 @@ impl Gpu {
             funcs.insert(name, f);
         }
 
-        tracing::info!(ordinal, kernels = funcs.len(), "opened CUDA device");
+        tracing::info!(
+            ordinal,
+            kernels = funcs.len(),
+            ?upload_allocator,
+            "opened CUDA device"
+        );
+        if let Some(memory) = host_memory_status() {
+            tracing::info!(%memory, "host memory at CUDA startup");
+        }
         let dummy = stream
             .alloc_zeros::<f32>(1)
             .map_err(|source| CudaError::Driver {
@@ -742,6 +753,7 @@ impl Gpu {
                 source,
             })?;
         Ok(Self {
+            upload_allocator,
             stream,
             module,
             funcs,
@@ -787,34 +799,34 @@ impl Gpu {
         Self::open(0)
     }
 
+    /// All host uploads share an allocation policy; scratch remains pooled.
+    fn upload_host<T: cudarc::driver::DeviceRepr>(
+        &self,
+        x: &[T],
+    ) -> Result<CudaSlice<T>, CudaError> {
+        let mut out = self.alloc_upload::<T>(x.len())?;
+        self.stream
+            .memcpy_htod(x, &mut out)
+            .map_err(|source| CudaError::Driver {
+                what: "copying uploaded tensor",
+                source,
+            })?;
+        Ok(out)
+    }
+
     /// Copies a slice to the device.
     pub fn upload(&self, x: &[f32]) -> Result<CudaSlice<f32>, CudaError> {
-        self.stream
-            .clone_htod(x)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading",
-                source,
-            })
+        self.upload_host(x)
     }
 
     /// Copies a slice of ids to the device.
     pub fn upload_i64(&self, x: &[i64]) -> Result<CudaSlice<i64>, CudaError> {
-        self.stream
-            .clone_htod(x)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading ids",
-                source,
-            })
+        self.upload_host(x)
     }
 
     /// Copies a slice of indices to the device.
     pub fn upload_i32(&self, x: &[i32]) -> Result<CudaSlice<i32>, CudaError> {
-        self.stream
-            .clone_htod(x)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading indices",
-                source,
-            })
+        self.upload_host(x)
     }
 
     /// Copies a buffer back to the host, synchronising.
@@ -1028,12 +1040,7 @@ impl Gpu {
     /// happened at load - see `xabe_st::StFile::tensor_f16`, which is also
     /// where the range check lives.
     pub fn upload_u16(&self, x: &[u16]) -> Result<CudaSlice<u16>, CudaError> {
-        self.stream
-            .clone_htod(x)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading f16 weights",
-                source,
-            })
+        self.upload_host(x)
     }
 
     /// Copies packed quantization blocks to the device, byte for byte.
@@ -1043,12 +1050,7 @@ impl Gpu {
     /// interprets them. That is the point - a conversion here would put the
     /// weights back at full width and give the whole exercise away.
     pub fn upload_u8(&self, x: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
-        self.stream
-            .clone_htod(x)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading quantized weights",
-                source,
-            })
+        self.upload_host(x)
     }
 
     /// Copies packed blocks with at most 1 MiB of host staging.
@@ -1090,11 +1092,7 @@ impl Gpu {
             .map_err(|e| CudaError::PackedUpload(e.to_string()))?;
         staging.resize(chunk_blocks * stride, 0u8);
         // Every byte is filled below before the allocation is returned.
-        let mut out =
-            unsafe { self.stream.alloc::<u8>(total) }.map_err(|source| CudaError::Driver {
-                what: "allocating packed weights",
-                source,
-            })?;
+        let mut out = self.alloc_packed(total)?;
         let mut filled = 0;
         let mut offset = 0;
         for part in parts {
@@ -1135,6 +1133,107 @@ impl Gpu {
             self.synchronize()?;
         }
         Ok(out)
+    }
+
+    /// Reclaim only unused pool pages. Live model allocations are untouched.
+    fn trim_packed_pool(&self) -> Result<(), cudarc::driver::DriverError> {
+        use cudarc::driver::result;
+        self.stream.synchronize()?;
+        let ctx = self.stream.context();
+        ctx.bind_to_thread()?;
+        unsafe {
+            let dev = result::device::get(ctx.ordinal() as i32)?;
+            let pool = result::device::get_default_mem_pool(dev)?;
+            result::mem_pool::trim_to(pool, 0)
+        }
+    }
+
+    /// Diagnose failure without losing the original allocation error.
+    fn packed_memory_status(&self) -> String {
+        use cudarc::driver::{result, sys};
+        let ctx = self.stream.context();
+        let memory = match ctx.mem_get_info() {
+            Ok((free, total)) => format!("CUDA free={free} total={total} bytes"),
+            Err(e) => format!("CUDA memory info unavailable: {e:?}"),
+        };
+        let pool_bytes = || -> Result<(u64, u64), cudarc::driver::DriverError> {
+            ctx.bind_to_thread()?;
+            unsafe {
+                let dev = result::device::get(ctx.ordinal() as i32)?;
+                let pool = result::device::get_default_mem_pool(dev)?;
+                let mut reserved = 0u64;
+                let mut used = 0u64;
+                result::mem_pool::get_attribute(
+                    pool,
+                    sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                    (&mut reserved as *mut u64).cast(),
+                )?;
+                result::mem_pool::get_attribute(
+                    pool,
+                    sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                    (&mut used as *mut u64).cast(),
+                )?;
+                Ok((reserved, used))
+            }
+        };
+        let mut description = match pool_bytes() {
+            Ok((reserved, used)) => format!("{memory}; pool reserved={reserved} used={used} bytes"),
+            Err(e) => format!("{memory}; pool info unavailable: {e:?}"),
+        };
+        description.push_str(&format!("; upload allocator={:?}", self.upload_allocator));
+        if let Some(host) = host_memory_status() {
+            description.push_str(&format!("; {host}"));
+        }
+        description
+    }
+
+    /// Retry an OOM once after releasing cached pages; other errors pass through.
+    /// The caller fills every byte before exposing the returned allocation.
+    fn alloc_packed(&self, bytes: usize) -> Result<CudaSlice<u8>, CudaError> {
+        self.alloc_upload::<u8>(bytes)
+    }
+
+    fn alloc_upload<T: cudarc::driver::DeviceRepr>(
+        &self,
+        len: usize,
+    ) -> Result<CudaSlice<T>, CudaError> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| CudaError::PackedUpload("upload size overflow".into()))?;
+        use cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY;
+        let first = match unsafe { self.upload_allocator.alloc::<T>(&self.stream, len) } {
+            Ok(out) => return Ok(out),
+            Err(e) if e.0 == CUDA_ERROR_OUT_OF_MEMORY => e,
+            Err(source) => {
+                return Err(CudaError::Driver {
+                    what: "allocating uploaded tensor",
+                    source,
+                });
+            }
+        };
+        let before = self.packed_memory_status();
+        let source = match self.trim_packed_pool() {
+            Ok(()) => {
+                tracing::warn!(bytes, memory = %before, "upload allocation failed; reclaimed unused pool pages, retrying once");
+                match unsafe { self.upload_allocator.alloc::<T>(&self.stream, len) } {
+                    Ok(out) => return Ok(out),
+                    Err(e) => e,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "could not reclaim unused CUDA pool pages");
+                first
+            }
+        };
+        Err(CudaError::UploadOutOfMemory {
+            bytes,
+            device: self.stream.context().ordinal(),
+            source,
+            memory: format!(
+                "before reclaim: {before}; after: {}",
+                self.packed_memory_status()
+            ),
+        })
     }
 
     /// One Q6_K block, file layout to device layout.
@@ -1183,12 +1282,7 @@ impl Gpu {
             .iter()
             .map(|&v| half::f16::from_f32(v).to_bits())
             .collect();
-        self.stream
-            .clone_htod(&packed)
-            .map_err(|source| CudaError::Driver {
-                what: "uploading f16 weights",
-                source,
-            })
+        self.upload_host(&packed)
     }
 
     /// Blocks until every queued kernel has finished.
@@ -6003,11 +6097,32 @@ mod upload_tests {
                 ordered
             };
             let uploaded = g.upload_quant_parts(q, &parts).unwrap();
+            // Reclamation must not release or alter a live model allocation.
+            g.trim_packed_pool().unwrap();
+            let status = g.packed_memory_status();
+            assert!(status.contains("CUDA free="), "{status}");
+            assert!(status.contains("pool reserved="), "{status}");
             assert_eq!(g.stream.clone_dtoh(&uploaded).unwrap(), expected);
             assert!(matches!(
                 g.upload_quant_parts(q, &[&raw[..ts], &raw[..1]]),
                 Err(CudaError::RaggedBlockBytes { .. })
             ));
+        }
+        // Ordinary device allocations cannot exceed physical device capacity
+        // on Linux. Exercise the failure/reclaim/retry path without first
+        // filling a shared card with disposable allocations.
+        #[cfg(target_os = "linux")]
+        {
+            let (_, total) = g.stream.context().mem_get_info().unwrap();
+            let requested = total.checked_mul(2).unwrap();
+            match g.alloc_packed(requested) {
+                Err(CudaError::UploadOutOfMemory { bytes, memory, .. }) => {
+                    assert_eq!(bytes, requested);
+                    assert!(memory.contains("before reclaim:"), "{memory}");
+                    assert!(memory.contains("after:"), "{memory}");
+                }
+                other => panic!("expected diagnosed allocation failure: {other:?}"),
+            }
         }
     }
 }

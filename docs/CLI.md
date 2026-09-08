@@ -37,6 +37,22 @@ must still fit; the engine does not offload them automatically.
 
 ### Stage selection
 
+On Windows, CUDA host uploads (including model weights) use ordinary
+`cuMemAlloc` allocations by default. Linux keeps the stream-pool upload path.
+`XABE_CUDA_UPLOAD_ALLOCATOR=legacy` selects ordinary allocations explicitly;
+`pool` selects the stream pool, and `auto` restores the platform default.
+Scratch buffers remain pooled in either mode. The startup log prints
+`upload_allocator=Legacy` or `upload_allocator=Pool`, so the selected path is
+visible. An invalid value fails at device construction.
+
+This is a compatibility path for Windows WDDM, where a CUDA allocation can
+be refused before the physical VRAM capacity is reached. It does not override
+Windows commit/residency budgets. Upload OOM errors include the requested
+bytes, CUDA free/total memory, pool reserved/used bytes and, on Windows,
+physical-memory availability and the process's available commit/commit limit
+at the time of failure. The Windows values are from `GlobalMemoryStatusEx`;
+the process commit limit can be smaller than the system-wide limit.
+
 Every stage is satisfied one of two ways, and the symmetry is the whole design:
 
 | | |

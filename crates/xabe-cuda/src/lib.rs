@@ -21,6 +21,7 @@
 //! correctness and to measure, and `docs/OPTIMIZATION.md` is explicit that
 //! optimisation arrives with a measurement rather than ahead of one.
 
+mod allocation;
 mod device;
 mod error;
 mod kernels;

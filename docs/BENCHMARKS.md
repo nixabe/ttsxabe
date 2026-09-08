@@ -3774,3 +3774,102 @@ one. Turing has fp16 tensor cores but the cast overhead dominates when the
 kernels are memory-bound.
 
 Do not assume fp16 is free here. Measure it, and expect it to lose.
+
+## Full-pipeline memory check on GPU 2 (2026-09-08)
+
+A Windows startup failed while allocating the chat model's packed weights.
+The same stage configuration was exercised here after the bounded-host-upload
+change and with the packed-allocation reclaim/retry diagnostics in the working
+binary. All four CUDA stages were explicitly placed on GPU 2; VAD stayed on
+CPU. This is Linux 6.8.0-138-generic, NVIDIA driver 595.84, one Quadro RTX 8000
+with 49,152 MiB, and approximately 126 GiB of system RAM. It is not a Windows
+WDDM reproduction or a test under a 16 GiB host-memory limit.
+
+The checkpoints were `models/asr/breeze-asr-26`,
+`models/vad/silero-v5.1.2.safetensors`,
+`models/taigi-translator-13b-Q4_K_M.gguf`,
+`models/breeze2-8b-Q4_K_M.gguf`, and `models/tts/tacotron2-nan`.
+The first completed run kept both `--tts-model` and
+`--tts-engine tacotron2=models/tts/tacotron2-nan`, matching the reported command.
+Health confirmed two synthesisers, named `mms` (the default registration name,
+actually Tacotron2 here) and `tacotron2`. The second run omitted the extra
+registration and measured startup and idle only.
+
+`nvidia-smi` sampled total GPU 2 residency alongside `/proc/<pid>/status` at a
+median interval of 0.546 seconds. GPU values include the baseline and driver
+allocations; the process RSS high-water mark comes from `VmHWM`, so it also
+captures peaks between samples. GPU peaks below are sampled peaks.
+
+| Point in the run | GPU MiB | Process RSS MiB |
+| --- | ---: | ---: |
+| Before startup | 6 | — |
+| Ready, two Tacotron2 registrations | 16,441 | 357.3 |
+| After first fresh conversation | 17,081 | 383.0 |
+| After sixth fresh conversation | 17,081 | 383.7 |
+| After sixth history-retaining turn | 17,081 | 383.8 |
+| After the spoken turn, idle for 30 seconds | 17,465 | 385.9 |
+| After stopping the process | 6 | — |
+| Separate run: ready, one Tacotron2 registration | 16,215 | 356.7 |
+
+The duplicated registration costs **226 MiB at startup** in this sitting.
+The two-registration run completed three HTTP transcriptions of
+`bench/clips/a.wav`, one direct synthesis through each registration, six text
+turns with conversation reset before each, six further turns retaining history,
+and one audio WebSocket turn using the same clip. Both synthesisers were used
+alternately for the text turns. All requests completed, with no error events,
+CUDA OOMs, or allocation-recovery warnings. The typed prompt was
+`請用一句簡短的話介紹台灣的一種水果。`; the built-in system prompt was unchanged.
+
+The sampled GPU peak was **17,465 MiB (17.06 GiB)**, leaving 31,687 MiB of the
+card unoccupied. Residency rose with warm-up and the spoken workload, then
+plateaued; it did not increase on every repeated turn. This short sequential
+run found no runaway VRAM growth, but does not establish a bound for arbitrary
+prompt lengths, concurrency, or long-running service.
+
+The largest host RSS was during startup: **7,922.1 MiB** by `VmHWM` with both
+registrations, and 7,890.7 MiB with one. Most sampled startup RSS was file-backed
+checkpoint pages: sampled anonymous-memory peaks were 514.5 and 573.2 MiB,
+respectively. Once the loaded engine was idle, the two-registration process
+held 385.9 MiB RSS, including 259.7 MiB anonymous memory. RSS, file-backed pages,
+and Windows system commit are different measurements; these numbers do not
+identify the cause of the Windows allocation failure.
+
+The local capture is `/tmp/xabe-gpu2-memory/`: `run.py`, per-run engine logs,
+`duplicate-samples.csv`, `single-samples.csv`, per-run event JSON, and
+`summary.json`. An earlier attempt completed startup and three voice replies
+before a frame-length parsing bug in the test client stopped the workload;
+its files are retained with an `attempt1-` prefix and are excluded from the
+table above. Both measured engine processes were stopped afterward, and GPU 2
+returned to its 6 MiB baseline.
+
+### Ordinary upload allocations on the same Linux card
+
+The Windows compatibility policy was then exercised here with
+`XABE_CUDA_UPLOAD_ALLOCATOR=legacy`, one Tacotron2 registration, and the same
+checkpoints and workload (one direct synthesis instead of two). All requests
+completed without errors or allocation-recovery warnings. This tests the
+ordinary CUDA upload path, not WDDM or the Windows commit budget.
+
+| Point in the run | GPU MiB |
+| --- | ---: |
+| Before startup | 6 |
+| Ready | 16,945 |
+| After sixth fresh conversation | 17,637 |
+| After sixth history-retaining turn | 17,713 |
+| After spoken turn and 30 seconds idle | 17,883 |
+| After stopping the process | 6 |
+
+The sampled peak was 17,883 MiB. Idle residency remained at that value.
+Startup RSS high-water mark was 7,920.3 MiB, sampled anonymous memory peaked
+at 514.1 MiB, and final idle RSS was 386.5 MiB. Ordinary allocations used
+730 MiB more at startup than the earlier single-registration pooled run;
+this is a compatibility change, not a measured memory-saving optimization.
+The earlier full-workload run had two registrations, so its peak is not a
+controlled allocator comparison. Captures are `run-legacy.py`,
+`legacy-single-engine.log`, `legacy-single-samples.csv`, and
+`legacy-single-events.json` in the same local capture directory.
+
+The release workspace tests, 70 general GPU kernel tests and 15 packed-weight
+GPU tests passed; the GPU tests explicitly selected this allocation policy on
+GPU 2. A release `cargo check` of `xabe-engine` targeting
+`x86_64-pc-windows-gnu` also passed. Windows runtime verification remains open.

@@ -34,3 +34,6 @@ path = "src/bin/bench_attn.rs"
 [[bin]]
 name = "bench-gemv"
 path = "src/bin/bench_gemv.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
