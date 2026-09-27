@@ -1588,6 +1588,16 @@ __device__ __forceinline__ void gemm_ld_x4(
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(p));
 }
 
+// `ldmatrix`, transposed: each 8x8 tile is handed back as its transpose, so a
+// tile stored `[k][n]` arrives as the `[n][k]` fragment a `b` operand wants.
+__device__ __forceinline__ void gemm_ld_x4_t(
+    const unsigned* row, unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3)
+{
+    unsigned p = (unsigned)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(p));
+}
+
 // One tile row's four words of trip `kc` - eight halves of the contraction -
 // as one load when the row is aligned and the quad lies inside `k`, word at a
 // time otherwise. Past the end of the contraction or the rows, zero: a zero
@@ -1623,7 +1633,7 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32, 2) void gemm_hh(
     int w_rs,
     int ksplit,
     float* __restrict__ partial,
-    long sb, int accum)
+    long sb, int accum, int epi)
 {
     static_assert(GEMM_HH_WM * GEMM_HH_WN == GEMM_WARPS, "the warp grid is the block");
     static_assert(GEMM_KC % 16 == 0, "a trip is whole 16-element k steps");
@@ -1794,6 +1804,41 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32, 2) void gemm_hh(
         }
         return;
     }
+    if (epi == 1) {
+        // GELU, stored at f16: `act_gelu_f16`'s formula on the value the plain
+        // epilogue would have stored, so the pair of launches it replaces and
+        // this one produce the same bits. `out` is `[m, n]` halves here; the
+        // launcher only asks for it with one slice and no accumulation, and
+        // with an even `n`, so a lane's two adjacent columns are one word.
+        unsigned* o = (unsigned*)out;
+        #pragma unroll
+        for (int nt = 0; nt < GEMM_HH_NS; ++nt) {
+            const int col0 = cbase + nt * 8;
+            if (col0 >= n) {
+                continue;
+            }
+            const float bias0 = bias ? bb[col0] : 0.0f;
+            const float bias1 = bias ? bb[col0 + 1] : 0.0f;
+            #pragma unroll
+            for (int ms = 0; ms < GEMM_HH_MS; ++ms) {
+                const int row0 = rbase + 16 * ms;
+                const int row1 = row0 + 8;
+                #pragma unroll
+                for (int hf = 0; hf < 2; ++hf) {
+                    const int row = hf ? row1 : row0;
+                    if (row < m) {
+                        const float v0 = acc[ms][nt][2 * hf] + bias0;
+                        const float v1 = acc[ms][nt][2 * hf + 1] + bias1;
+                        const float y0 = 0.5f * v0 * (1.0f + erff(v0 * 0.70710678118654752f));
+                        const float y1 = 0.5f * v1 * (1.0f + erff(v1 * 0.70710678118654752f));
+                        o[((size_t)row * n + col0) >> 1] =
+                            (unsigned)f32_to_f16(y0) | ((unsigned)f32_to_f16(y1) << 16);
+                    }
+                }
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int nt = 0; nt < GEMM_HH_NS; ++nt) {
         const int col0 = cbase + nt * 8;
@@ -1889,6 +1934,7 @@ extern "C" __global__ void gemm_reduce(
 #define GEMM_I8_WARPS  8
 #define GEMM_I8_MT     128     // rows of `a` per block
 #define GEMM_I8_NT     128     // rows of `w` per block
+#define GEMM_I8_GM     8       // row tiles a raster band; see the kernel
 // 64 of contraction a trip, which is two Q4_K sub-blocks - and the pairing is
 // the point. Q4_K stores the low nibble of a byte at element `j` and the high
 // nibble at `j + 32`, so a trip of 32 reads sixteen bytes and uses half of each
@@ -2012,12 +2058,28 @@ __device__ __forceinline__ void gemm_i8_body(
     const int g    = lane >> 2;
     const int tg   = lane & 3;
 
-    // `x` is the row tile, not the column tile, and that ordering is the point:
-    // the blocks that share a weight tile are the ones that differ in `m`, so
-    // making them consecutive puts them on the machine together and lets L2
-    // serve the weight to all but the first.
-    const int m0 = blockIdx.x * MT;
-    const int n0 = blockIdx.y * GEMM_I8_NT;
+    // Which tile, in bands of `GEMM_I8_GM` row tiles. The blocks the machine
+    // issues together are consecutive in `x` then `y`, and this remaps that
+    // order so that consecutive blocks walk a band of row tiles against one
+    // weight tile, then the same band against the next weight tile. A wave
+    // then touches `GM` row tiles of the activation and `wave / GM` tiles of
+    // the weight - rather than every row tile against about two weight tiles,
+    // which is what `x` as the row tile gave, and which past a few thousand
+    // rows streamed the whole activation from memory again for every pair of
+    // weight tiles. Below `GM` row tiles it is the old order exactly.
+    int tm, tn;
+    {
+        const int nm = (int)gridDim.x, nn = (int)gridDim.y;
+        const int pid = (int)blockIdx.y * nm + (int)blockIdx.x;
+        const int per = GEMM_I8_GM * nn;
+        const int fm = (pid / per) * GEMM_I8_GM;
+        const int gs = min(nm - fm, GEMM_I8_GM);
+        const int loc = pid % per;
+        tm = fm + loc % gs;
+        tn = loc / gs;
+    }
+    const int m0 = tm * MT;
+    const int n0 = tn * GEMM_I8_NT;
     // A square-ish warp grid, because a warp's shared traffic is
     // `(MS + NPW) * KS` words and `MS * NPW` is fixed by the `mma` count. One
     // warp per column strip made that 18 words a trip; two by four makes it 12.
@@ -2332,487 +2394,397 @@ GEMM_I8_ENTRY(gemm_i8_q6k_narrow, QT_Q6_K, GEMM_I8_MT_NARROW)
 // Attention for a whole prompt - or a whole encoder window - in one kernel:
 // scores, mask, softmax and the value product, with nothing materialised. The
 // unfused chain writes the score matrix, reads it back to softmax it, writes
-// the probabilities, and reads them again for the value product -
-// `heads * tq * tk` floats three times over, plus a head split and a merge. At
-// 512 tokens on the 13 B that chain measured about 27 ms a prefill, and the
-// Whisper encoder's 20 x 1500 x 1500 scores are 180 MB a layer; the score
+// the probabilities and reads them again for the value product; the score
 // tensor exists only so the softmax can find its row maximum, and the
 // running-maximum trick removes that need.
 //
-// One block owns 32 query rows of one head and walks the keys 32 at a time,
-// keeping the output accumulator in registers. Per tile: scores by `m16n8k8`
-// into f32, the row maximum folded into a running one, the accumulator
-// rescaled by `exp(m_old - m_new)`, probabilities rounded to f16 - exactly
-// where the unfused chain rounded them, on their way into the value product -
-// and one more `m16n8k8` against the values. `__expf`, because that is what
-// `softmax_causal` and `softmax_rows` both use; this kernel replaces them and
-// must not be a precision change.
+// It is organised the way FlashAttention-2 is: **each warp owns sixteen query
+// rows outright** - all of the tile's keys and all of the head's output
+// columns - so the softmax never leaves the warp. The kernel this replaced
+// split a tile's keys and columns across eight warps, which made every row's
+// maximum and sum a trip through shared memory and four barriers a tile, gave
+// each warp one `mma` for every `a` fragment it loaded, and re-staged a
+// grouped model's keys and values once for every query head. It ran at 13 to
+// 19 TFLOP/s; this runs at 36 to 50 on the Llama shapes. docs/KERNELS.md has
+// the table. Here:
 //
-// **The one place it is not the chain's arithmetic** is where the normaliser
-// divides. `softmax_rows` scales the probabilities by `1/l` before rounding
-// them to f16; an online softmax cannot, because `l` is not known until the
-// last tile, so it rounds `exp(s - m)` instead and divides the f32 accumulator
-// at the end. Both roundings are one f16 step on a positive number, so the
-// relative error is the same size - and on a 1500-key encoder row the online
-// form is the better conditioned of the two, because `exp(s - m)` sits near 1
-// where `p / l` sits near 1/1500. It is still a change, so it is stated here
-// and measured against the captured oracle rather than assumed harmless.
+// - The queries are loaded once, straight into `a` fragment registers.
+// - A tile's scores stay in the `m16n8k8` accumulator. The accumulator's
+//   layout - a lane holds columns `2tg, 2tg + 1` of rows `g` and `g + 8` - is
+//   exactly the `a` fragment layout of the value product with the keys as its
+//   contraction, so the probabilities are packed from the registers the score
+//   product wrote and never touch shared memory.
+// - The row maximum is four lanes' worth of shuffles, and the row sum is not
+//   reduced at all until the end: each lane keeps its own partial, which the
+//   rescale factor scales exactly as it scales the whole.
+// - Both B operands come in four fragments an `ldmatrix.x4`.
 //
-// **Causality is a flag, not a shape.** A decoder prompt masks the upper
-// triangle and the loop bound doubles as a free skip of it; the Whisper
-// encoder attends over the whole window and passes `causal = 0`, which turns
-// the per-row limit into the key count and nothing else.
+// Shared memory holds one key tile and one value tile and nothing else, so a
+// tile costs two barriers: one before it is staged and one after.
 //
-// Layouts are the caches' own: K is `[kv_head][pos][hd]`, V is
-// `[kv_head][hd][cap]`, and the queries are read straight out of the
-// projection buffer at `[tq, heads * hd]` - no `split_heads` - with the
-// merged context written the same way, so no `merge_heads` either.
-// Grouped-query models map `head / (heads / kv_heads)`.
+// **A grouped-query block is the group.** `gb` heads share a block - the query
+// heads of one key-value head, at the same sixteen positions - and the four
+// warps are those heads, so one staging of K and V serves all of them. An
+// ungrouped model gets four warps of one head over 64 positions instead. The
+// causal diagonal is therefore sixteen positions wide for a grouped model
+// rather than a whole block's worth, and a warp whose rows all end before a
+// tile skips that tile's arithmetic (it still stages its share, and still
+// meets the barriers).
 //
-// **`HD` is a template parameter, and the two widths that exist are
-// instantiated by name below.** The fragment layout is what depends on it: a
-// warp owns `HD / 32` of the output's n8 column fragments, so 128 gives four
-// and 64 gives two, and the shared-memory strides follow. Every other tile
-// shape - 32 query rows, 32 keys a trip, eight warps as two query groups by
-// four column groups - is independent of the head width and is not repeated
-// per instantiation. A width that is not instantiated is refused by name in
-// the wrapper rather than indexing across heads in bounds.
+// The arithmetic is the chain's in the places the test pins: operands rounded
+// to f16 into both products, scores and context accumulated in f32,
+// probabilities rounded to f16 on their way into the value product, the
+// normaliser summed at f32 from the unrounded probabilities. The exponential
+// is `ex2.approx` on scores pre-multiplied by `scale * log2(e)`, which is what
+// `__expf` compiles to with the multiply folded in.
 
-#define FA_WARPS 8
+#define FA_WARPS 4
 
-// One block owns QT query rows of one head and walks the keys KT at a time.
-//
-// **QT was the knob that mattered while this kernel was moving bytes.** A
-// block stages every key and value it walks past, so the whole of K and V is
-// re-staged once per query block: at 1500 encoder positions and QT 32 that is
-// 47 trips through 0.8 MB. That is why QT is 64 here rather than 32, and it is
-// no longer what limits the kernel - holding the cache at f16, which halves
-// that traffic exactly, changed nothing at all, because at 768 KB a head the
-// re-reads were already inside a 6 MB L2.
-//
-// **KT is the knob now, and what it buys is `mma` per shared load.** A warp
-// issues KF * 1 products in the score phase for one `a` fragment and KF `b`
-// fragments, so a wider key tile gives a warp more column fragments to spend
-// each loaded query fragment on - KT 64 puts KF and NT at 4 where KT 32 left
-// them at 2, and takes the kernel from 1.75 words loaded per `mma` to 1.5.
-// It also halves the number of trips, and with them the barriers.
-//
-// KT 64 was measured before and rejected, and that measurement was
-// confounded: with the score tile still in shared memory it cost 45.8 KB, one
-// resident block, and half the threads - which is exactly enough to cancel
-// what it gains. Once the scores stay in registers it fits in 28.25 KB, keeps
-// two blocks, and pays. docs/BENCHMARKS.md has the whole sweep.
-//
-// The warp grid follows from QT: QG query groups of 16 rows, and the remaining
-// FA_WARPS / QG warps spread across the key fragments of the score product and
-// the column fragments of the value product. Every count below is derived, so
-// a new (QT, KT, HD) is a template argument rather than an edit.
-// `KVH` says the caches are f16. Both staging loops already round what they
-// read to f16 on the way into shared memory, so an f16 cache does not cost a
-// conversion here - it removes one, and halves what the loop fetches. It is a
-// template argument and not a flag because these two loops run once a key tile
-// and a branch inside them is a branch in the hot path.
-template <int HD, int KT, int QT, bool KVH>
+__device__ __forceinline__ float fa_ex2(float x) {
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// Eight consecutive elements of a K row or a V row as four packed words, zero
+// past `n` valid elements. `al` says the eight start 16-byte aligned in the
+// cache, which is a property of the capacity and so uniform across a launch.
+template <bool KVH>
+__device__ __forceinline__ uint4 fa_fetch8(const void* base, size_t off, int n, bool al)
+{
+    uint4 w = make_uint4(0u, 0u, 0u, 0u);
+    if (n <= 0) {
+        return w;
+    }
+    if (KVH) {
+        const unsigned short* p = (const unsigned short*)base + off;
+        if (n >= 8 && al) {
+            return *reinterpret_cast<const uint4*>(p);
+        }
+        unsigned short h[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            h[i] = i < n ? p[i] : (unsigned short)0;
+        }
+        w.x = (unsigned)h[0] | ((unsigned)h[1] << 16);
+        w.y = (unsigned)h[2] | ((unsigned)h[3] << 16);
+        w.z = (unsigned)h[4] | ((unsigned)h[5] << 16);
+        w.w = (unsigned)h[6] | ((unsigned)h[7] << 16);
+        return w;
+    } else {
+        const float* p = (const float*)base + off;
+        float f[8];
+        if (n >= 8 && al) {
+            const float4 a = *reinterpret_cast<const float4*>(p);
+            const float4 b = *reinterpret_cast<const float4*>(p + 4);
+            f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w;
+            f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                f[i] = i < n ? p[i] : 0.0f;
+            }
+        }
+        w.x = gemm_pack(f[0], f[1]);
+        w.y = gemm_pack(f[2], f[3]);
+        w.z = gemm_pack(f[4], f[5]);
+        w.w = gemm_pack(f[6], f[7]);
+        return w;
+    }
+}
+
+// `ROWS` reads K and V from a projection's own `[pos, stride]` rows rather
+// than from a cache - the Whisper encoder's case, whose keys and values are
+// columns of one stacked q/k/v product and would otherwise each be split into
+// heads by a pass of their own. The value tile is then staged `[key][d]`,
+// which is the transpose of what the value product's `b` operand wants, and
+// `ldmatrix.trans` hands it over in the right layout for free. `OH` writes the
+// context as f16, rounded exactly as the tiled matmul would round it on the
+// way in, so the output projection after it can take both operands at f16.
+template <int HD, int KT, bool KVH, bool ROWS, bool OH>
 __device__ __forceinline__ void flash_attn_impl(
     const float* __restrict__ q,
     const void* __restrict__ kc,
     const void* __restrict__ vc,
-    float* __restrict__ out,
-    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+    void* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal,
+    int gb, int qs, int kvs, int scale_q)
 {
-    // Words a Qs/Ks row: HD/2 packed pairs, plus four to spread the banks.
-    constexpr int QSTR = HD / 2 + 4;
+    // Words a staged K row (HD halves) and a staged V row (KT halves), each
+    // padded by four so that eight rows an `ldmatrix` phase land on all 32
+    // banks once, and each a multiple of four so every row is 16-byte aligned.
     constexpr int KSTR = HD / 2 + 4;
-    // Words a Vs or Ps row: KT/2 packed pairs, padded the same way.
     constexpr int VSTR = KT / 2 + 4;
-    constexpr int PSTR = KT / 2 + 4;
-    // Query groups of 16 rows, and the warp columns left over for them.
-    constexpr int QG = QT / 16;
-    constexpr int CG = FA_WARPS / QG;
-    // n8 output column fragments a warp owns: CG column groups cover HD.
-    constexpr int NT = (HD / 8) / CG;
-    // n8 key fragments a warp owns in the score product: CG warp columns
-    // cover KT.
-    constexpr int KF = (KT / 8) / CG;
-    constexpr int KVS = (HD * VSTR > KT * KSTR) ? HD * VSTR : KT * KSTR;
+    constexpr int NF = KT / 8;   // key fragments a tile: the score product's n
+    constexpr int NO = HD / 8;   // output column fragments
+    constexpr int KS = HD / 8;   // contraction steps of the score product
+    static_assert(KS % 4 == 0 && NF % 4 == 0, "B fragments come four an ldmatrix");
+    // Words of the value tile: `[d][key]` off a cache, `[key][d]` off rows.
+    constexpr int VWORDS = ROWS ? KT * KSTR : HD * VSTR;
+    static_assert((KT * KSTR + VWORDS) * 4 <= 48 * 1024, "tile exceeds 48 KB");
 
-    // Every count above divides exactly or the warp grid silently drops work.
-    static_assert(QT % 16 == 0 && FA_WARPS % QG == 0, "QT does not tile");
-    static_assert(NT * CG * 8 == HD, "the column groups do not cover HD");
-    static_assert(KF * CG * 8 == KT, "the warp columns do not cover KT");
-
-    // sm_75 gives a block 48 KB of *static* shared memory - the 64 KB needs a
-    // dynamic opt-in this kernel does not take. It gives an *SM* 64 KB, so
-    // what this comes to also decides how many blocks are resident, and that
-    // has decided more of this kernel's speed than anything else: every shape
-    // measured at one resident block came in at 114 ms or worse and every one
-    // at two or three came in under 116. docs/BENCHMARKS.md has the sweep.
-    constexpr int SHARED = (QT * QSTR + KVS + QT * PSTR + QT * CG + 3 * QT) * 4;
-    static_assert(SHARED <= 48 * 1024, "the tile exceeds 48 KB of shared memory");
-
-    __shared__ __align__(16) unsigned qs[QT * QSTR];
-    __shared__ __align__(16) unsigned kvs[KVS];
-    __shared__ __align__(16) unsigned ps[QT * PSTR];
-    // One slot a row per warp column. This is all that is left of a `[QT][KT]`
-    // score tile: the scores stay in the registers the `mma` left them in, and
-    // what the warps have to tell each other is not the scores but the
-    // reduction over them - CG numbers a row, twice a tile. See the score
-    // product below.
-    __shared__ float sm_part[QT * CG];
-    __shared__ float sm_m[QT], sm_l[QT], sm_fac[QT];
+    __shared__ __align__(16) unsigned ks_[KT * KSTR];
+    __shared__ __align__(16) unsigned vs_[VWORDS];
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid = warp * 32 + lane;
     const int g = lane >> 2, tg = lane & 3;
 
-    const int qt0 = blockIdx.x * QT;
-    const int h = blockIdx.y;
-    const int kh = h / (heads / kv_heads);
+    // The block's rows: `gb` heads by `pb` positions, a warp sixteen positions
+    // of one head.
+    const int pb = 16 * (FA_WARPS / gb);
+    const int group = heads / kv_heads;
+    const int h = blockIdx.y * gb + warp % gb;
+    const int kh = (blockIdx.y * gb) / group;
+    const int bp0 = blockIdx.x * pb;
+    const int p0 = bp0 + (warp / gb) * 16;
     const int dq = heads * HD;
 
-    // Elements either way; the f16 pointers are words, so a head's offset is
-    // halved with it. `cap` is even for exactly this reason - see `Cache`.
-    const float* kb = KVH ? (const float*)0 : (const float*)kc + (size_t)kh * cap * HD;
-    const float* vb = KVH ? (const float*)0 : (const float*)vc + (size_t)kh * HD * cap;
-    const unsigned* kbh =
-        KVH ? (const unsigned*)kc + (size_t)kh * cap * (HD / 2) : (const unsigned*)0;
-    const unsigned* vbh =
-        KVH ? (const unsigned*)vc + (size_t)kh * HD * (cap / 2) : (const unsigned*)0;
+    // Bases in elements. `cap` is even (see `Cache`), so the f16 value rows
+    // start on a word. Off rows, a head is a column offset and a position is
+    // `kvs` elements.
+    const size_t kbase = ROWS ? (size_t)kh * HD : (size_t)kh * cap * HD;
+    const size_t vbase = ROWS ? (size_t)kh * HD : (size_t)kh * HD * cap;
+    // Eight elements a load are 16 bytes at f16 and 32 at f32; a K row is HD
+    // elements, so off a cache it is always aligned. A V row is `cap`
+    // elements; off rows both are `kvs`.
+    const bool kal = ROWS ? (KVH ? kvs % 8 == 0 : kvs % 4 == 0) : true;
+    const bool val = ROWS ? kal : (KVH ? (cap % 8 == 0) : (cap % 4 == 0));
+    const size_t krs = ROWS ? (size_t)kvs : (size_t)HD;
 
-    // Queries once, rounded to f16 - the same rounding the tiled gemm applied
-    // to its operands. A row past `tq` stages zeros and is never stored.
-    for (int i = tid; i < QT * (HD / 2); i += FA_WARPS * 32) {
-        const int r = i / (HD / 2), j = i % (HD / 2);
-        unsigned w = 0u;
-        if (qt0 + r < tq) {
-            const float2 v =
-                *reinterpret_cast<const float2*>(q + (size_t)(qt0 + r) * dq
-                                                 + (size_t)h * HD + 2 * j);
-            w = gemm_pack(v.x, v.y);
-        }
-        qs[r * QSTR + j] = w;
-    }
-    if (tid < QT) {
-        sm_m[tid] = -1.0f / 0.0f;
-        sm_l[tid] = 0.0f;
-    }
-
-    // The output accumulator: warp `w` owns query group `w / CG` (16 rows)
-    // and value columns `(w % CG) * NT * 8 .. + NT * 8 - 1`, as NT fragments.
-    const int mg = warp / CG;
-    const int ng0 = (warp % CG) * NT;
-    float acc[NT][4];
+    // The queries, rounded to f16, straight into `a` fragments. Rows past `tq`
+    // are zeros and are never stored.
+    // With `scale_q` the scale goes on the queries before they are rounded -
+    // Whisper's placement, and the same f32 product the separate scaling pass
+    // it replaces computed - and the scores are left unscaled.
+    const int r0 = p0 + g, r1 = p0 + g + 8;
+    const float qsc = scale_q ? scale : 1.0f;
+    unsigned qa[KS][2];
     #pragma unroll
-    for (int i = 0; i < NT; ++i) {
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            acc[i][j] = 0.0f;
+    for (int s = 0; s < KS; ++s) {
+        const int col = h * HD + s * 8 + 2 * tg;
+        float2 x = make_float2(0.0f, 0.0f), y = make_float2(0.0f, 0.0f);
+        if (r0 < tq) {
+            x = *reinterpret_cast<const float2*>(q + (size_t)r0 * qs + col);
         }
+        if (r1 < tq) {
+            y = *reinterpret_cast<const float2*>(q + (size_t)r1 * qs + col);
+        }
+        qa[s][0] = gemm_pack(x.x * qsc, x.y * qsc);
+        qa[s][1] = gemm_pack(y.x * qsc, y.y * qsc);
     }
-    __syncthreads();
 
-    // Causal: the last key a row of this block may see is
-    // `past + qt0 + QT - 1`, so the loop stops there and never touches the
-    // upper triangle. Non-causal: every row sees every key.
+    float acc[NO][4];
+    #pragma unroll
+    for (int i = 0; i < NO; ++i) {
+        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    }
+    // Running maximum (in log2 units) and this lane's share of the sum, for
+    // rows `g` and `g + 8`.
+    float m0 = -1.0f / 0.0f, m1 = -1.0f / 0.0f;
+    float l0 = 0.0f, l1 = 0.0f;
+
     const int ktot = past + tq;
-    const int kend = causal ? min(ktot, past + qt0 + QT) : ktot;
+    // The last key each row may see, and the last any row of this warp or
+    // this block may see.
+    const int lim0 = causal ? min(past + r0, ktot - 1) : ktot - 1;
+    const int lim1 = causal ? min(past + r1, ktot - 1) : ktot - 1;
+    const int wlim = causal ? min(past + p0 + 15, ktot - 1) : ktot - 1;
+    const int kend = causal ? min(ktot, past + bp0 + pb) : ktot;
+    const float sl2 = (scale_q ? 1.0f : scale) * 1.4426950408889634f;
+
     for (int kv0 = 0; kv0 < kend; kv0 += KT) {
-        // Keys, `[pos][d]`, rounded like the queries. Positions past `kend`
-        // stage zeros; the mask discards whatever the mma made of them.
-        for (int i = tid; i < KT * (HD / 2); i += FA_WARPS * 32) {
-            const int r = i / (HD / 2), j = i % (HD / 2);
-            unsigned w = 0u;
-            if (kv0 + r < kend) {
-                if (KVH) {
-                    // Already the packed pair this wants.
-                    w = kbh[(size_t)(kv0 + r) * (HD / 2) + j];
+        __syncthreads();
+        // Keys `[pos][d]`: KT rows of HD / 8 loads.
+        for (int i = tid; i < KT * (HD / 8); i += FA_WARPS * 32) {
+            const int r = i / (HD / 8), c = i % (HD / 8);
+            const uint4 w = fa_fetch8<KVH>(
+                kc, kbase + (size_t)(kv0 + r) * krs + 8 * c,
+                kv0 + r < kend ? 8 : 0, kal);
+            *reinterpret_cast<uint4*>(&ks_[r * KSTR + 4 * c]) = w;
+            if (ROWS) {
+                // The value row of the same position, the same columns.
+                const uint4 v = fa_fetch8<KVH>(
+                    vc, vbase + (size_t)(kv0 + r) * krs + 8 * c,
+                    kv0 + r < kend ? 8 : 0, val);
+                *reinterpret_cast<uint4*>(&vs_[r * KSTR + 4 * c]) = v;
+            }
+        }
+        // Values `[d][pos]`: HD rows of KT / 8 loads. Positions past `kend`
+        // are zeros, because a probability of zero times whatever an unused
+        // slot holds is only zero if that slot is finite.
+        for (int i = tid; !ROWS && i < HD * (KT / 8); i += FA_WARPS * 32) {
+            const int r = i / (KT / 8), c = i % (KT / 8);
+            const int p = kv0 + 8 * c;
+            const uint4 w = fa_fetch8<KVH>(
+                vc, vbase + (size_t)r * cap + p, min(8, kend - p), val);
+            *reinterpret_cast<uint4*>(&vs_[r * VSTR + 4 * c]) = w;
+        }
+        __syncthreads();
+        if (kv0 > wlim) {
+            continue;
+        }
+
+        // S = Q K^T: NF key fragments, each four contraction steps an
+        // `ldmatrix.x4` - lanes 0-7 name the fragment's eight key rows at step
+        // `s`, lanes 8-15 at `s + 1`, and so on.
+        float sc[NF][4];
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            sc[f][0] = sc[f][1] = sc[f][2] = sc[f][3] = 0.0f;
+            #pragma unroll
+            for (int s = 0; s < KS; s += 4) {
+                unsigned b0, b1, b2, b3;
+                gemm_ld_x4(&ks_[(f * 8 + (lane & 7)) * KSTR + (s + (lane >> 3)) * 4],
+                           b0, b1, b2, b3);
+                gemm_mma_step(sc[f][0], sc[f][1], sc[f][2], sc[f][3], qa[s][0], qa[s][1], b0);
+                gemm_mma_step(sc[f][0], sc[f][1], sc[f][2], sc[f][3], qa[s + 1][0], qa[s + 1][1], b1);
+                gemm_mma_step(sc[f][0], sc[f][1], sc[f][2], sc[f][3], qa[s + 2][0], qa[s + 2][1], b2);
+                gemm_mma_step(sc[f][0], sc[f][1], sc[f][2], sc[f][3], qa[s + 3][0], qa[s + 3][1], b3);
+            }
+        }
+
+        // Scale into log2 units and mask; the row maximum over this lane's
+        // columns, then over the quad that shares the row.
+        float mx0 = -1.0f / 0.0f, mx1 = -1.0f / 0.0f;
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            const int c = kv0 + f * 8 + 2 * tg;
+            sc[f][0] = c <= lim0 ? sc[f][0] * sl2 : -1.0f / 0.0f;
+            sc[f][1] = c + 1 <= lim0 ? sc[f][1] * sl2 : -1.0f / 0.0f;
+            sc[f][2] = c <= lim1 ? sc[f][2] * sl2 : -1.0f / 0.0f;
+            sc[f][3] = c + 1 <= lim1 ? sc[f][3] * sl2 : -1.0f / 0.0f;
+            mx0 = fmaxf(mx0, fmaxf(sc[f][0], sc[f][1]));
+            mx1 = fmaxf(mx1, fmaxf(sc[f][2], sc[f][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+        // Every row sees key 0 on the first tile it computes, so the new
+        // maximum is finite from then on; on that tile the old one is minus
+        // infinity and its factor is exactly zero.
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float f0 = fa_ex2(m0 - mn0), f1 = fa_ex2(m1 - mn1);
+        m0 = mn0;
+        m1 = mn1;
+
+        // Probabilities, packed as the value product's `a` fragments.
+        unsigned pa[NF][2];
+        float s0 = 0.0f, s1 = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            const float p00 = fa_ex2(sc[f][0] - mn0);
+            const float p01 = fa_ex2(sc[f][1] - mn0);
+            const float p10 = fa_ex2(sc[f][2] - mn1);
+            const float p11 = fa_ex2(sc[f][3] - mn1);
+            s0 += p00 + p01;
+            s1 += p10 + p11;
+            pa[f][0] = gemm_pack(p00, p01);
+            pa[f][1] = gemm_pack(p10, p11);
+        }
+        l0 = l0 * f0 + s0;
+        l1 = l1 * f1 + s1;
+
+        // O = O * fac + P V: for each output fragment, the tile's NF
+        // contraction steps four an `ldmatrix.x4` off the `[d][pos]` tile.
+        #pragma unroll
+        for (int nt = 0; nt < NO; ++nt) {
+            acc[nt][0] *= f0;
+            acc[nt][1] *= f0;
+            acc[nt][2] *= f1;
+            acc[nt][3] *= f1;
+            #pragma unroll
+            for (int s = 0; s < NF; s += 4) {
+                unsigned b0, b1, b2, b3;
+                if (ROWS) {
+                    // Eight keys of eight columns a matrix, transposed on the
+                    // way out: lanes 8j..8j+7 name keys `8(s + j) + 0..7`.
+                    gemm_ld_x4_t(&vs_[(8 * (s + (lane >> 3)) + (lane & 7)) * KSTR + 4 * nt],
+                                 b0, b1, b2, b3);
                 } else {
-                    const float2 v = *reinterpret_cast<const float2*>(
-                        kb + (size_t)(kv0 + r) * HD + 2 * j);
-                    w = gemm_pack(v.x, v.y);
+                    gemm_ld_x4(&vs_[(nt * 8 + (lane & 7)) * VSTR + (s + (lane >> 3)) * 4],
+                               b0, b1, b2, b3);
                 }
-            }
-            kvs[r * KSTR + j] = w;
-        }
-        __syncthreads();
-
-        // S = Q K^T for this tile. Each warp covers one query group and KF
-        // of the tile's n8 key fragments. The `a` fragment is loaded once per
-        // contraction step and reused across them.
-        //
-        // **The scores never leave the registers the `mma` writes them to.**
-        // They used to go to a `[QT][KT]` shared tile, be read back for the
-        // running maximum and read again for the exponential - three passes
-        // over 9 KB a tile, and a third of the block's shared budget, which is
-        // its residency. What crosses warps instead is the reduction rather
-        // than the scores: the `m16n8k8` accumulator gives a lane two rows of
-        // its fragment, the four lanes sharing a `g` hold the rest of those
-        // rows, so an xor butterfly folds a warp's own columns and only CG
-        // partials a row reach shared memory.
-        const int sng = warp % CG;
-        float d[KF][4];
-        {
-            #pragma unroll
-            for (int f = 0; f < KF; ++f) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    d[f][j] = 0.0f;
-                }
-            }
-            #pragma unroll
-            for (int ks = 0; ks < HD / 8; ++ks) {
-                unsigned a0, a1;
-                gemm_ld_a(&qs[(mg * 16 + (lane & 15)) * QSTR + 4 * ks],
-                          a0, a1);
-                #pragma unroll
-                for (int f = 0; f < KF; ++f) {
-                    const unsigned b0 = gemm_ld_b(
-                        &kvs[((sng * KF + f) * 8 + (lane & 7)) * KSTR + 4 * ks]);
-                    gemm_mma_step(d[f][0], d[f][1], d[f][2], d[f][3], a0, a1, b0);
-                }
-            }
-            // Scaled here rather than on the way out to shared memory, which
-            // is the same arithmetic in the same place: the scale was always
-            // applied to the accumulator before anything read it.
-            #pragma unroll
-            for (int f = 0; f < KF; ++f) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    d[f][j] *= scale;
-                }
+                gemm_mma_step(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], pa[s][0], pa[s][1], b0);
+                gemm_mma_step(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], pa[s + 1][0], pa[s + 1][1], b1);
+                gemm_mma_step(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], pa[s + 2][0], pa[s + 2][1], b2);
+                gemm_mma_step(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], pa[s + 3][0], pa[s + 3][1], b3);
             }
         }
-
-        // This warp's maximum for each of its two rows, masked. `lim` is the
-        // last key a row may attend to - its own position when causal, the
-        // last key otherwise.
-        const int r0 = mg * 16 + g;
-        const int lim0 = causal ? (past + qt0 + r0) : (ktot - 1);
-        const int lim1 = causal ? (past + qt0 + r0 + 8) : (ktot - 1);
-        {
-            float a = -1.0f / 0.0f, b = -1.0f / 0.0f;
-            #pragma unroll
-            for (int f = 0; f < KF; ++f) {
-                const int c = kv0 + (sng * KF + f) * 8 + 2 * tg;
-                if (c <= lim0) {
-                    a = fmaxf(a, d[f][0]);
-                }
-                if (c + 1 <= lim0) {
-                    a = fmaxf(a, d[f][1]);
-                }
-                if (c <= lim1) {
-                    b = fmaxf(b, d[f][2]);
-                }
-                if (c + 1 <= lim1) {
-                    b = fmaxf(b, d[f][3]);
-                }
-            }
-            #pragma unroll
-            for (int o = 1; o < 4; o <<= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));
-                b = fmaxf(b, __shfl_xor_sync(0xffffffff, b, o));
-            }
-            if (tg == 0) {
-                sm_part[r0 * CG + sng] = a;
-                sm_part[(r0 + 8) * CG + sng] = b;
-            }
-        }
-        __syncthreads();
-
-        // The running maximum, one thread a row: it folds the CG warp columns
-        // into the row's own and leaves the rescale factor for everyone. One
-        // thread because `sm_m` is read and written here, and a second writer
-        // would race with it rather than agree with it.
-        if (tid < QT) {
-            float mx = -1.0f / 0.0f;
-            #pragma unroll
-            for (int c = 0; c < CG; ++c) {
-                mx = fmaxf(mx, sm_part[tid * CG + c]);
-            }
-            const float m_new = fmaxf(sm_m[tid], mx);
-            sm_fac[tid] = __expf(sm_m[tid] - m_new);
-            sm_m[tid] = m_new;
-        }
-        __syncthreads();
-
-        // Probabilities, rounded to f16 on their way into the value product -
-        // where the unfused chain rounded them too - and the row sums, folded
-        // the way the maxima were. A lane's two accumulator columns are
-        // adjacent and the first is even, so the pair it holds is exactly one
-        // packed word of `ps` and the layout the value product's `a` fragment
-        // wants falls out of the score product's own.
-        {
-            const float m0 = sm_m[r0], m1 = sm_m[r0 + 8];
-            float s0 = 0.0f, s1 = 0.0f;
-            #pragma unroll
-            for (int f = 0; f < KF; ++f) {
-                const int c = kv0 + (sng * KF + f) * 8 + 2 * tg;
-                const float p00 = (c <= lim0) ? __expf(d[f][0] - m0) : 0.0f;
-                const float p01 = (c + 1 <= lim0) ? __expf(d[f][1] - m0) : 0.0f;
-                const float p10 = (c <= lim1) ? __expf(d[f][2] - m1) : 0.0f;
-                const float p11 = (c + 1 <= lim1) ? __expf(d[f][3] - m1) : 0.0f;
-                s0 += p00 + p01;
-                s1 += p10 + p11;
-                const int w = (sng * KF + f) * 4 + tg;
-                ps[r0 * PSTR + w] = gemm_pack(p00, p01);
-                ps[(r0 + 8) * PSTR + w] = gemm_pack(p10, p11);
-            }
-            #pragma unroll
-            for (int o = 1; o < 4; o <<= 1) {
-                s0 += __shfl_xor_sync(0xffffffff, s0, o);
-                s1 += __shfl_xor_sync(0xffffffff, s1, o);
-            }
-            if (tg == 0) {
-                sm_part[r0 * CG + sng] = s0;
-                sm_part[(r0 + 8) * CG + sng] = s1;
-            }
-        }
-
-        // Values, `[d][pos]` - the cache's own transposed layout, which is
-        // already the `[n][k]` shape the B fragment wants.
-        for (int i = tid; i < HD * (KT / 2); i += FA_WARPS * 32) {
-            const int r = i / (KT / 2), j = i % (KT / 2);
-            unsigned w = 0u;
-            if (kv0 + 2 * j + 1 < kend) {
-                if (KVH) {
-                    // `cap` and `kv0` are both even, so the pair this word
-                    // wants is one word of the cache and not two halves of
-                    // neighbouring ones.
-                    w = vbh[((size_t)r * cap + kv0) / 2 + j];
-                } else {
-                    const float2 v = *reinterpret_cast<const float2*>(
-                        vb + (size_t)r * cap + kv0 + 2 * j);
-                    w = gemm_pack(v.x, v.y);
-                }
-            } else if (kv0 + 2 * j < kend) {
-                if (KVH) {
-                    // The odd tail: keep the low half, zero the one the mask
-                    // would have discarded anyway.
-                    w = vbh[((size_t)r * cap + kv0) / 2 + j] & 0x0000ffffu;
-                } else {
-                    w = gemm_pack(vb[(size_t)r * cap + kv0 + 2 * j], 0.0f);
-                }
-            }
-            kvs[r * VSTR + j] = w;
-        }
-        __syncthreads();
-
-        // The running sum, one thread a row, for the reason the maximum is.
-        // Nothing reads `sm_l` before the final store, so it is folded in
-        // beside the value product rather than costing a barrier of its own;
-        // the loop's closing barrier is what stops the next tile overwriting
-        // `sm_part` underneath it.
-        if (tid < QT) {
-            float sum = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < CG; ++c) {
-                sum += sm_part[tid * CG + c];
-            }
-            sm_l[tid] = sm_l[tid] * sm_fac[tid] + sum;
-        }
-
-        // O = O * fac + P V, with the `a` fragment again loaded once per
-        // contraction step and reused across the column fragments. The
-        // rescale factor is per row, and a lane's fragment rows are `g` and
-        // `g + 8` of its group.
-        {
-            float d[NT][4];
-            #pragma unroll
-            for (int nt = 0; nt < NT; ++nt) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    d[nt][j] = 0.0f;
-                }
-            }
-            #pragma unroll
-            for (int ks = 0; ks < KT / 8; ++ks) {
-                unsigned a0, a1;
-                gemm_ld_a(&ps[(mg * 16 + (lane & 15)) * PSTR + 4 * ks], a0, a1);
-                #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
-                    const unsigned b0 = gemm_ld_b(
-                        &kvs[((ng0 + nt) * 8 + (lane & 7)) * VSTR + 4 * ks]);
-                    gemm_mma_step(d[nt][0], d[nt][1], d[nt][2], d[nt][3],
-                                  a0, a1, b0);
-                }
-            }
-            const float f0 = sm_fac[mg * 16 + g];
-            const float f1 = sm_fac[mg * 16 + g + 8];
-            #pragma unroll
-            for (int nt = 0; nt < NT; ++nt) {
-                acc[nt][0] = acc[nt][0] * f0 + d[nt][0];
-                acc[nt][1] = acc[nt][1] * f0 + d[nt][1];
-                acc[nt][2] = acc[nt][2] * f1 + d[nt][2];
-                acc[nt][3] = acc[nt][3] * f1 + d[nt][3];
-            }
-        }
-        __syncthreads();
     }
 
-    // O / l, written merged: `[tq, heads * hd]`, `split_heads` and
-    // `merge_heads` both gone.
-    const int r0 = mg * 16 + g, r1 = r0 + 8;
-    const float inv0 = sm_l[r0] > 0.0f ? 1.0f / sm_l[r0] : 0.0f;
-    const float inv1 = sm_l[r1] > 0.0f ? 1.0f / sm_l[r1] : 0.0f;
+    // The row sums, over the quad, and O / l written merged.
+    l0 += __shfl_xor_sync(0xffffffff, l0, 1);
+    l0 += __shfl_xor_sync(0xffffffff, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffff, l1, 1);
+    l1 += __shfl_xor_sync(0xffffffff, l1, 2);
+    const float inv0 = l0 > 0.0f ? 1.0f / l0 : 0.0f;
+    const float inv1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
     #pragma unroll
-    for (int nt = 0; nt < NT; ++nt) {
-        const int col = (size_t)h * HD + (ng0 + nt) * 8 + 2 * tg;
-        if (qt0 + r0 < tq) {
-            float* o = out + (size_t)(qt0 + r0) * dq + col;
-            o[0] = acc[nt][0] * inv0;
-            o[1] = acc[nt][1] * inv0;
-        }
-        if (qt0 + r1 < tq) {
-            float* o = out + (size_t)(qt0 + r1) * dq + col;
-            o[0] = acc[nt][2] * inv1;
-            o[1] = acc[nt][3] * inv1;
+    for (int nt = 0; nt < NO; ++nt) {
+        const int col = h * HD + nt * 8 + 2 * tg;
+        if (OH) {
+            unsigned* o = (unsigned*)out;
+            if (r0 < tq) {
+                o[((size_t)r0 * dq + col) / 2] = gemm_pack(acc[nt][0] * inv0, acc[nt][1] * inv0);
+            }
+            if (r1 < tq) {
+                o[((size_t)r1 * dq + col) / 2] = gemm_pack(acc[nt][2] * inv1, acc[nt][3] * inv1);
+            }
+        } else {
+            float* o = (float*)out;
+            if (r0 < tq) {
+                *reinterpret_cast<float2*>(o + (size_t)r0 * dq + col) =
+                    make_float2(acc[nt][0] * inv0, acc[nt][1] * inv0);
+            }
+            if (r1 < tq) {
+                *reinterpret_cast<float2*>(o + (size_t)r1 * dq + col) =
+                    make_float2(acc[nt][2] * inv1, acc[nt][3] * inv1);
+            }
         }
     }
 }
 
-// The two head widths that exist in this engine: 128 for both Llama stages,
-// 64 for every Whisper size (large-v2's 1280 over 20 heads, and the smaller
-// ones' too - Whisper holds the head width fixed and varies the count). Each
-// takes the query tile its own traffic wants: the Whisper encoder walks 1500
-// keys and 64 rows a block halves what it re-stages, where a Llama prefill's
-// causal loop stops at the block's own diagonal and 32 is already enough.
-// Both were measured, and docs/BENCHMARKS.md has the numbers.
-extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn(
-    const float* __restrict__ q,
-    const float* __restrict__ kc,
-    const float* __restrict__ vc,
-    float* __restrict__ out,
-    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 3) void flash_attn(
+    const float* __restrict__ q, const float* __restrict__ kc,
+    const float* __restrict__ vc, float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal, int gb)
 {
-    flash_attn_impl<128, 32, 32, false>(q, kc, vc, out, tq, past, heads,
-                                        kv_heads, cap, scale, causal);
+    flash_attn_impl<128, 32, false, false, false>(q, kc, vc, out, tq, past, heads, kv_heads,
+                                              cap, scale, causal, gb, heads * 128, 0, 0);
 }
 
-// The same at 128, reading an f16 cache. Only this width, because the chat
-// model is the only stage that holds its cache that way - the ASR's is a
-// 64-wide encoder cache it re-reads inside L2, where an f16 copy was measured
-// and bought nothing. See docs/BENCHMARKS.md.
-extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_h(
-    const float* __restrict__ q,
-    const unsigned short* __restrict__ kc,
-    const unsigned short* __restrict__ vc,
-    float* __restrict__ out,
-    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 3) void flash_attn_h(
+    const float* __restrict__ q, const unsigned short* __restrict__ kc,
+    const unsigned short* __restrict__ vc, float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal, int gb)
 {
-    flash_attn_impl<128, 32, 32, true>(q, kc, vc, out, tq, past, heads,
-                                       kv_heads, cap, scale, causal);
+    flash_attn_impl<128, 32, true, false, false>(q, kc, vc, out, tq, past, heads, kv_heads,
+                                             cap, scale, causal, gb, heads * 128, 0, 0);
 }
 
-extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 2) void flash_attn_64(
-    const float* __restrict__ q,
-    const float* __restrict__ kc,
-    const float* __restrict__ vc,
-    float* __restrict__ out,
-    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal)
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 3) void flash_attn_64(
+    const float* __restrict__ q, const float* __restrict__ kc,
+    const float* __restrict__ vc, float* __restrict__ out,
+    int tq, int past, int heads, int kv_heads, int cap, float scale, int causal, int gb)
 {
-    flash_attn_impl<64, 64, 64, false>(q, kc, vc, out, tq, past, heads,
-                                       kv_heads, cap, scale, causal);
+    flash_attn_impl<64, 64, false, false, false>(q, kc, vc, out, tq, past, heads, kv_heads,
+                                             cap, scale, causal, gb, heads * 64, 0, 0);
+}
+
+// The Whisper encoder's attention off its stacked q/k/v product: queries,
+// keys and values are columns of one `[t, 3d]` buffer `qkvs` elements a row,
+// the scale goes on the queries, and the context is written at f16 for the
+// output projection. Not causal, ungrouped, and no cache.
+extern "C" __global__ __launch_bounds__(FA_WARPS * 32, 3) void flash_attn_64_rows(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, unsigned short* __restrict__ out,
+    int t, int heads, float scale, int qkvs)
+{
+    flash_attn_impl<64, 64, false, true, true>(q, k, v, out, t, 0, heads, heads, t, scale,
+                                           0, 1, qkvs, qkvs, 1);
 }
 
 // ---------------------------------------------------------------- convolution
@@ -5727,9 +5699,17 @@ __device__ __forceinline__ void attn_decode_run_impl(
     // online softmax - so the merge below reads `splits` partials a head
     // rather than one a chunk. At 8192 positions and 64-key chunks that was
     // 128 partials merged by one block, on the critical path of every layer.
-    const int per = (chunks + splits - 1) / splits;
-    const int c0 = blockIdx.x * per;
-    const int c1 = min(chunks, c0 + per);
+    //
+    // The chunks a block walks are strided by `splits`, not contiguous: block
+    // `b` takes `b`, `b + splits`, `b + 2 * splits`... so at any moment a
+    // head's blocks are reading neighbouring chunks - one contiguous span of
+    // every value row and consecutive key rows - rather than each reading its
+    // own region of a row hundreds of bytes from the next block's. The value
+    // cache is `[d][cap]`, so a chunk is 64 bytes of each of 128 rows `cap`
+    // apart, and which DRAM pages those land on is the whole difference.
+    const int c0 = blockIdx.x;
+    const int cs = splits;
+    const int c1 = chunks;
 
     const int ks = lane / LPK, wo = (lane - ks * LPK) * 4;
     const unsigned* kbase = kc + (size_t)h * cap * W;
@@ -5824,7 +5804,7 @@ __device__ __forceinline__ void attn_decode_run_impl(
     }
 
     const float sf = scale_q ? 1.0f : scale;
-    for (int c = c0; c < c1; ++c) {
+    for (int c = c0; c < c1; c += cs) {
     const int nk = min(CH, tk - c * CH);
 
     // Scores: the lane's partial dot products, then a reduction across the
@@ -5880,18 +5860,21 @@ __device__ __forceinline__ void attn_decode_run_impl(
     if (c == c0) {
         load_values(c);
     }
-    if (c + 1 < c1) {
-        load_keys(c + 1);
+    if (c + cs < c1) {
+        load_keys(c + cs);
     }
     __syncthreads();
 
-    // The softmax over the chunk, by warp 0: `SPL` scores a lane, 32 apart.
+    // The softmax over the chunk, a warp a query row: `SPL` scores a lane, 32
+    // apart. With a group of four and four warps every row is done at once;
+    // this was warp 0 alone, walking the rows in turn while the other three
+    // waited at the barrier below.
     constexpr int SPL = CH / 32;
     static_assert(SPL >= 1 && CH % 32 == 0, "a chunk is whole warps of scores");
-    if (tid < 32) {
+    {
         #pragma unroll
         for (int g = 0; g < G; ++g) {
-            if (g < group) {
+            if (g < group && g % WARPS == warp) {
                 float* row = sc + g * CH;
                 float v[SPL], p[SPL];
                 float m = row[lane];
@@ -5972,8 +5955,8 @@ __device__ __forceinline__ void attn_decode_run_impl(
             mr[g] = mn;
         }
     }
-    if (c + 1 < c1) {
-        load_values(c + 1);
+    if (c + cs < c1) {
+        load_values(c + cs);
     }
     // The next trip's scores overwrite `sc` and its softmax `m_s`.
     __syncthreads();

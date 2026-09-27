@@ -45,6 +45,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    for name in ["attn_decode_h128_c32", "attn_decode_h128_run"] {
+        if let Some((regs, local, shared)) = g.kernel_resources(name) {
+            println!("{name}: {regs} registers, {local} B spilled, {shared} B shared");
+        }
+    }
     // (name, heads, kv_heads, hd, tk, cap)
     let shapes = [
         (
@@ -61,6 +66,7 @@ fn main() -> ExitCode {
         ("chat 8B, 2048 ctx", 32, 8, 128, 2048, 2048),
         ("chat 8B, 4096 ctx", 32, 8, 128, 4096, 4096),
         ("chat 8B, 8192 ctx", 32, 8, 128, 8192, 8192),
+        ("chat 8B, 8192 of 16384", 32, 8, 128, 8192, 16384),
         ("translator 13B, 128 ctx", 40, 40, 128, 128, 256),
         ("translator 13B, 256 ctx", 40, 40, 128, 256, 256),
         ("translator 13B, 512 ctx", 40, 40, 128, 512, 512),

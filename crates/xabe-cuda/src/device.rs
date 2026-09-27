@@ -43,10 +43,22 @@ const SM_TARGET: usize = 144;
 /// geometry; `docs/BENCHMARKS.md` has the table.
 const AD_BLOCK_TARGET: usize = 216;
 
+/// The fewest runs a head is split into, whatever `AD_BLOCK_TARGET` comes to
+/// over its key-value heads. `AD_BLOCK_TARGET` alone gives the translator's
+/// forty heads six runs each, and its 4000-position step measured 5.29 ms
+/// that way against 5.06 at fourteen; the chat model's eight heads get 27
+/// either way. Swept at 1, 10, 14, 18 and 24.
+const AD_MIN_SPLITS: usize = 14;
+
 /// The context past which a 128-wide head decodes with the run kernel. At
 /// 2048 positions the two kernels measured level; from 4096 the run kernel is
 /// ahead on both Llama geometries.
 const AD_RUN_FROM: usize = 2048;
+
+/// The same for a model without query groups, whose chunk kernel has less
+/// work a block: the translator's 2048-position step measured 2.99 ms on the
+/// chunk kernel and 2.85 on the run kernel, and 1.61 against 1.64 at 1024.
+const AD_RUN_FROM_UNGROUPED: usize = 1024;
 
 /// The shortest contraction a split slice is allowed.
 ///
@@ -606,6 +618,7 @@ const NAMES: &[&str] = &[
     "rope_cache_f16",
     "cache_grow_f16",
     "flash_attn_h",
+    "flash_attn_64_rows",
     "quantize_q8",
     "cache_append",
     "cache_append_t",
@@ -1320,6 +1333,21 @@ impl Gpu {
             .unwrap_or_else(|| panic!("{name} was in NAMES but not loaded"))
     }
 
+    /// What the compiler gave a kernel: registers a thread, local (spilled)
+    /// bytes a thread, and static shared bytes a block. `None` for a name
+    /// that was not loaded.
+    ///
+    /// For the benchmarks: occupancy has decided more of this crate's kernel
+    /// work than anything else, and this is `ptxas -v` without a toolkit.
+    pub fn kernel_resources(&self, name: &str) -> Option<(i32, i32, i32)> {
+        let f = self.funcs.get(name)?;
+        Some((
+            f.num_regs().ok()?,
+            f.local_size_bytes().ok()?,
+            f.shared_size_bytes().ok()?,
+        ))
+    }
+
     /// A flat launch over `n` elements.
     fn flat(n: usize) -> LaunchConfig {
         LaunchConfig {
@@ -1347,8 +1375,77 @@ fn launched<T>(
     what: &'static str,
     r: Result<T, cudarc::driver::DriverError>,
 ) -> Result<(), CudaError> {
-    r.map(|_| ())
-        .map_err(|source| CudaError::Driver { what, source })
+    let r = r
+        .map(|_| ())
+        .map_err(|source| CudaError::Driver { what, source });
+    if r.is_ok() && kprof::enabled() {
+        kprof::mark(what);
+    }
+    r
+}
+
+/// A per-kernel wall-clock profile, for a host with no `nsys`.
+///
+/// Off unless `XABE_KPROF` is set. When it is, every launch that goes through
+/// [`launched`] synchronises the context and charges the time since the
+/// previous mark to that kernel's name - so a kernel's figure includes the
+/// host work issued since the last launch, and the synchronisation takes away
+/// the launch overlap a real run has. It answers *where* a pass goes, not how
+/// fast it is; time the pass with it off.
+pub mod kprof {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct State {
+        last: Instant,
+        by_name: HashMap<&'static str, (u64, f64)>,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static S: OnceLock<Mutex<State>> = OnceLock::new();
+        S.get_or_init(|| {
+            Mutex::new(State {
+                last: Instant::now(),
+                by_name: HashMap::new(),
+            })
+        })
+    }
+
+    /// Whether `XABE_KPROF` was set when this was first asked.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("XABE_KPROF").is_some())
+    }
+
+    pub(crate) fn mark(what: &'static str) {
+        // A failed synchronise shows up at the next checked call; the profile
+        // is not the place to report it.
+        let _ = cudarc::driver::result::ctx::synchronize();
+        let now = Instant::now();
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+        let dt = now.duration_since(s.last).as_secs_f64();
+        s.last = now;
+        let e = s.by_name.entry(what).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += dt;
+    }
+
+    /// Discards everything recorded so far and restarts the clock.
+    pub fn reset() {
+        let _ = cudarc::driver::result::ctx::synchronize();
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+        s.by_name.clear();
+        s.last = Instant::now();
+    }
+
+    /// `(kernel, launches, seconds)`, most expensive first.
+    pub fn report() -> Vec<(&'static str, u64, f64)> {
+        let s = state().lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<_> = s.by_name.iter().map(|(k, (n, t))| (*k, *n, *t)).collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        v
+    }
 }
 
 /// The kernels.
@@ -2462,6 +2559,10 @@ impl Gpu {
                 .arg(&o_off);
         }
         lb.arg(&sb).arg(&accum);
+        let plain = 0i32;
+        if hh {
+            lb.arg(&plain);
+        }
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: if small {
@@ -3118,6 +3219,104 @@ impl Gpu {
     /// that and letting the matmul stage the result. It exists for the
     /// encoder's MLP, where the inner activation is 30.7 MB that the second
     /// projection re-reads once per column tile.
+    /// `gelu_f16(a w^T + bias)` for two f16 operands, `[m, n]` halves out, as
+    /// one launch: the f16-by-f16 matmul with GELU in its epilogue.
+    ///
+    /// The same numbers as [`Self::gemm_batched`] then [`Self::gelu_f16`] -
+    /// the epilogue applies `act_gelu_f16`'s formula to the value the plain
+    /// epilogue would have stored, and rounds it the same way - without the
+    /// f32 intermediate written and read back. Where the fused kernel does not
+    /// apply (a split contraction, an odd width, a mat-vec's row count) it is
+    /// those two launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gelu_f16(
+        &self,
+        a: &CudaSlice<u16>,
+        w: &CudaSlice<u16>,
+        bias: Option<&CudaSlice<f32>>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        let fused = m > GEMV_MAX_M
+            && k.is_multiple_of(2)
+            && n.is_multiple_of(2)
+            && ksplit_for(m, k, n, 1) == 1;
+        if !fused {
+            let y = self.gemm_batched(
+                Operand::F16(a),
+                Operand::F16(w),
+                bias,
+                Batch::single(m * n),
+                m,
+                k,
+                n,
+            )?;
+            return self.gelu_f16(&y, m * n);
+        }
+        if a.len() < m * k || w.len() < n * k {
+            return Err(CudaError::SliceOverrun {
+                at: (m * k).max(n * k),
+                len: a.len().min(w.len()),
+            });
+        }
+        if let Some(b) = bias
+            && b.len() < n
+        {
+            return Err(CudaError::SliceOverrun { at: n, len: b.len() });
+        }
+        // SAFETY: the grid covers every (row, column pair) of `[m, n]` once and
+        // the epilogue stores each pair as one word; `n` is even.
+        let mut out =
+            unsafe { self.stream.alloc::<u16>(m * n) }.map_err(|source| CudaError::Driver {
+                what: "allocating",
+                source,
+            })?;
+        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let (sa, sw, so, sb) = (0i64, 0i64, 0i64, 0i64);
+        let (one, zero, gelu) = (1i32, 0i32, 1i32);
+        let null: u64 = 0;
+        let f = self.func("gemm_hh");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(a).arg(w);
+        match bias {
+            Some(v) => lb.arg(v),
+            None => lb.arg(&null),
+        };
+        lb.arg(&mut out)
+            .arg(&mi)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&sa)
+            .arg(&sw)
+            .arg(&so)
+            .arg(&one)
+            .arg(&one)
+            .arg(&zero)
+            .arg(&zero)
+            .arg(&zero)
+            .arg(&zero)
+            .arg(&one)
+            .arg(&null)
+            .arg(&sb)
+            .arg(&zero)
+            .arg(&gelu);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(kernels::GEMM_NT),
+                (m as u32).div_ceil(kernels::GEMM_MT),
+                1,
+            ),
+            block_dim: (32, kernels::GEMM_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the operands were checked to hold `[m, k]` and `[n, k]`, the
+        // bias `n`, and every global access inside the kernel is bounds checked
+        // against m, k and n.
+        launched("gemm_hh", unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
     pub fn gelu_f16(&self, x: &CudaSlice<f32>, n: usize) -> Result<CudaSlice<u16>, CudaError> {
         let mut out =
             unsafe { self.stream.alloc::<u16>(n) }.map_err(|source| CudaError::Driver {
@@ -5291,12 +5490,9 @@ impl Gpu {
         // instantiated at would index across heads *in bounds* and return
         // plausible context, so it is refused by name and the caller falls
         // back to the unfused chain.
-        // The query rows a block owns, which is the kernel's own `QT` and
-        // therefore its grid stride. It is not the same at both widths: see
-        // the kernel's header for why the encoder's instantiation takes 64.
-        let (name, qt) = match head_dim {
-            128 => ("flash_attn", 32),
-            64 => ("flash_attn_64", 64),
+        let name = match head_dim {
+            128 => "flash_attn",
+            64 => "flash_attn_64",
             _ => {
                 return Err(CudaError::UnsupportedAttention {
                     head_dim,
@@ -5313,35 +5509,11 @@ impl Gpu {
             });
         }
         // SAFETY: every (row, column) of the output is written by exactly one
-        // lane of the store loop below; rows past `tq` are predicated off.
+        // lane of the kernel's store loop; rows past `tq` are predicated off.
         let mut out = unsafe { self.uninit(tq * heads * head_dim) }?;
-        let (tqi, pi, hi, kvi, ci) = (
-            tq as i32,
-            past as i32,
-            heads as i32,
-            kv_heads as i32,
-            cap as i32,
-        );
-        let causal_i = i32::from(causal);
-        let f = self.func(name);
-        let mut lb = self.stream.launch_builder(f);
-        lb.arg(q)
-            .arg(k)
-            .arg(v)
-            .arg(&mut out)
-            .arg(&tqi)
-            .arg(&pi)
-            .arg(&hi)
-            .arg(&kvi)
-            .arg(&ci)
-            .arg(&scale)
-            .arg(&causal_i);
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: ((tq as u32).div_ceil(qt), heads as u32, 1),
-            block_dim: (32, 8, 1),
-            shared_mem_bytes: 0,
-        };
-        launched(name, unsafe { lb.launch(cfg) })?;
+        self.flash_launch(
+            name, q, k, v, &mut out, tq, past, heads, kv_heads, cap, scale, causal,
+        )?;
         Ok(out)
     }
 
@@ -5370,11 +5542,8 @@ impl Gpu {
         // instantiated at would index across heads *in bounds* and return
         // plausible context, so it is refused by name and the caller falls
         // back to the unfused chain.
-        // The query rows a block owns, which is the kernel's own `QT` and
-        // therefore its grid stride. It is not the same at both widths: see
-        // the kernel's header for why the encoder's instantiation takes 64.
-        let (name, qt) = match head_dim {
-            128 => ("flash_attn_h", 32),
+        let name = match head_dim {
+            128 => "flash_attn_h",
             _ => {
                 return Err(CudaError::UnsupportedAttention {
                     head_dim,
@@ -5394,14 +5563,118 @@ impl Gpu {
             });
         }
         // SAFETY: every (row, column) of the output is written by exactly one
-        // lane of the store loop below; rows past `tq` are predicated off.
+        // lane of the kernel's store loop; rows past `tq` are predicated off.
         let mut out = unsafe { self.uninit(tq * heads * head_dim) }?;
-        let (tqi, pi, hi, kvi, ci) = (
+        self.flash_launch(
+            name, q, k, v, &mut out, tq, past, heads, kv_heads, cap, scale, causal,
+        )?;
+        Ok(out)
+    }
+
+    /// Non-causal attention over a stacked `[t, 3 d]` q/k/v product, the
+    /// context returned at f16 as `[t, d]` - the Whisper encoder's shape, 64
+    /// wide and ungrouped.
+    ///
+    /// Replaces a head split of the keys, a transposed head split of the
+    /// values, a scaling pass over the queries and an f32 context: the kernel
+    /// reads all three from the product's own rows, puts `scale` on the
+    /// queries before rounding them - where the scaling pass put it - and
+    /// rounds the context to f16 the way the tiled matmul would round it on
+    /// the way in, so the output projection can take `gemm_hh` and produce
+    /// the same bits.
+    pub fn flash_attn_rows(
+        &self,
+        qkv: &CudaSlice<f32>,
+        t: usize,
+        heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<u16>, CudaError> {
+        if head_dim != 64 {
+            return Err(CudaError::UnsupportedAttention {
+                head_dim,
+                heads,
+                kv_heads: heads,
+            });
+        }
+        let d = heads * head_dim;
+        if qkv.len() < t * 3 * d {
+            return Err(CudaError::SliceOverrun {
+                at: t * 3 * d,
+                len: qkv.len(),
+            });
+        }
+        // SAFETY: every (row, column) of the context is written by exactly one
+        // lane: a warp owns sixteen rows of one head and stores all 64 of its
+        // columns, and rows past `t` are never read.
+        let mut out = unsafe { self.stream.alloc::<u16>(t * d) }.map_err(|source| {
+            CudaError::Driver {
+                what: "allocating",
+                source,
+            }
+        })?;
+        let k = qkv.slice(d..);
+        let v = qkv.slice(2 * d..);
+        let (ti, hi, si) = (t as i32, heads as i32, (3 * d) as i32);
+        let f = self.func("flash_attn_64_rows");
+        let mut lb = self.stream.launch_builder(f);
+        lb.arg(qkv)
+            .arg(&k)
+            .arg(&v)
+            .arg(&mut out)
+            .arg(&ti)
+            .arg(&hi)
+            .arg(&scale)
+            .arg(&si);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (t.div_ceil(64) as u32, heads as u32, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the grid tiles `t` by 64 positions and the heads one a
+        // block; every read of `qkv` is a row below `t` at a column below
+        // `3 d`, which the length check above covers.
+        launched("flash_attn_64_rows", unsafe { lb.launch(cfg) })?;
+        Ok(out)
+    }
+
+    /// Launches `flash_attn_impl`: four warps a block, a warp sixteen query rows
+    /// of one head, and a block the query heads of one key-value group where
+    /// the group divides into it. See the kernel for why.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_launch<T: cudarc::driver::DeviceRepr>(
+        &self,
+        name: &'static str,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<T>,
+        v: &CudaSlice<T>,
+        out: &mut CudaSlice<f32>,
+        tq: usize,
+        past: usize,
+        heads: usize,
+        kv_heads: usize,
+        cap: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<(), CudaError> {
+        let group = heads / kv_heads.max(1);
+        // Heads a block: as much of the group as four warps hold. The rest of
+        // the block's warps take further positions of the same heads.
+        let gb = if group.is_multiple_of(4) {
+            4
+        } else if group.is_multiple_of(2) {
+            2
+        } else {
+            1
+        };
+        let pb = 16 * (4 / gb);
+        let (tqi, pi, hi, kvi, ci, gbi) = (
             tq as i32,
             past as i32,
             heads as i32,
             kv_heads as i32,
             cap as i32,
+            gb as i32,
         );
         let causal_i = i32::from(causal);
         let f = self.func(name);
@@ -5409,21 +5682,25 @@ impl Gpu {
         lb.arg(q)
             .arg(k)
             .arg(v)
-            .arg(&mut out)
+            .arg(out)
             .arg(&tqi)
             .arg(&pi)
             .arg(&hi)
             .arg(&kvi)
             .arg(&ci)
             .arg(&scale)
-            .arg(&causal_i);
+            .arg(&causal_i)
+            .arg(&gbi);
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: ((tq as u32).div_ceil(qt), heads as u32, 1),
-            block_dim: (32, 8, 1),
+            grid_dim: (tq.div_ceil(pb) as u32, (heads / gb) as u32, 1),
+            block_dim: (32, 4, 1),
             shared_mem_bytes: 0,
         };
-        launched(name, unsafe { lb.launch(cfg) })?;
-        Ok(out)
+        // SAFETY: every (row, head) of the output is owned by exactly one warp
+        // - blocks tile positions by `pb` and heads by `gb` - and rows past
+        // `tq` are predicated off; every cache read is bounded by `past + tq
+        // <= cap`, which the caller's cache guarantees.
+        launched(name, unsafe { lb.launch(cfg) })
     }
 
     /// Attention for one query position, in one launch, off an f16 cache.
@@ -5560,7 +5837,9 @@ impl Gpu {
         // query groups to share a head's reads, wide ones once the merge over
         // many partials is what the last block waits on.
         Ok(match head_dim {
-            128 if tk > AD_RUN_FROM => "attn_decode_h128_run",
+            128 if tk > AD_RUN_FROM || (heads == kv_heads && tk > AD_RUN_FROM_UNGROUPED) => {
+                "attn_decode_h128_run"
+            }
             128 if tk <= 256 || heads == kv_heads => "attn_decode_h128_c32",
             128 if tk >= 2048 => "attn_decode_h128_c128",
             128 => "attn_decode_h128",
@@ -5810,7 +6089,8 @@ impl Gpu {
         // case of one chunk a block.
         let run = name == "attn_decode_h128_run";
         let splits = if run {
-            let per = chunks.div_ceil(AD_BLOCK_TARGET.div_ceil(kv_heads).max(1));
+            let want = AD_BLOCK_TARGET.div_ceil(kv_heads).max(AD_MIN_SPLITS);
+            let per = chunks.div_ceil(want.max(1));
             chunks.div_ceil(per)
         } else {
             chunks

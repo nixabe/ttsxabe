@@ -2238,11 +2238,23 @@ fn an_offset_past_the_end_of_the_source_is_refused() {
 /// width that is only ever exercised through the model would have its
 /// indexing checked by nothing.
 fn fused_attention_case(heads: usize, kv_heads: usize, hd: usize, causal: bool) {
-    let Some(g) = gpu() else { return };
-
     // Odd on purpose: a query count that is not a whole tile, and a cache with
     // more capacity than positions.
-    let (tq, past, cap) = (70usize, 33usize, 160usize);
+    fused_attention_sized(heads, kv_heads, hd, causal, 70, 33, 160, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fused_attention_sized(
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    causal: bool,
+    tq: usize,
+    past: usize,
+    cap: usize,
+    half_cache: bool,
+) {
+    let Some(g) = gpu() else { return };
     let tk = past + tq;
     let scale = (hd as f32).powf(-0.5);
 
@@ -2266,13 +2278,21 @@ fn fused_attention_case(heads: usize, kv_heads: usize, hd: usize, causal: bool) 
     }
 
     let dq = g.upload(&q).expect("upload q");
-    let dk = g.upload(&kc).expect("upload k");
-    let dv = g.upload(&vc).expect("upload v");
-    let out = g
-        .flash_attn(
+    let out = if half_cache {
+        let dk = g.upload_f16(&kc).expect("upload k");
+        let dv = g.upload_f16(&vc).expect("upload v");
+        g.flash_attn_f16(
             &dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale, causal,
         )
-        .expect("flash_attn");
+        .expect("flash_attn_f16")
+    } else {
+        let dk = g.upload(&kc).expect("upload k");
+        let dv = g.upload(&vc).expect("upload v");
+        g.flash_attn(
+            &dq, &dk, &dv, tq, past, heads, kv_heads, hd, cap, scale, causal,
+        )
+        .expect("flash_attn")
+    };
     let got = g.download(&out).expect("download");
 
     // Operands are rounded to f16 because the kernel rounds them; the
@@ -2395,6 +2415,25 @@ fn fused_attention_crosses_head_width_with_grouping() {
 fn the_narrow_instantiation_masks_as_well_as_the_wide_one() {
     fused_attention_case(4, 4, 64, true);
     fused_attention_case(4, 2, 64, true);
+}
+
+/// The shapes the prefill actually runs, off the f16 cache it actually holds.
+///
+/// A block is the query heads of one key-value group at sixteen positions
+/// when the group divides by four - the chat model's four - two when it
+/// divides by two, and four warps of one head over 64 positions otherwise, as
+/// the translator's is. Each mapping indexes heads and positions differently,
+/// so each is driven: several blocks of rows, a causal diagonal that crosses
+/// a block's warps unevenly, a prefix already in the cache, a group of eight
+/// that spans two blocks of heads, and a capacity whose value rows are not
+/// sixteen-byte aligned.
+#[test]
+fn fused_attention_holds_at_the_prefill_shapes() {
+    fused_attention_sized(8, 2, 128, true, 150, 0, 256, true);
+    fused_attention_sized(8, 1, 128, true, 90, 17, 128, true);
+    fused_attention_sized(4, 4, 128, true, 200, 40, 256, true);
+    fused_attention_sized(4, 2, 128, true, 130, 5, 138, true);
+    fused_attention_sized(4, 4, 64, false, 300, 0, 300, false);
 }
 
 /// A head width the kernel is not instantiated at is refused, not indexed.
@@ -2764,6 +2803,9 @@ fn the_fused_decode_attention_matches_the_chain() {
         (32, 8, 128, 4096, 4096, true, false),
         (32, 8, 128, 8192, 8192, true, false),
         (32, 8, 128, 7777, 8192, true, false),
+        // Ungrouped past 1024, which takes the run kernel as the translator
+        // does, with the fourteen-run floor rather than the block target.
+        (40, 40, 128, 1500, 1536, true, false),
         (8, 8, 64, 5000, 5056, false, true),
     ];
     for (i, &(heads, kv, hd, tk, cap, half, scale_q)) in cases.iter().enumerate() {
@@ -3975,4 +4017,78 @@ fn the_f16_matmul_is_the_matmul_bit_for_bit() {
         );
     }
     assert!(split_seen >= 1, "no case reached the split path");
+}
+
+/// The encoder's attention off its stacked q/k/v rows is the head-split path,
+/// bit for bit.
+///
+/// `flash_attn_rows` reads the keys and values as columns of one `[t, 3d]`
+/// product where the path it replaces split them into heads first, puts the
+/// scale on the queries itself where that path ran a scaling pass, and writes
+/// the context at f16 where that path wrote f32 for the next matmul to round.
+/// Every one of those is the same numbers in a different place: the same f32
+/// product for the scaled query, the same `mma` steps in the same order - the
+/// value operand arrives by a transposed `ldmatrix` rather than a transposed
+/// copy - and the same round to f16. So the check is equality. A window that
+/// is not a whole tile, and the encoder's own.
+#[test]
+fn the_encoder_attention_off_its_rows_is_the_split_path() {
+    let Some(g) = gpu() else { return };
+    for &(t, heads) in &[(150usize, 4usize), (1500, 20)] {
+        let hd = 64;
+        let d = heads * hd;
+        let scale = (hd as f32).powf(-0.5);
+        let qkv: Vec<f32> = seq(t * 3 * d, 611).iter().map(|v| v * 3.0).collect();
+        let col = |c0: usize| -> Vec<f32> {
+            (0..t)
+                .flat_map(|r| qkv[r * 3 * d + c0..r * 3 * d + c0 + d].to_vec())
+                .collect()
+        };
+        let mut q = g.upload(&col(0)).unwrap();
+        let k = g.split_heads(&g.upload(&col(d)).unwrap(), t, heads, hd).unwrap();
+        let v = g.split_heads_t(&g.upload(&col(2 * d)).unwrap(), t, heads, hd).unwrap();
+        g.scale_inplace(&mut q, t * d, scale).unwrap();
+        let ctx = g
+            .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)
+            .unwrap();
+        let want = g.download_u16(&g.to_f16(&ctx, t * d).unwrap()).unwrap();
+        let got = g
+            .download_u16(
+                &g.flash_attn_rows(&g.upload(&qkv).unwrap(), t, heads, hd, scale)
+                    .unwrap(),
+            )
+            .unwrap();
+        let bad = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        assert_eq!(bad, 0, "t {t} heads {heads}: {bad} of {} differ", want.len());
+    }
+}
+
+/// The matmul with GELU in its epilogue is the matmul and then the GELU, bit
+/// for bit - the encoder's feed-forward shape, a ragged one, and one below the
+/// tiled kernel's row count, where it is the two launches by construction.
+#[test]
+fn the_gelu_epilogue_is_the_matmul_then_the_gelu() {
+    let Some(g) = gpu() else { return };
+    for &(m, k, n) in &[(1500usize, 1280usize, 5120usize), (130, 96, 70), (3, 64, 32)] {
+        let a = g.to_f16(&g.upload(&seq(m * k, 71)).unwrap(), m * k).unwrap();
+        let w = g.upload_f16(&seq(n * k, 72)).unwrap();
+        let b = g.upload(&seq(n, 73)).unwrap();
+        let y = g
+            .gemm_batched(
+                xabe_cuda::Operand::F16(&a),
+                xabe_cuda::Operand::F16(&w),
+                Some(&b),
+                xabe_cuda::Batch::single(m * n),
+                m,
+                k,
+                n,
+            )
+            .unwrap();
+        let want = g.download_u16(&g.gelu_f16(&y, m * n).unwrap()).unwrap();
+        let got = g
+            .download_u16(&g.gemm_gelu_f16(&a, &w, Some(&b), m, k, n).unwrap())
+            .unwrap();
+        let bad = want.iter().zip(&got).filter(|(x, y)| x != y).count();
+        assert_eq!(bad, 0, "{m}x{k}x{n}: {bad} of {} differ", want.len());
+    }
 }
