@@ -38,12 +38,6 @@ struct GNorm {
 }
 
 /// The four projections of one attention block, on the device.
-struct GAttention {
-    q: GLinear,
-    k: GLinear,
-    v: GLinear,
-    out: GLinear,
-}
 
 /// A decoder layer's self-attention: the three input projections stacked
 /// into one `[3 d, d]` f16 weight, so a decoded row's queries, keys and
@@ -57,6 +51,9 @@ struct GSelfAttention {
     q_b: Option<CudaSlice<f32>>,
     k_b: Option<CudaSlice<f32>>,
     v_b: Option<CudaSlice<f32>>,
+    /// The three biases as one `[3 d]`, zeros where a third has none, for
+    /// the one product over the whole stack the encoder takes.
+    qkv_b: CudaSlice<f32>,
     out: GLinear,
 }
 
@@ -82,7 +79,7 @@ struct GCrossAttention {
 /// One encoder block, on the device.
 struct GEncoderLayer {
     attn_ln: GNorm,
-    attn: GAttention,
+    attn: GSelfAttention,
     ffn_ln: GNorm,
     fc1: GLinear,
     fc2: GLinear,
@@ -122,10 +119,28 @@ struct GConv {
 /// and then unusable, and its differential proof is the captured oracle
 /// directly rather than a scalar twin of the whole model. The *kernels* still
 /// have their twins; it is only the assembly of them that does not.
+/// A flag a vocabulary entry, set for each id in `ids`; an id past the
+/// vocabulary cannot be produced and so needs no flag.
+fn mask(ids: &[u32], vocab: usize) -> Vec<bool> {
+    let mut m = vec![false; vocab];
+    for &id in ids {
+        if let Some(f) = m.get_mut(id as usize) {
+            *f = true;
+        }
+    }
+    m
+}
+
 pub struct AsrModel {
     gpu: Gpu,
     cfg: WhisperConfig,
     decoding: GenerationConfig,
+    /// `decoding.suppress_tokens` as one flag a vocabulary entry, and
+    /// `begin_suppress_tokens` as a second, for `pick`: asking the lists
+    /// themselves was a linear search of ninety-odd ids for each of the
+    /// vocabulary's 51 864, every decoded token.
+    suppress: Vec<bool>,
+    suppress_first: Vec<bool>,
     frontend: Frontend,
     tokenizer: Tokenizer,
     conv1: GConv,
@@ -244,14 +259,6 @@ impl AsrModel {
                 b: up(n.bias)?,
             })
         };
-        let att = |a: &Attention| -> Result<GAttention, AsrError> {
-            Ok(GAttention {
-                q: lin(&a.q)?,
-                k: lin(&a.k)?,
-                v: lin(&a.v)?,
-                out: lin(&a.out)?,
-            })
-        };
         // The three weights are each `[d_model, d_model]` - `WhisperWeights`
         // refused the checkpoint otherwise - so stacking them is one
         // concatenation and the row offset of each third is `d_model`.
@@ -260,11 +267,19 @@ impl AsrModel {
             w.extend_from_slice(a.q.weight);
             w.extend_from_slice(a.k.weight);
             w.extend_from_slice(a.v.weight);
+            let d = a.q.out_dim;
+            let mut b = vec![0.0f32; 3 * d];
+            for (part, bias) in [a.q.bias, a.k.bias, a.v.bias].into_iter().enumerate() {
+                if let Some(bias) = bias {
+                    b[part * d..(part + 1) * d].copy_from_slice(bias);
+                }
+            }
             Ok(GSelfAttention {
                 qkv: up16(&w)?,
                 q_b: a.q.bias.map(up).transpose()?,
                 k_b: a.k.bias.map(up).transpose()?,
                 v_b: a.v.bias.map(up).transpose()?,
+                qkv_b: up(&b)?,
                 out: lin(&a.out)?,
             })
         };
@@ -290,7 +305,7 @@ impl AsrModel {
             } = l;
             enc_layers.push(GEncoderLayer {
                 attn_ln: nrm(attn_ln)?,
-                attn: att(attn)?,
+                attn: stack(attn)?,
                 ffn_ln: nrm(ffn_ln)?,
                 fc1: lin(fc1)?,
                 fc2: lin(fc2)?,
@@ -362,6 +377,8 @@ impl AsrModel {
             cross_k,
             cross_v,
             cross_v_bias,
+            suppress: mask(&decoding.suppress_tokens, cfg.vocab_size),
+            suppress_first: mask(&decoding.begin_suppress_tokens, cfg.vocab_size),
             cfg,
             decoding,
             frontend,
@@ -687,8 +704,17 @@ impl AsrModel {
         // pure cost - which is the decoder, where this is called with one row.
         if t > GEMV_MAX_M {
             let x = self.normed_f16(h, Some(res), ln, t)?;
-            let inner = self.project(Operand::F16(&x), fc1, t)?;
-            let inner = self.gpu.gelu_f16(&inner, t * fc1.out_dim)?;
+            // The activation in the matmul's epilogue, stored at f16 for the
+            // next: the same bits as the product and then `gelu_f16`, without
+            // the 30.7 MB f32 intermediate written and read back.
+            let inner = self.gpu.gemm_gelu_f16(
+                &x,
+                &fc1.w,
+                fc1.b.as_ref(),
+                t,
+                fc1.in_dim,
+                fc1.out_dim,
+            )?;
             return self.project(Operand::F16(&inner), fc2, t);
         }
         let x = self.norm_add(h, res, ln, t)?;
@@ -778,33 +804,45 @@ impl AsrModel {
         let mut res: Option<CudaSlice<f32>> = None;
         for (i, l) in self.enc_layers.iter().enumerate() {
             let x = self.normed_f16(&mut h, res.take().as_ref(), &l.attn_ln, t)?;
-            let k = self.gpu.split_heads(
-                &self.project(Operand::F16(&x), &l.attn.k, t)?,
-                t,
-                heads,
-                hd,
-            )?;
-            let v = self.gpu.split_heads_t(
-                &self.project(Operand::F16(&x), &l.attn.v, t)?,
-                t,
-                heads,
-                hd,
-            )?;
-            let ctx = if fused {
-                // The scale stays on the query rather than moving to the
-                // scores, for the reason [`Self::queries`] gives - so the
-                // kernel is handed 1.0 and the rounding is the chain's. The
-                // fused path also skips the query's head split and the
-                // context's merge: it reads the projection buffer's layout
-                // and writes it back.
-                let mut q = self.project(Operand::F16(&x), &l.attn.q, t)?;
-                self.gpu
-                    .scale_inplace(&mut q, t * d, (hd as f32).powf(-0.5))?;
-                self.gpu
-                    .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)?
+            let out = if fused {
+                // One product for the queries, keys and values, and the
+                // attention reads all three from its rows: no head split of
+                // either cache operand and no scaling pass. The scale stays on
+                // the query rather than moving to the scores, for the reason
+                // [`Self::queries`] gives - the kernel applies it before it
+                // rounds, where the pass it replaces did. The context comes
+                // back at f16, rounded as the tiled matmul would have rounded
+                // it, so the output projection is the f16-by-f16 kernel with
+                // the same result.
+                let qkv = self.gpu.gemm_batched(
+                    Operand::F16(&x),
+                    Operand::F16(&l.attn.qkv),
+                    Some(&l.attn.qkv_b),
+                    Batch::single(t * 3 * d),
+                    t,
+                    d,
+                    3 * d,
+                )?;
+                let ctx =
+                    self.gpu
+                        .flash_attn_rows(&qkv, t, heads, hd, (hd as f32).powf(-0.5))?;
+                self.project(Operand::F16(&ctx), &l.attn.out, t)?
             } else {
-                let q = self.queries(Operand::F16(&x), &l.attn.q, t, heads)?;
-                self.attend(
+                let k = self.gpu.split_heads(
+                    &self.project_part(Operand::F16(&x), &l.attn, 1, t)?,
+                    t,
+                    heads,
+                    hd,
+                )?;
+                let v = self.gpu.split_heads_t(
+                    &self.project_part(Operand::F16(&x), &l.attn, 2, t)?,
+                    t,
+                    heads,
+                    hd,
+                )?;
+                let q =
+                    self.queries_from(self.project_part(Operand::F16(&x), &l.attn, 0, t)?, t, heads)?;
+                let ctx = self.attend(
                     Operand::F32(&q),
                     Operand::F32(&k),
                     Operand::F32(&v),
@@ -813,9 +851,9 @@ impl AsrModel {
                     t,
                     heads,
                     false,
-                )?
+                )?;
+                self.project(Operand::F32(&ctx), &l.attn.out, t)?
             };
-            let out = self.project(Operand::F32(&ctx), &l.attn.out, t)?;
             res = Some(self.feed_forward(&mut h, &out, &l.ffn_ln, &l.fc1, &l.fc2, t)?);
             if i < taps {
                 // A tap is the block's output, so the deferred sum is taken
@@ -1252,8 +1290,9 @@ impl AsrModel {
     /// others.
     fn pick(&self, row: &[f32], first: bool) -> u32 {
         let suppressed = |id: u32| {
-            self.decoding.suppress_tokens.contains(&id)
-                || (first && self.decoding.begin_suppress_tokens.contains(&id))
+            let i = id as usize;
+            self.suppress.get(i).copied().unwrap_or(false)
+                || (first && self.suppress_first.get(i).copied().unwrap_or(false))
         };
         row.iter()
             .enumerate()
