@@ -9,6 +9,11 @@ use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, LlamaConfig, LlamaWeights, Tokenizer};
 use xabe_st::StSet;
 
+/// Positions a prefill leaves free in the cache for the reply after it, so
+/// that a prompt landing on a power of two does not re-stride the whole cache
+/// on the first token decoded. See where the cache grows.
+const REPLY_RESERVE: usize = 256;
+
 /// The checkpoint, in whichever container it happens to be.
 ///
 /// The 13 B translator exists on this machine twice: as the 🤗 safetensors
@@ -657,7 +662,13 @@ impl Translator {
         let (h_dim, heads) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
         let hd = self.cfg.head_dim();
         let past = cache.len;
-        let want = need.next_power_of_two().max(256);
+        // A prefill reserves room for the reply that follows it; see the chat
+        // model's `REPLY_RESERVE`. A one-position step grows by doubling alone.
+        let reserve = if need > past + 1 { REPLY_RESERVE } else { 0 };
+        let want = (need + reserve)
+            .next_power_of_two()
+            .max(256)
+            .min(self.cfg.max_position_embeddings.max(need));
         let was = cache.cap;
         // Re-strided, not copied - the cache is head-major and `cap` is the
         // stride between heads. See `Gpu::cache_grow`, and the chat model,

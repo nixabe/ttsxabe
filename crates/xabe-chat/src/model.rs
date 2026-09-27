@@ -6,6 +6,11 @@ use xabe_cuda::{Batch, CudaSlice, DecodeScratch, Gpu, NormScratch, Operand, Q8, 
 use xabe_gguf::GgufFile;
 use xabe_llama::{Bound, Bpe, LlamaConfig, LlamaWeights};
 
+/// Positions a prefill leaves free in the cache for the reply after it, so
+/// that a prompt landing on a power of two does not re-stride the whole cache
+/// on the first token decoded. See where the cache grows.
+const REPLY_RESERVE: usize = 256;
+
 /// Whether a block-quantized checkpoint stays packed on the card.
 ///
 /// The default is [`Packing::Packed`], which is what makes a quantized file
@@ -689,7 +694,17 @@ impl ChatModel {
         let mut pending: Option<(CudaSlice<f32>, Q8)> = None;
         let first = cache.k.is_empty();
         if cache.cap < past + n {
-            let want = (past + n).next_power_of_two().max(256);
+            // A prefill is followed by a reply, so it sizes the cache for one:
+            // a prompt that lands on a power of two would otherwise fill its
+            // cache exactly and pay a whole re-stride - 1 GB copied and 2 GB
+            // zeroed at 8192 positions, about 11 ms - on the first token it
+            // decodes. llama.cpp allocates its whole context up front; this is
+            // the part of that worth having.
+            let reserve = if n > 1 { REPLY_RESERVE } else { 0 };
+            let want = (past + n + reserve)
+                .next_power_of_two()
+                .max(256)
+                .min(self.cfg.max_position_embeddings.max(past + n));
             let was = cache.cap;
             // Re-strided, not copied. The cache is head-major and `cap` is the
             // stride between heads in both layouts, so a flat copy of the live
