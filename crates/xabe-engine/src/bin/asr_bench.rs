@@ -169,6 +169,7 @@ fn stages(
     let mut enc = Vec::new();
     let mut kv = Vec::new();
     let mut dec = Vec::new();
+    let mut pre = Vec::new();
     let mut tokens = 0;
 
     for i in 0..args.runs + args.warmup {
@@ -186,10 +187,32 @@ fn stages(
         gpu.synchronize()?;
         let t_kv = t.elapsed();
 
+        // The prompt's own pass - start of transcript, language, task - which
+        // every utterance pays before its first token, on the multi-row path.
+        let prefix = model.generation().prefix(&args.language, "transcribe")?;
+        let t = Instant::now();
+        let _ = model.decode(&prefix, &mut cache)?;
+        gpu.synchronize()?;
+        let t_pre = t.elapsed();
+
+        let last = i + 1 == args.runs + args.warmup;
+        if last && xabe_cuda::kprof::enabled() {
+            xabe_cuda::kprof::reset();
+        }
         let t = Instant::now();
         let ids = model.generate(&features, &args.language, 64)?;
         gpu.synchronize()?;
         let t_dec = t.elapsed();
+        if last && xabe_cuda::kprof::enabled() {
+            // With `XABE_KPROF` set: where one whole `generate` went -
+            // encoder, cache and decode - kernel by kernel, synchronised.
+            let rows = xabe_cuda::kprof::report();
+            let total: f64 = rows.iter().map(|r| r.2).sum();
+            println!("  generate, per kernel (synchronised; {:.1} ms in all):", total * 1e3);
+            for (name, n, t) in rows.iter().take(30) {
+                println!("    {name:<28} {n:>7}  {:>9.2} ms  {:>5.1}%", t * 1e3, 100.0 * t / total);
+            }
+        }
 
         // `generate` runs the encoder again, so the decode-only figure is what
         // it took minus what the encoder and the cache cost. Timing it any
@@ -200,6 +223,7 @@ fn stages(
             mel.push(t_mel);
             enc.push(t_enc);
             kv.push(t_kv);
+            pre.push(t_pre);
             dec.push(t_dec.saturating_sub(t_enc).saturating_sub(t_kv));
             tokens = ids.len();
         }
@@ -210,5 +234,6 @@ fn stages(
     summarise("encoder", enc, seconds);
     summarise("cross-attention KV", kv, seconds);
     summarise("decode loop", dec, seconds);
+    summarise("  of which the prefix", pre, seconds);
     Ok(())
 }

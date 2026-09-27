@@ -101,6 +101,30 @@ fn report(name: &str, prompt: usize, decode: usize, pre: f64, dec: f64, bytes: f
     );
 }
 
+/// With `XABE_KPROF` set, starts a per-kernel profile of the last round.
+fn kprof_start(last: bool) {
+    if last && xabe_cuda::kprof::enabled() {
+        xabe_cuda::kprof::reset();
+    }
+}
+
+/// Prints the per-kernel profile `kprof_start` began, most expensive first.
+fn kprof_dump(last: bool, what: &str) {
+    if !(last && xabe_cuda::kprof::enabled()) {
+        return;
+    }
+    let rows = xabe_cuda::kprof::report();
+    let total: f64 = rows.iter().map(|r| r.2).sum();
+    println!("  {what}, per kernel (synchronised; {:.1} ms in all):", total * 1e3);
+    for (name, n, t) in rows.iter().take(24) {
+        println!(
+            "    {name:<28} {n:>7}  {:>9.2} ms  {:>5.1}%",
+            t * 1e3,
+            100.0 * t / total
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let bytes = weight_bytes(&args.model);
@@ -122,7 +146,9 @@ fn main() -> ExitCode {
             };
             let (mut pres, mut decs) = (Vec::new(), Vec::new());
             for r in 0..args.rounds + 1 {
+                let last = r == args.rounds;
                 let mut cache = m.cache();
+                kprof_start(last);
                 let t0 = Instant::now();
                 if m.forward_last(&ids, &mut cache).is_err() {
                     eprintln!("prefill failed");
@@ -130,7 +156,9 @@ fn main() -> ExitCode {
                 }
                 m.gpu().synchronize().ok();
                 let pre = t0.elapsed().as_secs_f64() * 1e3;
+                kprof_dump(last, "prefill");
 
+                kprof_start(last);
                 let t0 = Instant::now();
                 for i in 0..args.decode {
                     if let Err(why) = m.forward_last(&[1500 + i as u32 % 100], &mut cache) {
@@ -140,6 +168,7 @@ fn main() -> ExitCode {
                 }
                 m.gpu().synchronize().ok();
                 let dec = t0.elapsed().as_secs_f64() * 1e3;
+                kprof_dump(last, "decode");
                 // The first round is warm-up.
                 if r > 0 {
                     pres.push(pre);
@@ -176,6 +205,8 @@ fn main() -> ExitCode {
                 // first row's.
                 let mut caches: Vec<xabe_translate::Cache> = Vec::with_capacity(rows);
                 let mut pre = 0.0;
+                let last = r == args.rounds;
+                kprof_start(last);
                 for row in 0..rows {
                     let mut cache = m.cache();
                     let t0 = Instant::now();
@@ -189,7 +220,9 @@ fn main() -> ExitCode {
                     }
                     caches.push(cache);
                 }
+                kprof_dump(last, "prefill");
 
+                kprof_start(last);
                 let t0 = Instant::now();
                 for i in 0..args.decode {
                     let toks: Vec<u32> = (0..rows).map(|j| 1500 + (i + j) as u32 % 100).collect();
@@ -206,6 +239,7 @@ fn main() -> ExitCode {
                 }
                 m.gpu().synchronize().ok();
                 let dec = t0.elapsed().as_secs_f64() * 1e3;
+                kprof_dump(last, "decode");
                 if r > 0 {
                     pres.push(pre);
                     decs.push(dec);
