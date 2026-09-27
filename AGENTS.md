@@ -187,27 +187,26 @@ starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **1.02x** against `whisper-server` on three seconds of
-speech and **1.09x to 1.21x** from five seconds up — ahead on every clip,
-and on the briefest by 3.5 ms with the two engines' twenty-round spreads not
-overlapping, which is the first sitting that has been true. It was 0.99x on
-that clip for two rounds and recorded as level rather than won, because the
-milestone asks for the short end and "faster" is not what 0.99x says; it is
-recorded as won now, by that margin and no more. The two engines have
-opposite cost structures: the encoder is a fixed 30-second window for both
-and ours is about 20 ms slower at it, so every transcription starts that far
-behind, while the decode is about 2.5 ms a token cheaper here and pays it off
-at about nine tokens — one fewer than the shortest clip produces.
+medians. The ASR is **1.21x** against `whisper-server` on three seconds of
+speech and **1.27x to 1.37x** from five seconds up. It is ahead on every clip,
+and the twenty-round spreads are 30 ms apart on the briefest. It was 0.99x on
+that clip for two rounds and recorded as level rather than won, then 1.02x by
+3.5 ms. What moved it this time is the encoder, which had not moved in any
+earlier round. The two engines used to have opposite cost structures: the
+encoder is a fixed 30-second window for both and ours was about 20 ms slower
+at it, paid off by a decode about 2.5 ms a token cheaper. The encoder is now
+78.5 ms against the 83 ms `whisper.cpp` measured in an earlier sitting, so
+the engine starts level or ahead and the decode widens the lead.
 
 That comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
 with CUDA against the same checkpoint, converted by its own script, both sides
 are strictly single-pass greedy, and the two are alternated in pairs in one
-run. What is left of the gap is the **encoder** and nothing else: about 102 ms
-against `whisper.cpp`'s 83, and about 73 of those 102 ms are a tiled `gemm`
-running at 22.4 TFLOP/s.
+run. The encoder was the whole of the gap for five rounds, about 102 ms
+against `whisper.cpp`'s 83, and it is now 78.5. The next paragraphs are the
+history of how that was misdiagnosed and then closed.
 
-The last 8 ms did not come from the encoder, and the accounting that said the
+Before that, the 8 ms to 1.02x did not come from the encoder, and the accounting that said the
 shortest clip was out of reach had missed them for a reason worth carrying:
 it had set the decoder aside as *level* with `whisper.cpp` and level is not
 the same as done. The decoder was spending twenty-two launches a layer on a
@@ -233,21 +232,27 @@ it, and half the gap was the kernels either side. Timing every one of them
 found a transpose written as a scatter at 141 GB/s and four projections a layer
 reading f32 into a matmul that stages f16 regardless. `docs/BENCHMARKS.md` has
 that round; the point to carry is that the profile was worth taking and the
-assumption was not. **What that is short of is not the arithmetic.** The instruction is
-measured at 102.3 TFLOP/s on this card and f32 accumulation costs 0.7% of it,
-so the f16-accumulation trade this file used to name as the only way past buys
-essentially nothing here. It is not the memory system either, since rounding the
-activations to f16 was worth 5%. **It is the register file**, and that is
-measured rather than inferred: `ptxas -v` puts the kernel at exactly 128
-registers a thread with no spill, which is exactly the budget for the two
-resident blocks that are this architecture's only latency hiding, and 64 of the
-128 are accumulators a 128x128 tile over 256 threads cannot give up.
-Software-pipelining the staging — the standard fix, and the one thing left to
-try — needs 184 registers and was measured at half the throughput; five further
-tile-and-occupancy arrangements of it were also measured and all lost. So the
-remaining gap is an architecture this kernel shape has run out of room on, not
-a missing trick: a deep pipeline here wants `cp.async`, which arrived with
-sm_80. `docs/KERNELS.md` has the table and `ncu` was never needed.
+assumption was not. The next wrong assumption was the register file. It was
+measured, not inferred: `ptxas -v` put `gemm` at exactly 128 registers a thread
+with no spill, the budget for the two resident blocks that are this
+architecture's only latency hiding. Software-pipelining the staging needed
+184 and ran at half the throughput. Five further tile-and-occupancy
+arrangements also lost, and this file concluded that a deep pipeline needed
+`cp.async`, which arrived with sm_80. **That was true of `gemm`'s warp tile and
+not of the architecture.** `gemm_hh` keeps the 128x128 tile and the 64
+accumulators a thread but makes the warps a 2x4 grid, which frees the A
+fragment registers every warp had been holding. With those registers the
+pipeline fits: 33.2, 31.1 and 47.5 TFLOP/s at the encoder's three shapes
+against 19.7, 19.8 and 25.6, `gemm`'s output bit for bit, and the encoder went
+from 105.5 ms to 78.5. The lesson is the same one twice: a measured limit is
+a limit of the shape measured. `docs/KERNELS.md` has both tables.
+
+The decode attention also gained a kernel for long contexts:
+`attn_decode_h128_run` walks a run of chunks a block past 2048 positions
+rather than a block a chunk. It is 1.25x on the chat model's attention at
+8192 and 4.7% of a whole decode step at an 8 K context.
+`docs/BENCHMARKS.md` has it under "Past a wave of blocks", including a sweep
+that shows the translator wants a different block target from the chat model.
 
 And the Llama stages are **level with or ahead of llama.cpp on every measured
 row**: the chat model ahead on prefill at both

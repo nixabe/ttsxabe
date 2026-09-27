@@ -30,7 +30,7 @@ exists.
 | LSTM cell, gates i f g o | VAD decoder | `xabe-vad` lstm | (cpu only) | `xabe-vad` reference |
 | discrete Fourier transform, any length | mel frontend | `xabe_dsp::Fft` | (cpu only) | `xabe-dsp` fft |
 | mel filter bank and spectrogram | ASR frontend | `xabe_audio::mel_power` | (cpu only) | `xabe-whisper` frontend |
-| tiled matmul, f16 operands | ASR everywhere | `xabe_dsp::linear` | `gemm` | `xabe-cuda` kernels |
+| tiled matmul, f16 operands | ASR everywhere | `xabe_dsp::linear` | `gemm`; `gemm_hh` when both operands arrive f16 | `xabe-cuda` kernels |
 | matmul for a handful of rows | ASR decode | `xabe_dsp::linear` | `gemv` | `xabe-cuda` kernels |
 | convolution as a matrix | ASR encoder stem | `xabe_dsp::conv1d_strided` | `im2col` + `gemm` | `xabe-cuda` kernels |
 | head split, merge and transpose | ASR attention | (index formula, in the test) | `split_heads`, `split_heads_t`, `merge_heads` | `xabe-cuda` kernels |
@@ -46,7 +46,7 @@ exists.
 | split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
 | KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
 | fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
-| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
+| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h128_run` past 2048 positions, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
 | packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
 | mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
 | rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
@@ -606,9 +606,56 @@ accumulators alone are half of them. There is no room in the other half for a
 staged trip. A deep pipeline here needs `cp.async`, which stages global to
 shared without a register in between and arrived with sm_80.
 
-That is the honest end of this line of work. The remaining distance to cuBLAS is
-not a missing trick in the staging loop; it is an architecture that this kernel
-shape has run out of room on.
+That paragraph ended by calling this the honest end of the line of work, and
+it was not. What had run out of room was **this warp tile**, not the
+architecture. The next section divides the same block tile differently, and
+the pipeline that lost at every arrangement in the table above fits.
+
+### `gemm_hh`: the same tile, a warp grid, and the pipeline that fits
+
+`gemm`'s eight warps each own all 128 rows of the block tile and 16 of its
+columns. Every warp therefore loads the whole A tile out of shared memory to
+feed two n tiles, 18 shared loads for 16 `mma` a k step, and holds the A
+fragments for all eight m steps in registers. Those fragment registers are
+the ones the pipelined variants above had nowhere to find.
+
+`gemm_hh` keeps the block tile (128x128), the trip, the 256 threads and the 64
+accumulators a thread, and makes the warps a 2x4 grid, each owning 64 rows by
+32 columns. A 16-element k step is four `ldmatrix.x4` for A and two for B
+against 32 `mma`. For A, lanes 0-15 name rows 0-15 of an m16 tile at the step's
+first eight halves and lanes 16-31 the same rows at its second eight, so the
+four registers are `mma`'s `(a0, a1)` for each half. For B, lanes 0-7 and 8-15
+name one n8 tile's rows at the two halves, and lanes 16-31 the next tile's.
+The registers that frees hold the next trip's global loads, 16 registers of
+`uint4` issued at the top of the trip and stored to shared after its
+arithmetic. A trip's load latency is paid under the previous trip's `mma`
+rather than in front of it.
+
+A tile row's four words for a trip are one sixteen-byte load when the row is
+aligned and the quad lies inside `k`, and a word at a time otherwise. Past the
+end of the contraction or the rows they are zero, which is the rule `gemm`
+stages by. So `k` has to be even, since a row is read as whole words, and
+`k = 30` exercises the word-at-a-time path in the test.
+
+**It is `gemm`, bit for bit, and is tested as equality.** Each accumulator
+takes the step's first eight halves for every tile and then its second, so
+every output sees its k8 steps in `gemm`'s order. The operands are the same
+too: `gemm` rounds an f32 activation to f16 as it stages it, and `to_f16` is
+the same `cvt.rn`. The epilogue is `gemm`'s over the warp's rows and columns,
+including the two-pass load-then-store form for an accumulating output. The
+split contraction and `gemm_reduce` are shared unchanged.
+
+The launcher takes it when both operands are f16 and the weight is neither
+packed nor row-strided, the matmul is not small enough for `gemv`, and `k` is
+even. In the engine that is the Whisper encoder's projections and
+feed-forwards and the cross-attention cache build. At the encoder's three
+shapes it measured 33.2, 31.1 and 47.5 TFLOP/s against the same call's
+19.7, 19.8 and 25.6 through `gemm`. `docs/BENCHMARKS.md` has the table and
+the encoder it bought, 105.5 ms to 78.5.
+
+The register count was not taken with `ptxas -v` this round, so this section
+does not state it. The argument above explains why the pipeline fits. The
+throughput shows that it does.
 
 ## The integer matmul, `gemm_i8`
 
@@ -1258,6 +1305,41 @@ kernel's output while being about right in its timing. The differential test
 caught it at one key, where the second score a lane read the next group's
 row. The softmax now takes `CH / 32` scores a lane and the test drives every
 width the launcher can choose.
+
+### Past a wave of blocks, `attn_decode_h128_run`
+
+At long contexts the chunk kernel's shape turns against it. A block a chunk is
+a grid several waves deep, 256 blocks a head at 8192 positions and 32-key
+chunks. Each block loads one chunk, waits on it and exits, and the last block
+merges 256 partials alone on every layer's critical path.
+
+The run kernel launches `splits` blocks a head instead, so that the grid is
+about `AD_BLOCK_TARGET` = 216 blocks, three resident on each of 72 SMs:
+`per = ceil(chunks / ceil(216 / kv_heads))` chunks a block and
+`splits = ceil(chunks / per)`. Each block walks `per` contiguous chunks, the
+last whatever is left, so none is empty. Across a run it carries the online softmax: the
+context, the running maximum and the sum, with every thread keeping its own
+copy of the maximum and sum so the rescale needs no further barrier. The
+next chunk's key loads go out as soon as this chunk's scores are reduced, and
+its value loads at the bottom of the trip, so they land while this chunk's
+softmax and value product run. The chunk is 32 keys, the width it measured
+best at.
+
+A run of one chunk is the chunk kernel's arithmetic exactly. On a run's first
+chunk the running maximum is minus infinity, so the empty run is scaled by
+zero and the chunk by `exp(0) = 1`. The publish-and-merge that closes a
+layer is one function shared by both kernels, where `idx` of `nparts` is a
+chunk in one and a run in the other. The scratch is sized for `chunks`
+partials, which is at least `splits`, so the run kernel reuses
+`DecodeScratch` unchanged.
+
+The launcher takes it for 128-wide heads past `AD_RUN_FROM` = 2048 positions.
+At 2048 the two kernels measured level; from 4096 the run kernel is ahead on
+both Llama geometries, and at 8192 on the chat model it is 2.55 ms per 32
+layers against 3.17. The differential test adds the chat geometry at 4096,
+8192 and 7777 of 8192, where the last run is short, and a 64-wide case past a
+wave. `docs/BENCHMARKS.md` has the block-target sweep, which shows the
+translator's 40 key-value heads preferring more blocks than 216.
 
 ### The context's twin
 

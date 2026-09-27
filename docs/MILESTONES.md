@@ -175,6 +175,20 @@ mark is given for that sitting and that margin; the encoder is still 20 ms
 behind and a clip shorter than nine tokens would still lose. `docs/BENCHMARKS.md`
 has both rounds under "The decoder's round".
 
+**The encoder has since had its round, and the margin is no longer thin.**
+The register-file account above was right about `gemm`'s warp tile and wrong
+about the architecture. `gemm_hh` splits the same 128x128 tile over its warps
+as a 2x4 grid, and the pipelined staging that lost six ways in that account
+fits: 33.2, 31.1 and 47.5 TFLOP/s at the encoder's shapes against 19.7, 19.8
+and 25.6, bit for bit `gemm`'s output. The encoder went from 105.5 ms to 78.5,
+below the 83 `whisper.cpp` measured in an earlier sitting, and the
+cross-attention cache from 13.5 to 9.5. Interleaved against `whisper-server`
+on 2026-09-27: 155.7 against 188.6 ms at 2.93 s, 188.9 against 239.3 at
+4.98 s, 224.7 against 291.8 at 8.22 s and 257.6 against 351.8 at 10.34 s,
+which is **1.21x, 1.27x, 1.30x and 1.37x**. The two longer clips were
+regenerated and are not the ones the earlier rows measured.
+`docs/BENCHMARKS.md` has it under "The encoder's matmul on a warp grid".
+
 The filter bank is computed rather than shipped, and matches the capture *bit
 for bit*: both sides evaluate the same closed form in f64 and round once, with
 no reduction for an ordering to disagree about. That removes a runtime asset
