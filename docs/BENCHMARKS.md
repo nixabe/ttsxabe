@@ -2,18 +2,17 @@
 
 ## Current standing
 
-The one-line version: the synthesiser is 1.24x faster than PyTorch, the ASR is
-1.21x against `whisper-server` on three seconds of speech and 1.27x to 1.37x
-from five seconds up - ahead on every clip, with the twenty-round spreads
-nowhere near overlapping, alternated in one sitting against a `whisper-server`
-built here from the same checkpoint - and both Llama
-stages are **level with or
-ahead of llama.cpp on every number measured** - the chat model ahead on all
-three of its rows (1.08x and 1.17x prefill, 1.06x decode), the translator
-ahead on decode, level on 512-token prefill, and at 0.94x of a 128-token
-llama.cpp median that swings 20% between its own runs, which the table below
-reads as inside llama.cpp's noise and no stronger claim. Each of those has its
-own section; this paragraph is not the evidence for any of them.
+The one-line version: the synthesiser is 1.24x faster than PyTorch; the ASR is
+1.45x against `whisper-server` on three seconds of speech and 1.50x to 1.58x
+from five seconds up, alternated in one sitting against a `whisper-server`
+built here from the same checkpoint; and both Llama stages are **ahead of
+llama.cpp on every measured row but one**, from 128 tokens to the models'
+long contexts - chat prefill 1.08x to 1.14x and decode 1.02x to 1.09x
+through 8192 positions, translator prefill 1.03x to 1.18x and decode 1.02x to
+1.07x through 3968. The one row not won is the translator prefilling a
+24-token clause, at 0.74x. "Long context: the round that won it" has the
+table; each of those has its own section, and this paragraph is not the
+evidence for any of them.
 
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
@@ -63,22 +62,24 @@ appended to.
 
 | clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
-| 2.93 s | 155.7 ms | 188.6 ms | **1.21x** | identical |
-| 4.98 s | 188.9 ms | 239.3 ms | **1.27x** | identical |
-| 8.22 s | 224.7 ms | 291.8 ms | **1.30x** | identical |
-| 10.34 s | 257.6 ms | 351.8 ms | **1.37x** | differ by one character |
+| 2.93 s | 130.3 ms | 188.9 ms | **1.45x** | identical |
+| 4.98 s | 159.6 ms | 239.1 ms | **1.50x** | identical |
+| 8.22 s | 191.8 ms | 291.8 ms | **1.52x** | identical |
+| 10.34 s | 221.6 ms | 351.0 ms | **1.58x** | differ by one character |
 
-Taken 2026-09-27. What moved this row is the encoder, for the first time: the
-f16-by-f16 matmul `gemm_hh` took it from 105.5 ms to 78.5 and the
-cross-attention cache from 13.5 to 9.5 ("The encoder's matmul on a warp grid"
-below), and the decoder did not move. The `whisper-server` column is within
-1 ms of the previous sitting's on the two clips both sittings share, which is
-the check that the sitting was quiet. The two longer clips are not the ones
-the previous table measured (7.28 s and 9.95 s): `bench/` is gitignored and
-they have since been regenerated, so their rows are not comparable with the
-older ones.
+Taken 2026-09-27, the second sitting of the day. The row before it, earlier
+the same day, was 1.21x / 1.27x / 1.30x / 1.37x, and what moved it is in
+"The encoder's second round" below: the encoder from 78.5 ms to 57.7, and the
+decode loop from 66.6 to 59.2. The `whisper-server` column is within 0.5 ms of
+that sitting's on every clip. The two longer clips are not the ones the
+tables before today measured (7.28 s and 9.95 s): `bench/` is gitignored and
+they were regenerated, so their rows are not comparable with older ones.
 
-The row before this one was 1.02x / 1.09x / 1.09x / 1.21x, and before that
+The row before that - the first of 2026-09-27 - moved on the encoder alone,
+from the f16-by-f16 matmul `gemm_hh` (105.5 ms to 78.5; "The encoder's matmul
+on a warp grid" below).
+
+Before those, 1.02x / 1.09x / 1.09x / 1.21x, and before that
 0.99x / 1.05x / 1.05x / 1.15x and 0.94x / 1.00x / 0.99x / 1.08x. All of those
 moved from the decoder and none from the encoder. The decoder's rounds are in
 "Eight launches a layer" below; on the 2.93 s clip that round's twenty rounds
@@ -92,19 +93,16 @@ which is what this engine does and all it does. That turned out not to matter
 is the difference between a matched comparison and one that happened to be
 matched.
 
-**The milestone's target is met on every clip, and now at the short end as
-well.** The two engines had opposite cost structures, and the encoder was
-what made them opposite. The encoder is a fixed 30-second window for both,
-and ours was about 20 ms slower at it, so every transcription started that far
-behind and the cheaper decode paid it off at about nine tokens. At 78.5 ms the
-encoder is now about 5 ms *faster* than the 83.3 ms `whisper-bench` measured
-for `whisper.cpp`'s. That figure is from an earlier sitting, so the precise
-margin is not claimed, but both halves of the cost structure point the same
-way now. The engine starts ahead and the decode widens the lead by about
-2.5 ms a token.
+**The milestone's target is met on every clip, and the short end by the
+widest margin it has had.** The two engines used to have opposite cost
+structures - an encoder about 20 ms slower here, paid off by a decode about
+2.5 ms a token cheaper - and the encoder was what made them opposite. At
+57.7 ms it is now about 25 ms *faster* than the 83.3 ms `whisper-bench`
+measured for `whisper.cpp`'s in an earlier sitting, so the engine starts well
+ahead and the decode widens it.
 
 **The workload this engine exists for is the short end.** The pipeline runs
-greedy over VAD-gated utterances of a few seconds, and that is the 1.21x row.
+greedy over VAD-gated utterances of a few seconds, and that is the 1.45x row.
 
 The longest clip is also weaker evidence for a second reason: the
 transcripts diverge. Both engines are single-pass greedy on the same weights,
@@ -775,6 +773,53 @@ run kernel (the "Past a wave of blocks" section). That is the likely cause, but
 it has not been isolated. It is worth about 0.03 ms a token, below what the
 decode loop above resolves.
 
+### The encoder's second round, and a picker that searched a list: 78.5 ms to 57.7
+
+Four changes, each measured on its own with `xabe-asr-bench --stages`, 2.93 s
+clip, nine-round medians:
+
+| change | encoder | decode loop |
+| --- | ---: | ---: |
+| before | 79.2 ms | 66.6 |
+| the prefill attention rewritten (see "Prefill attention" under the Llama stages) | 72.8 | |
+| the greedy picker reads a mask | | **59.2** |
+| one q/k/v product; attention off its rows; f16 context into `gemm_hh` | 65.3 | |
+| GELU in fc1's epilogue, stored f16 | **57.7** | |
+
+**The picker was 0.6 ms a token of host time.** `pick` asked
+`suppress_tokens.contains(&id)` - a `Vec` of ninety-odd ids - for each of the
+vocabulary's 51 864 entries, every decoded token. The per-kernel profile
+(`XABE_KPROF`, below) charged it to the embedding gather that followed,
+because that is the next launch after the host work; the kernel itself is
+microseconds. Two precomputed masks, the same answer.
+
+**The encoder's attention reads its operands where the projection left them.**
+q, k and v are one stacked `[3d, d]` product; `flash_attn_64_rows` reads all
+three from its rows, puts the scale on the queries itself and returns the
+context at f16, so the head split, the transposed head split and the scaling
+pass are gone and the output projection runs on `gemm_hh` (0.148 ms at this
+shape) rather than `gemm` (0.25). And fc1 applies GELU in its epilogue and
+stores f16, which removed a 30.7 MB intermediate a layer. Each piece is
+bit-identical to what it replaced; the stacked product may split its
+contraction differently from three separate ones.
+
+Transcripts reproduce the reference. The encoder oracle moved on clip `a` from
+3.6e-3 to 4.1e-3 of full scale against a gate of 1.5e-2. Clip `b` was over the
+gate before this round, at one element (0.276 of full scale), and is at 0.749
+there now, and the reason is worth knowing: Whisper puts one massive
+activation - channel 845 here - in a single row of the silent padding, and
+*which* near-identical padding row takes it turns on rounding. The capture has
+it at row 1326; this engine at 1247. The neighbouring rows agree to 1e-2 and
+the decoder oracle, which reads this encoder's own output, passes. An
+element-wise gate cannot tolerate that row moving; the gate is left as it is
+and the finding is recorded here.
+
+What is left of a decoder step is about 4.5 ms against 3.1 ms of weights and
+cross-attention cache at the card's rate. Its f16 mat-vecs run at 419 GB/s at
+1280 x 1280 and 500-515 at the feed-forward shapes when issued back to back
+(`bench-gemv` has both columns now), and the 4-token prompt pass is 8.9 ms of
+the loop.
+
 ### Translator
 
 Measured now that it runs. It is on the reply path whenever `--direct-taigi` is
@@ -1049,7 +1094,82 @@ they are what makes the packed-weight work measurable at all - but nothing here
 should claim the pipeline is fastest with them in the reply path, because it is
 not.
 
+## Long context: the round that won it
+
+At the start of 2026-09-27 the Llama stages were ahead of llama.cpp at short
+contexts and behind at long ones: chat prefill at 8192 tokens was 2024 tok/s
+against 2460 (0.82x), and chat decode after an 8192-token prompt 81.3 against
+84.1. This is the table after the round, `llama-bench -ngl 99 -r 5` alternated
+with `xabe-llm-bench --rounds 9` twice through in one sitting, same card, same
+two files. Each llama.cpp cell is the mean of its two passes; the engine's two
+passes agree to 1% on every cell and the first is given. Decode is 64 tokens
+after a prompt of the given length, against `tg64 @ d<depth>`.
+
+| Breeze2 8 B Q4_K_M | llama.cpp | this engine | |
+| --- | ---: | ---: | ---: |
+| prefill, 128 tok | 2255 +/- 170 | **2460 tok/s** | 1.09x |
+| prefill, 512 | 2813 | **3035** | 1.08x |
+| prefill, 2048 | 2704 | **2983** | 1.10x |
+| prefill, 4096 | 2610 | **2911** | 1.12x |
+| prefill, 8192 | 2418 | **2746** | 1.14x |
+| decode, from empty / 128 | 99.5 | **108.2 tok/s** | 1.09x |
+| decode at 1024 | 96.9 | **104.3** | 1.08x |
+| decode at 2048 | 94.6 | **100.9** | 1.07x |
+| decode at 4096 | 91.0 | **95.7** | 1.05x |
+| decode at 8192 | 84.1 | **86.1** | 1.02x |
+
+| Taigi 13 B Q4_K_M | llama.cpp | this engine | |
+| --- | ---: | ---: | ---: |
+| prefill, 24 tok | **695 +/- 95** | 516 tok/s | **0.74x** |
+| prefill, 128 | 1365 | **1400** | 1.03x |
+| prefill, 512 | 1510 | **1641** | 1.09x |
+| prefill, 2048 | 1451 | **1664** | 1.15x |
+| prefill, 3968 | 1366 | **1607** | 1.18x |
+| decode, from empty / 128 | 60.6 | **65.0** | 1.07x |
+| decode at 1024 | 56.1 | **58.9** | 1.05x |
+| decode at 2048 | 51.8 | **54.0** | 1.04x |
+| decode at 3968 | 46.2 | **47.0** | 1.02x |
+
+**The 24-token row is a loss and is recorded as one.** It is the translator's
+real clause length, so it is not a corner: 46.5 ms against about 33. It was
+52.4 before this round; `KERNELS.md` has the 32-row tile that took it to
+46.5, the five attempts that did not close the rest, and the lever left. The
+decode margins at the longest contexts are the thinnest wins in the table and
+are read as such.
+
+What moved, measured one change at a time against the previous binary:
+
+- **Prefill attention rewritten**, FlashAttention-2's organisation - a warp
+  owns sixteen query rows, the softmax is warp-local, the probabilities go
+  from the score accumulator into the value product's operand without
+  touching shared memory, and a grouped model's block is its query group.
+  `bench-flash`, one layer: chat at 8192 positions 29.9 ms to 11.0-12.2,
+  translator at 3968 9.19 to 3.25. Chat prefill at 8192: 2040 to 2425 tok/s.
+- **The int8 matmul walks bands of eight row tiles.** At long prompts a wave
+  had been every row tile against two weight tiles, re-streaming the whole
+  activation from DRAM. Chat prefill at 8192: 2402 to 2777.
+- **A prefill reserves room for its reply.** A prompt that landed on a power
+  of two filled its cache exactly, and the first decoded token re-strode all
+  of it - about 11 ms at 8192. llama.cpp allocates its whole context; a
+  prefill here now sizes the cache for 256 more positions.
+- **The decode attention deals its chunks strided**, so its speed stops
+  depending on the cache's capacity (8192 positions in a 16384 cache: 3.18 ms
+  per 32 layers to 2.64), plus a warp a query row for the softmax, at least
+  fourteen runs a head, and the run kernel from 1024 positions for the
+  translator. Chat decode at 8192: 12.30 ms a token to 11.61.
+- **The SwiGLU stores only the int8 twin** where the down projection reads
+  nothing else - half a gigabyte a layer at 8192 tokens. About 1.5% of
+  prefill at every length.
+- **A 32-row int8 tile** for prompts of 32 tokens or fewer.
+
+`docs/KERNELS.md` has each kernel, and the per-kernel profiles that found
+them came from `XABE_KPROF`, under "How to measure".
+
 ## Against llama.cpp: level or ahead on every row
+
+**Superseded by "Long context: the round that won it" above**, which covers
+more prompt lengths and depths in a later sitting. This section is kept for
+its protocol notes and for how the llama.cpp column moved between sittings.
 
 `llama-bench` on the same card and the same two files, `-ngl 99`, against
 `xabe-llm-bench` at the same shapes.
@@ -3511,6 +3631,21 @@ defaults. A ratio measured against a badly configured baseline is not a result.
   runs of identical code - measured, while chasing a change that turned out to
   be noise - which is more than most optimisations are worth. Only numbers from
   the same alternated run are comparable.
+- This host has no `nsys` and no counter permission for `ncu`. `XABE_KPROF=1`
+  is the substitute: every launch synchronises and charges the time since the
+  previous mark to its kernel's name, and `xabe-llm-bench` (last round's
+  prefill and decode) and `xabe-asr-bench --stages` (one whole `generate`)
+  print the table. A kernel's figure includes whatever host work ran since the
+  last launch - which is how the Whisper picker's list search showed up, under
+  the embedding gather after it - and the synchronisation removes the overlap
+  a real run has. It says where a pass goes; time it with the variable unset.
+- `Gpu::kernel_resources` is `ptxas -v` without a toolkit: registers, spilled
+  bytes and static shared memory of any loaded kernel. `bench-flash`,
+  `bench-attn`, `bench-gemm` and `bench-qgemm` print it for theirs.
+- One kernel alone: `bench-flash` (prefill attention), `bench-attn` (decode
+  attention), `bench-gemm` (f16 tiled matmul), `bench-qgemm` (the packed
+  matmul at a prefill's row counts, synthetic weights), `bench-gemv` (the f16
+  mat-vec, once and back to back).
 
 ## Correctness gates
 

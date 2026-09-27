@@ -42,11 +42,11 @@ exists.
 | scaled rotary embedding | chat-model attention | `xabe_dsp::rope_scaled` | `rope` | `xabe-cuda` kernels |
 | key-value head expansion | chat-model attention | — | `repeat_kv` | `xabe-cuda` kernels |
 | int8 quantization of an activation | both Llama stages | `xabe_dsp::quantize_q8` | `quantize_q8` | `xabe-cuda` quant |
-| tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `xabe_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k` | `xabe-cuda` quant |
+| tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `xabe_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k`, each at three row tiles (128, 64, 32) | `xabe-cuda` quant |
 | split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
 | KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
 | fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
-| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h128_run` past 2048 positions, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
+| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h128_run` past 2048 positions (1024 ungrouped), `attn_decode_h64_run` for the Whisper cross-attention, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
 | packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
 | mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
 | rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
@@ -653,9 +653,17 @@ shapes it measured 33.2, 31.1 and 47.5 TFLOP/s against the same call's
 19.7, 19.8 and 25.6 through `gemm`. `docs/BENCHMARKS.md` has the table and
 the encoder it bought, 105.5 ms to 78.5.
 
-The register count was not taken with `ptxas -v` this round, so this section
-does not state it. The argument above explains why the pipeline fits. The
-throughput shows that it does.
+`Gpu::kernel_resources` reports it now: 128 registers a thread, no spill, the
+same as `gemm`. The pipeline fits in the registers `gemm`'s warp tile spent on
+A fragments.
+
+**An epilogue that applies GELU and stores f16**, `gemm_gelu_f16`, for the
+Whisper encoder's first feed-forward projection: `act_gelu_f16`'s formula on
+the value the plain epilogue would have stored, so the pair of launches it
+replaces and this one produce the same bits, which the test checks. It removes
+a 30.7 MB f32 intermediate written and read back a layer, and the encoder
+measured 65.3 ms to 57.7 for it - more than the GELU pass alone cost, because
+the f32 store had been costing the matmul too.
 
 ## The integer matmul, `gemm_i8`
 
@@ -707,6 +715,42 @@ turn, which is what first audio waits on.
 The choice is `m <= 64`, made where the kernel name is picked. Below that the
 wide tile would be computing a majority of nothing; above it the narrow one
 would double the block count for the same work.
+
+### And a third at 32, one warp row
+
+"Sixty-four is a floor" was a floor of *that warp grid*. A 32-row tile keeps
+every warp's four row groups by taking one warp row instead of two: four warps
+of 32 rows by 32 columns, 128 threads, each still feeding both of its
+`ldmatrix .x4` loads four fragments. `WM`, the warps down the tile, is a
+template parameter now, and so is the trip length.
+
+At a short prompt this is where the kernel's time goes: a K-quant rescales
+every output once a 32-element sub-block - an `I2F` at quarter rate and four
+scale products for every two `mma` - and at 64 rows a 24-token clause spends
+40 of them on nothing. `bench-qgemm`, 24 rows, 32 launches a sample:
+
+| weight | 64-row tile | 32-row tile |
+| --- | ---: | ---: |
+| 13 B gate+up, Q4_K | 529 us | **418** |
+| 13 B down, Q6_K | 361 | **303** |
+| 8 B gate+up, Q4_K | 404 | **303** |
+
+The trip is 64 elements for Q4_K and 128 for Q6_K, each the better measured:
+Q4_K at 128 lost its occupancy to the doubled tile (30 KB of shared, two
+blocks an SM) and came in at 500-568 us, while Q6_K's down projection was 287
+against 309. The translator's 24-token prefill is 52.4 ms to 45.4 for it.
+
+**Still behind llama.cpp at this size** (33 ms), and five things that did not
+close it are worth not trying again: an L2 prefetch of the next trips' weights
+(worse the further ahead, 52 ms to 73), a register-pipelined fetch of the next
+trip (418 us to 517 - the header re-read a trip costs more than the latency it
+hides), more split-K for the skinny tile (every setting slower), a longer
+Q4_K trip, and tighter launch bounds (spills: 46 ms to 98). What none of them
+touched is that at any moment a launch's blocks read 32 bytes from each of
+tens of thousands of weight rows 2.9 KB apart. The mat-vec reads the same
+bytes row-contiguously at 565 GB/s; this reads them at 190. A weight layout
+tiled for the trip is the lever left, and it would have to be one the decode
+path reads too.
 
 ### The trip is 64 elements, and that number is not a tuning constant
 
@@ -798,11 +842,20 @@ is extracted with selects rather than a subscript: indexing a register array by
 a runtime value puts the whole array in local memory, which is the thing the
 cache exists to avoid.
 
-### Blocks are ordered by row tile, not column tile
+### Blocks walk bands of eight row tiles
 
-`blockIdx.x` is the row tile. The blocks that share a weight tile are the ones
-that differ in `m`, so making them consecutive puts them on the machine together
-and lets L2 serve the weight to all but the first. Worth about 1%, and free.
+The blocks the machine issues together are consecutive in `x` then `y`, and
+the kernel remaps that order: consecutive blocks take a band of `GEMM_I8_GM`
+= 8 row tiles against one weight tile, then the same band against the next.
+This used to be `x` as the row tile, so that blocks sharing a weight tile ran
+together - worth about 1% at the prompt lengths it was measured at. It was
+wrong at long ones: a resident wave was *every* row tile against about two
+weight tiles, and past a few thousand rows the whole int8 activation went back
+to DRAM for every pair of weight tiles. At 8192 tokens the int8 matmuls cost
+0.339 ms a token against 0.283 at 2048 for the same work per row. Banded,
+chat prefill at 8192 is 2402 tok/s to 2777, and 2048 does not move. Bands of
+4 to 16 measured the same; 8 is about `sqrt(wave * weight bytes an element)`,
+the band that makes a wave's two operands cost the same.
 
 ### A batch may share its left operand
 
@@ -1003,13 +1056,35 @@ them.
 
 ### Shape
 
-One block owns QT query rows of one head and walks the keys KT at a time.
-Scores by `m16n8k8` into f32, probabilities rounded to f16 on their way into
-the value product, one more `m16n8k8` against the values, the output
-accumulator in registers throughout. When the pass is causal the loop's upper
-bound is the last key its rows may see, so the upper triangle is never
-computed at all - the fusion gets the triangle skip that would have been a
-special case in the tiled gemm for free.
+Four warps a block, and **each warp owns sixteen query rows outright** - all
+of a tile's keys and all of the head's output columns - which is how
+FlashAttention-2 is organised and is the whole difference from the kernel this
+replaced. Per 32-key tile (64 at head width 64):
+
+- The queries are loaded once, rounded to f16, straight into `m16n8k8` `a`
+  fragment registers; nothing about them is staged.
+- K and V are staged into shared memory, one tile each, and read back four
+  fragments an `ldmatrix.x4`.
+- The scores stay in the accumulator the score product wrote. That
+  accumulator's layout - a lane holds columns `2tg, 2tg + 1` of rows `g` and
+  `g + 8` - is exactly the `a` fragment layout of the value product with the
+  keys as its contraction, so the probabilities are packed from those
+  registers and never touch shared memory.
+- The row maximum is two shuffles across the four lanes that share a row. The
+  row sum is not reduced at all until the end: each lane keeps its own partial,
+  which the rescale factor scales exactly as it scales the whole.
+
+So a tile costs two barriers, one before the staging and one after, and no
+warp waits on another's softmax.
+
+**A grouped-query block is the group.** When the group divides by four the
+block's four warps are the four query heads of one key-value head at the same
+sixteen positions, so one staging of K and V serves all of them and the
+causal diagonal a block straddles is sixteen positions wide; by two, two heads
+over 32 positions; otherwise four warps of one head over 64 positions. A warp
+whose rows all end before a tile skips that tile's arithmetic and still
+stages its share. The mapping is a launch argument rather than a template
+parameter, because it changes only index arithmetic.
 
 **Causality is a flag, not a shape.** The encoder attends over its whole
 1500-position window, and all that costs is a per-row limit of the key count
@@ -1018,94 +1093,59 @@ dangerous one: the causal loop bound stops at the last tile a row can see, so
 a masking mistake there truncates the row and shows up, while with the mask
 open the kernel reads every tile either way and a wrong per-row limit would
 only shift *which* keys are summed - still a full softmax, still plausible
-context. The differential test drives both modes for that reason.
+context. The differential test drives both modes for that reason, and every
+block mapping.
 
-The layouts are the caches' own. K is `[kv_head][pos][hd]`, which is the
-`[n][k]` shape the score product's B fragment wants; V is `[kv_head][hd][cap]`,
-which is the same shape for the value product; the queries are read straight
-out of the projection buffer and the merged context written straight back in
-`[tq, heads * hd]`. So `split_heads`, `merge_heads` and `repeat_kv` all
-disappear from the prompt path rather than getting faster. A grouped-query
-model maps `head / (heads / kv_heads)` and reads the one cached copy.
+The layouts are the caches' own. K is `[kv_head][pos][hd]`, the `[n][k]` shape
+the score product's B fragment wants; V is `[kv_head][hd][cap]`, the same shape
+for the value product; the queries are read straight out of the projection
+buffer and the merged context written back in `[tq, heads * hd]`. So
+`split_heads`, `merge_heads` and `repeat_kv` disappear from the prompt path.
 
-### The tile: traffic first, then `mma` per load
+Occupancy decides the launch bounds. `__launch_bounds__(128, 3)` holds the
+128-wide entry to 168 registers with 56 bytes of spill, and it measured faster
+than two blocks at 218 registers with none - 11.0 ms against 14.2 at the chat
+model's 8192-position layer. Three resident blocks is this kernel's only way to
+hide a tile's staging behind another block's arithmetic.
 
-QT, KT and HD are all template parameters and the warp grid is derived from
-them, so a new shape is an argument rather than an edit. HD is forced by the
-model. The other two have each been the binding constraint in turn, and the
-order matters because the second one was invisible until the first was fixed.
+### The kernel it replaced, and what it measured
 
-**QT paid first, and the reason was traffic.** A block stages every key and
-value it walks past, so the whole of K and V is re-staged once per query block.
-At the encoder's 1500 positions and QT 32 that is 47 trips through 0.8 MB -
-724 MB a layer. QT 64 halved the re-staging and took the kernel from 967 us a
-layer to 791. A Llama prefill keeps 32, whose causal loop stops at the block's
-own diagonal and never walks a long key axis to begin with.
+The first `flash_attn` gave one block 32 or 64 query rows of one head and
+split each tile's keys and output columns across eight warps. That made every
+row's maximum and sum a trip through shared memory - four barriers a tile -
+gave each warp one `mma` for every `a` fragment it loaded, and re-staged a
+grouped model's K and V once for every query head of the group. Its history is
+worth keeping because each fix was real and each was measured: a 64-row query
+tile for the encoder (967 us a layer to 791), keeping the scores in registers
+so a 64-key tile fitted two resident blocks (117.5 ms of encoder to 112.5),
+and the finding that an f16 cache changed nothing because one head's keys and
+values already sat in L2. It ran at 13 to 19 TFLOP/s. `bench-flash`, one layer,
+same card and binary:
 
-**Traffic then stopped being the answer**, and two measurements say so rather
-than one. Only about a third of the halved re-staging came back as time; and
-holding the whole cache at f16, which halves those same bytes again and is
-*bit-for-bit* the same arithmetic because the kernel rounded them on the way
-into shared memory anyway, changed nothing at all. One head's keys and values
-are 768 KB and 144 blocks are resident, so the re-reads were already inside a
-6 MB L2. `docs/BENCHMARKS.md` has both.
+| shape | old | this | |
+| --- | ---: | ---: | ---: |
+| chat 8 B, 2048 positions | 2.61 ms | 0.95 | 2.7x |
+| chat 8 B, 8192 positions | 29.9 | 11.0 - 12.2 | 2.5 - 2.7x |
+| translator 13 B, 3968 | 9.19 | 3.25 | 2.8x |
+| Whisper encoder, 1500 | 0.59 | 0.43 | 1.4x |
 
-**What was left is shared loads per `mma`, and that is what KT buys.** A warp
-issuing `MT * NF` products for `MT` `a` fragments and `NF` `b` fragments spends
-`(2*MT + NF) / (MT*NF)` shared words a product - `ldmatrix.x2` for the row
-fragment, `.x1` for the column. The tiled `gemm` next door has always been
-shaped for this: `GEMM_MSTEPS` 8 by `GEMM_NPW` 2 is 1.125 words a product, and
-it runs at three times this kernel's rate on the same tensor cores. The
-encoder's fused attention sat at 1.75.
+The 8192-position layer swings between 11.0 and 12.2 ms from one run of the
+same binary to the next - clock drift on a 12 ms kernel - and both ends are
+given.
 
-At `hd` 64 and QT 64 the warp grid is four query groups by two column groups,
-so a warp's column fragment count is `KT / 16`. KT 32 leaves it at 2; **KT 64
-puts it at 4 and takes the kernel to 1.5 words a product**, and halves the trip
-count and its barriers on the way. Measured on the encoder, three rounds
-alternated against the previous build: 117.5 ms to 112.5.
+### Row mode, for the Whisper encoder
 
-**KT 64 had been measured before and rejected, and that measurement was
-confounded.** With the score tile still in shared memory a KT 64 block wanted
-45.8 KB, which is one resident block on an SM's 64 KB and half the threads -
-just enough to cancel what the wider tile gains, which is why it read as
-"changed the encoder by nothing". Removing the score tile is what made the
-knob work. The general lesson is in `docs/BENCHMARKS.md`: **a parameter that
-measures flat may be paying for itself in a currency you are not looking at.**
-
-Residency is the currency here, and it dominated everything in a thirteen-shape
-sweep: every shape measured at one resident block came in at 114 ms or worse
-and every one at two or three came in under 116, regardless of its load ratio.
-The `static_assert` on the computed tile size says which limit and by how much -
-QT 128 wants more than sm_75 gives a block in *static* shared memory and
-otherwise fails in `ptxas` at module load with `CUDA_ERROR_INVALID_PTX` and no
-reason attached - and three more check that the derived warp counts divide
-exactly, because a warp grid that does not cover its tile drops work silently.
-
-### The scores never leave the registers the `mma` wrote them to
-
-This is what freed the shared memory KT 64 needed, and it is a saving twice
-over. The scores used to go to a `[QT][KT]` f32 tile in shared memory, be read
-back to find each row's maximum, and be read again to exponentiate - three
-passes over 9 KB a trip, and a third of the block's shared budget, which is to
-say a third of its residency.
-
-None of that is necessary, because **what the warps have to tell each other is
-not the scores but the reduction over them**. The `m16n8k8` accumulator hands a
-lane two rows of its fragment and two adjacent columns, and the four lanes
-sharing a `g` hold the rest of those two rows - so an xor butterfly over those
-four lanes folds a warp's own columns without touching memory, and only CG
-partials a row, one per warp column, reach shared memory at all. A `[QT][CG]`
-array replaces a `[QT][KT]` one: at the encoder's shape, 512 bytes for 9216.
-
-The masking moves with them. A lane knows its own row and its own two columns,
-so the per-row key limit is applied to the accumulator directly rather than to
-a shared tile - which is a different index than the old pass used, and is why
-the differential tests now drive the narrow instantiation causally even though
-nothing in the engine asks it to.
-
-The probability layout falls out rather than being arranged: a lane's two
-columns are adjacent and the first is even, so the pair it holds is exactly one
-packed word of the `ps` tile the value product's `a` fragment reads.
+`flash_attn_64_rows` reads the queries, keys and values as three column ranges
+of one stacked `[t, 3d]` projection rather than from a cache, so the encoder
+needs no head split of its keys and no transposed head split of its values.
+The value tile is staged `[key][d]` - the transpose of what the value
+product's `b` operand wants - and `ldmatrix.trans` hands it over in the right
+layout for free. It also puts the scale on the queries before rounding them,
+where the separate scaling pass put it, and writes the context at f16 rounded
+exactly as the tiled matmul would round it on the way in, so the output
+projection takes `gemm_hh`. Every one of those is the same numbers in a
+different place, and `the_encoder_attention_off_its_rows_is_the_split_path`
+checks equality, not closeness.
 
 ### The head width
 
@@ -1115,10 +1155,9 @@ holds the head width fixed and varies the count, so large-v2's 1280 over 20
 heads and tiny's 384 over 6 are the same 64. The width is the only thing the
 fragment layout depends on: a warp owns `hd / 32` of the output's n8 column
 fragments, four at 128 and two at 64, and the shared-memory strides follow.
-The query and key tiles are not width-independent and are chosen per
-instantiation - 64 rows and 64 keys a trip for the encoder, 32 and 32 for a
-Llama prefill - but the eight warps and the derivation of the grid from them
-are the same at both. A width the kernel is *not* instantiated at is refused by
+The key tile is chosen per instantiation - 64 keys a trip for the encoder,
+32 for a Llama prefill, which is what three resident blocks of 128-wide
+registers allow - and the four warps of sixteen rows are the same at both. A width the kernel is *not* instantiated at is refused by
 construction rather than by tolerance: it would index another head's values, in
 bounds, and return plausible context. `Gpu::supports_flash` is the predicate
 callers use to pick a path, so choosing the unfused chain does not mean
@@ -1127,9 +1166,11 @@ allocating an output buffer and throwing it away.
 ### The arithmetic is the chain's, deliberately
 
 Operands round to f16 where the tiled `gemm` rounded them, scores accumulate
-in f32, `__expf` because that is what `softmax_causal` and `softmax_rows` both
-use, probabilities round to f16 exactly where the chain rounded them - on their
-way into the value product - and the normaliser sums unrounded f32.
+in f32, probabilities round to f16 exactly where the chain rounded them - on
+their way into the value product - and the normaliser sums unrounded f32. The
+exponential is `ex2.approx` on scores pre-multiplied by `scale * log2(e)`,
+which is what `__expf` - the chain's softmax - compiles to, with the multiply
+folded in.
 
 **One place it is deliberately not the chain's arithmetic**, and it is worth
 naming rather than discovering later. `softmax_rows` scales the probabilities
@@ -1340,6 +1381,50 @@ layers against 3.17. The differential test adds the chat geometry at 4096,
 8192 and 7777 of 8192, where the last run is short, and a 64-wide case past a
 wave. `docs/BENCHMARKS.md` has the block-target sweep, which shows the
 translator's 40 key-value heads preferring more blocks than 216.
+
+### Which chunks a block walks decided more than how it walks them
+
+The run kernel first gave each block a contiguous run of chunks. It now deals
+them out strided - block `b` takes `b`, `b + splits`, `b + 2 * splits` - and
+nothing else about it changed. The value cache is `[d][cap]`, so a 32-key
+chunk is 64 bytes from each of 128 rows `cap` apart; with contiguous runs, a
+head's blocks were reading those 64-byte pieces hundreds of bytes from one
+another across a whole row, and the kernel's speed depended on the cache's
+*capacity*, not its length. With strided chunks they read one contiguous
+stretch of every row at a time. `bench-attn`, 8192 positions:
+
+| capacity | contiguous runs | strided |
+| --- | ---: | ---: |
+| 8192 | 2.57 ms | 2.57 |
+| 8448 | 2.83 | 2.61 |
+| 16384 | 3.18 | **2.64** |
+| 16640 | 3.49 | 2.93 |
+
+That mattered in production and not only in the benchmark: a cache that has
+grown is twice its length, and an 8192-token prompt's cache is 16384.
+
+Three smaller changes rode with it, each measured. The softmax is a warp a
+query row rather than warp 0 walking the group while three warps waited (2.57
+to 2.48 ms at 8192). Every head gets at least `AD_MIN_SPLITS` = 14 runs,
+because `AD_BLOCK_TARGET` over the translator's forty heads gave it six (5.29
+to 5.06 ms at 4000). And a model without query groups takes the run kernel
+past 1024 positions rather than 2048 (the translator at 2048: 2.99 to 2.85).
+Wider chunks were tried and lost everywhere: 64 keys read 3.02 ms at 8192 and
+128 keys 4.94.
+
+The same kernel is instantiated at head width 64 for the Whisper decoder's
+cross-attention over its 1500 encoder positions, `attn_decode_h64_run`: 0.82
+to 0.75 ms per 32 layers.
+
+**A tensor-core decode attention was built and rejected.** Each warp streamed
+its own sixteen-key slices with K and V loaded straight from memory into
+`mma` fragments - a key permutation made each lane's value load eight
+contiguous bytes - and no barrier in the loop. It rounds the queries and the
+probabilities to f16, which the chunk and run kernels do not, and it came in
+at 9.8e-4 of full scale against a test that holds this kernel to 2e-5; it was
+also 2x slower as first written, spilling 272 bytes. The precision is the
+reason it is not here, and the test is right to hold it: every decoded token
+passes through it.
 
 ### The context's twin
 

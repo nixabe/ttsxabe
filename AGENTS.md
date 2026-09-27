@@ -187,16 +187,16 @@ starting work rather than this paragraph.
 
 Three standings are worth knowing here because they are easy to assume wrongly.
 The synthesiser is 1.24x faster than the PyTorch reference on interleaved
-medians. The ASR is **1.21x** against `whisper-server` on three seconds of
-speech and **1.27x to 1.37x** from five seconds up. It is ahead on every clip,
-and the twenty-round spreads are 30 ms apart on the briefest. It was 0.99x on
-that clip for two rounds and recorded as level rather than won, then 1.02x by
-3.5 ms. What moved it this time is the encoder, which had not moved in any
-earlier round. The two engines used to have opposite cost structures: the
-encoder is a fixed 30-second window for both and ours was about 20 ms slower
-at it, paid off by a decode about 2.5 ms a token cheaper. The encoder is now
-78.5 ms against the 83 ms `whisper.cpp` measured in an earlier sitting, so
-the engine starts level or ahead and the decode widens the lead.
+medians. The ASR is **1.45x** against `whisper-server` on three seconds of
+speech and **1.50x to 1.58x** from five seconds up, ahead on every clip by
+far more than either engine's spread. It was 0.99x on that clip for two
+rounds and recorded as level rather than won, then 1.02x by 3.5 ms, then
+1.21x once the encoder moved for the first time. The two engines used to have
+opposite cost structures: the encoder is a fixed 30-second window for both
+and ours was about 20 ms slower at it, paid off by a decode about 2.5 ms a
+token cheaper. The encoder is now 57.7 ms against the 83 ms `whisper.cpp`
+measured in an earlier sitting, so the engine starts well ahead and the
+decode widens the lead.
 
 That comparison used to be the one in the repository whose two halves were not
 measured in the same sitting; it is not any more. `whisper.cpp` is built here
@@ -247,20 +247,27 @@ against 19.7, 19.8 and 25.6, `gemm`'s output bit for bit, and the encoder went
 from 105.5 ms to 78.5. The lesson is the same one twice: a measured limit is
 a limit of the shape measured. `docs/KERNELS.md` has both tables.
 
-The decode attention also gained a kernel for long contexts:
-`attn_decode_h128_run` walks a run of chunks a block past 2048 positions
-rather than a block a chunk. It is 1.25x on the chat model's attention at
-8192 and 4.7% of a whole decode step at an 8 K context.
-`docs/BENCHMARKS.md` has it under "Past a wave of blocks", including a sweep
-that shows the translator wants a different block target from the chat model.
+The Llama stages are **ahead of llama.cpp on every measured row but one**,
+short context to long: chat prefill 1.08x to 1.14x from 128 to 8192 tokens,
+chat decode 1.09x from empty and 1.02x after 8192 positions, translator
+prefill 1.03x to 1.18x from 128 to 3968 tokens and decode 1.07x to 1.02x.
+The long-context rows were losses at the start of 2026-09-27 - chat prefill
+at 8192 was 0.82x - and five things won them: the prefill attention
+rewritten on FlashAttention-2's organisation (2.5x to 2.8x a layer), the
+int8 matmul walking bands of row tiles so a long activation stops going back
+to DRAM for every pair of weight tiles, a prefill that reserves room for its
+reply rather than re-striding a full cache on the first decoded token, the
+decode attention dealing its chunks strided so its speed stops depending on
+the cache's capacity, and the SwiGLU skipping a store nothing read.
 
-And the Llama stages are **level with or ahead of llama.cpp on every measured
-row**: the chat model ahead on prefill at both
-prompt lengths (2447 against 2259 at 128 tokens, 2928 against 2513 at 512) and
-on decode (100.9 against 95.3), the translator ahead on decode (61.4 against
-60.0), level on 512-token prefill (1636 against 1647), and at 0.94x on
-128-token prefill against a llama.cpp median that swings 20% between its own
-runs — recorded as inside its noise, not as a win.
+**The one row not won is the one the pipeline runs most**: the translator
+prefilling a 24-token clause, 46.5 ms against llama.cpp's 33 (0.74x). A
+32-row int8 tile took it from 52.4; five further attempts are recorded as
+rejected in `docs/KERNELS.md`, and what they point at is the weight *layout* -
+a short prompt's blocks read 32 bytes from each of tens of thousands of rows
+at once, which DRAM serves at a third of the rate the row-contiguous mat-vec
+gets. `docs/BENCHMARKS.md` has the table under "Long context: the round that
+won it".
 
 The translator's *latency* is a separate question from its throughput and has
 its own section in `docs/BENCHMARKS.md`. What is worth knowing here: a

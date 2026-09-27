@@ -189,6 +189,15 @@ which is **1.21x, 1.27x, 1.30x and 1.37x**. The two longer clips were
 regenerated and are not the ones the earlier rows measured.
 `docs/BENCHMARKS.md` has it under "The encoder's matmul on a warp grid".
 
+A second round the same day took the encoder to 57.7 ms and the decode loop
+from 66.6 to 59.2: the prefill attention rewritten on FlashAttention-2's
+organisation, one stacked q/k/v product whose rows the attention reads
+directly, GELU in the fc1 epilogue, and a greedy picker that had been
+searching a list of ninety suppressed ids for each of 51 864 vocabulary
+entries every token. Interleaved against `whisper-server` in a second sitting:
+**1.45x, 1.50x, 1.52x and 1.58x** on the same four clips, transcripts as
+before. `docs/BENCHMARKS.md` has it under "The encoder's second round".
+
 The filter bank is computed rather than shipped, and matches the capture *bit
 for bit*: both sides evaluate the same closed form in f64 and round once, with
 no reduction for an ordering to disagree about. That removes a runtime asset
