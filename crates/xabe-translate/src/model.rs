@@ -14,6 +14,10 @@ use xabe_st::StSet;
 /// on the first token decoded. See where the cache grows.
 const REPLY_RESERVE: usize = 256;
 
+/// A packed weight as `Source::packed` finds it: the file's rows, borrowed and
+/// in upload order, and the block format they are in.
+type PackedRows<'a> = (Vec<&'a [u8]>, Quant);
+
 /// The checkpoint, in whichever container it happens to be.
 ///
 /// The 13 B translator exists on this machine twice: as the 🤗 safetensors
@@ -113,7 +117,7 @@ impl Source {
         &'a self,
         b: &Bound,
         cfg: &LlamaConfig,
-    ) -> Result<Option<(Vec<&'a [u8]>, Quant)>, TranslateError> {
+    ) -> Result<Option<PackedRows<'a>>, TranslateError> {
         let Self::Gguf(f) = self else {
             return Ok(None);
         };

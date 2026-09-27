@@ -37,8 +37,6 @@ struct GNorm {
     b: CudaSlice<f32>,
 }
 
-/// The four projections of one attention block, on the device.
-
 /// A decoder layer's self-attention: the three input projections stacked
 /// into one `[3 d, d]` f16 weight, so a decoded row's queries, keys and
 /// values are one launch that places each where the attention reads it -

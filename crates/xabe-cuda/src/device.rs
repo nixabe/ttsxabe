@@ -1486,7 +1486,7 @@ fn launched<T>(
 /// A per-kernel wall-clock profile, for a host with no `nsys`.
 ///
 /// Off unless `XABE_KPROF` is set. When it is, every launch that goes through
-/// [`launched`] synchronises the context and charges the time since the
+/// `launched` synchronises the context and charges the time since the
 /// previous mark to that kernel's name - so a kernel's figure includes the
 /// host work issued since the last launch, and the synchronisation takes away
 /// the launch overlap a real run has. It answers *where* a pass goes, not how
