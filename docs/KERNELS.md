@@ -749,8 +749,58 @@ Q4_K trip, and tighter launch bounds (spills: 46 ms to 98). What none of them
 touched is that at any moment a launch's blocks read 32 bytes from each of
 tens of thousands of weight rows 2.9 KB apart. The mat-vec reads the same
 bytes row-contiguously at 565 GB/s; this reads them at 190. A weight layout
-tiled for the trip is the lever left, and it would have to be one the decode
-path reads too.
+tiled for the trip was the lever left, and it had to be one the decode path
+reads too. It is the next section.
+
+### A K-quant sits on the card in tiles
+
+Q4_K and Q6_K are uploaded in a device order rather than the file's:
+
+    [tile of 64 rows][group of 4 super-blocks][row][block in group]
+
+`qblk` in the kernel source is the one place it is written down, and every
+kernel that reads a K-quant - the mat-vecs, the tiled integer matmul, the
+dequantizing `gemm`, `embed_q`, `q_at` - asks it where a block is.
+`Gpu::upload_quant_parts` writes each 1 MiB staging chunk in that order from
+the file's rows, so the host still never holds a tensor, and the order is a
+permutation: a short last tile and a short last group take what is left, and
+nothing is padded. The card holds the file's bytes and no more.
+
+The shape is decided by the two readers. The mat-vec's warp reads four
+super-blocks of one row a trip, 576 bytes, so a group of four keeps that read
+exactly as contiguous as it was; the matmul's trip reads one super-block for
+32 to 128 rows, and inside a tile those rows now sit side by side. What was
+tried, `bench-qgemm` at 1 and 24 rows (13 B gate+up, down, q; 8 B gate+up):
+
+| order | 1 row | 24 rows |
+| --- | ---: | ---: |
+| the file's | 140.8 / 109.3 / 31.2 / 116.8 us | 413 / 288 / 97.4 / 306 |
+| whole tiles, no groups | gate+up 190 | - |
+| 64 x 8 | 141.3 / 109.9 / 31.8 / 116.7 | 354 / 297 / 95.8 / 323 |
+| 64 x 4, 64-bit addressing | 140.9 / 110.1 / 31.6 / 116.7 | 362 / 292 / 89.4 / 286 |
+| **64 x 4, 32-bit addressing** | 140.6 / 110.1 / 31.2 / 116.4 | **345 / 264 / 85.2 / 277** |
+
+Tiles of 32, 64 and 128 rows were within noise of one another, and 64 was
+marginally ahead. Whole tiles with no groups broke the mat-vec, whose warp
+then read 144 bytes a row; eight to a group lost a third of the matmul's gain
+and did not help the mat-vec. Four is what one warp reads.
+
+**The finding to carry is the arithmetic.** The first working version put
+`qblk` in 64-bit integers, and end to end it was 46.5 ms to 42.5 on the
+translator's 24-token prefill, 1.5% *slower* at 512 tokens, and 0.3% slower
+at decode. The same order addressed in 32 bits - `qblk` is asked once an
+item a trip in the matmul's staging, inside a kernel at its 128-register
+bound - is 46.5 to 39.7, 311.5 to 309.9 at 512, and decode level or a hair
+ahead. A walker, `QWalk`, steps the mat-vec's pointer a group at a time
+rather than asking `qblk` each trip. The upload refuses a matrix of 2^32
+blocks so nothing can wrap.
+
+What the order costs is views. A view of a stacked matrix - a batch element,
+or a projection read from a row offset - has to begin on a tile, and end on
+one unless it runs to the end of the upload, because the kernel sizes the
+last tile from `n`. `gemm_batched_from` refuses anything else as
+`UntiledView`, by name. Every stacked projection in the two Llama models is a
+multiple of 64 rows.
 
 ### The trip is 64 elements, and that number is not a tuning constant
 

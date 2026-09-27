@@ -395,7 +395,7 @@ impl Translator {
                 None
             } {
                 Some((bytes, ty)) => GWeight::Packed {
-                    data: gpu.upload_quant_parts(ty, &bytes)?,
+                    data: gpu.upload_quant_parts(ty, &bytes, b.shape[1])?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -425,7 +425,7 @@ impl Translator {
                         all.extend_from_slice(&bytes);
                     }
                     GWeight::Packed {
-                        data: gpu.upload_quant_parts(ty, &all)?,
+                        data: gpu.upload_quant_parts(ty, &all, bs[0].shape[1])?,
                         ty,
                     }
                 }
@@ -507,7 +507,7 @@ impl Translator {
                 None
             } {
                 Some((bytes, ty)) => GEmbed::Packed {
-                    data: gpu.upload_quant_parts(ty, &bytes)?,
+                    data: gpu.upload_quant_parts(ty, &bytes, w.embed_tokens.shape[1])?,
                     ty,
                 },
                 None => GEmbed::F32(wide(&w.embed_tokens)?),

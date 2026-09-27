@@ -261,13 +261,16 @@ decode attention dealing its chunks strided so its speed stops depending on
 the cache's capacity, and the SwiGLU skipping a store nothing read.
 
 **The one row not won is the one the pipeline runs most**: the translator
-prefilling a 24-token clause, 46.5 ms against llama.cpp's 33 (0.74x). A
-32-row int8 tile took it from 52.4; five further attempts are recorded as
-rejected in `docs/KERNELS.md`, and what they point at is the weight *layout* -
-a short prompt's blocks read 32 bytes from each of tens of thousands of rows
-at once, which DRAM serves at a third of the rate the row-contiguous mat-vec
-gets. `docs/BENCHMARKS.md` has the table under "Long context: the round that
-won it".
+prefilling a 24-token clause, 39.7 ms against llama.cpp's 33 (0.84x). A
+32-row int8 tile took it from 52.4 to 46.5, and the weight *layout* took it
+the rest: a short prompt's blocks had read 32 bytes from each of tens of
+thousands of rows at once, and Q4_K and Q6_K now sit on the card in 64-row
+tiles of four-super-block groups, so those rows are side by side while a
+decode warp's 576-byte read is as contiguous as before - decode level, 512
+tokens level, 16 to 32 tokens 1.16x to 1.18x. The finding to carry is that
+the order won only once its address was computed in 32 bits: in 64 it was a
+third of the gain and a loss at 512. `docs/KERNELS.md` has the layout and
+`docs/BENCHMARKS.md` the table under "The short prefill: a K-quant in tiles".
 
 The translator's *latency* is a separate question from its throughput and has
 its own section in `docs/BENCHMARKS.md`. What is worth knowing here: a

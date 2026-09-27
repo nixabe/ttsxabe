@@ -809,11 +809,84 @@ __device__ __forceinline__ float q6k_wide(
          + a1 * d * shi * (float)(dot1 - 32 * sum1);
 }
 
+// ---------------------------------------------------- the K-quant device order
+//
+// A Q4_K or Q6_K matrix does not sit on the card in the file's row-major
+// block order. `Gpu::upload_quant_parts` lays it out
+//
+//     [tile of QT_TILE rows][group of QT_GRP super-blocks][row][block]
+//
+// so a row's super-blocks still travel four together - the 576 bytes one warp
+// of the mat-vec reads a trip, contiguous exactly as before - while the rows
+// of a tile sit side by side at each group. The tiled integer matmul stages a
+// trip of one super-block for 32 to 128 rows at a time, and in the file's
+// order those were reads of 32 bytes each a row's length apart; at a short
+// prompt, where there is little arithmetic to hide it, that scatter was what
+// the kernel waited on. Here a trip reads inside one or two tiles' groups.
+// QT_TILE is 64 because it measured marginally ahead of 32 and 128, and
+// QT_GRP is 4 because 8 lost a third of the prefill gain and did not help the
+// mat-vec: four is what one warp reads a trip.
+//
+// The last tile of a matrix whose rows are not a multiple of QT_TILE holds
+// what is left, and the last group of a row whose super-blocks are not a
+// multiple of QT_GRP holds what is left, so the order is a permutation of the
+// blocks and nothing is padded. A view of a stacked matrix - a batch element,
+// or a projection read from a row offset - has to start on a tile boundary,
+// which `Gpu::gemm_batched_from` and friends check.
+//
+// `qblk` is the one place that order is written down; every kernel that reads
+// a K-quant weight asks it where block `b` of row `row` is. `n` is the rows of
+// the matrix the caller was handed.
+#define QT_TILE 64
+#define QT_GRP 4
+__device__ __forceinline__ size_t qblk(long row, int b, int nb, int n) {
+    // In 32 bits, and that is measured rather than tidy: the tiled matmul
+    // asks this once an item a trip, and the same order addressed in 64-bit
+    // arithmetic lost a third of its prefill gain at 24 rows and made a
+    // 512-row prefill 1.5% slower than the row-major order it replaced. The
+    // upload refuses a matrix of 2^32 blocks, so nothing here can wrap.
+    const unsigned rw = (unsigned)row;
+    const unsigned t = rw / QT_TILE, r = rw % QT_TILE;
+    const unsigned rows = min((unsigned)QT_TILE, (unsigned)n - t * QT_TILE);
+    const unsigned g = (unsigned)b / QT_GRP, j = (unsigned)b % QT_GRP;
+    const unsigned gs = min((unsigned)QT_GRP, (unsigned)nb - g * QT_GRP);
+    return (size_t)(t * QT_TILE * (unsigned)nb + g * rows * QT_GRP + r * gs + j);
+}
+
+// A warp that walks one row a whole group a trip - the decode mat-vecs, four
+// super-blocks a trip with lane group `sub` on block `sub` - does not need
+// `qblk` per trip: a full group of that row is a fixed stride on from the
+// last. `at` is where lane group `sub` reads on the trip at `b`; only a short
+// last group, when the row's super-blocks are not a multiple of QT_GRP, is
+// asked of `qblk` again.
+struct QWalk {
+    unsigned base, step;
+    __device__ __forceinline__ QWalk(long row, int nb, int n) {
+        const unsigned rw = (unsigned)row;
+        const unsigned t = rw / QT_TILE, r = rw % QT_TILE;
+        const unsigned rows = min((unsigned)QT_TILE, (unsigned)n - t * QT_TILE);
+        step = rows * QT_GRP;
+        base = t * QT_TILE * (unsigned)nb + r * min((unsigned)QT_GRP, (unsigned)nb);
+    }
+    __device__ __forceinline__ size_t at(long row, int b, int sub, int nb, int n) const {
+        const unsigned g = (unsigned)b / QT_GRP;
+        return (g + 1) * QT_GRP <= (unsigned)nb
+                   ? (size_t)(base + g * step + ((unsigned)b % QT_GRP) + (unsigned)sub)
+                   : qblk(row, b + sub, nb, n);
+    }
+};
+
+// Whether a ggml type id is laid out in that order on the card.
+__device__ __forceinline__ bool q_tiled(int ty) {
+    return ty == QT_Q4_K || ty == QT_Q6_K;
+}
+
 __device__ __forceinline__ float q_at(
-    const unsigned char* w, int ty, int bs, int ts, long row, int k, int kk)
+    const unsigned char* w, int ty, int bs, int ts, long row, int k, int kk, int n)
 {
-    long b = row * (long)(k / bs) + (long)(kk / bs);
-    return q_elem(ty, w + b * (long)ts, kk % bs);
+    const size_t b = q_tiled(ty) ? qblk(row, kk / bs, k / bs, n)
+                                 : (size_t)row * (size_t)(k / bs) + (size_t)(kk / bs);
+    return q_elem(ty, w + b * (size_t)ts, kk % bs);
 }
 
 #define GEMV_WARPS 8
@@ -906,15 +979,15 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const size_t r = (size_t)blockIdx.z * (size_t)a_rows + row;
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
-            const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
             // A warp covers four super-blocks a trip, and a row is not always a
             // multiple of four of them - the 13 B translator's down projection
             // contracts over 13824, which is 54. The lanes past the end sit out
             // rather than the row being refused: their contribution is a
             // separate term of the warp reduction, so skipping it is exact.
+            const QWalk qw(col, nb, n);
             for (int b = 0; b < nb; b += 4) {
                 if (b + sub < nb) {
-                    acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                    acc += q4k_wide(wq + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                     xa, xs, slot, jlo, q0, ((b + sub) << 8) + jlo);
                 }
             }
@@ -926,13 +999,13 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             if ((((unsigned long long)af) & 15ull) == 0ull) {
                 for (int b = 0; b < nb; ++b) {
                     acc += q4k_pair<true>(
-                        wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                        wq + qblk(col, b, nb, n) * (size_t)q_ts,
                         av + (b << 8), hi, kk);
                 }
             } else {
                 for (int b = 0; b < nb; ++b) {
                     acc += q4k_pair<false>(
-                        wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                        wq + qblk(col, b, nb, n) * (size_t)q_ts,
                         av + (b << 8), hi, kk);
                 }
             }
@@ -950,10 +1023,10 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const size_t r = (size_t)blockIdx.z * (size_t)a_rows + row;
             const signed char* xa = qa + r * k;
             const float* xs = asc + r * (k >> 5);
-            const unsigned char* wc = wq + (size_t)col * nb * (size_t)q_ts;
+            const QWalk qw(col, nb, n);
             for (int b = 0; b < nb; b += 4) {
                 if (b + sub < nb) {
-                    acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                    acc += q6k_wide(wq + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                     xa, xs, qlo, qho, sc_lo,
                                     ((b + sub) << 8) + jlo);
                 }
@@ -963,7 +1036,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
             const int j = lane << 3;
             const float* av = af + j;
             for (int b = 0; b < nb; ++b) {
-                acc += q6k_dot8(wq + ((size_t)col * nb + b) * (size_t)q_ts,
+                acc += q6k_dot8(wq + qblk(col, b, nb, n) * (size_t)q_ts,
                                 av + (b << 8), j);
             }
         } else {
@@ -976,7 +1049,7 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv(
                 } else {
                     av = af[i];
                 }
-                acc += av * q_at(wq, w_quant, q_bs, q_ts, col, k, i);
+                acc += av * q_at(wq, w_quant, q_bs, q_ts, col, k, i, n);
             }
         }
     } else if (w_half) {
@@ -1347,11 +1420,10 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
                 }
                 if (n0 + row < n) {
                     if (kk + GEMM_QRUN - 1 < k) {
-                        long nb = k / 256;
-                        const unsigned char* blk = wq
-                            + ((size_t)(n0 + row) * nb + (kk >> 8)) * (size_t)q_ts;
+                        const int nb = k / 256;
+                        const long sb = (long)qblk(n0 + row, kk >> 8, nb, n);
+                        const unsigned char* blk = wq + (size_t)sb * (size_t)q_ts;
                         if (w_quant == QT_Q4_K) {
-                            const long sb = (long)(n0 + row) * nb + (kk >> 8);
                             if (sb != bhdr_sb[u]) {
                                 bhdr[u] = (((size_t)blk) & 15) == 0
                                     ? *reinterpret_cast<const uint4*>(blk)
@@ -1372,7 +1444,7 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
                         #pragma unroll
                         for (int t = 0; t < GEMM_QRUN; ++t) {
                             if (kk + t < k) {
-                                e[t] = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + t);
+                                e[t] = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + t, n);
                             }
                         }
                     }
@@ -1404,8 +1476,8 @@ extern "C" __global__ __launch_bounds__(GEMM_WARPS * 32) void gemm(
                 // zero rather than clamp: zero contributes nothing.
                 float lo = 0.0f, hi = 0.0f;
                 if (n0 + row < n) {
-                    if (kk     < k) lo = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk);
-                    if (kk + 1 < k) hi = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + 1);
+                    if (kk     < k) lo = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk, n);
+                    if (kk + 1 < k) hi = q_at(wq, w_quant, q_bs, q_ts, n0 + row, k, kk + 1, n);
                 }
                 packed = gemm_pack(lo, hi);
             } else if (w_half) {
@@ -2187,7 +2259,7 @@ __device__ __forceinline__ void gemm_i8_body(
             for (int t = 0; t < GEMM_I8_KG / 4; ++t) lo[t] = hi[t] = 0u;
             float ds0 = 0.0f, ds1 = 0.0f, dm0 = 0.0f, dm1 = 0.0f;
             if (col < n) {
-                const long sb = (long)col * nb + (kc >> 8);
+                const long sb = (long)qblk(col, kc >> 8, nb, n);
                 const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
                 const int j = (kc & 255) + 64 * p + GEMM_I8_KG * hk;
                 if (sb != wsb[u]) {
@@ -6180,8 +6252,7 @@ __device__ __forceinline__ void gemv_q_rows_impl(
     }
     const int nb = k >> 8;
     const unsigned char* wc = w
-        + (size_t)blockIdx.z * (size_t)(sw >> 8) * (size_t)q_ts
-        + (size_t)col * nb * (size_t)q_ts;
+        + (size_t)blockIdx.z * (size_t)(sw >> 8) * (size_t)q_ts;
     const size_t r0 = (size_t)blockIdx.z * (size_t)a_rows;
     const signed char* xa = qa + r0 * k;
     const float* xs = (const float*)(qa + asc_off) + r0 * (k >> 5);
@@ -6194,9 +6265,10 @@ __device__ __forceinline__ void gemv_q_rows_impl(
     if (w_quant == QT_Q4_K) {
         const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
         const int q0 = jlo >> 5;
+        const QWalk qw(col, nb, n);
         for (int b = 0; b < nb; b += 4) {
             if (b + sub < nb) {
-                q4k_wide_rows<R>(wc + (size_t)(b + sub) * (size_t)q_ts,
+                q4k_wide_rows<R>(wc + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                  xa, xs, k, slot, jlo, q0, ((b + sub) << 8) + jlo, acc);
             }
         }
@@ -6206,9 +6278,10 @@ __device__ __forceinline__ void gemv_q_rows_impl(
         const int qho = 128 + (pp << 4) + (hh << 3);
         const int sc_lo = (pp << 2) + hh;
         const int jlo = (pp << 6) + (hh << 4);
+        const QWalk qw(col, nb, n);
         for (int b = 0; b < nb; b += 4) {
             if (b + sub < nb) {
-                q6k_wide_rows<R>(wc + (size_t)(b + sub) * (size_t)q_ts,
+                q6k_wide_rows<R>(wc + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                  xa, xs, k, qlo, qho, sc_lo, ((b + sub) << 8) + jlo, acc);
             }
         }
@@ -6474,14 +6547,15 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm(
     const float h0 = (lane == 0 && col < n) ? h[col] : 0.0f;
     float acc = 0.0f;
     if (col < n) {
-        const unsigned char* wc = w + (size_t)col * nb * (size_t)q_ts;
+        const unsigned char* wc = w;
         const int sub = lane >> 3, slot = lane & 7;
         if (w_quant == QT_Q4_K) {
             const int jlo = (slot >> 1) * 64 + (slot & 1) * 16;
             const int q0 = jlo >> 5;
+            const QWalk qw(col, nb, n);
             for (int b = 0; b < nb; b += 4) {
                 if (b + sub < nb) {
-                    acc += q4k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                    acc += q4k_wide(wc + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                     qa, asc, slot, jlo, q0, ((b + sub) << 8) + jlo);
                 }
             }
@@ -6491,9 +6565,10 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm(
             const int qho = 128 + (pp << 4) + (hh << 3);
             const int sc_lo = (pp << 2) + hh;
             const int jlo = (pp << 6) + (hh << 4);
+            const QWalk qw(col, nb, n);
             for (int b = 0; b < nb; b += 4) {
                 if (b + sub < nb) {
-                    acc += q6k_wide(wc + (size_t)(b + sub) * (size_t)q_ts,
+                    acc += q6k_wide(wc + qw.at(col, b, sub, nb, n) * (size_t)q_ts,
                                     qa, asc, qlo, qho, sc_lo,
                                     ((b + sub) << 8) + jlo);
                 }
@@ -6756,16 +6831,21 @@ extern "C" __global__ __launch_bounds__(GEMV_WARPS * 32) void gemv_norm_f16(
 //
 // One block a row; `table` holds `ch / bs` blocks of `ts` bytes a row, in the
 // device layout `Gpu::upload_quant` wrote.
+// `rows` is the table's vocabulary: a K-quant table sits in the tiled order
+// `qblk` describes, and its last tile's height depends on it.
 extern "C" __global__ void embed_q(
     const unsigned char* __restrict__ table, int ty, int bs, int ts,
     const long long* __restrict__ ids, float* __restrict__ out,
-    int t, int ch, float scale)
+    int t, int ch, float scale, int rows)
 {
     const int pos = blockIdx.x;
     if (pos >= t) return;
-    const unsigned char* row = table + (size_t)ids[pos] * (size_t)(ch / bs) * (size_t)ts;
+    const long id = (long)ids[pos];
+    const int nb = ch / bs;
     for (int c = threadIdx.x; c < ch; c += blockDim.x) {
-        out[(size_t)pos * ch + c] = q_elem(ty, row + (size_t)(c / bs) * ts, c % bs) * scale;
+        const size_t b = q_tiled(ty) ? qblk(id, c / bs, nb, rows)
+                                     : (size_t)id * (size_t)nb + (size_t)(c / bs);
+        out[(size_t)pos * ch + c] = q_elem(ty, table + b * (size_t)ts, c % bs) * scale;
     }
 }
 
@@ -6845,6 +6925,8 @@ pub const GEMM_I8_MT: u32 = define("GEMM_I8_MT");
 /// computes. See the note beside `GEMM_I8_ENTRY`.
 pub const GEMM_I8_MT_NARROW: u32 = define("GEMM_I8_MT_NARROW");
 pub const GEMM_I8_MT_SKINNY: u32 = define("GEMM_I8_MT_SKINNY");
+pub const QT_TILE: u32 = define("QT_TILE");
+pub const QT_GRP: u32 = define("QT_GRP");
 /// Rows `gemv_rows` will carry in one warp. `GEMV_MAX_M` must not exceed it.
 pub const GEMV_ROWS_MAX: u32 = define("GEMV_ROWS_MAX");
 /// Rows of the weight one `gemm_i8` block covers.

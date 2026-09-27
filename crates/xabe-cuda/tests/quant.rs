@@ -174,7 +174,7 @@ fn every_block_format_unpacks_element_for_element() {
     for &(q, gt) in FORMATS {
         let raw = blocks(q, n * k / q.block_size(), 7);
         let want = xabe_gguf::dequantize_blocks(gt, &raw, n * k).expect("the CPU decoder");
-        let dw = g.upload_quant(q, &raw).unwrap();
+        let dw = g.upload_quant(q, &raw, k).unwrap();
 
         for j0 in (0..k).step_by(16) {
             let rows = GEMV_MAX_M.min(k - j0);
@@ -239,7 +239,7 @@ fn quantized_gemv_matches_the_cpu_dequantizer() {
         let want = xabe_dsp::linear(&a, m, k, &w, Some(&bias), n);
 
         let da = g.upload(&a).unwrap();
-        let dw = g.upload_quant(q, &raw).unwrap();
+        let dw = g.upload_quant(q, &raw, k).unwrap();
         let db = g.upload(&bias).unwrap();
         let out = g
             .gemm_batched(
@@ -370,7 +370,7 @@ fn quantized_gemm_case(g: &xabe_cuda::Gpu, m: usize, k: usize, n: usize) {
         let want = xabe_dsp::linear(&ah, m, k, &wh, None, n);
 
         let da = g.upload(&a).unwrap();
-        let dw = g.upload_quant(q, &raw).unwrap();
+        let dw = g.upload_quant(q, &raw, k).unwrap();
         let out = g
             .gemm_batched(
                 Operand::F32(&da),
@@ -423,7 +423,7 @@ fn the_packed_path_refuses_what_it_cannot_address() {
     // find the block, so this would read into the previous row's last block:
     // in bounds, and wrong.
     let raw = blocks(Quant::Q4K, 4, 31);
-    let dw = g.upload_quant(Quant::Q4K, &raw).unwrap();
+    let dw = g.upload_quant(Quant::Q4K, &raw, 256).unwrap();
     let da = g.upload(&seq(300, 32)).unwrap();
     let err = g
         .gemm_batched(
@@ -524,7 +524,7 @@ fn the_wide_kquant_matvec_agrees_with_the_f32_product() {
         let raw = blocks(q, n * k / 256, 5);
         let wf = xabe_gguf::dequantize_blocks(gt, &raw, n * k).expect("the CPU decoder");
 
-        let dq = g.upload_quant(q, &raw).unwrap();
+        let dq = g.upload_quant(q, &raw, k).unwrap();
         let df = g.upload(&wf).unwrap();
 
         for rows in [1usize, 5] {
@@ -641,7 +641,7 @@ fn a_batch_over_one_activation_matches_the_same_products_apart() {
             let raw = blocks(q, count * n * k / q.block_size(), 31);
             let a = seq(m * k, 32);
             let da = g.upload(&a).unwrap();
-            let dw = g.upload_quant(q, &raw).unwrap();
+            let dw = g.upload_quant(q, &raw, k).unwrap();
 
             let together = g
                 .gemm_batched(
@@ -665,7 +665,7 @@ fn a_batch_over_one_activation_matches_the_same_products_apart() {
             let per = q.block_size();
             for c in 0..count {
                 let bytes = raw.len() / count;
-                let one = g.upload_quant(q, &raw[c * bytes..(c + 1) * bytes]).unwrap();
+                let one = g.upload_quant(q, &raw[c * bytes..(c + 1) * bytes], k).unwrap();
                 let apart = g
                     .gemm_batched(
                         Operand::F32(&da),
@@ -730,7 +730,7 @@ fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
     for &(q, gt) in FORMATS {
         let raw = blocks(q, vocab * ch / q.block_size(), 11);
         let want = xabe_gguf::dequantize_blocks(gt, &raw, vocab * ch).expect("the CPU decoder");
-        let table = g.upload_quant(q, &raw).unwrap();
+        let table = g.upload_quant(q, &raw, ch).unwrap();
         let ids: Vec<i64> = vec![8, 0, 3, 3, 8];
         let dids = g.upload_i64(&ids).unwrap();
         let got = g
@@ -761,7 +761,7 @@ fn the_packed_embedding_gather_matches_the_cpu_dequantizer() {
     }
     // A row that is not a whole number of blocks is refused, not decoded.
     let raw = blocks(Quant::Q4K, 4, 12);
-    let table = g.upload_quant(Quant::Q4K, &raw).unwrap();
+    let table = g.upload_quant(Quant::Q4K, &raw, 256).unwrap();
     let dids = g.upload_i64(&[0]).unwrap();
     assert!(
         g.embed_packed(&table, Quant::Q4K, &dids, 1, 300, 1.0)
@@ -783,7 +783,7 @@ fn the_norm_fused_matvec_is_the_chain_it_replaces() {
 
         let da = g.upload(&a).unwrap();
         let aq = g.quantize_activation(&da, 1, k).unwrap();
-        let dw = g.upload_quant(q, &raw).unwrap();
+        let dw = g.upload_quant(q, &raw, k).unwrap();
         let dnw = g.upload(&nw).unwrap();
 
         // The chain: the same packed mat-vec on the same twin, then the add
@@ -897,38 +897,25 @@ fn the_norm_fused_matvec_is_the_chain_it_replaces() {
 ///
 /// One row goes through the mat-vec, many through the tiled kernels - the
 /// integer one for the K-quant, the f16 one otherwise - and the f16 weight
-/// is offset in elements where the packed one is offset in whole blocks. The
-/// refusal is the offset that is not whole blocks.
+/// is offset in elements where the packed one is offset in whole blocks. A
+/// K-quant is offset in whole 64-row tiles, and refuses anything else.
 #[test]
 fn a_product_from_an_offset_row_is_the_product_of_the_rows_from_there() {
     let Some(g) = gpu() else { return };
     let (k, n_all, first, n) = (1024usize, 96usize, 40usize, 24usize);
+    // A K-quant sits in 64-row tiles, so its views are a whole tile in, and
+    // either whole tiles long or running to the end: the upload's last tile
+    // is the only one that is short.
+    let q_all = 280usize;
     for m in [1usize, 64] {
         let a = seq(m * k, 71);
         let da = g.upload(&a).unwrap();
         // Packed.
-        let raw = blocks(Quant::Q4K, n_all * k / 256, 72);
-        let dw = g.upload_quant(Quant::Q4K, &raw).unwrap();
+        let raw = blocks(Quant::Q4K, q_all * k / 256, 72);
+        let dw = g.upload_quant(Quant::Q4K, &raw, k).unwrap();
         let bpr = k / 256 * Quant::Q4K.type_size();
-        let part = g
-            .upload_quant(Quant::Q4K, &raw[first * bpr..(first + n) * bpr])
-            .unwrap();
-        let want = g
-            .gemm_batched(
-                Operand::F32(&da),
-                Operand::Q {
-                    data: &part,
-                    ty: Quant::Q4K,
-                },
-                None,
-                Batch::single(m * n),
-                m,
-                k,
-                n,
-            )
-            .unwrap();
-        let got = g
-            .gemm_batched_from(
+        let packed = |first: usize, n: usize| {
+            g.gemm_batched_from(
                 Operand::F32(&da),
                 Operand::Q {
                     data: &dw,
@@ -941,12 +928,46 @@ fn a_product_from_an_offset_row_is_the_product_of_the_rows_from_there() {
                 k,
                 n,
             )
-            .unwrap();
-        assert_eq!(
-            g.download(&want).unwrap(),
-            g.download(&got).unwrap(),
-            "packed, m {m}"
-        );
+        };
+        for (first, n) in [(128usize, 128usize), (256, 24), (0, 256)] {
+            let part = g
+                .upload_quant(Quant::Q4K, &raw[first * bpr..(first + n) * bpr], k)
+                .unwrap();
+            let want = g
+                .gemm_batched(
+                    Operand::F32(&da),
+                    Operand::Q {
+                        data: &part,
+                        ty: Quant::Q4K,
+                    },
+                    None,
+                    Batch::single(m * n),
+                    m,
+                    k,
+                    n,
+                )
+                .unwrap();
+            let got = packed(first, n).unwrap();
+            assert_eq!(
+                g.download(&want).unwrap(),
+                g.download(&got).unwrap(),
+                "packed rows {first}..{}, m {m}",
+                first + n
+            );
+        }
+        // A view off a tile, or stopping inside one, is refused by name.
+        for (first, n) in [(40usize, 24usize), (128, 24)] {
+            assert!(
+                matches!(
+                    packed(first, n),
+                    Err(xabe_cuda::CudaError::UntiledView { tile: 64, .. })
+                ),
+                "rows {first}..{} should be refused",
+                first + n
+            );
+        }
+        // An offset past the rows there are.
+        assert!(packed(q_all - n + 1, n).is_err());
         // f16.
         let wf = seq(n_all * k, 73);
         let dh = g.upload_f16(&wf).unwrap();
@@ -979,23 +1000,6 @@ fn a_product_from_an_offset_row_is_the_product_of_the_rows_from_there() {
             g.download(&got).unwrap(),
             "f16, m {m}"
         );
-        // An offset past the rows there are.
-        assert!(
-            g.gemm_batched_from(
-                Operand::F32(&da),
-                Operand::Q {
-                    data: &dw,
-                    ty: Quant::Q4K
-                },
-                n_all - n + 1,
-                None,
-                Batch::single(m * n),
-                m,
-                k,
-                n
-            )
-            .is_err()
-        );
     }
 }
 
@@ -1011,7 +1015,7 @@ fn several_rows_against_a_packed_weight_are_the_rows_one_at_a_time() {
     let (k, n) = (1280usize, 96usize);
     for q in [Quant::Q4K, Quant::Q6K] {
         let raw = blocks(q, n * k / q.block_size(), 71);
-        let dw = g.upload_quant(q, &raw).unwrap();
+        let dw = g.upload_quant(q, &raw, k).unwrap();
         let bias = g.upload(&seq(n, 72)).unwrap();
         for m in 2..=4usize {
             for (count, shared) in [(1usize, false), (3, true)] {

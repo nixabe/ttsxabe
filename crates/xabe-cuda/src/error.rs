@@ -67,6 +67,44 @@ pub enum CudaError {
         block: usize,
     },
 
+    /// A view of a K-quant matrix that does not start on a device tile.
+    ///
+    /// Q4_K and Q6_K sit on the card in `Q_TILE`-row tiles (see `qblk` in the
+    /// kernel source), so a batch element or a row offset that begins inside
+    /// one would read the blocks of rows it was never handed - in bounds, and
+    /// decoding to plausible numbers.
+    #[error("a packed view starting at row {row} is not on a {tile}-row device tile")]
+    UntiledView {
+        /// The first row of the view.
+        row: usize,
+        /// Rows a device tile.
+        tile: usize,
+    },
+
+    /// A packed upload whose blocks are not a whole number of rows.
+    ///
+    /// The device order of a K-quant is a function of its row length; bytes
+    /// that end part-way through a row have no place in it.
+    #[error("{blocks} blocks is not a whole number of {per_row}-block rows")]
+    RaggedRows {
+        /// Blocks handed over.
+        blocks: usize,
+        /// Blocks a row, `k / block_size`.
+        per_row: usize,
+    },
+
+    /// A K-quant upload of 2^32 blocks or more.
+    ///
+    /// The kernels place a block in the tiled order with 32-bit arithmetic,
+    /// which is the cost that decides whether the order pays at all; a matrix
+    /// past that would wrap and read the wrong block rather than fail. At 256
+    /// elements a block it is a trillion weights, so this is never a model.
+    #[error("{blocks} blocks is more than the tiled order addresses")]
+    TooManyBlocks {
+        /// Blocks handed over.
+        blocks: usize,
+    },
+
     /// A packed tensor whose byte count is not a whole number of blocks.
     ///
     /// Checked at upload because Q6_K is restrided on the way to the device -

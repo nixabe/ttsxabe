@@ -107,6 +107,26 @@ const TAIL_IDLE_MIN: f64 = 0.3;
 ///   avoiding when the waves are already full: the same model's 13824-wide
 ///   projections, three exact waves, measured 80% *slower* split in two. The
 ///   slice floor is higher here too; see `KSLICE_TAIL`.
+/// Rows a device tile of a K-quant matrix; `QT_TILE` in the kernel source.
+pub const Q_TILE: usize = kernels::QT_TILE as usize;
+
+/// The source `(row, super-block)` of each block of a K-quant matrix, in the
+/// order it sits on the card: tiles of `QT_TILE` rows, and within a tile,
+/// super-blocks `QT_GRP` at a time for every row of it. `qblk` in the kernel
+/// source is the inverse, and the two are the only statements of the order.
+pub fn tiled_order(rows: usize, per_row: usize) -> impl Iterator<Item = (usize, usize)> {
+    let (t, g) = (kernels::QT_TILE as usize, kernels::QT_GRP as usize);
+    (0..rows.div_ceil(t)).flat_map(move |tile| {
+        let r0 = tile * t;
+        let height = t.min(rows - r0);
+        (0..per_row.div_ceil(g)).flat_map(move |grp| {
+            let b0 = grp * g;
+            let width = g.min(per_row - b0);
+            (0..height).flat_map(move |r| (0..width).map(move |j| (r0 + r, b0 + j)))
+        })
+    })
+}
+
 pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
     let blocks =
         n.div_ceil(kernels::GEMM_NT as usize) * m.div_ceil(kernels::GEMM_MT as usize) * batch;
@@ -1082,20 +1102,34 @@ impl Gpu {
         self.upload_host(x)
     }
 
-    /// Copies packed blocks with at most 1 MiB of host staging.
-    pub fn upload_quant(&self, q: Quant, bytes: &[u8]) -> Result<CudaSlice<u8>, CudaError> {
-        self.upload_quant_parts(q, &[bytes])
+    /// Copies packed blocks with at most 1 MiB of host staging. `k` is the
+    /// matrix's row length in elements.
+    pub fn upload_quant(
+        &self,
+        q: Quant,
+        bytes: &[u8],
+        k: usize,
+    ) -> Result<CudaSlice<u8>, CudaError> {
+        self.upload_quant_parts(q, &[bytes], k)
     }
 
     /// Concatenates borrowed block ranges on the device, repacking Q6_K in chunks.
     ///
-    /// Parts may be tensor rows in an arbitrary order. Validate every part and
+    /// Parts may be tensor rows in an arbitrary order; together they are the
+    /// matrix in row-major order, `k` elements a row. Validate every part and
     /// the final size before allocating; never assemble a whole tensor on the
     /// host. Synchronize each copy before reusing its staging buffer.
+    ///
+    /// A Q4_K or Q6_K matrix is written in the device order `qblk` in the
+    /// kernel source describes - `Q_TILE`-row tiles, super-blocks four at a time -
+    /// by filling each staging chunk in that order from the parts, so the
+    /// host still holds one chunk and never the tensor. Every other format is
+    /// written in the file's order.
     pub fn upload_quant_parts(
         &self,
         q: Quant,
         parts: &[&[u8]],
+        k: usize,
     ) -> Result<CudaSlice<u8>, CudaError> {
         let ts = q.type_size();
         let stride = q.device_stride();
@@ -1111,6 +1145,47 @@ impl Gpu {
                 .checked_add(part.len() / ts)
                 .ok_or_else(|| CudaError::PackedUpload("block count overflow".into()))?;
         }
+        let bs = q.block_size();
+        if !k.is_multiple_of(bs) || k == 0 {
+            return Err(CudaError::RaggedBlock { k, block: bs });
+        }
+        let per_row = k / bs;
+        if !blocks.is_multiple_of(per_row) {
+            return Err(CudaError::RaggedRows { blocks, per_row });
+        }
+        let tiled = matches!(q, Quant::Q4K | Quant::Q6K);
+        if tiled && u32::try_from(blocks).is_err() {
+            return Err(CudaError::TooManyBlocks { blocks });
+        }
+        // Where each row's first block sits among the parts, found in one
+        // pass, so that placing a block in device order is a step or two
+        // from its row's start rather than a search.
+        let rows = blocks / per_row;
+        let mut row_start: Vec<(usize, usize)> = Vec::new();
+        if tiled {
+            row_start
+                .try_reserve_exact(rows)
+                .map_err(|e| CudaError::PackedUpload(e.to_string()))?;
+            let (mut p, mut off) = (0usize, 0usize);
+            for _ in 0..rows {
+                while p < parts.len() && off >= parts[p].len() {
+                    off -= parts[p].len();
+                    p += 1;
+                }
+                row_start.push((p, off));
+                off += per_row * ts;
+            }
+        }
+        let source = |row: usize, b: usize| -> &[u8] {
+            let (mut p, mut off) = row_start[row];
+            off += b * ts;
+            while off >= parts[p].len() {
+                off -= parts[p].len();
+                p += 1;
+            }
+            &parts[p][off..off + ts]
+        };
+        let order = tiled_order(rows, per_row);
         let total = blocks
             .checked_mul(stride)
             .ok_or_else(|| CudaError::PackedUpload("device byte count overflow".into()))?;
@@ -1124,8 +1199,15 @@ impl Gpu {
         let mut out = self.alloc_packed(total)?;
         let mut filled = 0;
         let mut offset = 0;
-        for part in parts {
-            for src in part.chunks_exact(ts) {
+        let sequential = parts.iter().flat_map(|p| p.chunks_exact(ts));
+        let placed = order.map(|(row, b)| source(row, b));
+        let blocks_in_order: Box<dyn Iterator<Item = &[u8]>> = if tiled {
+            Box::new(placed)
+        } else {
+            Box::new(sequential)
+        };
+        {
+            for src in blocks_in_order {
                 let dst = &mut staging[filled..filled + stride];
                 if q == Quant::Q6K {
                     Self::q6k_device_block(src, dst);
@@ -2068,6 +2150,36 @@ impl Gpu {
                         k: w_skip,
                         block: bs,
                     });
+                }
+                // A K-quant sits in `Q_TILE`-row tiles, so a view into a stacked
+                // matrix must begin on one: the row offset, and every batch
+                // element after the first.
+                // (A ragged `k` is refused below, by name.)
+                if matches!(ty, Quant::Q4K | Quant::Q6K) && k > 0 && k.is_multiple_of(bs) {
+                    if !w_first.is_multiple_of(Q_TILE) {
+                        return Err(CudaError::UntiledView {
+                            row: w_first,
+                            tile: Q_TILE,
+                        });
+                    }
+                    let per = batch.w / k.max(1);
+                    if batch.count > 1 && !per.is_multiple_of(Q_TILE) {
+                        return Err(CudaError::UntiledView {
+                            row: per,
+                            tile: Q_TILE,
+                        });
+                    }
+                    // The kernel sizes the last tile from `n`, so a view that
+                    // stops inside a tile would read that tile's rows at the
+                    // wrong stride - unless its last tile is the upload's.
+                    let total = data.len() / ty.device_stride() / (k / bs);
+                    let ends = (batch.count == 1 || batch.w == 0) && w_first + n == total;
+                    if !n.is_multiple_of(Q_TILE) && !ends {
+                        return Err(CudaError::UntiledView {
+                            row: w_first + n,
+                            tile: Q_TILE,
+                        });
+                    }
                 }
                 (data.len(), (w_skip / bs + n * k / bs) * ty.device_stride())
             }
@@ -4535,6 +4647,10 @@ impl Gpu {
             t as i32,
             ch as i32,
         );
+        // The vocabulary, which the device order of a K-quant table depends
+        // on; the table holds a whole number of rows or it was refused at
+        // upload.
+        let rows = (table.len() / ty.device_stride() / (ch / bs)) as i32;
         let f = self.func("embed_q");
         let mut lb = self.stream.launch_builder(f);
         lb.arg(table)
@@ -4545,7 +4661,8 @@ impl Gpu {
             .arg(&mut out)
             .arg(&ti)
             .arg(&chi)
-            .arg(&scale);
+            .arg(&scale)
+            .arg(&rows);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (t as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -6455,23 +6572,32 @@ mod upload_tests {
             let ts = q.type_size();
             let stride = q.device_stride();
             // Two full staging chunks and a tail, with source-part boundaries
-            // deliberately different from the upload boundaries.
-            let blocks = 2 * (1024 * 1024 / stride) + 17;
+            // deliberately different from the upload boundaries. Six blocks a
+            // row puts a short group at the end of every row, and the row
+            // count leaves the last tile short too.
+            let per_row = 6;
+            let rows = (2 * (1024 * 1024 / stride) + 17).div_ceil(per_row);
+            let blocks = rows * per_row;
             let raw: Vec<u8> = (0..blocks * ts)
                 .map(|i| ((i * 31 + i / ts) % 251) as u8)
                 .collect();
             let parts = [&raw[3 * ts..], &[][..], &raw[..3 * ts]];
             let ordered = parts.concat();
-            let expected = if q == Quant::Q6K {
-                let mut old = vec![0u8; blocks * stride];
-                for (src, dst) in ordered.chunks_exact(ts).zip(old.chunks_exact_mut(stride)) {
+            let mut device = vec![0u8; blocks * stride];
+            for (src, dst) in ordered.chunks_exact(ts).zip(device.chunks_exact_mut(stride)) {
+                if q == Quant::Q6K {
                     Gpu::q6k_device_block(src, dst);
+                } else {
+                    dst.copy_from_slice(src);
                 }
-                old
-            } else {
-                ordered
-            };
-            let uploaded = g.upload_quant_parts(q, &parts).unwrap();
+            }
+            let mut expected = Vec::with_capacity(device.len());
+            for (row, b) in tiled_order(rows, per_row) {
+                let at = (row * per_row + b) * stride;
+                expected.extend_from_slice(&device[at..at + stride]);
+            }
+            assert_ne!(expected, device, "the order is not the identity");
+            let uploaded = g.upload_quant_parts(q, &parts, per_row * 256).unwrap();
             // Reclamation must not release or alter a live model allocation.
             g.trim_packed_pool().unwrap();
             let status = g.packed_memory_status();
@@ -6479,7 +6605,7 @@ mod upload_tests {
             assert!(status.contains("pool reserved="), "{status}");
             assert_eq!(g.stream.clone_dtoh(&uploaded).unwrap(), expected);
             assert!(matches!(
-                g.upload_quant_parts(q, &[&raw[..ts], &raw[..1]]),
+                g.upload_quant_parts(q, &[&raw[..ts], &raw[..1]], 256),
                 Err(CudaError::RaggedBlockBytes { .. })
             ));
         }

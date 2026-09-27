@@ -92,7 +92,7 @@ fn main() -> ExitCode {
     tracing::info!("{:<14} {:>5} {:>10} {:>8}", "weight", "rows", "us", "GB/s");
     for &(what, k, n, q) in weights {
         let raw = blocks(q, n * k / q.block_size());
-        let w = g.upload_quant(q, &raw).expect("upload");
+        let w = g.upload_quant(q, &raw, k).expect("upload");
         let bytes = raw.len() as f64;
         for &m in &rows {
             let a = g.upload(&seq(m * k)).expect("upload a");

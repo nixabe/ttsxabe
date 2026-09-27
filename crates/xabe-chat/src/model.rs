@@ -300,7 +300,7 @@ impl ChatModel {
                 .flatten();
             let w = match packed {
                 Some(ty) => GWeight::Packed {
-                    data: gpu.upload_quant_parts(ty, &Self::packed(&f, b, &cfg, ty)?)?,
+                    data: gpu.upload_quant_parts(ty, &Self::packed(&f, b, &cfg, ty)?, b.shape[1])?,
                     ty,
                 },
                 None => GWeight::F16(narrow(b)?),
@@ -327,7 +327,7 @@ impl ChatModel {
                         all.extend_from_slice(&Self::packed(&f, b, &cfg, ty)?);
                     }
                     GWeight::Packed {
-                        data: gpu.upload_quant_parts(ty, &all)?,
+                        data: gpu.upload_quant_parts(ty, &all, head.shape[1])?,
                         ty,
                     }
                 }
@@ -430,7 +430,11 @@ impl ChatModel {
             .flatten()
         {
             Some(ty) => GEmbed::Packed {
-                data: gpu.upload_quant_parts(ty, &Self::packed(&f, &w.embed_tokens, &cfg, ty)?)?,
+                data: gpu.upload_quant_parts(
+                    ty,
+                    &Self::packed(&f, &w.embed_tokens, &cfg, ty)?,
+                    w.embed_tokens.shape[1],
+                )?,
                 ty,
             },
             None => GEmbed::F32(wide(&w.embed_tokens)?),

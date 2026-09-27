@@ -10,9 +10,10 @@ llama.cpp on every measured row but one**, from 128 tokens to the models'
 long contexts - chat prefill 1.08x to 1.14x and decode 1.02x to 1.09x
 through 8192 positions, translator prefill 1.03x to 1.18x and decode 1.02x to
 1.07x through 3968. The one row not won is the translator prefilling a
-24-token clause, at 0.74x. "Long context: the round that won it" has the
-table; each of those has its own section, and this paragraph is not the
-evidence for any of them.
+24-token clause, at 0.74x then and 0.84x since the K-quant weights sit on the
+card in tiles ("The short prefill: a K-quant in tiles"). "Long context: the
+round that won it" has the table; each of those has its own section, and this
+paragraph is not the evidence for any of them.
 
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
@@ -1094,6 +1095,35 @@ they are what makes the packed-weight work measurable at all - but nothing here
 should claim the pipeline is fastest with them in the reply path, because it is
 not.
 
+## The short prefill: a K-quant in tiles
+
+Q4_K and Q6_K sit on the card as 64-row tiles of four-super-block groups
+rather than the file's row-major blocks - `KERNELS.md`, "A K-quant sits on
+the card in tiles", has the order and the variants that lost. The previous
+commit's binary against this one, alternated twice through in one sitting,
+`xabe-llm-bench --rounds 9 --decode 64`; the two passes agree to 1.3% on
+every cell and the first is given.
+
+| | before | tiled | |
+| --- | ---: | ---: | ---: |
+| translator prefill, 16 tok | 45.4 ms | **38.5** | 1.18x |
+| translator prefill, 24 | 46.5 | **39.7** | 1.17x |
+| translator prefill, 32 | 47.5 | **41.0** | 1.16x |
+| translator prefill, 64 | 60.0 | **55.9** | 1.07x |
+| translator prefill, 128 | 91.9 | **88.2** | 1.04x |
+| translator prefill, 512 | 311.5 | **309.9** | 1.01x |
+| translator decode after 24 | 15.19 ms/tok | 15.15 | level |
+| chat prefill, 24 | 24.6 | **23.0** | 1.07x |
+| chat prefill, 128 | 52.4 | **51.1** | 1.03x |
+| chat prefill, 512 | 169.7 | **166.9** | 1.02x |
+| chat decode after 24 | 9.21 ms/tok | 9.18 | level |
+
+llama.cpp's `pp24` on the translator was 723 +/- 76 tok/s in the same
+sitting, so the 24-token row is 604 against 723: **0.84x**, from 0.74x. Still
+a loss. Profiled with `XABE_KPROF`, one launch at a time, the integer matmul
+is 35.9 ms of the prefill's 42.9 - 7.8 GB of weights at about 220 GB/s,
+against the 565 the mat-vec streams the same bytes at.
+
 ## Long context: the round that won it
 
 At the start of 2026-09-27 the Llama stages were ahead of llama.cpp at short
@@ -1130,7 +1160,8 @@ after a prompt of the given length, against `tg64 @ d<depth>`.
 | decode at 2048 | 51.8 | **54.0** | 1.04x |
 | decode at 3968 | 46.2 | **47.0** | 1.02x |
 
-**The 24-token row is a loss and is recorded as one.** It is the translator's
+**The 24-token row is a loss and is recorded as one** (0.84x since, under "The
+short prefill: a K-quant in tiles"). It is the translator's
 real clause length, so it is not a corner: 46.5 ms against about 33. It was
 52.4 before this round; `KERNELS.md` has the 32-row tile that took it to
 46.5, the five attempts that did not close the rest, and the lever left. The
