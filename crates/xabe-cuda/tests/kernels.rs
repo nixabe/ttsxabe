@@ -2758,6 +2758,13 @@ fn the_fused_decode_attention_matches_the_chain() {
         (6, 6, 64, 448, 448, false, true),
         // Past the merge's shared arrays: 258 chunks take the serial form.
         (4, 2, 128, 16500, 16512, true, false),
+        // Past a wave of blocks, so a block walks a run of chunks with the
+        // softmax carried across them - the chat model's geometry, and a
+        // context that leaves the last run short.
+        (32, 8, 128, 4096, 4096, true, false),
+        (32, 8, 128, 8192, 8192, true, false),
+        (32, 8, 128, 7777, 8192, true, false),
+        (8, 8, 64, 5000, 5056, false, true),
     ];
     for (i, &(heads, kv, hd, tk, cap, half, scale_q)) in cases.iter().enumerate() {
         let salt = 300 + 3 * i as u64;
@@ -3886,4 +3893,86 @@ fn the_gate_with_its_conditioning_is_the_add_then_the_gate() {
             .is_err(),
         "a block past the row must be refused"
     );
+}
+
+/// `gemm_hh`, the f16-by-f16 matmul, is `gemm` bit for bit.
+///
+/// The two are reached through the same call: an f32 activation takes `gemm`,
+/// which rounds it to f16 as it stages, and the same activation rounded by
+/// `to_f16` - the same `cvt.rn` - takes `gemm_hh`. They are the same operands
+/// and each output takes its k8 `mma` steps in the same order in both, so the
+/// check is equality, not closeness. The shapes cover ragged tiles in every
+/// dimension, a contraction whose rows are not sixteen-byte aligned (`k = 30`)
+/// and so is staged a word at a time, split contractions, a batch with its
+/// own biases accumulated into what the output holds, and the encoder.
+#[test]
+fn the_f16_matmul_is_the_matmul_bit_for_bit() {
+    let Some(g) = gpu() else { return };
+    // (m, k, n, batch, accumulate)
+    let cases: &[(usize, usize, usize, usize, bool)] = &[
+        (17, 8, 8, 1, false),
+        (129, 32, 130, 1, false),
+        (200, 40, 70, 1, false),
+        (100, 30, 50, 1, false),
+        (65, 6, 17, 1, true),
+        (128, 4096, 1024, 1, false),
+        (40, 1536, 2048, 1, false),
+        (300, 96, 200, 3, true),
+        (1500, 1280, 1280, 1, false),
+        (1500, 5120, 1280, 1, true),
+    ];
+    let mut split_seen = 0;
+    for (i, &(m, k, n, count, accumulate)) in cases.iter().enumerate() {
+        let salt = 900 + 5 * i as u64;
+        let a = seq(count * m * k, salt);
+        let w = seq(count * n * k, salt + 1);
+        let bias = seq(count * n, salt + 2);
+        let init = seq(count * m * n, salt + 3);
+        if xabe_cuda::ksplit_for(m, k, n, count) > 1 {
+            split_seen += 1;
+        }
+        let da = g.upload(&a).unwrap();
+        let dh = g.to_f16(&da, a.len()).unwrap();
+        let dw = g.upload_f16(&w).unwrap();
+        let db = g.upload(&bias).unwrap();
+        let batch = xabe_cuda::Batch {
+            count,
+            a: m * k,
+            w: n * k,
+            out: m * n,
+            w_row: 0,
+        };
+        let run = |a: xabe_cuda::Operand<'_>| {
+            let mut out = g.upload(&init).unwrap();
+            g.gemm_batched_into(
+                a,
+                xabe_cuda::Operand::F16(&dw),
+                Some(&db),
+                n,
+                batch,
+                m,
+                k,
+                n,
+                accumulate,
+                &mut out,
+                0,
+            )
+            .unwrap();
+            g.download(&out).unwrap()
+        };
+        let want = run(xabe_cuda::Operand::F32(&da));
+        let got = run(xabe_cuda::Operand::F16(&dh));
+        let bad = want
+            .iter()
+            .zip(&got)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            bad,
+            0,
+            "gemm_hh {m}x{k}x{n} x{count} accumulate {accumulate}: {bad} of {} differ",
+            want.len()
+        );
+    }
+    assert!(split_seen >= 1, "no case reached the split path");
 }

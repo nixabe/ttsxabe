@@ -37,6 +37,17 @@ const CONV_BLOCK: u32 = 128;
 /// the staging stops paying for itself.
 const SM_TARGET: usize = 144;
 
+/// Blocks the decode attention's run kernel spreads a layer over: three
+/// resident a card's 72 SMs. Past this many chunks a block walks a run of
+/// them rather than taking one. Swept at 72 to 576 on the chat model's
+/// geometry; `docs/BENCHMARKS.md` has the table.
+const AD_BLOCK_TARGET: usize = 216;
+
+/// The context past which a 128-wide head decodes with the run kernel. At
+/// 2048 positions the two kernels measured level; from 4096 the run kernel is
+/// ahead on both Llama geometries.
+const AD_RUN_FROM: usize = 2048;
+
 /// The shortest contraction a split slice is allowed.
 ///
 /// A slice reads the whole `GEMM_MT x GEMM_NT` tile footprint however little of
@@ -573,6 +584,7 @@ const NAMES: &[&str] = &[
     "depthwise_conv1d",
     "transposed_conv1d",
     "gemm",
+    "gemm_hh",
     "gemm_i8_q4k",
     "gemm_i8_q6k",
     "gemm_i8_q4k_narrow",
@@ -662,6 +674,7 @@ const NAMES: &[&str] = &[
     "attn_decode_h128_c32",
     "attn_decode_h128",
     "attn_decode_h128_c128",
+    "attn_decode_h128_run",
     "attn_decode_h64",
     "attn_decode_h64_g8",
     "attn_decode_h64_g8_c32",
@@ -2365,7 +2378,25 @@ impl Gpu {
             return Ok(());
         }
 
-        let f = self.func(if small { "gemv" } else { "gemm" });
+        // Both operands f16 and nothing packed or strided: the warp grid
+        // with the next trip's loads in flight, `gemm`'s numbers bit for
+        // bit. Every row of either operand is read as whole words, so `k`
+        // must be even; the kernel takes a row sixteen bytes at a time where
+        // it is aligned and a word at a time where it is not.
+        let hh = !small
+            && a_half == 1
+            && w_half == 1
+            && w_quant == 0
+            && w_rs == 0
+            && k.is_multiple_of(2);
+        let name = if small {
+            "gemv"
+        } else if hh {
+            "gemm_hh"
+        } else {
+            "gemm"
+        };
+        let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
         match (&widened, a) {
             (Some(h), _) => lb.arg(h),
@@ -2448,9 +2479,7 @@ impl Gpu {
         // SAFETY: the grid covers every (batch, m, n) exactly once, `out` is
         // batch*m*n elements, and every global read and write inside the kernel
         // is bounds checked against m, k and n.
-        launched(if small { "gemv" } else { "gemm" }, unsafe {
-            lb.launch(cfg)
-        })?;
+        launched(name, unsafe { lb.launch(cfg) })?;
 
         if let Some(p) = &partial {
             self.reduce_partials(
@@ -5531,6 +5560,7 @@ impl Gpu {
         // query groups to share a head's reads, wide ones once the merge over
         // many partials is what the last block waits on.
         Ok(match head_dim {
+            128 if tk > AD_RUN_FROM => "attn_decode_h128_run",
             128 if tk <= 256 || heads == kv_heads => "attn_decode_h128_c32",
             128 if tk >= 2048 => "attn_decode_h128_c128",
             128 => "attn_decode_h128",
@@ -5769,11 +5799,22 @@ impl Gpu {
         }
         let group = heads / kv_heads;
         let ch = match name {
-            "attn_decode_h128_c32" | "attn_decode_h64_g8_c32" => 32,
+            "attn_decode_h128_c32" | "attn_decode_h64_g8_c32" | "attn_decode_h128_run" => 32,
             "attn_decode_h128_c128" => 128,
             _ => kernels::AD_CH as usize,
         };
         let chunks = tk.div_ceil(ch);
+        // The run kernel shares a head's chunks between `splits` blocks, each
+        // walking `per` of them - the last whatever is left, so none is
+        // empty - and merges one partial a block. The chunk kernel is the
+        // case of one chunk a block.
+        let run = name == "attn_decode_h128_run";
+        let splits = if run {
+            let per = chunks.div_ceil(AD_BLOCK_TARGET.div_ceil(kv_heads).max(1));
+            chunks.div_ceil(per)
+        } else {
+            chunks
+        };
 
         // Grow the scratch to this call's shape. Doubling the chunk count
         // keeps the allocations logarithmic in the context; a change of head
@@ -5808,12 +5849,13 @@ impl Gpu {
         let mut q8 = twin;
         let asc_off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
         let (qo, oo) = (q_off as i64, out_off as i64);
-        let (tki, gi, ci, sqi, chi) = (
+        let (tki, gi, ci, sqi, chi, spi) = (
             tk as i32,
             group as i32,
             cap as i32,
             i32::from(scale_q),
             chunks as i32,
+            splits as i32,
         );
         let f = self.func(name);
         let mut lb = self.stream.launch_builder(f);
@@ -5835,21 +5877,25 @@ impl Gpu {
             .arg(&scale)
             .arg(&sqi)
             .arg(&chi);
+        if run {
+            lb.arg(&spi);
+        }
         match &mut q8 {
             Some(q) => lb.arg(&mut q.buf).arg(&asc_off),
             None => lb.arg(&null).arg(&asc_off),
         };
         lb.arg(&qo).arg(&oo);
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (chunks as u32, kv_heads as u32, 1),
+            grid_dim: (splits as u32, kv_heads as u32, 1),
             block_dim: (head_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the grid covers every (chunk, head) once; the caches are
-        // checked above to hold `kv_heads * cap * head_dim`, the chunk's keys
-        // are bounded by `tk <= cap` inside the kernel, the scratch holds
-        // `chunks` partials a head, and the query, the output row and the
-        // twin's row are bounds checked above.
+        // SAFETY: the grid covers every (chunk, head) once, a run of chunks a
+        // block; the caches are checked above to hold `kv_heads * cap *
+        // head_dim`, the chunk's keys are bounded by `tk <= cap` inside the
+        // kernel, the scratch holds `chunks >= splits` partials a head, and
+        // the query, the output row and the twin's row are bounds checked
+        // above.
         launched(name, unsafe { lb.launch(cfg) })
     }
 
