@@ -169,3 +169,85 @@ Peak `nvidia-smi` memory while each tool runs a matching workload on an otherwis
 | Tacotron2 + WaveGlow | PyTorch fp32 | 1260 MiB | 908 MiB | 1.39x |
 | Tacotron2 + WaveGlow | PyTorch fp16 | 1052 MiB | 908 MiB | 1.16x |
 | VITS | PyTorch fp32 | 406 MiB | 332 MiB | 1.22x |
+
+## Workflow: full serving vs router mode
+
+The same `xabe-engine --serve` binary answers spoken and typed turns over its WebSocket in two configurations, both on the one card and both loaded at once. Every stage runs the same checkpoint in both modes.
+
+| Stage | Full serving mode | Router mode |
+| --- | --- | --- |
+| VAD | xabe, in process (CPU) | xabe, in process (CPU) |
+| ASR | xabe, in process | `whisper-server` over HTTP |
+| Chat LLM | xabe, in process | `llama-server -ngl 99 -c 4096` over HTTP |
+| Translator | xabe, in process | `llama-server -ngl 99 -c 4096` over HTTP |
+| TTS | xabe Tacotron2 + WaveGlow, in process | PyTorch Tacotron2 + WaveGlow (fp16) over HTTP |
+
+Both modes use `--temperature 0 --translate-ahead 0`. Each turn starts a fresh conversation. The router's TTS server gets the engine's own text front end (clause split, POJ to Tâi-lô, stop cue), so both synthesisers receive identical text. The results are medians of 7 rounds after 2 warm-up rounds, with the two modes alternated in every round. Timings are taken at the client, from sending the turn to each event. Speedup = router time / full time.
+
+### Summary
+
+| Measure | Speedup (range) | Geometric mean |
+| --- | ---: | ---: |
+| First audio, identical-reply turns | 1.34x – 1.56x | **1.44x** |
+| Whole turn, identical-reply turns | 1.41x – 1.56x | **1.47x** |
+| First audio, all 8 turns | 0.91x – 1.69x | **1.40x** |
+| Turn time per second of audio, all 8 turns | 0.64x – 1.65x | **1.35x** |
+| VAD + ASR, spoken turns | 1.20x – 1.25x | **1.22x** |
+| Synthesis, per second of audio | 2.81x – 3.39x | **3.05x** |
+| Translation, per source character | 0.92x – 1.31x | **1.13x** |
+| Transcript to first reply token | 0.67x – 0.80x | **0.77x** |
+| Reply stream rate inside a turn | 0.40x – 0.87x | **0.65x** |
+
+The last two rows are losses. Their likely causes were not isolated in this run:
+
+- **Transcript to first reply token:** `llama-server` has prompt caching on by default, so it can reuse the system-prompt prefix between turns.
+- **Reply stream rate:** in full mode, the first clause's translation and synthesis run in the same process on the same card while the reply is still streaming.
+
+### Identical-reply turns
+
+Typed turns that tell the chat model to repeat a fixed sentence word for word (`請一字不改地只回覆這句話：…`). The reply text was identical in both modes on all four. The Taigi translation was identical on R1 and R2 and differed by a few words on R3 and R4.
+
+| Turn | Reply | Tokens | First token full / router | First audio full / router | Speedup | Whole turn full / router | Speedup | Audio full / router |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| R1 | 你好，很高興認識你。 | 10 | 51 / 41 ms | 818 / 1212 ms | **1.48x** | 819 / 1213 ms | **1.48x** | 3.4 / 3.6 s |
+| R2 | 今天天氣很好，我們一起去公園散步，好嗎？ | 17 | 53 / 41 ms | 690 / 928 ms | **1.34x** | 1454 / 2096 ms | **1.44x** | 7.1 / 6.1 s |
+| R3 | 你好，我是你的助理，今天天氣很好，我們一起去公園散步，好嗎？ | 24 | 54 / 41 ms | 794 / 1092 ms | **1.38x** | 2122 / 3314 ms | **1.56x** | 12.9 / 12.6 s |
+| R4 | 謝謝你的問題，我們明天早上一起去市場買菜，然後去公園散步，晚上再一起吃飯。 | 31 | 82 / 55 ms | 653 / 1016 ms | **1.56x** | 2883 / 4052 ms | **1.41x** | 14.7 / 13.1 s |
+
+### Spoken turns
+
+Clips a–d from the ASR benchmark, sent as audio turns. Transcripts were identical in both modes. At temperature 0 the two chat backends still write different replies, so these turns do different amounts of downstream work (tokens and audio are shown).
+
+| Clip | VAD + ASR full / router | Speedup | First audio full / router | Speedup | Whole turn full / router | Speedup | Reply tokens full / router | Audio full / router |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| a | 244 / 305 ms | **1.25x** | 926 / 1253 ms | **1.35x** | 1263 / 1776 ms | **1.41x** | 15 / 17 | 3.8 / 3.8 s |
+| b | 351 / 434 ms | **1.24x** | 1013 / 1704 ms | **1.68x** | 1542 / 1705 ms | **1.11x** | 15 / 12 | 4.8 / 3.6 s |
+| c | 500 / 605 ms | **1.21x** | 906 / 1528 ms | **1.69x** | 906 / 2258 ms | **2.49x** | 5 / 15 | 1.1 / 4.3 s |
+| d | 624 / 748 ms | **1.20x** | 1705 / 1545 ms | **0.91x** | 2614 / 3368 ms | **1.29x** | 23 / 17 | 9.0 / 7.9 s |
+
+### Phase rates
+
+Medians across all 8 turns. Per-clause translation and synthesis times come from the engine's own `chunk spoken` log line, which both modes emit. In router mode they include the HTTP round trip.
+
+| Phase | Full | Router | Speedup |
+| --- | ---: | ---: | ---: |
+| VAD + ASR (spoken turns) | 425.7 ms | 519.7 ms | **1.22x** |
+| Transcript to first reply token | 51.8 ms | 40.6 ms | **0.78x** |
+| Reply stream rate inside a turn | 39.6 tok/s | 64.2 tok/s | **0.62x** |
+| Translation, per source character | 50.2 ms | 58.8 ms | **1.17x** |
+| Synthesis, per second of audio | 42.7 ms | 131.5 ms | **3.08x** |
+| Whole turn, per second of audio | 264.0 ms | 382.8 ms | **1.45x** |
+
+### VRAM while serving
+
+Per-process `nvidia-smi` usage after all turns. The router's own `xabe-engine` process (VAD on CPU) holds no device memory.
+
+| Full mode | | Router mode | |
+| --- | ---: | --- | ---: |
+| xabe-engine, all stages | 17328 MiB | whisper-server | 3682 MiB |
+|  |  | llama-server (chat) | 5224 MiB |
+|  |  | llama-server (translator) | 11020 MiB |
+|  |  | PyTorch TTS server | 9242 MiB |
+| **Total** | **17328 MiB** | **Total** | **29168 MiB** |
+
+Router / full: **1.68x** the memory. The PyTorch figure includes its caching allocator's reserve after the longest utterances.
