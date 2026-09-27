@@ -36,6 +36,10 @@ name = "bench-flash"
 path = "src/bin/bench_flash.rs"
 
 [[bin]]
+name = "bench-qgemm"
+path = "src/bin/bench_qgemm.rs"
+
+[[bin]]
 name = "bench-gemv"
 path = "src/bin/bench_gemv.rs"
 

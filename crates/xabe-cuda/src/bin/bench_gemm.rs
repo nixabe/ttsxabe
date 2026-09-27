@@ -66,6 +66,19 @@ fn main() -> ExitCode {
         }
     };
 
+    for name in [
+        "gemm",
+        "gemm_hh",
+        "gemm_i8_q4k",
+        "gemm_i8_q4k_narrow",
+        "gemm_i8_q6k_narrow",
+        "gemm_i8_q4k_skinny",
+        "gemm_i8_q6k_skinny",
+    ] {
+        if let Some((regs, local, shared)) = gpu.kernel_resources(name) {
+            tracing::info!("{name}: {regs} registers, {local} B spilled, {shared} B shared");
+        }
+    }
     tracing::info!(
         "{:>6} {:>6} {:>6}  {:>10} {:>10} {:>8}  {:>7}  {:>10} {:>7}",
         "m",

@@ -2000,7 +2000,7 @@ __device__ __forceinline__ void ld_i8_x4(unsigned* d, const unsigned* row)
 // argument because it decides which staging code exists at all and whether the
 // two `mma` steps of a sub-block share an accumulator: as a runtime branch,
 // ptxas allocated registers for the union of both and scheduled for neither.
-template <int QT, int MT>
+template <int QT, int MT, int WM, int KC>
 __device__ __forceinline__ void gemm_i8_body(
     const signed char* __restrict__ qa,
     int asc_off,
@@ -2021,12 +2021,30 @@ __device__ __forceinline__ void gemm_i8_body(
     // `MR` is what one warp owns down the tile and `MS` how many `m8n8k16`
     // rows that is. Four is the floor and not a tuning choice: the fragment
     // load below is an `ldmatrix .x4`, which takes four row groups at once.
-    constexpr int MR = MT / GEMM_I8_WM;
+    //
+    // `WM` is how many warps share the tile's rows. Two for the 128- and
+    // 64-row tiles; one for the 32-row tile, which is then four warps rather
+    // than eight - each still owning four row groups and four column tiles,
+    // which is what the two `ldmatrix .x4` loads take.
+    //
+    // `KC` is the contraction a staged trip covers. Each weight row gives a
+    // trip `KC / 2` contiguous bytes of Q4_K quants, and that is what the
+    // skinny tile needed: at 64 a warp read 32 bytes from each of sixteen rows
+    // kilobytes apart, which DRAM serves at a fraction of its rate, and at a
+    // short prompt nothing amortised it.
+    constexpr int SUB = KC / 32;               // sub-blocks a trip
+    constexpr int IPR = KC / 32;               // staging items a weight row
+    constexpr int WORDS = KC / 4;
+    constexpr int STRIDE = WORDS + 4;
+    static_assert(KC % 64 == 0 && 256 % KC == 0, "a trip is whole pair groups of a super-block");
+    constexpr int THREADS = WM * GEMM_I8_WN * 32;
+    constexpr int BITER = (GEMM_I8_NT * IPR + THREADS - 1) / THREADS;
+    constexpr int MR = MT / WM;
     constexpr int MS = MR / 8;
     static_assert(MS % 4 == 0, "the fragment load takes four row groups");
 
-    __shared__ __align__(16) unsigned au[MT * GEMM_I8_STRIDE];
-    __shared__ __align__(16) unsigned bu[GEMM_I8_NT * GEMM_I8_STRIDE];
+    __shared__ __align__(16) unsigned au[MT * STRIDE];
+    __shared__ __align__(16) unsigned bu[GEMM_I8_NT * STRIDE];
     // Scales, paired so that a lane fetches both halves of what it needs in one
     // eight-byte load. This is the difference between the scales costing more
     // shared traffic than the fragments and costing a fraction of them.
@@ -2034,9 +2052,9 @@ __device__ __forceinline__ void gemm_i8_body(
     // `asx` is (scale, sum of codes) per row per sub-block; `bds` is `d * sc`
     // per `mma` step, because Q6_K changes scale every sixteen weights; `bdm`
     // is `dmin * mn` per sub-block, which Q6_K does not have at all.
-    __shared__ __align__(8) float asx[MT * GEMM_I8_SUB * 2];
-    __shared__ __align__(8) float bds[GEMM_I8_SUB][GEMM_I8_KS][GEMM_I8_NT];
-    __shared__ __align__(8) float bdm[GEMM_I8_SUB][GEMM_I8_NT];
+    __shared__ __align__(8) float asx[MT * SUB * 2];
+    __shared__ __align__(8) float bds[SUB][GEMM_I8_KS][GEMM_I8_NT];
+    __shared__ __align__(8) float bdm[SUB][GEMM_I8_NT];
 
     // Codes then scales in one allocation, the layout `quantize_q8` writes.
     const float* __restrict__ ascale = (const float*)(qa + asc_off);
@@ -2086,8 +2104,8 @@ __device__ __forceinline__ void gemm_i8_body(
     const int mb0 = (warp / GEMM_I8_WN) * MR;
     const int nb0 = (warp % GEMM_I8_WN) * GEMM_I8_NR;
 
-    const int kstep = ((k + ksplit - 1) / ksplit + GEMM_I8_KC - 1)
-                      / GEMM_I8_KC * GEMM_I8_KC;
+    const int kstep = ((k + ksplit - 1) / ksplit + KC - 1)
+                      / KC * KC;
     const int kbeg  = slice * kstep;
     const int kend  = min(k, kbeg + kstep);
 
@@ -2108,24 +2126,24 @@ __device__ __forceinline__ void gemm_i8_body(
     // sixteen bytes at the front of one (Q4_K) or at byte 192 of one (Q6_K).
     // Re-reading those every trip measured 17.5% of this kernel; caching them
     // per thread is the same trick `gemm` uses, for the same reason.
-    uint4 whdr[GEMM_I8_BITER];
-    float wd[GEMM_I8_BITER];
-    long  wsb[GEMM_I8_BITER];
+    uint4 whdr[BITER];
+    float wd[BITER];
+    long  wsb[BITER];
     #pragma unroll
-    for (int u = 0; u < GEMM_I8_BITER; ++u) {
+    for (int u = 0; u < BITER; ++u) {
         wsb[u] = -1;
         wd[u] = 0.0f;
     }
 
-    for (int kc = kbeg; kc < kend; kc += GEMM_I8_KC) {
+    for (int kc = kbeg; kc < kend; kc += KC) {
         // The activation is already int8: `gemm_batched` quantizes it once for
         // the whole launch. Doing it here instead - which the first version of
         // this kernel did - repeats the maximum, the reciprocal and the
         // rounding once per column tile, 32 times over on a 4096-wide
         // projection, and measured 640 tok/s against the f16 kernel's 1926. So
         // this is a copy: one sub-block a thread, 32 bytes in and 32 out.
-        for (int i = tid; i < MT * GEMM_I8_SUB; i += GEMM_I8_THREADS) {
-            const int r = i / GEMM_I8_SUB, sb = i % GEMM_I8_SUB;
+        for (int i = tid; i < MT * SUB; i += THREADS) {
+            const int r = i / SUB, sb = i % SUB;
             const int row = m0 + r;
             uint4 v0 = make_uint4(0u, 0u, 0u, 0u), v1 = v0;
             float d = 0.0f;
@@ -2137,7 +2155,7 @@ __device__ __forceinline__ void gemm_i8_body(
                 d = ascale[(arow + row) * (size_t)groups + (kc >> 5) + sb];
             }
             uint4* dst = reinterpret_cast<uint4*>(
-                &au[r * GEMM_I8_STRIDE + 8 * sb]);
+                &au[r * STRIDE + 8 * sb]);
             dst[0] = v0;
             dst[1] = v1;
             // The code sum is wanted per sub-block rather than per step: it is
@@ -2145,8 +2163,8 @@ __device__ __forceinline__ void gemm_i8_body(
             // across a sub-block and Q6_K does not have.
             int t = sum4(v0.w, sum4(v0.z, sum4(v0.y, sum4(v0.x, 0))));
             t = sum4(v1.w, sum4(v1.z, sum4(v1.y, sum4(v1.x, t))));
-            asx[2 * (GEMM_I8_SUB * r + sb)] = d;
-            asx[2 * (GEMM_I8_SUB * r + sb) + 1] = (float)t;
+            asx[2 * (SUB * r + sb)] = d;
+            asx[2 * (SUB * r + sb) + 1] = (float)t;
         }
 
         // The weights. One thread stages sixteen bytes and both nibbles of
@@ -2155,10 +2173,14 @@ __device__ __forceinline__ void gemm_i8_body(
         // `w & 0x0F0F0F0F` already *is* four int8 codes in the order the
         // tensor core reads them.
         #pragma unroll
-        for (int u = 0; u < GEMM_I8_BITER; ++u) {
-            const int i = tid + u * GEMM_I8_THREADS;
-            if (i >= GEMM_I8_NT * GEMM_I8_KS) break;
-            const int r = i / GEMM_I8_KS, h = i % GEMM_I8_KS;
+        for (int u = 0; u < BITER; ++u) {
+            const int i = tid + u * THREADS;
+            if (i >= GEMM_I8_NT * IPR) break;
+            // Item `h` of a row: pair group `p` of the trip - 64 elements,
+            // whose low nibbles are one sub-block and high nibbles the next -
+            // and `hk`, which sixteen of its elements.
+            const int r = i / IPR, h = i % IPR;
+            const int p = h >> 1, hk = h & 1;
             const int col = n0 + r;
             unsigned lo[GEMM_I8_KG / 4], hi[GEMM_I8_KG / 4];
             #pragma unroll
@@ -2167,7 +2189,7 @@ __device__ __forceinline__ void gemm_i8_body(
             if (col < n) {
                 const long sb = (long)col * nb + (kc >> 8);
                 const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
-                const int j = (kc & 255) + GEMM_I8_KG * h;
+                const int j = (kc & 255) + 64 * p + GEMM_I8_KG * hk;
                 if (sb != wsb[u]) {
                     wsb[u] = sb;
                     if (QT == QT_Q4_K) {
@@ -2247,17 +2269,17 @@ __device__ __forceinline__ void gemm_i8_body(
                     }
                 }
             }
-            unsigned* dst = &bu[r * GEMM_I8_STRIDE + (GEMM_I8_KG / 4) * h];
+            unsigned* dst = &bu[r * STRIDE + 16 * p + (GEMM_I8_KG / 4) * hk];
             #pragma unroll
             for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
                 dst[t] = lo[t];
                 dst[8 + t] = hi[t];
             }
-            bds[0][h][r] = ds0;
-            bds[1][h][r] = ds1;
-            if (h == 0) {
-                bdm[0][r] = dm0;
-                bdm[1][r] = dm1;
+            bds[2 * p][hk][r] = ds0;
+            bds[2 * p + 1][hk][r] = ds1;
+            if (hk == 0) {
+                bdm[2 * p][r] = dm0;
+                bdm[2 * p + 1][r] = dm1;
             }
         }
         __syncthreads();
@@ -2266,7 +2288,7 @@ __device__ __forceinline__ void gemm_i8_body(
         // of fragments and scales in registers, and holding both sets at once
         // spills 160 bytes to local memory.
         #pragma unroll 1
-        for (int sb = 0; sb < GEMM_I8_SUB; ++sb) {
+        for (int sb = 0; sb < SUB; ++sb) {
             // Both `mma` steps of a sub-block, and their scales, hoisted out of
             // the row loop: neither depends on which row is being multiplied.
             unsigned bfr[GEMM_I8_KS][GEMM_I8_NPW];
@@ -2274,7 +2296,7 @@ __device__ __forceinline__ void gemm_i8_body(
             #pragma unroll
             for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
                 ld_i8_x4(bfr[ks], &bu[(nb0 + 8 * (lane >> 3) + (lane & 7))
-                                      * GEMM_I8_STRIDE + 8 * sb + 4 * ks]);
+                                      * STRIDE + 8 * sb + 4 * ks]);
                 #pragma unroll
                 for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
                     const int c = nb0 + 8 * nt + 2 * tg;
@@ -2295,7 +2317,7 @@ __device__ __forceinline__ void gemm_i8_body(
                 for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
                     ld_i8_x4(afr[ks],
                              &au[(mb0 + 8 * (4 * m4 + (lane >> 3)) + (lane & 7))
-                                 * GEMM_I8_STRIDE + 8 * sb + 4 * ks]);
+                                 * STRIDE + 8 * sb + 4 * ks]);
                 }
                 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
@@ -2303,7 +2325,7 @@ __device__ __forceinline__ void gemm_i8_body(
                     // (scale, sum of codes) for this row and sub-block, in one
                     // load.
                     const float2 a2 = *reinterpret_cast<const float2*>(
-                        &asx[2 * (GEMM_I8_SUB * (mb0 + 8 * ms + g) + sb)]);
+                        &asx[2 * (SUB * (mb0 + 8 * ms + g) + sb)]);
                     #pragma unroll
                     for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
                         // `sum a*w = as*ds*sum(ia*q) - as*dm*sum(ia)`, where
@@ -2368,26 +2390,39 @@ __device__ __forceinline__ void gemm_i8_body(
     }
 }
 
-#define GEMM_I8_ENTRY(name, qt, mt)                                           \
-    extern "C" __global__ __launch_bounds__(GEMM_I8_THREADS, 2) void name(    \
+#define GEMM_I8_ENTRY(name, qt, mt, wm, kc, lb)                               \
+    extern "C" __global__ __launch_bounds__(wm * GEMM_I8_WN * 32, lb) void name( \
         const signed char* __restrict__ qa, int asc_off,                      \
         const unsigned char* __restrict__ wq, const float* __restrict__ bias, \
         float* __restrict__ out, int m, int k, int n, long sw, long so,       \
         int q_ts, int a_rows, int ksplit, float* __restrict__ partial)        \
     {                                                                         \
-        gemm_i8_body<qt, mt>(qa, asc_off, wq, bias, out, m, k, n, sw, so,     \
-                             q_ts, a_rows, ksplit, partial);                  \
+        gemm_i8_body<qt, mt, wm, kc>(qa, asc_off, wq, bias, out, m, k, n, sw, so, \
+                                 q_ts, a_rows, ksplit, partial);              \
     }
 
-// Two row tiles, and the narrow one is not a tuning knob. A prefill computes
-// `MT` rows whether the prompt has them or not, and a translator's prompt is
-// twenty-odd tokens - so at 128 rows nine tenths of the arithmetic is padding.
-// 64 is the narrowest this kernel's `ldmatrix .x4` allows; see `gemm_i8_body`.
+// Three row tiles, and the narrow ones are not a tuning knob. A prefill
+// computes `MT` rows whether the prompt has them or not, and a translator's
+// prompt is twenty-odd tokens - so at 128 rows nine tenths of the arithmetic
+// is padding. At a short prompt that padding is the kernel's whole cost: a
+// K-quant rescales every output once a 32-element sub-block, and the
+// conversion and the four scale products that takes cost more issue slots
+// than the `mma` they follow. 64 is the narrowest a two-warp-row grid allows;
+// 32 takes one warp row and four warps.
 #define GEMM_I8_MT_NARROW 64
-GEMM_I8_ENTRY(gemm_i8_q4k, QT_Q4_K, GEMM_I8_MT)
-GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K, GEMM_I8_MT)
-GEMM_I8_ENTRY(gemm_i8_q4k_narrow, QT_Q4_K, GEMM_I8_MT_NARROW)
-GEMM_I8_ENTRY(gemm_i8_q6k_narrow, QT_Q6_K, GEMM_I8_MT_NARROW)
+#define GEMM_I8_MT_SKINNY 32
+// A skinny trip's contraction: Q4_K's measured best at 64 - 418 us against
+// 500 at 128 on the 13 B gate and up - and Q6_K's at 128, 287 against 309
+// on its down projection, where the longer run a row outweighs the occupancy
+// the doubled tile costs.
+#define GEMM_I8_KC_SKINNY 64
+#define GEMM_I8_KC_SKINNY_Q6 128
+GEMM_I8_ENTRY(gemm_i8_q4k, QT_Q4_K, GEMM_I8_MT, 2, GEMM_I8_KC, 2)
+GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K, GEMM_I8_MT, 2, GEMM_I8_KC, 2)
+GEMM_I8_ENTRY(gemm_i8_q4k_narrow, QT_Q4_K, GEMM_I8_MT_NARROW, 2, GEMM_I8_KC, 2)
+GEMM_I8_ENTRY(gemm_i8_q6k_narrow, QT_Q6_K, GEMM_I8_MT_NARROW, 2, GEMM_I8_KC, 2)
+GEMM_I8_ENTRY(gemm_i8_q4k_skinny, QT_Q4_K, GEMM_I8_MT_SKINNY, 1, GEMM_I8_KC_SKINNY, 4)
+GEMM_I8_ENTRY(gemm_i8_q6k_skinny, QT_Q6_K, GEMM_I8_MT_SKINNY, 1, GEMM_I8_KC_SKINNY_Q6, 4)
 
 // ------------------------------------------------------------ flash attention
 //
@@ -4299,11 +4334,15 @@ extern "C" __global__ void rms_norm(
 // they alias one allocation, and one `&mut` is the only shape Rust will hand
 // over. What it buys is a launch a layer, and at one row a launch is most of
 // what a small kernel costs.
+// `store` 0 leaves `x` as it was and writes only the twin: a packed down
+// projection reads the codes and never the floats, which at a long prefill
+// are half a gigabyte a layer.
 extern "C" __global__ void silu_mul_pair(
     float* __restrict__ x,
     signed char* __restrict__ qa,
     int asc_off,
-    int n)
+    int n,
+    int store)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n && !qa) {
@@ -4314,7 +4353,9 @@ extern "C" __global__ void silu_mul_pair(
         // `expf` for the reason `silu_mul` gives.
         float v = x[i];
         y = v * (1.0f / (1.0f + expf(-v))) * x[i + n];
-        x[i] = y;
+        if (store) {
+            x[i] = y;
+        }
     }
     if (!qa) {
         return;
@@ -6024,6 +6065,9 @@ extern "C" __global__ __launch_bounds__(HD, LB) void NAME(                     \
 }
 
 AD_RUN_ENTRY(attn_decode_h128_run, 128, true, 32, AD_GMAX, unsigned short, 4)
+// The same for the Whisper decoder's cross-attention: 64-wide heads over the
+// 1500 encoder positions, ungrouped, off the packed f16 cache.
+AD_RUN_ENTRY(attn_decode_h64_run, 64, true, 32, AD_GMAX, unsigned short, 8)
 
 
 // ------------------------------------------- several rows, one weight stream
@@ -6800,6 +6844,7 @@ pub const GEMM_I8_MT: u32 = define("GEMM_I8_MT");
 /// The narrow row tile, for a prefill with fewer rows than the wide one
 /// computes. See the note beside `GEMM_I8_ENTRY`.
 pub const GEMM_I8_MT_NARROW: u32 = define("GEMM_I8_MT_NARROW");
+pub const GEMM_I8_MT_SKINNY: u32 = define("GEMM_I8_MT_SKINNY");
 /// Rows `gemv_rows` will carry in one warp. `GEMV_MAX_M` must not exceed it.
 pub const GEMV_ROWS_MAX: u32 = define("GEMV_ROWS_MAX");
 /// Rows of the weight one `gemm_i8` block covers.

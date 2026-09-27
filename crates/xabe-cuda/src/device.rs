@@ -600,6 +600,8 @@ const NAMES: &[&str] = &[
     "gemm_i8_q4k",
     "gemm_i8_q6k",
     "gemm_i8_q4k_narrow",
+    "gemm_i8_q4k_skinny",
+    "gemm_i8_q6k_skinny",
     "gemm_i8_q6k_narrow",
     "gemm_reduce",
     "flash_attn",
@@ -688,6 +690,7 @@ const NAMES: &[&str] = &[
     "attn_decode_h128",
     "attn_decode_h128_c128",
     "attn_decode_h128_run",
+    "attn_decode_h64_run",
     "attn_decode_h64",
     "attn_decode_h64_g8",
     "attn_decode_h64_g8_c32",
@@ -2297,10 +2300,20 @@ impl Gpu {
             // would be computing a majority of nothing - which is every prefill
             // this pipeline runs, because a clause is twenty-odd tokens.
             let narrow = m <= kernels::GEMM_I8_MT_NARROW as usize;
-            let mt = if narrow {
+            let skinny = m <= kernels::GEMM_I8_MT_SKINNY as usize
+                && std::env::var_os("XABE_NO_SKINNY").is_none();
+            let mt = if skinny {
+                kernels::GEMM_I8_MT_SKINNY
+            } else if narrow {
                 kernels::GEMM_I8_MT_NARROW
             } else {
                 kernels::GEMM_I8_MT
+            };
+            // The skinny tile is one warp row: four warps, not eight.
+            let warps = if skinny {
+                kernels::GEMM_I8_WARPS / 2
+            } else {
+                kernels::GEMM_I8_WARPS
             };
             // One kernel per block format: the staging differs entirely and
             // compiling both into one entry point cost registers on both.
@@ -2310,8 +2323,10 @@ impl Gpu {
                 // computes `GEMM_I8_MT` rows either way, so a 24-token prefill
                 // against 128 of them is five sixths padding. See the note
                 // beside `GEMM_I8_ENTRY`.
+                Some(Quant::Q6K) if skinny => "gemm_i8_q6k_skinny",
                 Some(Quant::Q6K) if narrow => "gemm_i8_q6k_narrow",
                 Some(Quant::Q6K) => "gemm_i8_q6k",
+                _ if skinny => "gemm_i8_q4k_skinny",
                 _ if narrow => "gemm_i8_q4k_narrow",
                 _ => "gemm_i8_q4k",
             };
@@ -2351,7 +2366,7 @@ impl Gpu {
                     (n as u32).div_ceil(kernels::GEMM_I8_NT),
                     (batch.count * ksplit) as u32,
                 ),
-                block_dim: (32, kernels::GEMM_I8_WARPS, 1),
+                block_dim: (32, warps, 1),
                 shared_mem_bytes: 0,
             };
             // SAFETY: the grid covers every (batch, m, n) exactly once, `out`
@@ -3263,7 +3278,10 @@ impl Gpu {
         if let Some(b) = bias
             && b.len() < n
         {
-            return Err(CudaError::SliceOverrun { at: n, len: b.len() });
+            return Err(CudaError::SliceOverrun {
+                at: n,
+                len: b.len(),
+            });
         }
         // SAFETY: the grid covers every (row, column pair) of `[m, n]` once and
         // the epilogue stores each pair as one word; `n` is even.
@@ -5099,14 +5117,38 @@ impl Gpu {
             });
         }
         Ok(self
-            .silu_mul_pair_inner(x, rows, k, true)?
+            .silu_mul_pair_inner(x, rows, k, true, true)?
+            .expect("asked for the twin"))
+    }
+
+    /// [`Self::silu_mul_pair`] returning the twin alone: `x` is left as it
+    /// was rather than overwritten with the gated values. For a down
+    /// projection that is a Q4_K or Q6_K weight over a contraction that is a
+    /// whole number of super-blocks - both packed paths read the codes and
+    /// never the floats - where the store is half a gigabyte a layer at an
+    /// 8192-token prefill.
+    pub fn silu_mul_pair_codes(
+        &self,
+        x: &mut CudaSlice<f32>,
+        rows: usize,
+        k: usize,
+    ) -> Result<Q8, CudaError> {
+        let n = rows * k;
+        if !n.is_multiple_of(BLOCK as usize) || !k.is_multiple_of(32) {
+            return Err(CudaError::RaggedBlock {
+                k: n,
+                block: BLOCK as usize,
+            });
+        }
+        Ok(self
+            .silu_mul_pair_inner(x, rows, k, true, false)?
             .expect("asked for the twin"))
     }
 
     /// [`Self::silu_mul_pair`] without the int8 twin, for an f16 down
     /// projection that would never read the codes.
     pub fn silu_mul_halves(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<(), CudaError> {
-        self.silu_mul_pair_inner(x, 1, n, false)?;
+        self.silu_mul_pair_inner(x, 1, n, false, true)?;
         Ok(())
     }
 
@@ -5116,6 +5158,7 @@ impl Gpu {
         rows: usize,
         k: usize,
         quantize: bool,
+        store: bool,
     ) -> Result<Option<Q8>, CudaError> {
         let n = rows * k;
         // SAFETY: one thread per element writes every code, and its group's
@@ -5130,7 +5173,7 @@ impl Gpu {
         };
         let off = q8.as_ref().map_or(0, |q| q.scale_offset() as i32);
         let null: u64 = 0;
-        let ni = n as i32;
+        let (ni, st) = (n as i32, i32::from(store));
         let f = self.func("silu_mul_pair");
         let mut lb = self.stream.launch_builder(f);
         lb.arg(x);
@@ -5138,7 +5181,7 @@ impl Gpu {
             Some(q) => lb.arg(&mut q.buf),
             None => lb.arg(&null),
         };
-        lb.arg(&off).arg(&ni);
+        lb.arg(&off).arg(&ni).arg(&st);
         launched("silu_mul_pair", unsafe { lb.launch(Self::flat(n)) })?;
         Ok(q8)
     }
@@ -5607,12 +5650,11 @@ impl Gpu {
         // SAFETY: every (row, column) of the context is written by exactly one
         // lane: a warp owns sixteen rows of one head and stores all 64 of its
         // columns, and rows past `t` are never read.
-        let mut out = unsafe { self.stream.alloc::<u16>(t * d) }.map_err(|source| {
-            CudaError::Driver {
+        let mut out =
+            unsafe { self.stream.alloc::<u16>(t * d) }.map_err(|source| CudaError::Driver {
                 what: "allocating",
                 source,
-            }
-        })?;
+            })?;
         let k = qkv.slice(d..);
         let v = qkv.slice(2 * d..);
         let (ti, hi, si) = (t as i32, heads as i32, (3 * d) as i32);
@@ -5851,6 +5893,10 @@ impl Gpu {
                 "attn_decode_h64_g8_c32"
             }
             64 if heads / kv_heads.max(1) > kernels::AD_GMAX as usize => "attn_decode_h64_g8",
+            // The Whisper decoder's cross-attention over its 1500 encoder
+            // positions: 0.82 ms per 32 layers on the chunk kernel, 0.75 on
+            // the run kernel.
+            64 if heads == kv_heads && tk > AD_RUN_FROM_UNGROUPED => "attn_decode_h64_run",
             64 => "attn_decode_h64",
             _ => {
                 return Err(CudaError::UnsupportedAttention {
@@ -6078,7 +6124,10 @@ impl Gpu {
         }
         let group = heads / kv_heads;
         let ch = match name {
-            "attn_decode_h128_c32" | "attn_decode_h64_g8_c32" | "attn_decode_h128_run" => 32,
+            "attn_decode_h128_c32"
+            | "attn_decode_h64_g8_c32"
+            | "attn_decode_h128_run"
+            | "attn_decode_h64_run" => 32,
             "attn_decode_h128_c128" => 128,
             _ => kernels::AD_CH as usize,
         };
@@ -6087,7 +6136,7 @@ impl Gpu {
         // walking `per` of them - the last whatever is left, so none is
         // empty - and merges one partial a block. The chunk kernel is the
         // case of one chunk a block.
-        let run = name == "attn_decode_h128_run";
+        let run = name == "attn_decode_h128_run" || name == "attn_decode_h64_run";
         let splits = if run {
             let want = AD_BLOCK_TARGET.div_ceil(kv_heads).max(AD_MIN_SPLITS);
             let per = chunks.div_ceil(want.max(1));

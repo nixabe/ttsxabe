@@ -2806,6 +2806,10 @@ fn the_fused_decode_attention_matches_the_chain() {
         // Ungrouped past 1024, which takes the run kernel as the translator
         // does, with the fourteen-run floor rather than the block target.
         (40, 40, 128, 1500, 1536, true, false),
+        // The Whisper decoder's cross-attention, which takes the 64-wide run
+        // kernel: 20 heads over 1500 positions, scale on the query, a
+        // capacity whose value rows are only eight-byte aligned.
+        (20, 20, 64, 1500, 1500, true, true),
         (8, 8, 64, 5000, 5056, false, true),
     ];
     for (i, &(heads, kv, hd, tk, cap, half, scale_q)) in cases.iter().enumerate() {
@@ -4045,8 +4049,12 @@ fn the_encoder_attention_off_its_rows_is_the_split_path() {
                 .collect()
         };
         let mut q = g.upload(&col(0)).unwrap();
-        let k = g.split_heads(&g.upload(&col(d)).unwrap(), t, heads, hd).unwrap();
-        let v = g.split_heads_t(&g.upload(&col(2 * d)).unwrap(), t, heads, hd).unwrap();
+        let k = g
+            .split_heads(&g.upload(&col(d)).unwrap(), t, heads, hd)
+            .unwrap();
+        let v = g
+            .split_heads_t(&g.upload(&col(2 * d)).unwrap(), t, heads, hd)
+            .unwrap();
         g.scale_inplace(&mut q, t * d, scale).unwrap();
         let ctx = g
             .flash_attn(&q, &k, &v, t, 0, heads, heads, hd, t, 1.0, false)
@@ -4059,7 +4067,12 @@ fn the_encoder_attention_off_its_rows_is_the_split_path() {
             )
             .unwrap();
         let bad = want.iter().zip(&got).filter(|(a, b)| a != b).count();
-        assert_eq!(bad, 0, "t {t} heads {heads}: {bad} of {} differ", want.len());
+        assert_eq!(
+            bad,
+            0,
+            "t {t} heads {heads}: {bad} of {} differ",
+            want.len()
+        );
     }
 }
 
@@ -4069,8 +4082,14 @@ fn the_encoder_attention_off_its_rows_is_the_split_path() {
 #[test]
 fn the_gelu_epilogue_is_the_matmul_then_the_gelu() {
     let Some(g) = gpu() else { return };
-    for &(m, k, n) in &[(1500usize, 1280usize, 5120usize), (130, 96, 70), (3, 64, 32)] {
-        let a = g.to_f16(&g.upload(&seq(m * k, 71)).unwrap(), m * k).unwrap();
+    for &(m, k, n) in &[
+        (1500usize, 1280usize, 5120usize),
+        (130, 96, 70),
+        (3, 64, 32),
+    ] {
+        let a = g
+            .to_f16(&g.upload(&seq(m * k, 71)).unwrap(), m * k)
+            .unwrap();
         let w = g.upload_f16(&seq(n * k, 72)).unwrap();
         let b = g.upload(&seq(n, 73)).unwrap();
         let y = g

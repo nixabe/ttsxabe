@@ -334,8 +334,22 @@ fn as_int8(v: &[f32], k: usize) -> Vec<f32> {
 fn quantized_gemm_matches_the_cpu_dequantizer() {
     let Some(g) = gpu() else { return };
     // Past GEMV_MAX_M so it dispatches to the tensor cores, and past one block
-    // tile in n so the predication runs too.
-    let (m, k, n) = (140usize, 512usize, 130usize);
+    // tile in n so the predication runs too. Each row count reaches one of
+    // the integer kernel's row tiles - 128, 64 and the 32-row skinny tile,
+    // whose trip is 128 elements rather than 64 - and 768 is three
+    // super-blocks, so a trip lands on both halves of one.
+    for &(m, k, n) in &[
+        (140usize, 512usize, 130usize),
+        (50, 512, 130),
+        (24, 768, 130),
+        (32, 512, 260),
+        (5, 256, 130),
+    ] {
+        quantized_gemm_case(&g, m, k, n);
+    }
+}
+
+fn quantized_gemm_case(g: &xabe_cuda::Gpu, m: usize, k: usize, n: usize) {
     assert!(m > xabe_cuda::GEMV_MAX_M, "this shape must take gemm");
 
     for &(q, gt) in FORMATS {
@@ -380,7 +394,7 @@ fn quantized_gemm_matches_the_cpu_dequantizer() {
         // which is what this is - and it is still nowhere near loose enough to
         // hide a permuted block, since permuting one changes the result by the
         // size of the terms rather than by the size of the rounding.
-        let name = format!("gemm {q:?}");
+        let name = format!("gemm {q:?} {m}x{k}x{n}");
         assert_eq!(want.len(), got.len(), "{name}: length");
         for row in 0..m {
             for col in 0..n {

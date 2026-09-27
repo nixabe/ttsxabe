@@ -55,8 +55,8 @@ fn main() -> ExitCode {
         }
     };
     println!(
-        "{:32} {:>10} {:>9} {:>7}",
-        "shape", "bytes", "median", "GB/s"
+        "{:32} {:>10} {:>10} {:>7}   {:>10} {:>7}",
+        "shape", "bytes", "median", "GB/s", "in stream", "GB/s"
     );
     for &(k, n, what) in SHAPES {
         let a = gpu.upload(&seq(k, 1)).expect("upload a");
@@ -85,13 +85,28 @@ fn main() -> ExitCode {
             times.push(t.elapsed().as_secs_f64() * 1e6);
         }
         let us = median(times);
+        // Back to back, as a decode step issues them: thirty-two launches and
+        // one synchronise, so the launch and the synchronise are not charged
+        // to every call.
+        let mut stream = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+            let t = Instant::now();
+            for _ in 0..32 {
+                let _ = run(&gpu);
+            }
+            gpu.synchronize().expect("sync");
+            stream.push(t.elapsed().as_secs_f64() * 1e6 / 32.0);
+        }
+        let su = median(stream);
         let bytes = (n * k * 2) as f64;
         println!(
-            "{:32} {:>10} {:>7.1} us {:>7.0}",
+            "{:32} {:>10} {:>7.1} us {:>7.0}   {:>7.1} us {:>7.0}",
             format!("{what} {k}x{n}"),
             format!("{:.1} MB", bytes / 1e6),
             us,
-            bytes / us / 1e3
+            bytes / us / 1e3,
+            su,
+            bytes / su / 1e3
         );
     }
     ExitCode::SUCCESS
