@@ -37,6 +37,12 @@ const CONV_BLOCK: u32 = 128;
 /// the staging stops paying for itself.
 const SM_TARGET: usize = 144;
 
+/// Blocks the streaming int8 matmul can hold resident: four of its four-warp
+/// blocks an SM on this card's 72, which is what its 11 KB of shared memory
+/// and 128 registers allow. A launch with fewer splits its contraction until
+/// it has about that many, and never below two super-blocks a slice.
+const STREAM_TARGET: usize = 288;
+
 /// Blocks the decode attention's run kernel spreads a layer over: three
 /// resident a card's 72 SMs. Past this many chunks a block walks a run of
 /// them rather than taking one. Swept at 72 to 576 on the chat model's
@@ -87,26 +93,6 @@ const KSLICE_TAIL: usize = 2048;
 /// between those two measurements, not derived.
 const TAIL_IDLE_MIN: f64 = 0.3;
 
-/// How many ways `gemm` splits the contraction at this shape. One is no split.
-///
-/// A function rather than an expression at the call site so the geometry can be
-/// asserted without a device: what it returns decides whether a launch writes
-/// `out` or a scratch buffer, and getting it wrong is silent.
-///
-/// Two regimes, split on whether the launch fills one wave of `SM_TARGET`
-/// resident blocks:
-///
-/// * **Under a wave**, splitting turns idle SMs into concurrent slices and the
-///   old rule stands: fill the machine, keep a slice at least `KSLICE_MIN`.
-/// * **Over a wave**, more blocks do not buy concurrency - they buy a shorter
-///   *tail*. A launch of 1.11 waves runs its last 16 blocks on an otherwise
-///   idle machine for a whole block's k-loop, and splitting s ways cuts that
-///   straggler's loop by s. That is worth having exactly when the idle
-///   fraction is large - the translator's 5120-wide projections at 512 tokens,
-///   160 blocks, 44% idle, measured 15-25% faster split four ways - and worth
-///   avoiding when the waves are already full: the same model's 13824-wide
-///   projections, three exact waves, measured 80% *slower* split in two. The
-///   slice floor is higher here too; see `KSLICE_TAIL`.
 /// Rows a device tile of a K-quant matrix; `QT_TILE` in the kernel source.
 pub const Q_TILE: usize = kernels::QT_TILE as usize;
 
@@ -127,6 +113,26 @@ pub fn tiled_order(rows: usize, per_row: usize) -> impl Iterator<Item = (usize, 
     })
 }
 
+/// How many ways `gemm` splits the contraction at this shape. One is no split.
+///
+/// A function rather than an expression at the call site so the geometry can be
+/// asserted without a device: what it returns decides whether a launch writes
+/// `out` or a scratch buffer, and getting it wrong is silent.
+///
+/// Two regimes, split on whether the launch fills one wave of `SM_TARGET`
+/// resident blocks:
+///
+/// * **Under a wave**, splitting turns idle SMs into concurrent slices and the
+///   old rule stands: fill the machine, keep a slice at least `KSLICE_MIN`.
+/// * **Over a wave**, more blocks do not buy concurrency - they buy a shorter
+///   *tail*. A launch of 1.11 waves runs its last 16 blocks on an otherwise
+///   idle machine for a whole block's k-loop, and splitting s ways cuts that
+///   straggler's loop by s. That is worth having exactly when the idle
+///   fraction is large - the translator's 5120-wide projections at 512 tokens,
+///   160 blocks, 44% idle, measured 15-25% faster split four ways - and worth
+///   avoiding when the waves are already full: the same model's 13824-wide
+///   projections, three exact waves, measured 80% *slower* split in two. The
+///   slice floor is higher here too; see `KSLICE_TAIL`.
 pub fn ksplit_for(m: usize, k: usize, n: usize, batch: usize) -> usize {
     let blocks =
         n.div_ceil(kernels::GEMM_NT as usize) * m.div_ceil(kernels::GEMM_MT as usize) * batch;
@@ -622,6 +628,14 @@ const NAMES: &[&str] = &[
     "gemm_i8_q4k_narrow",
     "gemm_i8_q4k_skinny",
     "gemm_i8_q6k_skinny",
+    "gemm_i8_stream_q4k_m1",
+    "gemm_i8_stream_q4k_m2",
+    "gemm_i8_stream_q4k_m3",
+    "gemm_i8_stream_q4k_m4",
+    "gemm_i8_stream_q6k_m1",
+    "gemm_i8_stream_q6k_m2",
+    "gemm_i8_stream_q6k_m3",
+    "gemm_i8_stream_q6k_m4",
     "gemm_i8_q6k_narrow",
     "gemm_reduce",
     "flash_attn",
@@ -2342,8 +2356,19 @@ impl Gpu {
         // Kept to a whole number of staged trips each, and only while a slice
         // still has enough contraction to amortise its staging; below that the
         // split costs more than the idle SMs do.
+        //
+        // A prompt of up to 32 rows against a K-quant takes the streaming
+        // kernel instead, which sizes its split to its own capacity - see
+        // `gemm_i8_stream_body`. `XABE_NO_STREAM` sends it to the tiled one,
+        // for comparing.
+        let stream = use_i8
+            && m <= kernels::GEMM_IS_MP as usize
+            && std::env::var_os("XABE_NO_STREAM").is_none();
         let ksplit = if small {
             1
+        } else if stream {
+            let blocks = n.div_ceil(kernels::GEMM_IS_NT as usize) * batch.count;
+            (STREAM_TARGET / blocks).clamp(1, (k / 256 / 2).max(1))
         } else {
             ksplit_for(m, k, n, batch.count)
         };
@@ -2430,6 +2455,19 @@ impl Gpu {
             // One kernel per block format: the staging differs entirely and
             // compiling both into one entry point cost registers on both.
             let name = match w.quant() {
+                // One entry point a row-group count: see the kernel.
+                Some(Quant::Q6K) if stream => [
+                    "gemm_i8_stream_q6k_m1",
+                    "gemm_i8_stream_q6k_m2",
+                    "gemm_i8_stream_q6k_m3",
+                    "gemm_i8_stream_q6k_m4",
+                ][m.div_ceil(8) - 1],
+                _ if stream => [
+                    "gemm_i8_stream_q4k_m1",
+                    "gemm_i8_stream_q4k_m2",
+                    "gemm_i8_stream_q4k_m3",
+                    "gemm_i8_stream_q4k_m4",
+                ][m.div_ceil(8) - 1],
                 // The narrow row tile where the wide one would spend most of
                 // its arithmetic on rows the prompt does not have: a block
                 // computes `GEMM_I8_MT` rows either way, so a 24-token prefill
@@ -2472,14 +2510,26 @@ impl Gpu {
                 Some(p) => lb.arg(p),
                 None => lb.arg(&null),
             };
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (
-                    (m as u32).div_ceil(mt),
-                    (n as u32).div_ceil(kernels::GEMM_I8_NT),
-                    (batch.count * ksplit) as u32,
-                ),
-                block_dim: (32, warps, 1),
-                shared_mem_bytes: 0,
+            let cfg = if stream {
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (
+                        (n as u32).div_ceil(kernels::GEMM_IS_NT),
+                        1,
+                        (batch.count * ksplit) as u32,
+                    ),
+                    block_dim: (32, kernels::GEMM_IS_WARPS, 1),
+                    shared_mem_bytes: 0,
+                }
+            } else {
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (
+                        (m as u32).div_ceil(mt),
+                        (n as u32).div_ceil(kernels::GEMM_I8_NT),
+                        (batch.count * ksplit) as u32,
+                    ),
+                    block_dim: (32, warps, 1),
+                    shared_mem_bytes: 0,
+                }
             };
             // SAFETY: the grid covers every (batch, m, n) exactly once, `out`
             // is batch*m*n elements, and every global read and write inside
@@ -6584,7 +6634,10 @@ mod upload_tests {
             let parts = [&raw[3 * ts..], &[][..], &raw[..3 * ts]];
             let ordered = parts.concat();
             let mut device = vec![0u8; blocks * stride];
-            for (src, dst) in ordered.chunks_exact(ts).zip(device.chunks_exact_mut(stride)) {
+            for (src, dst) in ordered
+                .chunks_exact(ts)
+                .zip(device.chunks_exact_mut(stride))
+            {
                 if q == Quant::Q6K {
                     Gpu::q6k_device_block(src, dst);
                 } else {

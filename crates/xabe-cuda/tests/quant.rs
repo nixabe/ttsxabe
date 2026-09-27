@@ -665,7 +665,9 @@ fn a_batch_over_one_activation_matches_the_same_products_apart() {
             let per = q.block_size();
             for c in 0..count {
                 let bytes = raw.len() / count;
-                let one = g.upload_quant(q, &raw[c * bytes..(c + 1) * bytes], k).unwrap();
+                let one = g
+                    .upload_quant(q, &raw[c * bytes..(c + 1) * bytes], k)
+                    .unwrap();
                 let apart = g
                     .gemm_batched(
                         Operand::F32(&da),

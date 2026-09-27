@@ -802,6 +802,82 @@ last tile from `n`. `gemm_batched_from` refuses anything else as
 `UntiledView`, by name. Every stacked projection in the two Llama models is a
 multiple of 64 rows.
 
+### A short prompt streams: `gemm_i8_stream`
+
+With the weights tiled, the skinny kernel still read them at about 250 GB/s
+against the mat-vec's 565, and ablation said where the rest went. On the
+13 B gate and up at 24 rows, `bench-qgemm`, with the shared tiles kept live
+by a guarded sink so the compiler could not delete what it measured:
+
+| what the kernel did | us |
+| --- | ---: |
+| everything | 290 |
+| no `mma`, no epilogue | 230 |
+| fetch only: loads, activation copy, barriers | 224 |
+| the mat-vec, one row, the same bytes | 141 |
+
+So the tensor cores were not the problem and neither was the decode: a
+fetch serialised behind two barriers a trip, at eight to twelve warps an SM,
+was. Splitting each trip's staging into "issue every read" then "decode"
+took it to 294-323 and 36.6 ms end to end; raw Q4_K nibbles in shared memory
+(one `ldmatrix` of a raw run is two sub-blocks' fragments, low and high
+nibbles) and a 128-element trip took it to 34.1 ms. Both stayed in
+`gemm_i8`, below the 128-row tile and for Q4_K only: the 64-row tile gained
+from them (the 13 B gate and up 556 us to 508 at 64 rows), and the 128-row
+tile, which is bound by its arithmetic, lost to both - unpacking in the
+`mma` loop cost Q4_K 3% there, and a trip's raw words held across the
+activation copy spilled Q6_K and cost it 7% at 128 and 512 rows. Measured
+at the short end only, that loss reached a 128-token prefill end to end
+before it was caught.
+
+The kernel that closed the row is a different shape. `gemm_i8_stream_q4k`
+and `_q6k` are the mat-vec with tensor cores: a warp owns sixteen weight
+rows and reads them itself, a super-block a step, straight into `mma`
+fragments - lane (row `l >> 2`, `t`) loads word `t` of every sixteen-byte
+run, which is exactly the m8n8k16 B fragment of that run - with the next
+super-block's words in flight while this one's are multiplied. The
+activation, which is the only thing the warps share, is staged a super-block
+at a time and handed out through `ldmatrix`. Fetch alone ran 160-177 us, so
+the memory side was fixed at once; everything after was the compute side,
+and three things decided it, each measured on the same shape at 24 rows:
+
+| change | 13 B gate+up | down, Q6_K |
+| --- | ---: | ---: |
+| first version, eight rows a warp, and three changes after it that did not move it | 408-445 us | 258 |
+| (scale, sum) rows padded off one bank | **288** | - |
+| Q6_K's high fields dealt four words a lane, not sixteen | - | **214** |
+| sixteen rows a warp, one-super-block chunk, four blocks an SM | **243** | **189** |
+
+The first is the one worth knowing. The epilogue's (scale, sum) pairs sat at
+a row stride of 32 floats, so the eight lanes reading eight rows' pairs at
+once all hit one bank - an eight-way conflict on every sub-block's scale
+load, which cost more than every `mma` in the kernel. Two floats of padding
+a row. The second was a spill: every lane holding all sixteen high-field
+words, double-buffered, put Q6_K 48 bytes into local memory; each lane of a
+row now holds four and a step asks the lane that has the one it needs. The
+third trades barriers for occupancy: a chunk of two super-blocks halved the
+barriers but needed 21 KB of shared memory and three blocks an SM, and one
+super-block at 11 KB fits four, which hides the `ldmatrix` better than the
+saved barriers were worth.
+
+What did not work, each measured and removed: prefetching the next chunk's
+activation into registers (it spilled and gained nothing, at two blocks or
+three); keeping Q4_K's scales in the tiled kernel as header bytes plus one
+`(d, dmin)` to reach four blocks an SM there (the multiplies in the `mma`
+loop cost more than the block bought, 34.1 ms to 35.6); and skipping a
+32-row tile's padding rows in the tiled kernel (the branch cost Q6_K 72
+bytes of spill). The epilogue converts its integer dot with `i2f_small`, an
+exact two-instruction conversion on the full-rate pipes rather than `I2F`,
+which is quarter-rate here; it was changed together with the scale decode
+and its own share was not isolated.
+
+The arithmetic is `gemm_i8`'s, operation for operation - the same integer
+sums and the same `acc += as * (ds * dot - dm * sum)` a sub-block in k
+order - so at the same split the output is the same bits; the split is
+chosen for this kernel's capacity (288 blocks), which is why the translator's
+packed-against-unpacked agreement moved from 0.126 of the span to 0.131.
+Prompts of 5 to 32 rows take it, with `XABE_NO_STREAM` to compare.
+
 ### The trip is 64 elements, and that number is not a tuning constant
 
 Two Q4_K sub-blocks. Every part of the kernel's shape follows from it:

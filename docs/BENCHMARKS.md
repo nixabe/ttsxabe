@@ -5,15 +5,16 @@
 The one-line version: the synthesiser is 1.24x faster than PyTorch; the ASR is
 1.45x against `whisper-server` on three seconds of speech and 1.50x to 1.58x
 from five seconds up, alternated in one sitting against a `whisper-server`
-built here from the same checkpoint; and both Llama stages are **ahead of
-llama.cpp on every measured row but one**, from 128 tokens to the models'
+built here from the same checkpoint; and both Llama stages are **level with
+or ahead of llama.cpp on every measured row**, from 16 tokens to the models'
 long contexts - chat prefill 1.08x to 1.14x and decode 1.02x to 1.09x
 through 8192 positions, translator prefill 1.03x to 1.18x and decode 1.02x to
-1.07x through 3968. The one row not won is the translator prefilling a
-24-token clause, at 0.74x then and 0.84x since the K-quant weights sit on the
-card in tiles ("The short prefill: a K-quant in tiles"). "Long context: the
-round that won it" has the table; each of those has its own section, and this
-paragraph is not the evidence for any of them.
+1.07x through 3968. The row that was not won - the translator prefilling a
+24-token clause, at 0.74x - is won now: 1.20x at 16 and 24 tokens and 1.22x
+at 32, and the chat model 1.15x at 24 ("The short prefill won: a matmul that
+streams"), with 64 tokens level. "Long context: the round that won it" has
+the long rows; each of those has its own section, and this paragraph is not
+the evidence for any of them.
 
 One Quadro RTX 8000, `facebook/mms-tts-nan`, the sentence
 `lí hó, kin-á-ji̍t thinn-khì chin hó.` (69 symbols, ~2.6 s of audio at 16 kHz).
@@ -1095,6 +1096,53 @@ they are what makes the packed-weight work measurable at all - but nothing here
 should claim the pipeline is fastest with them in the reply path, because it is
 not.
 
+## The short prefill won: a matmul that streams
+
+The 24-token row was the one this file recorded as lost - 0.74x, then 0.84x
+once the weights sat in tiles. It is won now, at every prompt length llama.cpp
+was run at from 16 to 32 tokens. The kernel is `gemm_i8_stream`, the mat-vec
+with tensor cores: a warp reads its own sixteen weight rows straight into
+`mma` fragments with the next super-block in flight, and only the 24-row
+activation is shared. `KERNELS.md`, "A short prompt streams", has the design,
+the ablations that pointed at it and the three changes that decided it.
+
+The previous commit's binary against this one, alternated twice through in
+one sitting with `llama-bench -n 0 -ngl 99 -r 9` on the same card and file,
+`xabe-llm-bench --rounds 9 --decode 64`. The engine's two passes agree to
+1.1% on every cell and the first is given; llama.cpp's two agree to 1% and
+their mean is given.
+
+| Taigi 13 B Q4_K_M | before | now | | llama.cpp | |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefill, 16 tok | 38.7 ms | **25.0** | 1.55x | 531 +/- 60 tok/s | **1.20x** |
+| prefill, 24 | 40.1 | **27.4** | 1.46x | 731 +/- 42 | **1.20x** |
+| prefill, 32 | 41.0 | **30.2** | 1.36x | 868 +/- 32 | **1.22x** |
+| prefill, 64 | 56.0 | **52.5** | 1.07x | 1210 +/- 34 | 1.01x |
+| prefill, 128 | 88.2 | **87.3** | 1.01x | | |
+| prefill, 512 | 309.6 | **306.5** | 1.01x | | |
+| decode after 24 | 15.17 ms/tok | 15.15 | level | | |
+
+| Breeze2 8 B Q4_K_M | before | now | | llama.cpp | |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefill, 24 tok | 23.1 ms | **17.0** | 1.36x | 1224 +/- 159 tok/s | **1.15x** |
+| prefill, 128 | 50.9 | **50.2** | 1.01x | | |
+| prefill, 512 | 166.2 | **165.1** | 1.01x | | |
+| decode after 24 | 9.18 ms/tok | 9.18 | level | | |
+
+The 64-token row is level, not won: 1218 against 1210 with llama.cpp's
+spread at 34. The chat model's 24-token row is ahead by more than llama.cpp's
+own spread, which at 160 tok/s is the widest in the table.
+
+`bench-qgemm` at 24 rows, microseconds, the previous commit against this one:
+13 B gate+up 343 to **268**, 13 B down (Q6_K) 264 to **166**, 13 B q 88 to
+**61**, 8 B gate+up 273 to **196**.
+
+One thing in the round is a warning rather than a result. The staging
+changes that paid at 24 and 64 rows were first applied to every row tile of
+`gemm_i8`, and a sitting that measured only the short end would have
+shipped a 2% loss at 128 tokens on both models; the full-range table above
+is what caught it.
+
 ## The short prefill: a K-quant in tiles
 
 Q4_K and Q6_K sit on the card as 64-row tiles of four-super-block groups
@@ -1160,8 +1208,9 @@ after a prompt of the given length, against `tg64 @ d<depth>`.
 | decode at 2048 | 51.8 | **54.0** | 1.04x |
 | decode at 3968 | 46.2 | **47.0** | 1.02x |
 
-**The 24-token row is a loss and is recorded as one** (0.84x since, under "The
-short prefill: a K-quant in tiles"). It is the translator's
+**The 24-token row is a loss and is recorded as one** (0.84x after "The short
+prefill: a K-quant in tiles", and won since, 1.20x, under "The short prefill
+won: a matmul that streams"). It is the translator's
 real clause length, so it is not a corner: 46.5 ms against about 33. It was
 52.4 before this round; `KERNELS.md` has the 32-row tile that took it to
 46.5, the five attempts that did not close the rest, and the lever left. The

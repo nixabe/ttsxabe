@@ -247,8 +247,9 @@ against 19.7, 19.8 and 25.6, `gemm`'s output bit for bit, and the encoder went
 from 105.5 ms to 78.5. The lesson is the same one twice: a measured limit is
 a limit of the shape measured. `docs/KERNELS.md` has both tables.
 
-The Llama stages are **ahead of llama.cpp on every measured row but one**,
-short context to long: chat prefill 1.08x to 1.14x from 128 to 8192 tokens,
+The Llama stages are **level with or ahead of llama.cpp on every measured
+row**, 16 tokens to long context: prefill 1.15x to 1.22x on 16- to 32-token
+prompts, level at 64, chat prefill 1.08x to 1.14x from 128 to 8192 tokens,
 chat decode 1.09x from empty and 1.02x after 8192 positions, translator
 prefill 1.03x to 1.18x from 128 to 3968 tokens and decode 1.07x to 1.02x.
 The long-context rows were losses at the start of 2026-09-27 - chat prefill
@@ -260,17 +261,24 @@ reply rather than re-striding a full cache on the first decoded token, the
 decode attention dealing its chunks strided so its speed stops depending on
 the cache's capacity, and the SwiGLU skipping a store nothing read.
 
-**The one row not won is the one the pipeline runs most**: the translator
-prefilling a 24-token clause, 39.7 ms against llama.cpp's 33 (0.84x). A
-32-row int8 tile took it from 52.4 to 46.5, and the weight *layout* took it
-the rest: a short prompt's blocks had read 32 bytes from each of tens of
-thousands of rows at once, and Q4_K and Q6_K now sit on the card in 64-row
-tiles of four-super-block groups, so those rows are side by side while a
-decode warp's 576-byte read is as contiguous as before - decode level, 512
-tokens level, 16 to 32 tokens 1.16x to 1.18x. The finding to carry is that
-the order won only once its address was computed in 32 bits: in 64 it was a
-third of the gain and a loss at 512. `docs/KERNELS.md` has the layout and
-`docs/BENCHMARKS.md` the table under "The short prefill: a K-quant in tiles".
+**The row that was not won is won now, and it is the one the pipeline runs
+most**: the translator prefilling a 24-token clause, 27.4 ms against
+llama.cpp's 731 tok/s - **1.20x**, from 0.74x - and 1.20x and 1.22x at 16 and
+32 tokens, with the chat model 1.15x at 24 and 64 tokens level. Three rounds
+took it. A 32-row int8 tile, 52.4 ms to 46.5. The weight *layout*, 46.5 to
+39.7: Q4_K and Q6_K sit on the card in 64-row tiles of four-super-block
+groups, so a short prompt's rows are side by side while a decode warp's
+576-byte read is as contiguous as before - and that order won only once its
+address was computed in 32 bits. And a new kernel, 39.7 to 27.4:
+`gemm_i8_stream` is the mat-vec with tensor cores, each warp reading its own
+weight rows straight into `mma` fragments with the next super-block in
+flight. The finding to carry from that one is how it was found: timed with
+its `mma` removed, the tiled kernel was still 224 us of its 290, so the
+fetch behind the barriers was the cost and no arithmetic change could have
+closed it - and the new kernel then spent more time than its arithmetic in
+an eight-way shared-memory bank conflict on its scale loads, which two
+floats of padding removed. `docs/KERNELS.md` has both kernels and
+`docs/BENCHMARKS.md` the table under "The short prefill won".
 
 The translator's *latency* is a separate question from its throughput and has
 its own section in `docs/BENCHMARKS.md`. What is worth knowing here: a

@@ -78,12 +78,29 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // What the kernels cost in registers, spill and shared memory: a short
+    // prompt's matmul is latency-bound, and its occupancy is the budget.
+    for name in [
+        "gemm_i8_q4k",
+        "gemm_i8_q6k",
+        "gemm_i8_q6k_narrow",
+        "gemm_i8_q4k_skinny",
+        "gemm_i8_q6k_skinny",
+        "gemm_i8_q4k_narrow",
+        "gemm_i8_stream_q4k_m3",
+        "gemm_i8_stream_q6k_m3",
+    ] {
+        if let Some((regs, local, shared)) = g.kernel_resources(name) {
+            tracing::info!("{name}: {regs} registers, {local} B spilled, {shared} B shared");
+        }
+    }
     // (what, k, n, format)
     let weights: &[(&str, usize, usize, Quant)] = &[
         ("13B gate+up", 5120, 27648, Quant::Q4K),
         ("13B down", 13824, 5120, Quant::Q6K),
         ("13B q", 5120, 5120, Quant::Q4K),
         ("8B gate+up", 4096, 28672, Quant::Q4K),
+        ("8B at 216 tiles", 4096, 27648, Quant::Q4K),
     ];
     let rows: Vec<usize> = std::env::var("XABE_ROWS")
         .ok()

@@ -2108,6 +2108,26 @@ __device__ __forceinline__ void gemm_i8_body(
     constexpr int IPR = KC / 32;               // staging items a weight row
     constexpr int WORDS = KC / 4;
     constexpr int STRIDE = WORDS + 4;
+    // Q4_K's weights go into shared memory as the file's nibbles, not as
+    // unpacked codes. The pairing that makes a 64-element trip read both
+    // halves of every byte also makes a raw sixteen-byte run two `mma`
+    // fragments at once: `ldmatrix` hands a lane four bytes of it, and their
+    // low nibbles are the fragment of one sub-block and their high nibbles
+    // the same position in the next. So the unpacking is a mask and a shift
+    // in the `mma` loop, and the tile is half the shared memory - which is
+    // what lets a skinny trip be 128 elements at three blocks an SM.
+    constexpr bool RAW = (QT == QT_Q4_K) && MT < 128;
+    // Both only below the wide tile, and the early reads only for Q4_K. At
+    // 128 rows the kernel is bound by its arithmetic: unpacking in the `mma`
+    // loop cost Q4_K there, and a trip's raw words held across the
+    // activation copy spilled Q6_K and cost it 7%. Q6_K on the narrow tile
+    // measured level either way, so it reads an item where it decodes it,
+    // as it always did.
+    constexpr bool EARLY = MT < 128 && QT == QT_Q4_K;
+    constexpr int BSTRIDE = (RAW ? KC / 8 : WORDS) + 4;
+    // Q4_K's scale is constant across a sub-block, so it keeps one a
+    // sub-block where Q6_K keeps one an `mma` step.
+    constexpr int DKS = RAW ? 1 : GEMM_I8_KS;
     static_assert(KC % 64 == 0 && 256 % KC == 0, "a trip is whole pair groups of a super-block");
     constexpr int THREADS = WM * GEMM_I8_WN * 32;
     constexpr int BITER = (GEMM_I8_NT * IPR + THREADS - 1) / THREADS;
@@ -2116,7 +2136,7 @@ __device__ __forceinline__ void gemm_i8_body(
     static_assert(MS % 4 == 0, "the fragment load takes four row groups");
 
     __shared__ __align__(16) unsigned au[MT * STRIDE];
-    __shared__ __align__(16) unsigned bu[GEMM_I8_NT * STRIDE];
+    __shared__ __align__(16) unsigned bu[GEMM_I8_NT * BSTRIDE];
     // Scales, paired so that a lane fetches both halves of what it needs in one
     // eight-byte load. This is the difference between the scales costing more
     // shared traffic than the fragments and costing a fraction of them.
@@ -2125,7 +2145,7 @@ __device__ __forceinline__ void gemm_i8_body(
     // per `mma` step, because Q6_K changes scale every sixteen weights; `bdm`
     // is `dmin * mn` per sub-block, which Q6_K does not have at all.
     __shared__ __align__(8) float asx[MT * SUB * 2];
-    __shared__ __align__(8) float bds[SUB][GEMM_I8_KS][GEMM_I8_NT];
+    __shared__ __align__(8) float bds[SUB][DKS][GEMM_I8_NT];
     __shared__ __align__(8) float bdm[SUB][GEMM_I8_NT];
 
     // Codes then scales in one allocation, the layout `quantize_q8` writes.
@@ -2208,6 +2228,49 @@ __device__ __forceinline__ void gemm_i8_body(
     }
 
     for (int kc = kbeg; kc < kend; kc += KC) {
+        // Every global read of the trip's weights first, into registers,
+        // and only then the activation copy and the decode. Written the
+        // obvious way - read an item, decode it, read the next - a trip
+        // waited on DRAM once for the header, once for each item's quants and
+        // once for the activation, in series, and a short prompt has too few
+        // warps an SM to hide that behind anyone else. The raw words are live
+        // only while staging, when none of the fragment registers are.
+        unsigned raw[BITER][GEMM_I8_KG / 4], rawh[BITER][2];
+        auto wfetch1 = [&](int u) {
+            {
+                const int i = tid + u * THREADS;
+                if (i >= GEMM_I8_NT * IPR) return;
+                const int r = i / IPR, h = i % IPR;
+                const int p = h >> 1, hk = h & 1;
+                const int col = n0 + r;
+                if (col < n) {
+                    const long sb = (long)qblk(col, kc >> 8, nb, n);
+                    const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
+                    const int j = (kc & 255) + 64 * p + GEMM_I8_KG * hk;
+                    if (sb != wsb[u]) {
+                        wsb[u] = sb;
+                        if (QT == QT_Q4_K) {
+                            whdr[u] = *reinterpret_cast<const uint4*>(blk);
+                        } else {
+                            whdr[u] = *reinterpret_cast<const uint4*>(blk + 192);
+                            wd[u] = q_f16(blk, 208);
+                        }
+                    }
+                    if (QT == QT_Q4_K) {
+                        q_words<GEMM_I8_KG / 4>(blk + 16 + ((j >> 6) << 5) + (j & 31), raw[u]);
+                    } else {
+                        const int pq = j >> 6, hq = (j >> 4) & 1;
+                        q_words<GEMM_I8_KG / 4>(blk + (pq << 5) + (hq << 4), raw[u]);
+                        q_words<2>(blk + 128 + (pq << 4) + (hq << 3), rawh[u]);
+                    }
+                }
+            }
+        };
+        if (EARLY) {
+            #pragma unroll
+            for (int u = 0; u < BITER; ++u) wfetch1(u);
+        }
+
         // The activation is already int8: `gemm_batched` quantizes it once for
         // the whole launch. Doing it here instead - which the first version of
         // this kernel did - repeats the maximum, the reciprocal and the
@@ -2259,16 +2322,27 @@ __device__ __forceinline__ void gemm_i8_body(
             for (int t = 0; t < GEMM_I8_KG / 4; ++t) lo[t] = hi[t] = 0u;
             float ds0 = 0.0f, ds1 = 0.0f, dm0 = 0.0f, dm1 = 0.0f;
             if (col < n) {
-                const long sb = (long)qblk(col, kc >> 8, nb, n);
-                const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
                 const int j = (kc & 255) + 64 * p + GEMM_I8_KG * hk;
-                if (sb != wsb[u]) {
-                    wsb[u] = sb;
+                // The wide tile reads an item where it decodes it, as it
+                // always did: see EARLY.
+                if (!EARLY) {
+                    const long sb = (long)qblk(col, kc >> 8, nb, n);
+                    const unsigned char* blk = wb + (size_t)sb * (size_t)q_ts;
+                    if (sb != wsb[u]) {
+                        wsb[u] = sb;
+                        if (QT == QT_Q4_K) {
+                            whdr[u] = *reinterpret_cast<const uint4*>(blk);
+                        } else {
+                            whdr[u] = *reinterpret_cast<const uint4*>(blk + 192);
+                            wd[u] = q_f16(blk, 208);
+                        }
+                    }
                     if (QT == QT_Q4_K) {
-                        whdr[u] = *reinterpret_cast<const uint4*>(blk);
+                        q_words<GEMM_I8_KG / 4>(blk + 16 + ((j >> 6) << 5) + (j & 31), raw[u]);
                     } else {
-                        whdr[u] = *reinterpret_cast<const uint4*>(blk + 192);
-                        wd[u] = q_f16(blk, 208);
+                        const int pq = j >> 6, hq = (j >> 4) & 1;
+                        q_words<GEMM_I8_KG / 4>(blk + (pq << 5) + (hq << 4), raw[u]);
+                        q_words<2>(blk + 128 + (pq << 4) + (hq << 3), rawh[u]);
                     }
                 }
                 if (QT == QT_Q4_K) {
@@ -2282,12 +2356,12 @@ __device__ __forceinline__ void gemm_i8_body(
                                       (j >> 5) + 1, sc, mn);
                     ds1 = q_half_lo(whdr[u].x) * (float)sc;
                     dm1 = q_half_hi(whdr[u].x) * (float)mn;
-                    unsigned w[GEMM_I8_KG / 4];
-                    q_words<GEMM_I8_KG / 4>(blk + 16 + ((j >> 6) << 5) + (j & 31), w);
+                    // Raw, the nibbles go to shared memory as they are and
+                    // the `mma` loop unpacks them; otherwise unpacked here.
                     #pragma unroll
                     for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
-                        lo[t] = w[t] & 0x0F0F0F0Fu;
-                        hi[t] = (w[t] >> 4) & 0x0F0F0F0Fu;
+                        lo[t] = RAW ? raw[u][t] : raw[u][t] & 0x0F0F0F0Fu;
+                        hi[t] = RAW ? 0u : (raw[u][t] >> 4) & 0x0F0F0F0Fu;
                     }
                 } else {
                     // Q6_K: `d * scales[j/16] * (q - 32)`, no minimum. In the
@@ -2326,10 +2400,8 @@ __device__ __forceinline__ void gemm_i8_body(
                     dm0 = wd[u];
                     dm1 = wd[u];
 
-                    const int pq = j >> 6, hq = (j >> 4) & 1;
-                    unsigned w[GEMM_I8_KG / 4], hw[2];
-                    q_words<GEMM_I8_KG / 4>(blk + (pq << 5) + (hq << 4), w);
-                    q_words<2>(blk + 128 + (pq << 4) + (hq << 3), hw);
+                    const unsigned* w = raw[u];
+                    const unsigned* hw = rawh[u];
                     #pragma unroll
                     for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
                         const unsigned a0 = w[t] & 0x0F0F0F0Fu;
@@ -2341,14 +2413,24 @@ __device__ __forceinline__ void gemm_i8_body(
                     }
                 }
             }
-            unsigned* dst = &bu[r * STRIDE + 16 * p + (GEMM_I8_KG / 4) * hk];
-            #pragma unroll
-            for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
-                dst[t] = lo[t];
-                dst[8 + t] = hi[t];
+            if (RAW) {
+                unsigned* dst = &bu[r * BSTRIDE + 8 * p + (GEMM_I8_KG / 4) * hk];
+                #pragma unroll
+                for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
+                    dst[t] = lo[t];
+                }
+            } else {
+                unsigned* dst = &bu[r * BSTRIDE + 16 * p + (GEMM_I8_KG / 4) * hk];
+                #pragma unroll
+                for (int t = 0; t < GEMM_I8_KG / 4; ++t) {
+                    dst[t] = lo[t];
+                    dst[8 + t] = hi[t];
+                }
             }
-            bds[2 * p][hk][r] = ds0;
-            bds[2 * p + 1][hk][r] = ds1;
+            if (!RAW || hk == 0) {
+                bds[2 * p][RAW ? 0 : hk][r] = ds0;
+                bds[2 * p + 1][RAW ? 0 : hk][r] = ds1;
+            }
             if (hk == 0) {
                 bdm[2 * p][r] = dm0;
                 bdm[2 * p + 1][r] = dm1;
@@ -2367,12 +2449,24 @@ __device__ __forceinline__ void gemm_i8_body(
             float2 ds2[GEMM_I8_KS][GEMM_I8_NPW], dm2[GEMM_I8_NPW];
             #pragma unroll
             for (int ks = 0; ks < GEMM_I8_KS; ++ks) {
-                ld_i8_x4(bfr[ks], &bu[(nb0 + 8 * (lane >> 3) + (lane & 7))
-                                      * STRIDE + 8 * sb + 4 * ks]);
+                if (RAW) {
+                    // Sub-blocks `2p` and `2p + 1` share pair group `p`'s
+                    // bytes: low nibbles for the first, high for the second.
+                    ld_i8_x4(bfr[ks], &bu[(nb0 + 8 * (lane >> 3) + (lane & 7))
+                                          * BSTRIDE + 8 * (sb >> 1) + 4 * ks]);
+                    #pragma unroll
+                    for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
+                        bfr[ks][nt] = (bfr[ks][nt] >> (4 * (sb & 1))) & 0x0F0F0F0Fu;
+                    }
+                } else {
+                    ld_i8_x4(bfr[ks], &bu[(nb0 + 8 * (lane >> 3) + (lane & 7))
+                                          * BSTRIDE + 8 * sb + 4 * ks]);
+                }
                 #pragma unroll
                 for (int nt = 0; nt < GEMM_I8_NPW; ++nt) {
                     const int c = nb0 + 8 * nt + 2 * tg;
-                    ds2[ks][nt] = *reinterpret_cast<const float2*>(&bds[sb][ks][c]);
+                    if (!RAW || ks == 0)
+                        ds2[ks][nt] = *reinterpret_cast<const float2*>(&bds[sb][RAW ? 0 : ks][c]);
                     if (ks == 0) dm2[nt] = *reinterpret_cast<const float2*>(&bdm[sb][c]);
                 }
             }
@@ -2487,7 +2581,7 @@ __device__ __forceinline__ void gemm_i8_body(
 // 500 at 128 on the 13 B gate and up - and Q6_K's at 128, 287 against 309
 // on its down projection, where the longer run a row outweighs the occupancy
 // the doubled tile costs.
-#define GEMM_I8_KC_SKINNY 64
+#define GEMM_I8_KC_SKINNY 128
 #define GEMM_I8_KC_SKINNY_Q6 128
 GEMM_I8_ENTRY(gemm_i8_q4k, QT_Q4_K, GEMM_I8_MT, 2, GEMM_I8_KC, 2)
 GEMM_I8_ENTRY(gemm_i8_q6k, QT_Q6_K, GEMM_I8_MT, 2, GEMM_I8_KC, 2)
@@ -2495,6 +2589,327 @@ GEMM_I8_ENTRY(gemm_i8_q4k_narrow, QT_Q4_K, GEMM_I8_MT_NARROW, 2, GEMM_I8_KC, 2)
 GEMM_I8_ENTRY(gemm_i8_q6k_narrow, QT_Q6_K, GEMM_I8_MT_NARROW, 2, GEMM_I8_KC, 2)
 GEMM_I8_ENTRY(gemm_i8_q4k_skinny, QT_Q4_K, GEMM_I8_MT_SKINNY, 1, GEMM_I8_KC_SKINNY, 4)
 GEMM_I8_ENTRY(gemm_i8_q6k_skinny, QT_Q6_K, GEMM_I8_MT_SKINNY, 1, GEMM_I8_KC_SKINNY_Q6, 4)
+
+// ------------------------------------------------ the streaming int8 matmul
+//
+// `gemm_i8` at a short prompt is a tiled kernel with nothing to tile: 24
+// rows of activation against 27648 of weight, and every trip it fetches a
+// slice of weight into shared memory, waits at a barrier, multiplies, and
+// waits again. Timed without its `mma` it was still 224 us of its 290 on the
+// 13 B gate and up - the fetch, serialised behind barriers at eight to
+// twelve warps an SM - where the mat-vec streams the same bytes in 141,
+// because nothing in it waits for anyone.
+//
+// So this is the mat-vec with tensor cores. A warp owns sixteen weight rows,
+// two groups of eight, and reads them itself, a super-block a step,
+// straight into `mma` fragments: lane (row `l >> 2` of a group, `t = l & 3`)
+// loads word `t` of each
+// sixteen-byte run of quants, and that is exactly the m8n8k16 B fragment of
+// that run - four consecutive codes of row `l >> 2` at k = 4t. Q4_K's
+// pairing makes one run two fragments, low nibbles one sub-block and high
+// nibbles the next, as in `gemm_i8`'s raw staging. The next super-block's
+// words are in flight while this one's are multiplied.
+//
+// The activation is what the warps share: a block stages GEMM_IS_AK
+// elements of every row of it in shared memory and hands them out through
+// `ldmatrix`. The chunk is one super-block, and that is measured rather than
+// obvious: two super-blocks halved the barriers but took 21 KB of shared
+// memory and three blocks an SM, and one super-block at 11 KB and four
+// blocks was 268 us to 243 on the 13 B gate and up. What a barrier costs
+// here is small, because a warp's next weights are already in flight
+// across it; what occupancy buys is warps to hide the `ldmatrix` behind.
+//
+// The arithmetic is `gemm_i8`'s, operation for operation - the same integer
+// sums, the same `acc += as * (ds * dot - dm * sum)` a sub-block in k order
+// - so at the same split the output is the same bits.
+#define GEMM_IS_WARPS 4
+
+// An integer to float, exactly, for |x| < 2^22: `x + 1.5 * 2^23` has an
+// ulp of one, so its bits are x's and the subtraction is exact. Two
+// full-rate instructions where `I2F` is a quarter-rate one, and a Q4_K dot
+// of 32 codes is under 61 000.
+__device__ __forceinline__ float i2f_small(int x) {
+    return __int_as_float(x + 0x4B400000) - 12582912.0f;
+}
+#define GEMM_IS_RG 2                      // groups of eight weight rows a warp
+#define GEMM_IS_NT 64                     // weight rows a block
+static_assert(GEMM_IS_NT == GEMM_IS_WARPS * 8 * GEMM_IS_RG, "the warps cover the block's rows");
+#define GEMM_IS_MP 32                     // activation rows it can hold
+#define GEMM_IS_AK 256                    // activation elements a chunk
+#define GEMM_IS_ASTRIDE (GEMM_IS_AK / 4 + 4)
+// (scale, sum) pairs a row, and two floats over: the eight lanes that read
+// eight rows' pairs at once then land on eight bank pairs rather than one.
+#define GEMM_IS_XSTRIDE (GEMM_IS_AK / 32 * 2 + 2)
+
+// `MG` is the activation's row groups of eight, a template parameter so the
+// `mma` and their epilogues are straight-line code at every prompt length.
+//
+// Q6_K is the same walk with its own words: a lane holds word `t` of each
+// low-bits run, four of the row's sixteen high-field words - every lane of a
+// row needs each of them, at its own shift, so a step fetches the one it
+// needs from the lane that holds it - word `t` of the sixteen scales, and
+// the word that carries `d`. Its scale changes every sixteen elements, so a
+// sub-block's two steps are folded into one integer sum with their scales,
+// as `gemm_i8` does, and converted once.
+//
+// A warp owns GEMM_IS_RG groups of eight weight rows. Every activation
+// fragment and every (scale, sum) pair it loads is then spent on that many
+// groups: at one group a warp's shared-memory traffic cost as much as its
+// `mma`, and that is what bounded the kernel once the fetch was fixed.
+template <int QT, int MG>
+__device__ __forceinline__ void gemm_i8_stream_body(
+    const signed char* __restrict__ qa, int asc_off,
+    const unsigned char* __restrict__ wq, const float* __restrict__ bias,
+    float* __restrict__ out, int m, int k, int n, long sw, long so,
+    int q_ts, int a_rows, int ksplit, float* __restrict__ partial)
+{
+    constexpr int RG = GEMM_IS_RG;
+    __shared__ __align__(16) unsigned au[GEMM_IS_MP * GEMM_IS_ASTRIDE];
+    __shared__ __align__(8) float asx[GEMM_IS_MP * GEMM_IS_XSTRIDE];
+
+    const float* __restrict__ ascale = (const float*)(qa + asc_off);
+    const int slice = (int)(blockIdx.z / (gridDim.z / ksplit));
+    const int bat = (int)(blockIdx.z % (gridDim.z / ksplit));
+    out += (size_t)bat * so;
+    const unsigned char* wb = wq + (size_t)bat * (size_t)((sw / 256) * (long)q_ts);
+    const size_t arow = (size_t)bat * (size_t)a_rows;
+
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int g = lane >> 2, t = lane & 3;
+    const int nb = k >> 8;
+    const int row0 = blockIdx.x * GEMM_IS_NT + warp * 8 * RG;   // the warp's first row
+    const int per = (nb + ksplit - 1) / ksplit;
+    const int sb0 = slice * per;
+    const int sb1 = min(nb, sb0 + per);
+
+    // A super-block of one row, as this lane holds it. Q4_K: word `t` of
+    // each of the eight runs, then word `t` of the header. Q6_K: word `t` of
+    // each low-bits run, words t, t + 4, t + 8 and t + 12 of the high
+    // fields, word `t` of the scales, and the word holding `d`.
+    constexpr int NW = QT == QT_Q4_K ? 9 : 14;
+    unsigned cq[RG][NW], nq[RG][NW];
+    auto fetch = [&](int b, unsigned (*q)[NW]) {
+        #pragma unroll
+        for (int j = 0; j < RG; ++j) {
+            const int wrow = row0 + 8 * j + g;
+            if (wrow < n && b < sb1) {
+                const unsigned* blk = reinterpret_cast<const unsigned*>(
+                    wb + qblk(wrow, b, nb, n) * (size_t)q_ts);
+                if (QT == QT_Q4_K) {
+                    #pragma unroll
+                    for (int c = 0; c < 8; ++c) q[j][c] = blk[4 + 4 * c + t];
+                    q[j][8] = blk[t];
+                } else {
+                    #pragma unroll
+                    for (int c = 0; c < 8; ++c) q[j][c] = blk[4 * c + t];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) q[j][8 + i] = blk[32 + 4 * i + t];
+                    q[j][12] = blk[48 + t];
+                    q[j][13] = blk[52];
+                }
+            } else {
+                #pragma unroll
+                for (int c = 0; c < NW; ++c) q[j][c] = 0u;
+            }
+        }
+    };
+
+    float acc[RG][MG][2];
+    #pragma unroll
+    for (int j = 0; j < RG; ++j)
+        #pragma unroll
+        for (int i = 0; i < MG; ++i) acc[j][i][0] = acc[j][i][1] = 0.0f;
+
+    fetch(sb0, cq);
+    const int bpc = GEMM_IS_AK / 256;   // super-blocks a chunk
+    for (int cb = sb0; cb < sb1; cb += bpc) {
+        const int cend = min(sb1, cb + bpc);
+        __syncthreads();
+        // The chunk of activation: (row, 32-element group) pairs, codes and
+        // the (scale, sum of codes) the minimum term wants.
+        for (int i = tid; i < GEMM_IS_MP * (GEMM_IS_AK / 32); i += GEMM_IS_WARPS * 32) {
+            const int r = i / (GEMM_IS_AK / 32), gr = i % (GEMM_IS_AK / 32);
+            const int kk = cb * 256 + gr * 32;
+            uint4 v0 = make_uint4(0u, 0u, 0u, 0u), v1 = v0;
+            float d = 0.0f;
+            if (r < m && kk < cend * 256) {
+                const uint4* src = reinterpret_cast<const uint4*>(qa + (arow + r) * (size_t)k + kk);
+                v0 = src[0];
+                v1 = src[1];
+                d = ascale[(arow + r) * (size_t)(k >> 5) + (kk >> 5)];
+            }
+            uint4* dst = reinterpret_cast<uint4*>(&au[r * GEMM_IS_ASTRIDE + 8 * gr]);
+            dst[0] = v0;
+            dst[1] = v1;
+            int sm = sum4(v0.w, sum4(v0.z, sum4(v0.y, sum4(v0.x, 0))));
+            sm = sum4(v1.w, sum4(v1.z, sum4(v1.y, sum4(v1.x, sm))));
+            asx[r * GEMM_IS_XSTRIDE + 2 * gr] = d;
+            asx[r * GEMM_IS_XSTRIDE + 2 * gr + 1] = (float)sm;
+        }
+        __syncthreads();
+
+        for (int b = cb; b < cend; ++b) {
+            fetch(b + 1, nq);
+            const int eb = (b - cb) * 256;   // this super-block within the chunk
+
+            // Per row group, what the epilogue scales by. Q4_K: the four
+            // lanes of row `g` each decode two of its eight sub-blocks, and
+            // each sub-block below fetches the two rows it multiplies - 2t
+            // and 2t + 1 - from whichever lanes decoded them; decoded where
+            // they are used, eight lanes decoded every row, each with its own
+            // quarter-rate conversions. Q6_K: `d` of rows 2t and 2t + 1.
+            float ods[RG][2], odm[RG][2], d6[RG][2];
+            #pragma unroll
+            for (int j = 0; j < RG; ++j) {
+                if (QT == QT_Q4_K) {
+                    const unsigned w0 = __shfl_sync(0xffffffffu, cq[j][8], 4 * g);
+                    const unsigned w1 = __shfl_sync(0xffffffffu, cq[j][8], 4 * g + 1);
+                    const unsigned w2 = __shfl_sync(0xffffffffu, cq[j][8], 4 * g + 2);
+                    const unsigned w3 = __shfl_sync(0xffffffffu, cq[j][8], 4 * g + 3);
+                    #pragma unroll
+                    for (int v = 0; v < 2; ++v) {
+                        unsigned char sc, mn;
+                        q_scale_min_words(w1, w2, w3, 2 * t + v, sc, mn);
+                        ods[j][v] = q_half_lo(w0) * (float)sc;
+                        odm[j][v] = q_half_hi(w0) * (float)mn;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        d6[j][u] = q_half_lo(__shfl_sync(0xffffffffu, cq[j][13], 4 * (2 * t + u)));
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int sbk = 0; sbk < 8; ++sbk) {
+                const int pg = sbk >> 1, hn = sbk & 1;
+                // The two steps of a sub-block into separate accumulators,
+                // so the second `mma` does not wait on the first.
+                int dd[2][RG][MG][2];
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int c = 2 * pg + h;
+                    const int e = eb + 64 * pg + 32 * hn + 16 * h;
+                    unsigned af[4];
+                    ld_i8_x4(af, &au[(8 * (lane >> 3) + (lane & 7)) * GEMM_IS_ASTRIDE + e / 4]);
+                    #pragma unroll
+                    for (int j = 0; j < RG; ++j) {
+                        unsigned bw;
+                        if (QT == QT_Q4_K) {
+                            bw = (cq[j][c] >> (4 * hn)) & 0x0F0F0F0Fu;
+                        } else {
+                            const unsigned lo = (cq[j][c] >> (4 * hn)) & 0x0F0F0F0Fu;
+                            const int hw6 = 2 * c + hn;   // which high-field word
+                            const unsigned hword = __shfl_sync(
+                                0xffffffffu, cq[j][8 + (hw6 >> 2)], 4 * g + (hw6 & 3));
+                            const unsigned hi = (hword >> (2 * t)) & 0x03030303u;
+                            bw = __vsub4(lo | (hi << 4), 0x20202020u);
+                        }
+                        #pragma unroll
+                        for (int mg = 0; mg < MG; ++mg) {
+                            dd[h][j][mg][0] = dd[h][j][mg][1] = 0;
+                            mma_s8(dd[h][j][mg][0], dd[h][j][mg][1], af[mg], bw);
+                        }
+                    }
+                }
+                const int gr = (eb >> 5) + sbk;
+                float2 a2[MG];
+                #pragma unroll
+                for (int mg = 0; mg < MG; ++mg) {
+                    a2[mg] = *reinterpret_cast<const float2*>(
+                        &asx[(8 * mg + g) * GEMM_IS_XSTRIDE + 2 * gr]);
+                }
+                #pragma unroll
+                for (int j = 0; j < RG; ++j) {
+                    if (QT == QT_Q4_K) {
+                        float ds[2], dm[2];
+                        #pragma unroll
+                        for (int u = 0; u < 2; ++u) {
+                            const int src = 4 * (2 * t + u) + (sbk >> 1);
+                            ds[u] = __shfl_sync(0xffffffffu, ods[j][sbk & 1], src);
+                            dm[u] = __shfl_sync(0xffffffffu, odm[j][sbk & 1], src);
+                        }
+                        #pragma unroll
+                        for (int mg = 0; mg < MG; ++mg) {
+                            #pragma unroll
+                            for (int u = 0; u < 2; ++u) {
+                                acc[j][mg][u] += a2[mg].x
+                                    * (ds[u] * i2f_small(dd[0][j][mg][u] + dd[1][j][mg][u])
+                                       - dm[u] * a2[mg].y);
+                            }
+                        }
+                    } else {
+                        // Scales `4pg + 2hn` and the one after: word `pg` of
+                        // the row's sixteen, held by that row's lane `pg`.
+                        int s0[2], s1[2];
+                        #pragma unroll
+                        for (int u = 0; u < 2; ++u) {
+                            const unsigned sw6 = __shfl_sync(0xffffffffu, cq[j][12],
+                                                             4 * (2 * t + u) + pg);
+                            s0[u] = (int)(signed char)(sw6 >> (16 * hn));
+                            s1[u] = (int)(signed char)(sw6 >> (16 * hn + 8));
+                        }
+                        #pragma unroll
+                        for (int mg = 0; mg < MG; ++mg) {
+                            #pragma unroll
+                            for (int u = 0; u < 2; ++u) {
+                                const int tt = s0[u] * dd[0][j][mg][u] + s1[u] * dd[1][j][mg][u];
+                                acc[j][mg][u] += a2[mg].x * d6[j][u] * (float)tt;
+                            }
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < RG; ++j)
+                #pragma unroll
+                for (int c = 0; c < NW; ++c) cq[j][c] = nq[j][c];
+        }
+    }
+
+    if (ksplit > 1) {
+        out = partial + ((size_t)slice * (gridDim.z / ksplit) + bat) * (size_t)m * n;
+    }
+    #pragma unroll
+    for (int j = 0; j < RG; ++j) {
+        const int col0 = row0 + 8 * j + 2 * t;
+        #pragma unroll
+        for (int mg = 0; mg < MG; ++mg) {
+            const int row = 8 * mg + g;
+            if (row >= m) continue;
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int col = col0 + u;
+                if (col < n) {
+                    const float bv = (bias && ksplit == 1) ? bias[col] : 0.0f;
+                    out[(size_t)row * n + col] = acc[j][mg][u] + bv;
+                }
+            }
+        }
+    }
+}
+
+#define GEMM_IS_ENTRY(name, qt, mg, lb)                                           \
+    extern "C" __global__ __launch_bounds__(GEMM_IS_WARPS * 32, lb) void name(     \
+        const signed char* __restrict__ qa, int asc_off,                          \
+        const unsigned char* __restrict__ wq, const float* __restrict__ bias,     \
+        float* __restrict__ out, int m, int k, int n, long sw, long so,           \
+        int q_ts, int a_rows, int ksplit, float* __restrict__ partial)            \
+    {                                                                             \
+        gemm_i8_stream_body<qt, mg>(qa, asc_off, wq, bias, out, m, k, n, sw, so,  \
+                                    q_ts, a_rows, ksplit, partial);               \
+    }
+#define GEMM_IS_LB 4
+GEMM_IS_ENTRY(gemm_i8_stream_q4k_m1, QT_Q4_K, 1, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q4k_m2, QT_Q4_K, 2, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q4k_m3, QT_Q4_K, 3, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q4k_m4, QT_Q4_K, 4, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q6k_m1, QT_Q6_K, 1, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q6k_m2, QT_Q6_K, 2, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q6k_m3, QT_Q6_K, 3, GEMM_IS_LB)
+GEMM_IS_ENTRY(gemm_i8_stream_q6k_m4, QT_Q6_K, 4, GEMM_IS_LB)
 
 // ------------------------------------------------------------ flash attention
 //
@@ -6915,6 +7330,18 @@ pub const GEMV_Q_ROWS: u32 = define("GEMV_Q_ROWS");
 pub const GEMM_MT: u32 = define("GEMM_MT");
 /// Rows of the weight one `gemm` block covers; the grid's `x` step.
 pub const GEMM_NT: u32 = define("GEMM_NT");
+/// Warps in a `gemm_i8_stream_q4k` block, eight weight rows each.
+// Far enough into the source that the scan outruns the lint's budget.
+#[allow(long_running_const_eval)]
+pub const GEMM_IS_WARPS: u32 = define("GEMM_IS_WARPS");
+/// Weight rows a `gemm_i8_stream_q4k` block covers.
+// Far enough into the source that the scan outruns the lint's budget.
+#[allow(long_running_const_eval)]
+pub const GEMM_IS_NT: u32 = define("GEMM_IS_NT");
+/// The most activation rows `gemm_i8_stream_q4k` takes.
+// Far enough into the source that the scan outruns the lint's budget.
+#[allow(long_running_const_eval)]
+pub const GEMM_IS_MP: u32 = define("GEMM_IS_MP");
 
 /// Warps per `gemm_i8` block.
 pub const GEMM_I8_WARPS: u32 = define("GEMM_I8_WARPS");
