@@ -707,14 +707,9 @@ impl AsrModel {
             // The activation in the matmul's epilogue, stored at f16 for the
             // next: the same bits as the product and then `gelu_f16`, without
             // the 30.7 MB f32 intermediate written and read back.
-            let inner = self.gpu.gemm_gelu_f16(
-                &x,
-                &fc1.w,
-                fc1.b.as_ref(),
-                t,
-                fc1.in_dim,
-                fc1.out_dim,
-            )?;
+            let inner =
+                self.gpu
+                    .gemm_gelu_f16(&x, &fc1.w, fc1.b.as_ref(), t, fc1.in_dim, fc1.out_dim)?;
             return self.project(Operand::F16(&inner), fc2, t);
         }
         let x = self.norm_add(h, res, ln, t)?;
@@ -823,9 +818,9 @@ impl AsrModel {
                     d,
                     3 * d,
                 )?;
-                let ctx =
-                    self.gpu
-                        .flash_attn_rows(&qkv, t, heads, hd, (hd as f32).powf(-0.5))?;
+                let ctx = self
+                    .gpu
+                    .flash_attn_rows(&qkv, t, heads, hd, (hd as f32).powf(-0.5))?;
                 self.project(Operand::F16(&ctx), &l.attn.out, t)?
             } else {
                 let k = self.gpu.split_heads(
@@ -840,8 +835,11 @@ impl AsrModel {
                     heads,
                     hd,
                 )?;
-                let q =
-                    self.queries_from(self.project_part(Operand::F16(&x), &l.attn, 0, t)?, t, heads)?;
+                let q = self.queries_from(
+                    self.project_part(Operand::F16(&x), &l.attn, 0, t)?,
+                    t,
+                    heads,
+                )?;
                 let ctx = self.attend(
                     Operand::F32(&q),
                     Operand::F32(&k),

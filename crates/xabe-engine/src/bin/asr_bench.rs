@@ -208,9 +208,16 @@ fn stages(
             // encoder, cache and decode - kernel by kernel, synchronised.
             let rows = xabe_cuda::kprof::report();
             let total: f64 = rows.iter().map(|r| r.2).sum();
-            println!("  generate, per kernel (synchronised; {:.1} ms in all):", total * 1e3);
+            println!(
+                "  generate, per kernel (synchronised; {:.1} ms in all):",
+                total * 1e3
+            );
             for (name, n, t) in rows.iter().take(30) {
-                println!("    {name:<28} {n:>7}  {:>9.2} ms  {:>5.1}%", t * 1e3, 100.0 * t / total);
+                println!(
+                    "    {name:<28} {n:>7}  {:>9.2} ms  {:>5.1}%",
+                    t * 1e3,
+                    100.0 * t / total
+                );
             }
         }
 

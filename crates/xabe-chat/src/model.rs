@@ -1054,6 +1054,13 @@ impl ChatModel {
             // would leave the codes unread.
             let packed_down = matches!(l.down.w, GWeight::Packed { .. });
             let want_q = packed_down && inter.is_multiple_of(256);
+            let kq_down = matches!(
+                l.down.w,
+                GWeight::Packed {
+                    ty: Quant::Q4K | Quant::Q6K,
+                    ..
+                }
+            );
             let gq = match (&up, want_q) {
                 (Some(u), true) => Some(self.gpu.silu_mul_q(&mut gate, u, n, inter)?),
                 (Some(u), false) => {
@@ -1061,6 +1068,9 @@ impl ChatModel {
                     None
                 }
                 // Fused: the two operands are the two halves of `gate`.
+                // A K-quant down projection reads only the codes - both of its
+                // paths take the twin - so the gated floats are not stored.
+                (None, true) if kq_down => Some(self.gpu.silu_mul_pair_codes(&mut gate, n, inter)?),
                 (None, true) => Some(self.gpu.silu_mul_pair(&mut gate, n, inter)?),
                 (None, false) => {
                     self.gpu.silu_mul_halves(&mut gate, n * inter)?;
