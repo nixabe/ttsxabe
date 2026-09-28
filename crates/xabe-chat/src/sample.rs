@@ -173,19 +173,8 @@ pub fn sample(logits: &mut [f32], recent: &[u32], s: &Sampling, rng: &mut Rng) -
     //    the probability alone would leave ties in an arbitrary order and make
     //    the draw depend on the sort's internals; breaking ties by id keeps a
     //    seed meaning one thing.
-    probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    if s.top_p < 1.0 {
-        let mut acc = 0.0;
-        let mut keep = probs.len();
-        for (i, &(_, p)) in probs.iter().enumerate() {
-            acc += p;
-            if acc >= s.top_p {
-                keep = i + 1;
-                break;
-            }
-        }
-        probs.truncate(keep.max(1));
-    }
+    let keep = nucleus(&mut probs, s.top_p);
+    probs.truncate(keep.max(1));
 
     // 5. The draw, over the renormalised remainder.
     let total: f32 = probs.iter().map(|&(_, p)| p).sum();
@@ -201,10 +190,146 @@ pub fn sample(logits: &mut [f32], recent: &[u32], s: &Sampling, rng: &mut Rng) -
     probs.last().map_or(0, |&(id, _)| id)
 }
 
+/// Most probable first, ties broken by id: a total order, so the sorted
+/// sequence is one sequence whatever algorithm produced it.
+fn by_mass(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+}
+
+/// Puts the smallest prefix of `probs` whose mass reaches `top_p` at its
+/// front, in [`by_mass`] order, and returns its length.
+///
+/// Only that prefix is ever sorted. It used to be the whole row - 128 256
+/// entries a token on the host, while the card waited for the next token's
+/// id - and at `temperature` 0.3 the nucleus is a handful of them. The
+/// candidates are the `k` heaviest, found by a selection, and `k` grows
+/// until their mass reaches `top_p`. Because the order is total, the `k`
+/// heaviest sorted are exactly the first `k` of the full sort, and the
+/// running sum adds the same values in the same order: the same cut, and
+/// the same draw, to the bit. `nucleus_matches_the_full_sort` holds it to
+/// that.
+fn nucleus(probs: &mut [(u32, f32)], top_p: f32) -> usize {
+    let n = probs.len();
+    if top_p >= 1.0 {
+        probs.sort_unstable_by(by_mass);
+        return n;
+    }
+    let mut k = 64.min(n);
+    loop {
+        if k < n {
+            probs.select_nth_unstable_by(k - 1, by_mass);
+        }
+        probs[..k].sort_unstable_by(by_mass);
+        let mut acc = 0.0;
+        for (i, &(_, p)) in probs[..k].iter().enumerate() {
+            acc += p;
+            if acc >= top_p {
+                return i + 1;
+            }
+        }
+        if k == n {
+            return n;
+        }
+        k = (k * 8).min(n);
+    }
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
         .map_or(0, |(i, _)| i as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sampler as it was before [`nucleus`]: the whole row sorted.
+    fn full_sort(logits: &mut [f32], recent: &[u32], s: &Sampling, rng: &mut Rng) -> u32 {
+        if (s.repeat_penalty - 1.0).abs() > f32::EPSILON {
+            for &t in recent {
+                if let Some(l) = logits.get_mut(t as usize) {
+                    *l = if *l > 0.0 {
+                        *l / s.repeat_penalty
+                    } else {
+                        *l * s.repeat_penalty
+                    };
+                }
+            }
+        }
+        if s.temperature <= 0.0 {
+            return argmax(logits);
+        }
+        for l in logits.iter_mut() {
+            *l /= s.temperature;
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (i as u32, (l - max).exp()))
+            .collect();
+        let sum: f32 = probs.iter().map(|&(_, p)| p).sum();
+        for p in &mut probs {
+            p.1 /= sum;
+        }
+        probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        if s.top_p < 1.0 {
+            let mut acc = 0.0;
+            let mut keep = probs.len();
+            for (i, &(_, p)) in probs.iter().enumerate() {
+                acc += p;
+                if acc >= s.top_p {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep.max(1));
+        }
+        let total: f32 = probs.iter().map(|&(_, p)| p).sum();
+        let mut r = rng.unit() * total;
+        for &(id, p) in &probs {
+            r -= p;
+            if r <= 0.0 {
+                return id;
+            }
+        }
+        probs.last().map_or(0, |&(id, _)| id)
+    }
+
+    #[test]
+    fn nucleus_matches_the_full_sort() {
+        // Flat rows, peaked rows, rows with ties and rows whose nucleus is
+        // past the first selection's 64, at the temperatures and cuts that
+        // exercise each: every draw must be the same id.
+        let mut noise = Rng::new(7);
+        let mut draws = 0;
+        for case in 0..400 {
+            let vocab = [128_256, 1000, 70, 3][case % 4];
+            let spread = [0.5f32, 4.0, 12.0, 30.0][(case / 4) % 4];
+            let mut row: Vec<f32> = (0..vocab).map(|_| (noise.unit() - 0.5) * spread).collect();
+            if case % 7 == 0 {
+                // Ties at the top, which only the id breaks.
+                for l in row.iter_mut().take(vocab.min(20)) {
+                    *l = spread;
+                }
+            }
+            let s = Sampling {
+                temperature: [0.3, 1.0, 2.0][case % 3],
+                top_p: [0.9, 0.5, 0.99, 1.0, 0.999][case % 5],
+                ..Sampling::default()
+            };
+            let recent: Vec<u32> = (0..8).map(|i| (i * 37 % vocab) as u32).collect();
+            let (mut a, mut b) = (Rng::new(case as u64 + 1), Rng::new(case as u64 + 1));
+            for _ in 0..3 {
+                let got = sample(&mut row.clone(), &recent, &s, &mut a);
+                let want = full_sort(&mut row.clone(), &recent, &s, &mut b);
+                assert_eq!(got, want, "case {case}: vocab {vocab}, {s:?}");
+                draws += 1;
+            }
+        }
+        assert_eq!(draws, 1200);
+    }
 }

@@ -24,8 +24,17 @@
 //! looked up. So the decoded text is what is scanned, and the emitted prefix
 //! is trimmed at the match - which also means a stop string can be *partially*
 //! present at the end of a chunk and must not be emitted yet.
+//!
+//! # The prompt's prefix is prefilled once
+//!
+//! Every turn's prompt opens with the same system prompt and few-shot turns,
+//! and a conversation's history grows by appending. [`Prefix`] keeps the cache
+//! from one completion to the next with the tokens it holds, and
+//! [`ChatModel::complete_after`] prefills only from the first token that
+//! differs - which is what llama-server's prompt cache does, and was the whole
+//! of its lead on transcript-to-first-token in `docs/MEASUREMENTS.md`.
 
-use crate::{ChatError, ChatModel, Rng, Sampling, sample};
+use crate::{Cache, ChatError, ChatModel, Rng, Sampling, sample};
 
 /// What a completion produced, and why it ended.
 #[derive(Debug, Clone)]
@@ -70,6 +79,51 @@ impl ChatModel {
         stops: &[String],
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, ChatError> {
+        self.complete_after(&mut self.prefix(), prompt, s, stops, on_token)
+    }
+
+    /// An empty [`Prefix`], for [`Self::complete_after`].
+    pub fn prefix(&self) -> Prefix {
+        Prefix {
+            cache: self.cache(),
+            held: Vec::new(),
+        }
+    }
+
+    /// [`Self::complete`], starting from whatever of `prompt` the previous
+    /// completion through `prefix` already put in the cache.
+    ///
+    /// The shared run is found on token ids, not on text, so a prompt that
+    /// tokenizes differently from the first byte that differs is still
+    /// reused exactly as far as it is the same. At least the prompt's last
+    /// token is always run, because its row is the one that predicts.
+    ///
+    /// On an error `prefix` is emptied: a pass that failed part-way may have
+    /// grown some layers' buffers and not others, and nothing about what it
+    /// holds can be trusted.
+    pub fn complete_after(
+        &self,
+        prefix: &mut Prefix,
+        prompt: &str,
+        s: &Sampling,
+        stops: &[String],
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion, ChatError> {
+        let out = self.complete_in(prefix, prompt, s, stops, on_token);
+        if out.is_err() {
+            *prefix = self.prefix();
+        }
+        out
+    }
+
+    fn complete_in(
+        &self,
+        prefix: &mut Prefix,
+        prompt: &str,
+        s: &Sampling,
+        stops: &[String],
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion, ChatError> {
         s.check()?;
         // `parse_special = false`: the prompt is user-influenced text, and a
         // user who types `<|eot_id|>` into the box must not be able to end the
@@ -81,13 +135,16 @@ impl ChatModel {
             return Err(ChatError::NothingToAnswer);
         }
 
-        let mut cache = self.cache();
+        let started = std::time::Instant::now();
+        let reused = prefix.shared_with(&ids).min(ids.len() - 1);
+        prefix.cache.truncate(reused);
+        prefix.held.truncate(reused);
         let mut rng = Rng::new(s.seed);
         let mut produced: Vec<u32> = Vec::new();
         let mut text = String::new();
         // How much of `text` has been handed to the caller.
         let mut emitted = 0usize;
-        let mut pending = ids.clone();
+        let mut pending = ids[reused..].to_vec();
         let mut stop = Stop::Limit;
 
         while produced.len() < s.max_tokens {
@@ -95,9 +152,18 @@ impl ChatModel {
             // are run so the cache is filled, and `forward_last` is how it
             // says so - projecting them all is the single biggest thing a
             // prefill can waste.
-            let logits = self.forward_last(&pending, &mut cache)?;
+            let logits = self.forward_last(&pending, &mut prefix.cache)?;
+            prefix.held.extend_from_slice(&pending);
             let mut row = self.gpu().download(&logits)?;
 
+            if produced.is_empty() {
+                tracing::debug!(
+                    prompt = ids.len(),
+                    reused,
+                    ms = started.elapsed().as_secs_f64() * 1e3,
+                    "prefilled",
+                );
+            }
             let back = produced.len().min(s.repeat_last_n);
             let id = sample(&mut row, &produced[produced.len() - back..], s, &mut rng);
 
@@ -182,6 +248,37 @@ impl ChatModel {
             || [("<|eot_id|>"), ("<|end_of_text|>"), ("<|eom_id|>")]
                 .iter()
                 .any(|s| t.special(s) == Some(id))
+    }
+}
+
+/// A cache kept from one completion to the next, and the tokens in it.
+///
+/// One conversation's worth: two callers taking turns through one `Prefix`
+/// still get right answers, but each evicts the other's run.
+pub struct Prefix {
+    cache: Cache,
+    /// Exactly the tokens `cache` holds, in order.
+    held: Vec<u32>,
+}
+
+impl Prefix {
+    /// How many leading tokens of `ids` the cache already holds.
+    fn shared_with(&self, ids: &[u32]) -> usize {
+        self.held
+            .iter()
+            .zip(ids)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    /// How many tokens the cache holds.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
     }
 }
 

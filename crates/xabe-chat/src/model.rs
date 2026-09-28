@@ -249,6 +249,16 @@ impl Cache {
         self.cap = 0;
         self.len = 0;
     }
+
+    /// Forgets every position from `len` on, keeping the ones before it.
+    ///
+    /// Nothing is zeroed or freed, and nothing needs to be: attention reads
+    /// only the first `len` positions of a buffer that has room for `cap`,
+    /// and the next forward pass writes its own keys and values from `len`
+    /// before any attention reads them. Longer than what is held is a no-op.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
 }
 
 impl ChatModel {

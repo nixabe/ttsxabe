@@ -36,6 +36,6 @@ mod model;
 mod sample;
 
 pub use error::ChatError;
-pub use generate::{Completion, Stop};
+pub use generate::{Completion, Prefix, Stop};
 pub use model::{Cache, ChatModel, Packing};
 pub use sample::{Rng, Sampling, sample};
