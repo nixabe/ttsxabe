@@ -737,7 +737,24 @@ impl Gpu {
     pub fn open(ordinal: usize) -> Result<Self, CudaError> {
         let upload_allocator = UploadAllocator::from_env()?;
         let ctx = Self::context(ordinal)?;
-        let stream = ctx.default_stream();
+        // A stream of its own, not the context's default. Every `Gpu` on a
+        // card shares the device's primary context, so the default stream
+        // is *one* queue for every stage in the process: a chat decode step
+        // queued behind a translator step or a vocoder pass waited for all
+        // of it, and its logits download - a synchronous copy on that
+        // stream - waited again. Measured in full serving mode on one card:
+        // the chat reply streamed at 39 tokens a second against 109 alone.
+        // A non-blocking stream orders this handle's work and nothing else's.
+        //
+        // Event tracking is off because it exists to order one allocation's
+        // use across several streams, and here a `Gpu`'s buffers are only
+        // ever touched on its own. Left on, it records an event per buffer
+        // per launch once a context has a second stream.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream().map_err(|source| CudaError::Driver {
+            what: "creating the stream",
+            source,
+        })?;
 
         // Keep freed stream-ordered allocations in the pool across
         // synchronises. The default release threshold is zero, which hands
