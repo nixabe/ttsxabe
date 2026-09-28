@@ -34,6 +34,18 @@ use xabe_serve::{
 /// not a budget.
 const TRANSLATE_MAX_NEW: usize = 256;
 
+/// How long a turn's first clause waits for a streaming reply before it
+/// shares the card with it.
+///
+/// A reply the length of the measured turns - 10 to 31 tokens, 0.1 to 0.3 s
+/// on its own - finishes inside this, and giving it the card first cost the
+/// first clause 15 to 60 ms of first audio and took the reply from 57 to 105
+/// tokens a second in `docs/MEASUREMENTS.md`: the translation then runs alone
+/// and makes back most of the wait. A reply longer than this has used it up
+/// and the two share from then, so the most a long reply can add to first
+/// audio is this, not the whole reply.
+const FIRST_CLAUSE_YIELD: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// How many synthesis jobs may wait before the caller blocks.
 ///
 /// Two. The queue is not where latency should be absorbed: a request that has
@@ -147,6 +159,22 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
         _ => None,
     };
     tracing::info!(shared_card = card.is_some(), "translator and synthesiser");
+    // The same arrangement between the chat model and the translator, for
+    // the same reason: the reply has the card while it streams. A turn's
+    // first clause is the exception and waits only `FIRST_CLAUSE_YIELD`,
+    // because the listener is waiting through it. See `spawn_translator`.
+    let chatting = match (&stages.llm, &stages.translator) {
+        (Stage::Local { device: llm, .. }, Stage::Local { device, .. })
+            if llm == device && !args.direct_taigi =>
+        {
+            Some(SharedCard::new())
+        }
+        _ => None,
+    };
+    tracing::info!(
+        shared_card = chatting.is_some(),
+        "chat model and translator"
+    );
 
     let asr = match &stages.asr {
         Stage::Remote { url } => Some(AsrBackend::Remote(Upstream::new(url)?)),
@@ -165,6 +193,7 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
             path,
             *device,
             card.clone(),
+            chatting.clone(),
         )?)),
         (Stage::Off, _) => None,
     };
@@ -175,6 +204,8 @@ fn build_state(args: &Args, stages: &Stages) -> Result<AppState, EngineError> {
             path,
             *device,
             config.stops(),
+            sampling(&config),
+            chatting.clone(),
         )?)),
         Stage::Off => None,
     };
@@ -409,6 +440,7 @@ fn spawn_translator(
     path: &std::path::Path,
     device: Device,
     card: Option<Arc<SharedCard>>,
+    chatting: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<TranslateJob>, EngineError> {
     // `Kind::has_cpu` refuses `--translator-device cpu` at preflight: the 13 B
     // is 27 GB of weights and 26 GFLOP a token.
@@ -432,6 +464,10 @@ fn spawn_translator(
             );
             let mut waiting: BTreeMap<u64, tokio::sync::oneshot::Sender<Result<String, String>>> =
                 BTreeMap::new();
+            // Clauses in the batch that were a turn's first, and when the
+            // newest of them stops yielding to the chat model.
+            let mut urgent: std::collections::BTreeSet<u64> = Default::default();
+            let mut yield_until: Option<std::time::Instant> = None;
             loop {
                 // Block only when idle; otherwise take what has arrived.
                 let job = if batch.is_empty() {
@@ -450,10 +486,32 @@ fn spawn_translator(
                 if let Some(c) = &card {
                     c.wait_free();
                 }
+                // Nor while the chat model is streaming a reply. A later
+                // clause is not needed until the one before it has been
+                // spoken, which is long after the reply has finished, so it
+                // waits for the reply to end. A turn's first clause is what
+                // the listener waits through in silence, so it waits at most
+                // `FIRST_CLAUSE_YIELD` from its arrival and then shares the
+                // card with whatever of the reply is left.
+                let first = job.as_ref().is_some_and(|j| j.first);
+                if first {
+                    yield_until = Some(std::time::Instant::now() + FIRST_CLAUSE_YIELD);
+                }
+                if let Some(c) = &chatting {
+                    match yield_until {
+                        Some(deadline) if first || !urgent.is_empty() => {
+                            c.wait_free_until(deadline)
+                        }
+                        _ => c.wait_free(),
+                    }
+                }
                 if let Some(job) = job {
                     match batch.admit(&job.text, &job.target) {
                         Ok(id) => {
                             waiting.insert(id, job.reply);
+                            if first {
+                                urgent.insert(id);
+                            }
                         }
                         Err(e) => {
                             let _ = job.reply.send(Err(e.to_string()));
@@ -465,6 +523,7 @@ fn spawn_translator(
                 match batch.step() {
                     Ok(done) => {
                         for (id, text) in done {
+                            urgent.remove(&id);
                             if let Some(reply) = waiting.remove(&id) {
                                 let _ = reply.send(Ok(text));
                             }
@@ -478,6 +537,7 @@ fn spawn_translator(
                         for (_, reply) in std::mem::take(&mut waiting) {
                             let _ = reply.send(Err(message.clone()));
                         }
+                        urgent.clear();
                         batch = model.batch(
                             TRANSLATE_MAX_NEW,
                             xabe_translate::Translator::REPEAT_PENALTY,
@@ -495,6 +555,29 @@ fn spawn_translator(
     Ok(tx)
 }
 
+/// The sampler the remote path puts in its request body, for the local model.
+///
+/// Read off the same `GatewayConfig` as [`GatewayConfig::completion_body`],
+/// so switching a running pipeline between `--llm-url` and `--llm-model`
+/// does not quietly change how the model is sampled. This used to be
+/// `Sampling::default()`, which is `gateway.py`'s 0.3 whatever `--temperature`
+/// said - so a `--temperature 0` pipeline took an argmax remotely and drew
+/// from a nucleus locally.
+fn sampling(config: &GatewayConfig) -> xabe_chat::Sampling {
+    let body = config.completion_body("");
+    let f = |k: &str, or: f32| body[k].as_f64().map_or(or, |v| v as f32);
+    let d = xabe_chat::Sampling::default();
+    xabe_chat::Sampling {
+        temperature: f("temperature", d.temperature),
+        top_p: f("top_p", d.top_p),
+        repeat_penalty: f("repeat_penalty", d.repeat_penalty),
+        max_tokens: body["n_predict"]
+            .as_u64()
+            .map_or(d.max_tokens, |v| v as usize),
+        ..d
+    }
+}
+
 /// Starts the chat model's thread and returns its work queue.
 ///
 /// One OS thread, started before the listener binds, exactly as the ASR, the
@@ -509,6 +592,8 @@ fn spawn_chat(
     // request body, so the two backends stop on the same strings. Building
     // them here from `person` and `bot` a second time is how they would drift.
     stops: Vec<String>,
+    sampling: xabe_chat::Sampling,
+    chatting: Option<Arc<SharedCard>>,
 ) -> Result<mpsc::Sender<CompletionJob>, EngineError> {
     // `Kind::has_cpu` refuses `--llm-device cpu` at preflight: the 8 B is
     // 16 GFLOP a token against scalar kernels that manage under 2 GFLOP/s.
@@ -521,20 +606,43 @@ fn spawn_chat(
     std::thread::Builder::new()
         .name("xabe-chat".into())
         .spawn(move || {
+            // Kept from turn to turn. Every prompt opens with the same system
+            // prompt and few-shot turns and a conversation's history only
+            // grows, so most of a turn's prompt is already in this cache and
+            // only what follows the first differing token is prefilled.
+            let mut prefix = model.prefix();
             while let Some(job) = rx.blocking_recv() {
-                // The sampler is `gateway.py`'s by default, which is what the
-                // remote path sends in its request body - so switching a
-                // running pipeline between `--llm-url` and `--llm-model` does
-                // not quietly change how the model is sampled.
-                let sampling = xabe_chat::Sampling::default();
-                let out = model.complete(&job.prompt, &sampling, &stops, &mut |piece| {
-                    // `blocking_send` failing means the receiver is gone,
-                    // which is the browser having cancelled the turn. Returning
-                    // false stops generation at the next token rather than at
-                    // the end of the sentence, so a barged-in reply stops
-                    // costing GPU time immediately.
-                    job.pieces.blocking_send(piece.to_string()).is_ok()
-                });
+                // Held while the reply is being made, released when it ends
+                // however it ends; see `spawn_translator` for what waits on
+                // it. *Not* held while this thread is blocked handing a piece
+                // on: the reader may itself be waiting for a translation to
+                // make room, and a translator waiting for this hold would
+                // close the circle.
+                let mut streaming = chatting.as_ref().map(|c| c.hold());
+                let out = model.complete_after(
+                    &mut prefix,
+                    &job.prompt,
+                    &sampling,
+                    &stops,
+                    &mut |piece| {
+                        // A closed channel means the receiver is gone, which
+                        // is the browser having cancelled the turn. Returning
+                        // false stops generation at the next token rather than
+                        // at the end of the sentence, so a barged-in reply
+                        // stops costing GPU time immediately.
+                        match job.pieces.try_send(piece.to_string()) {
+                            Ok(()) => true,
+                            Err(mpsc::error::TrySendError::Closed(_)) => false,
+                            Err(mpsc::error::TrySendError::Full(piece)) => {
+                                streaming = None;
+                                let sent = job.pieces.blocking_send(piece).is_ok();
+                                streaming = chatting.as_ref().map(|c| c.hold());
+                                sent
+                            }
+                        }
+                    },
+                );
+                drop(streaming);
                 if let Err(e) = out {
                     tracing::warn!(error = %e, "the chat model refused a turn");
                 }

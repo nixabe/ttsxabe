@@ -201,6 +201,11 @@ pub struct TranslateJob {
     pub text: String,
     /// The target script: `POJ`, `HAN`, `HL`, `ZH` or `EN`.
     pub target: String,
+    /// Whether this is the first clause of a turn - the one the listener is
+    /// waiting through in silence. A local translator sharing a card with the
+    /// chat model steps this one while a reply is still streaming and holds
+    /// the rest until it has finished.
+    pub first: bool,
     /// The translation, or a message describing why there is none.
     pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
@@ -231,7 +236,14 @@ impl TranslatorBackend {
     ///
     /// Both paths run the same prompt template and the same repetition
     /// penalty; the only difference is which process owns the weights.
-    pub async fn translate(&self, text: &str, target: &str) -> Result<String, crate::ServeError> {
+    /// `first` is [`TranslateJob::first`], and a remote translator has no use
+    /// for it.
+    pub async fn translate(
+        &self,
+        text: &str,
+        target: &str,
+        first: bool,
+    ) -> Result<String, crate::ServeError> {
         match self {
             TranslatorBackend::Remote(u) => {
                 u.completion(crate::client::translate_body(text, target))
@@ -242,6 +254,7 @@ impl TranslatorBackend {
                 tx.send(TranslateJob {
                     text: text.to_string(),
                     target: target.to_string(),
+                    first,
                     reply,
                 })
                 .await

@@ -578,6 +578,7 @@ async fn synthesis_worker(
             clauses += 1;
             let translator = translator.clone();
             let target = target.clone();
+            let first_clause = clauses == 1;
             tokio::spawn(async move {
                 // Timed per chunk because the two stages are bound by
                 // different things and only measurement says which one a
@@ -591,7 +592,7 @@ async fn synthesis_worker(
                 // 1.6 s.
                 let (text, taigi) = match &translator {
                     None => (chunk, String::new()),
-                    Some(t) => match t.translate(&chunk, &target).await {
+                    Some(t) => match t.translate(&chunk, &target, first_clause).await {
                         Ok(out) if !out.is_empty() => (out.clone(), out),
                         Ok(_) => (chunk, String::new()),
                         Err(e) => {
