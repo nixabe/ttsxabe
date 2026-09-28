@@ -64,6 +64,18 @@ pub async fn serve(addr: &str, state: AppState) -> Result<(), ServeError> {
         "serving"
     );
 
+    // Every accepted connection with Nagle off. A turn is a run of small
+    // frames - the transcript, then a token at a time - and with Nagle on,
+    // each one after the first waits for the previous one's ACK, which the
+    // other end delays by up to 40 ms. Measured as a flat 40 ms from the
+    // transcript to the first token whatever the model took, in both full
+    // and router mode, with the engine's own prefill at 16 ms of it.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!(%e, "could not turn Nagle off on a connection");
+        }
+    });
     axum::serve(listener, server::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
