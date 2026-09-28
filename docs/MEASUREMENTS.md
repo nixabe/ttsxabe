@@ -182,48 +182,75 @@ The same `xabe-engine --serve` binary answers spoken and typed turns over its We
 | Translator | xabe, in process | `llama-server -ngl 99 -c 4096` over HTTP |
 | TTS | xabe Tacotron2 + WaveGlow, in process | PyTorch Tacotron2 + WaveGlow (fp16) over HTTP |
 
+Measured 2026-09-28 at `c68ce4f` (the rest of this file is `813d72b`); the router mode's front end is the same binary, so what changed in the serving layer reached both modes.
 Both modes use `--temperature 0 --translate-ahead 0`. Each turn starts a fresh conversation. The router's TTS server gets the engine's own text front end (clause split, POJ to Tâi-lô, stop cue), so both synthesisers receive identical text. The results are medians of 7 rounds after 2 warm-up rounds, with the two modes alternated in every round. Timings are taken at the client, from sending the turn to each event. Speedup = router time / full time.
 
 ### Summary
 
 | Measure | Speedup (range) | Geometric mean |
 | --- | ---: | ---: |
-| First audio, identical-reply turns | 1.34x – 1.56x | **1.44x** |
-| Whole turn, identical-reply turns | 1.41x – 1.56x | **1.47x** |
-| First audio, all 8 turns | 0.91x – 1.69x | **1.40x** |
-| Turn time per second of audio, all 8 turns | 0.64x – 1.65x | **1.35x** |
-| VAD + ASR, spoken turns | 1.20x – 1.25x | **1.22x** |
-| Synthesis, per second of audio | 2.81x – 3.39x | **3.05x** |
-| Translation, per source character | 0.92x – 1.31x | **1.13x** |
-| Transcript to first reply token | 0.67x – 0.80x | **0.77x** |
-| Reply stream rate inside a turn | 0.40x – 0.87x | **0.65x** |
+| First audio, identical-reply turns | 1.46x – 1.58x | **1.50x** |
+| Whole turn, identical-reply turns | 1.52x – 1.66x | **1.58x** |
+| First audio, all 8 turns | 1.14x – 1.76x | **1.48x** |
+| Turn time per second of audio, all 8 turns | 0.67x – 2.06x | **1.47x** |
+| VAD + ASR, spoken turns | 1.17x – 1.22x | **1.19x** |
+| Synthesis, per second of audio | 2.87x – 3.64x | **3.11x** |
+| Translation, per source character | 0.66x – 1.62x | **1.08x** |
+| Transcript to first reply token | 1.34x – 2.11x | **1.54x** |
+| Reply stream rate inside a turn | 1.04x – 2.31x | **1.63x** |
 
-The last two rows are losses. Their likely causes were not isolated in this run:
+No row's geometric mean is a loss. The turns below 1x are spoken turns, where the two chat backends write different replies: clip c's reply is 4 tokens and 1.1 s of audio in full mode against 15 tokens and 4.2 s in router mode, which puts its whole-turn time per second of audio at 0.67x, and clip a's translation per character reads 0.66x. Translation time is measured from the moment a clause is queued, so it includes the up to 300 ms a turn's first clause now spends yielding the card to the streaming reply (see below). That yield is likely part of why this row's geometric mean is 1.08x here against 1.13x in the first run; the replies also changed, and the two were not separated.
 
-- **Transcript to first reply token:** `llama-server` has prompt caching on by default, so it can reuse the system-prompt prefix between turns.
-- **Reply stream rate:** in full mode, the first clause's translation and synthesis run in the same process on the same card while the reply is still streaming.
+### What changed since the first run
+
+The first run of this comparison (`eb34d10`, 2026-09-27) lost two rows: transcript to first reply token at **0.77x** and reply stream rate at **0.65x**. Four causes were found and one scheduling policy was changed, in the commits from `2d1b6fe` to `c68ce4f`.
+
+- **Every stage shared one CUDA stream.** Each stage's `Gpu` took cudarc's `default_stream()`, which is the legacy NULL stream of the device's primary context. All five in-process stages therefore queued on one stream: a chat decode step waited behind any translator step or vocoder pass issued before it, and its logits download waited again. Each `Gpu` now has its own non-blocking stream. Chat decode alone is unchanged (108.9 vs 108.7 tok/s at 64 tokens).
+- **The chat prompt was prefilled from scratch every turn.** The chat thread now keeps its cache between turns (`xabe_chat::Prefix`) and prefills only from the first token that differs, as `llama-server`'s prompt cache does. The measured turns reuse 82-96 of 100-130 prompt tokens. The tail prefill is bit-identical to a whole prefill (`crates/xabe-chat/tests/prefix.rs`).
+- **The local sampler ignored `--temperature`.** It always used `Sampling::default()` (0.3, top-p 0.9), while the router sent the configured value. At 0.3 it also sorted all 128 256 logits on the host every token, 5.7 ms against a 9.2 ms step. The local model now takes the same values the remote request body carries. The nucleus is found by partial selection under the same comparator: 1.2 ms, and the same draw as the full sort (checked over 1 200 draws).
+- **Nagle's algorithm on the WebSocket.** The server never set `TCP_NODELAY`, so each small frame after the first waited up to 40 ms for the client's delayed ACK. Transcript to first token read a flat 40.6 ms in both modes, while the engine's own prefill was 16-17 ms of it.
+- **Policy: the reply gets the card, the first clause waits at most 300 ms.** With separate streams the reply and the first clause's translation decode concurrently and split the memory bandwidth. The reply now holds the card while it streams (released whenever the reply is blocked handing a piece on). A turn's first clause waits for it at most 300 ms, then shares. Later clauses wait for the reply to end, since with `--translate-ahead 0` they are not needed until the clause before them has been spoken.
+
+### What each step bought
+
+Full mode against itself, median over all 8 turns, measured while the fixes were being made rather than in the run above.
+
+| Build | Transcript to first token | Reply stream rate |
+| --- | ---: | ---: |
+| Before (`eb34d10`) | 52.3 ms | 38.7 tok/s |
+| + one stream per stage | 52.2 ms | 49.4 tok/s |
+| + prefix reuse | 40.6 ms | 52.1 tok/s |
+| + sampler follows `--temperature` | 40.6 ms | 64.6 tok/s |
+| + `TCP_NODELAY` | 18.3 ms | 58.8 tok/s |
+| + reply holds the card | 18.4 ms | 104.5 tok/s |
+
+The sampler step changed the spoken turns' replies (clip c went from 5 tokens to 4), so its rate is not a like-for-like comparison. The `TCP_NODELAY` step lowered the measured rate, most likely because Nagle had been delivering token frames in bursts (one turn had read 502 tok/s). The last step cost first audio 15-60 ms against the build before it (R2 588 to 617 ms, R4 641 to 700 ms). First audio is still ahead of router mode on every turn in the tables above.
+
+A 55-token reply (`請用大約一百五十個字…`) was checked against the 300 ms bound: first audio 1265 ms full against 2114 ms router, and the reply streamed at 62.9 against 44.7 tok/s.
+
+A higher CUDA stream priority for the chat model was tried instead of the hold and dropped: +3% stream rate (53.4 vs 51.7 tok/s), with first audio slightly worse on two turns.
 
 ### Identical-reply turns
 
-Typed turns that tell the chat model to repeat a fixed sentence word for word (`請一字不改地只回覆這句話：…`). The reply text was identical in both modes on all four. The Taigi translation was identical on R1 and R2 and differed by a few words on R3 and R4.
+Typed turns that tell the chat model to repeat a fixed sentence word for word (`請一字不改地只回覆這句話：…`). The reply text was identical in both modes on all four. The Taigi translation, compared by reading (full mode reports POJ and router mode Tâi-lô, so the strings never match), was identical on R1 and R2 and differed by a few words on R3 and R4.
 
 | Turn | Reply | Tokens | First token full / router | First audio full / router | Speedup | Whole turn full / router | Speedup | Audio full / router |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| R1 | 你好，很高興認識你。 | 10 | 51 / 41 ms | 818 / 1212 ms | **1.48x** | 819 / 1213 ms | **1.48x** | 3.4 / 3.6 s |
-| R2 | 今天天氣很好，我們一起去公園散步，好嗎？ | 17 | 53 / 41 ms | 690 / 928 ms | **1.34x** | 1454 / 2096 ms | **1.44x** | 7.1 / 6.1 s |
-| R3 | 你好，我是你的助理，今天天氣很好，我們一起去公園散步，好嗎？ | 24 | 54 / 41 ms | 794 / 1092 ms | **1.38x** | 2122 / 3314 ms | **1.56x** | 12.9 / 12.6 s |
-| R4 | 謝謝你的問題，我們明天早上一起去市場買菜，然後去公園散步，晚上再一起吃飯。 | 31 | 82 / 55 ms | 653 / 1016 ms | **1.56x** | 2883 / 4052 ms | **1.41x** | 14.7 / 13.1 s |
+| R1 | 你好，很高興認識你。 | 10 | 16 / 22 ms | 761 / 1201 ms | **1.58x** | 762 / 1201 ms | **1.58x** | 4.6 / 3.4 s |
+| R2 | 今天天氣很好，我們一起去公園散步，好嗎？ | 17 | 17 / 23 ms | 613 / 912 ms | **1.49x** | 1371 / 2283 ms | **1.66x** | 6.8 / 8.2 s |
+| R3 | 你好，我是你的助理，今天天氣很好，我們一起去公園散步，好嗎？ | 24 | 19 / 26 ms | 724 / 1067 ms | **1.47x** | 2044 / 3218 ms | **1.57x** | 13.1 / 12.2 s |
+| R4 | 謝謝你的問題，我們明天早上一起去市場買菜，然後去公園散步，晚上再一起吃飯。 | 31 | 27 / 56 ms | 697 / 1016 ms | **1.46x** | 2626 / 3991 ms | **1.52x** | 12.8 / 12.7 s |
 
 ### Spoken turns
 
-Clips a–d from the ASR benchmark, sent as audio turns. Transcripts were identical in both modes. At temperature 0 the two chat backends still write different replies, so these turns do different amounts of downstream work (tokens and audio are shown).
+Clips a–d from the ASR benchmark, sent as audio turns. Transcripts were identical in both modes on a–c. On d the engine ends 身體才會硬朗 and `whisper.cpp` 身體才會強壯, in every round; the first run had the same split, and its text calling all four identical was wrong. At temperature 0 the two chat backends still write different replies, so these turns do different amounts of downstream work (tokens and audio are shown).
 
 | Clip | VAD + ASR full / router | Speedup | First audio full / router | Speedup | Whole turn full / router | Speedup | Reply tokens full / router | Audio full / router |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| a | 244 / 305 ms | **1.25x** | 926 / 1253 ms | **1.35x** | 1263 / 1776 ms | **1.41x** | 15 / 17 | 3.8 / 3.8 s |
-| b | 351 / 434 ms | **1.24x** | 1013 / 1704 ms | **1.68x** | 1542 / 1705 ms | **1.11x** | 15 / 12 | 4.8 / 3.6 s |
-| c | 500 / 605 ms | **1.21x** | 906 / 1528 ms | **1.69x** | 906 / 2258 ms | **2.49x** | 5 / 15 | 1.1 / 4.3 s |
-| d | 624 / 748 ms | **1.20x** | 1705 / 1545 ms | **0.91x** | 2614 / 3368 ms | **1.29x** | 23 / 17 | 9.0 / 7.9 s |
+| a | 276 / 337 ms | **1.22x** | 977 / 1292 ms | **1.32x** | 1760 / 1828 ms | **1.04x** | 14 / 17 | 6.9 / 3.8 s |
+| b | 406 / 487 ms | **1.20x** | 999 / 1759 ms | **1.76x** | 1526 / 1760 ms | **1.15x** | 15 / 12 | 4.8 / 3.4 s |
+| c | 588 / 691 ms | **1.18x** | 926 / 1609 ms | **1.74x** | 926 / 2327 ms | **2.51x** | 4 / 15 | 1.1 / 4.2 s |
+| d | 734 / 858 ms | **1.17x** | 1464 / 1663 ms | **1.14x** | 2067 / 3433 ms | **1.66x** | 19 / 17 | 6.7 / 7.9 s |
 
 ### Phase rates
 
@@ -231,12 +258,12 @@ Medians across all 8 turns. Per-clause translation and synthesis times come from
 
 | Phase | Full | Router | Speedup |
 | --- | ---: | ---: | ---: |
-| VAD + ASR (spoken turns) | 425.7 ms | 519.7 ms | **1.22x** |
-| Transcript to first reply token | 51.8 ms | 40.6 ms | **0.78x** |
-| Reply stream rate inside a turn | 39.6 tok/s | 64.2 tok/s | **0.62x** |
-| Translation, per source character | 50.2 ms | 58.8 ms | **1.17x** |
-| Synthesis, per second of audio | 42.7 ms | 131.5 ms | **3.08x** |
-| Whole turn, per second of audio | 264.0 ms | 382.8 ms | **1.45x** |
+| VAD + ASR (spoken turns) | 497.1 ms | 589.0 ms | **1.18x** |
+| Transcript to first reply token | 17.7 ms | 25.3 ms | **1.43x** |
+| Reply stream rate inside a turn | 104.9 tok/s | 59.9 tok/s | **1.75x** |
+| Translation, per source character | 50.7 ms | 58.9 ms | **1.16x** |
+| Synthesis, per second of audio | 42.3 ms | 129.7 ms | **3.06x** |
+| Whole turn, per second of audio | 229.5 ms | 385.5 ms | **1.68x** |
 
 ### VRAM while serving
 
@@ -244,10 +271,10 @@ Per-process `nvidia-smi` usage after all turns. The router's own `xabe-engine` p
 
 | Full mode | | Router mode | |
 | --- | ---: | --- | ---: |
-| xabe-engine, all stages | 17328 MiB | whisper-server | 3682 MiB |
-|  |  | llama-server (chat) | 5224 MiB |
+| xabe-engine, all stages | 17584 MiB | whisper-server | 3682 MiB |
 |  |  | llama-server (translator) | 11020 MiB |
-|  |  | PyTorch TTS server | 9242 MiB |
-| **Total** | **17328 MiB** | **Total** | **29168 MiB** |
+|  |  | llama-server (chat) | 5224 MiB |
+|  |  | PyTorch TTS server | 8936 MiB |
+| **Total** | **17584 MiB** | **Total** | **28862 MiB** |
 
-Router / full: **1.68x** the memory. The PyTorch figure includes its caching allocator's reserve after the longest utterances.
+Router / full: **1.64x** the memory. The PyTorch figure includes its caching allocator's reserve after the longest utterances.
