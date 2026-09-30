@@ -36,7 +36,7 @@ pub struct GatewayConfig {
     /// competing for the same SMs: on a three-clause turn synthesis went from
     /// 440 ms to about 950 and first audio from 2659 ms to 2919, the whole
     /// turn no faster - which is why the device-derived default is still zero
-    /// on one card and `xabe-engine --translate-ahead` exists to override it.
+    /// on one card and `llmtie-rs --translate-ahead` exists to override it.
     ///
     /// A stage reached over a URL is taken to be off this card, which is a
     /// guess: the URL may well be a `llama-server` on 127.0.0.1 holding the

@@ -55,7 +55,7 @@ fn capture() -> Option<PathBuf> {
 }
 
 fn device() -> Option<usize> {
-    std::env::var("XABE_COSY_DEVICE").ok()?.parse().ok()
+    std::env::var("LLMTIE_COSY_DEVICE").ok()?.parse().ok()
 }
 
 fn correlation(a: &[f32], b: &[f32]) -> f64 {
@@ -79,7 +79,7 @@ fn one_estimator_evaluation_matches_the_reference() {
     let (Some(dir), Some(dev)) = (capture(), device()) else {
         println!(
             "SKIP: needs .golden/cosyvoice (tools/oracle/capture_cosyvoice.py) \
-             and XABE_COSY_DEVICE=<free card>"
+             and LLMTIE_COSY_DEVICE=<free card>"
         );
         return;
     };

@@ -7,7 +7,7 @@
 use crate::EngineError;
 use std::path::{Component, Path, PathBuf};
 
-const MARKER: &str = "XABE_RAM_SCOPE_ENTERED";
+const MARKER: &str = "LLMTIE_RAM_SCOPE_ENTERED";
 
 /// Parse an exact positive byte count, optionally with a binary unit.
 pub fn parse_bytes(value: &str) -> Result<u64, String> {
@@ -121,11 +121,11 @@ mod tests {
     #[test]
     fn cli_accepts_exact_sizes_and_rejects_invalid_limits() {
         for (s, n) in [("32GiB", 32u64 << 30), ("512MiB", 512 << 20), ("123", 123)] {
-            let args = crate::Args::try_parse_from(["xabe-engine", "--max-system-ram", s]).unwrap();
+            let args = crate::Args::try_parse_from(["llmtie-rs", "--max-system-ram", s]).unwrap();
             assert_eq!(args.max_system_ram, Some(n));
         }
         for s in ["0", "-1", "1.5GiB", "32GB", "18446744073709551615TiB"] {
-            assert!(crate::Args::try_parse_from(["xabe-engine", "--max-system-ram", s]).is_err());
+            assert!(crate::Args::try_parse_from(["llmtie-rs", "--max-system-ram", s]).is_err());
         }
     }
 

@@ -1,13 +1,13 @@
 # Command surface
 
-The workspace builds two binaries: `xabe-engine`, the engine itself, and
+The workspace builds two binaries: `llmtie-rs`, the engine itself, and
 `xabe-tts-bench`, for timing the synthesiser.
 
-## `xabe-engine`
+## `llmtie-rs`
 
 ### System RAM budget
 
-Add `--max-system-ram 32GiB` (or `XABE_MAX_SYSTEM_RAM=32GiB`) to cap the
+Add `--max-system-ram 32GiB` (or `LLMTIE_MAX_SYSTEM_RAM=32GiB`) to cap the
 engine's system memory. Sizes are positive integer bytes, or integers followed
 by `KiB`, `MiB`, `GiB` or `TiB`. Omitting it preserves the existing unlimited
 behavior. Choose a budget below the machine's RAM, leaving room for other
@@ -39,7 +39,7 @@ must still fit; the engine does not offload them automatically.
 
 On Windows, CUDA host uploads (including model weights) use ordinary
 `cuMemAlloc` allocations by default. Linux keeps the stream-pool upload path.
-`XABE_CUDA_UPLOAD_ALLOCATOR=legacy` selects ordinary allocations explicitly;
+`LLMTIE_CUDA_UPLOAD_ALLOCATOR=legacy` selects ordinary allocations explicitly;
 `pool` selects the stream pool, and `auto` restores the platform default.
 Scratch buffers remain pooled in either mode. The startup log prints
 `upload_allocator=Legacy` or `upload_allocator=Pool`, so the selected path is
@@ -104,7 +104,7 @@ kernel. Nothing about the flag changes - the same path takes an f16 or a
 
 ```sh
 # everything in one process
-xabe-engine --serve 127.0.0.1:8000 \
+llmtie-rs --serve 127.0.0.1:8000 \
             --asr-model    models/asr/breeze-asr-26   --asr-device 0 \
             --vad-model    models/vad/silero-v5.1.2.safetensors \
             --tts-model    models/tts/mms-tts-nan     --tts-device 1 \
@@ -112,60 +112,60 @@ xabe-engine --serve 127.0.0.1:8000 \
             --llm-device   0
 
 # split across processes and GPUs, as run.sh does today
-xabe-engine --serve 127.0.0.1:8080 --asr-model models/asr/breeze-asr-26 \
+llmtie-rs --serve 127.0.0.1:8080 --asr-model models/asr/breeze-asr-26 \
             --vad-model models/vad/silero-v5.1.2.safetensors --asr-device 0
-xabe-engine --serve 127.0.0.1:8100 --tts-model models/tts/mms-tts-nan --tts-device 1
-xabe-engine --serve 127.0.0.1:8000 --asr-url http://127.0.0.1:8080 \
+llmtie-rs --serve 127.0.0.1:8100 --tts-model models/tts/mms-tts-nan --tts-device 1
+llmtie-rs --serve 127.0.0.1:8000 --asr-url http://127.0.0.1:8080 \
             --tts-url http://127.0.0.1:8100 --llm-url http://127.0.0.1:8082
 
 # one stage, one shot, no server
-xabe-engine --tts-model models/tts/mms-tts-nan --text "lí hó" --out hello.wav
-xabe-engine --asr-model models/asr/breeze-asr-26 --in clip.wav
-xabe-engine --vad-model models/vad/silero.safetensors --in clip.wav   # segments
+llmtie-rs --tts-model models/tts/mms-tts-nan --text "lí hó" --out hello.wav
+llmtie-rs --asr-model models/asr/breeze-asr-26 --in clip.wav
+llmtie-rs --vad-model models/vad/silero.safetensors --in clip.wav   # segments
 ```
 
 ### Flags
 
 | flag | env | default | |
 | --- | --- | --- | --- |
-| `--serve` | `XABE_SERVE` | — | listen address; without it the run is one-shot |
-| `--asr-model` | `XABE_ASR_MODEL` | — | speech-to-text checkpoint directory |
-| `--asr-url` | `XABE_ASR_URL` | — | delegate speech-to-text |
-| `--asr-device` | `XABE_ASR_DEVICE` | `0` | a CUDA device ordinal; **not** `cpu` |
-| `--vad-model` | `XABE_VAD_MODEL` | — | voice-activity checkpoint |
-| `--vad-url` | `XABE_VAD_URL` | — | delegate voice-activity detection |
-| `--vad-device` | `XABE_VAD_DEVICE` | `cpu` | `cpu` only; see below |
-| `--tts-model` | `XABE_TTS_MODEL` | — | directory, or the safetensors file itself |
-| `--tts-url` | `XABE_TTS_URL` | — | delegate text-to-speech |
-| `--tts-device` | `XABE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
-| `--translator-model` | `XABE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint: a 🤗 directory or a `.gguf` file |
-| `--translator-url` | `XABE_TRANSLATOR_URL` | — | delegate translation |
-| `--translator-device` | `XABE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
-| `--translate-ahead` | `XABE_TRANSLATE_AHEAD` | by device | `0` translates clauses in step with the synthesiser; `1` translates a turn's first clause alone and every later one as it arrives, decoded together. Defaults to `1` when the translator and the synthesiser are on different cards; see docs/BENCHMARKS.md |
-| `--llm-model` | `XABE_LLM_MODEL` | — | chat model, as a `.gguf`; GGUF only, see above |
-| `--llm-url` | `XABE_LLM_URL` | — | delegate the chat model to a llama-server |
-| `--llm-device` | `XABE_LLM_DEVICE` | `0` | a CUDA device ordinal; `cpu` is refused |
-| `--direct-taigi` | `XABE_DIRECT_TAIGI` | off | chat model answers in Taigi Han itself |
+| `--serve` | `LLMTIE_SERVE` | — | listen address; without it the run is one-shot |
+| `--asr-model` | `LLMTIE_ASR_MODEL` | — | speech-to-text checkpoint directory |
+| `--asr-url` | `LLMTIE_ASR_URL` | — | delegate speech-to-text |
+| `--asr-device` | `LLMTIE_ASR_DEVICE` | `0` | a CUDA device ordinal; **not** `cpu` |
+| `--vad-model` | `LLMTIE_VAD_MODEL` | — | voice-activity checkpoint |
+| `--vad-url` | `LLMTIE_VAD_URL` | — | delegate voice-activity detection |
+| `--vad-device` | `LLMTIE_VAD_DEVICE` | `cpu` | `cpu` only; see below |
+| `--tts-model` | `LLMTIE_TTS_MODEL` | — | directory, or the safetensors file itself |
+| `--tts-url` | `LLMTIE_TTS_URL` | — | delegate text-to-speech |
+| `--tts-device` | `LLMTIE_TTS_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--translator-model` | `LLMTIE_TRANSLATOR_MODEL` | — | Mandarin-to-Taigi checkpoint: a 🤗 directory or a `.gguf` file |
+| `--translator-url` | `LLMTIE_TRANSLATOR_URL` | — | delegate translation |
+| `--translator-device` | `LLMTIE_TRANSLATOR_DEVICE` | `0` | `cpu`, or a CUDA device ordinal |
+| `--translate-ahead` | `LLMTIE_TRANSLATE_AHEAD` | by device | `0` translates clauses in step with the synthesiser; `1` translates a turn's first clause alone and every later one as it arrives, decoded together. Defaults to `1` when the translator and the synthesiser are on different cards; see docs/BENCHMARKS.md |
+| `--llm-model` | `LLMTIE_LLM_MODEL` | — | chat model, as a `.gguf`; GGUF only, see above |
+| `--llm-url` | `LLMTIE_LLM_URL` | — | delegate the chat model to a llama-server |
+| `--llm-device` | `LLMTIE_LLM_DEVICE` | `0` | a CUDA device ordinal; `cpu` is refused |
+| `--direct-taigi` | `LLMTIE_DIRECT_TAIGI` | off | chat model answers in Taigi Han itself |
 | `--in` | — | — | one-shot input WAV; `-` reads stdin |
 | `--text` | — | — | one-shot input text; `-` reads stdin |
 | `--out` | — | — | one-shot output; `-` writes stdout |
-| `--tts-engine` | `XABE_TTS_ENGINES` | — | engines as `name=url` or `name=path`, repeatable; on its own it *is* the TTS stage |
-| `--cosy-voice` | `XABE_COSY_VOICE` | `<checkpoint>/voices/taigi-ref.safetensors` | speaker bundle for a local CosyVoice |
-| `--cosy-instruct` | `XABE_COSY_INSTRUCT` | a Taigi instruction | what a local CosyVoice is told; must end on `<|endofprompt|>` |
-| `--taco-sigma` | `XABE_TACO_SIGMA` | `tacotron2.json`'s `0.666` | WaveGlow's noise scale for a local Tacotron2 |
-| `--tts-default` | `XABE_TTS_DEFAULT` | `mms` | which engine the page selects |
-| `--translator-target` | `XABE_TRANSLATOR_TARGET` | `POJ` | `POJ`, `HAN` or `HL` |
-| `--asr-lang` | `XABE_ASR_LANG` | `zh` | never `en`; see below |
-| `--person` / `--bot` | `XABE_PERSON` / `XABE_BOT` | 使用者 / 小助理 | names in the transcript |
-| `--temperature` | `XABE_TEMPERATURE` | 0.3 | reply sampling |
-| `--max-tokens` | `XABE_MAX_TOKENS` | 160 | reply length cap |
-| `--history-turns` | `XABE_HISTORY_TURNS` | 6 | turns kept in the prompt |
-| `--min-chunk` | `XABE_MIN_CHUNK` | 6 | characters before a later chunk is spoken |
-| `--first-chunk` | `XABE_FIRST_CHUNK` | 4 | characters before the *first* chunk is spoken |
-| `--system-prompt` | `XABE_SYSTEM_PROMPT` | — | replaces the built-in system prompt, inline |
-| `--prompt-file` | `XABE_PROMPT_FILE` | — | the same, read from a file |
-| `--config` | `XABE_TTS_CONFIG` | next to the model | TTS `config.json` |
-| `--seed` | `XABE_SEED` | 0 | duration and prior sampling |
+| `--tts-engine` | `LLMTIE_TTS_ENGINES` | — | engines as `name=url` or `name=path`, repeatable; on its own it *is* the TTS stage |
+| `--cosy-voice` | `LLMTIE_COSY_VOICE` | `<checkpoint>/voices/taigi-ref.safetensors` | speaker bundle for a local CosyVoice |
+| `--cosy-instruct` | `LLMTIE_COSY_INSTRUCT` | a Taigi instruction | what a local CosyVoice is told; must end on `<|endofprompt|>` |
+| `--taco-sigma` | `LLMTIE_TACO_SIGMA` | `tacotron2.json`'s `0.666` | WaveGlow's noise scale for a local Tacotron2 |
+| `--tts-default` | `LLMTIE_TTS_DEFAULT` | `mms` | which engine the page selects |
+| `--translator-target` | `LLMTIE_TRANSLATOR_TARGET` | `POJ` | `POJ`, `HAN` or `HL` |
+| `--asr-lang` | `LLMTIE_ASR_LANG` | `zh` | never `en`; see below |
+| `--person` / `--bot` | `LLMTIE_PERSON` / `LLMTIE_BOT` | 使用者 / 小助理 | names in the transcript |
+| `--temperature` | `LLMTIE_TEMPERATURE` | 0.3 | reply sampling |
+| `--max-tokens` | `LLMTIE_MAX_TOKENS` | 160 | reply length cap |
+| `--history-turns` | `LLMTIE_HISTORY_TURNS` | 6 | turns kept in the prompt |
+| `--min-chunk` | `LLMTIE_MIN_CHUNK` | 6 | characters before a later chunk is spoken |
+| `--first-chunk` | `LLMTIE_FIRST_CHUNK` | 4 | characters before the *first* chunk is spoken |
+| `--system-prompt` | `LLMTIE_SYSTEM_PROMPT` | — | replaces the built-in system prompt, inline |
+| `--prompt-file` | `LLMTIE_PROMPT_FILE` | — | the same, read from a file |
+| `--config` | `LLMTIE_TTS_CONFIG` | next to the model | TTS `config.json` |
+| `--seed` | `LLMTIE_SEED` | 0 | duration and prior sampling |
 | `--noise-scale` | | 0.667 | prior temperature |
 | `--noise-scale-duration` | | 0.8 | duration temperature |
 | `--speaking-rate` | | 1.0 | duration multiplier |
@@ -209,7 +209,7 @@ eat the same thing: `mms-tts-nan` was trained on POJ and
 engine wants `POJ`, the same as mms:
 
 ```sh
-xabe-engine --serve 127.0.0.1:8000 \
+llmtie-rs --serve 127.0.0.1:8000 \
             --tts-model  models/tts/mms-tts-nan            --tts-device 2 \
             --tts-engine suisiann=models/tts/coqui-vits-suisiann \
             --tts-script suisiann=POJ
@@ -218,7 +218,7 @@ xabe-engine --serve 127.0.0.1:8000 \
 and the one-shot path takes romanisation directly:
 
 ```sh
-xabe-engine --tts-model models/tts/coqui-vits-suisiann --tts-device 0 \
+llmtie-rs --tts-model models/tts/coqui-vits-suisiann --tts-device 0 \
             --text "Lí hó, guá sī Tâi-oân-lâng." --out hello.wav
 ```
 
@@ -241,7 +241,7 @@ the rest:
 
 ```sh
 # tacotron2 and nothing else
-xabe-engine --serve 127.0.0.1:8100 \
+llmtie-rs --serve 127.0.0.1:8100 \
             --tts-engine  taco=models/tts/tacotron2-nan --tts-device 1 \
             --tts-default taco
 ```
@@ -251,7 +251,7 @@ speaks with, because that path has no engine to select by name.
 
 ```sh
 # all three synthesisers in one process, on card 2
-xabe-engine --serve 127.0.0.1:8000 \
+llmtie-rs --serve 127.0.0.1:8000 \
             --tts-model  models/tts/mms-tts-nan       --tts-device 2 \
             --tts-engine cosyvoice=models/tts/cosyvoice3-0.5b \
             --tts-engine tacotron2=models/tts/tacotron2-nan \
@@ -273,10 +273,10 @@ They are the same setting with a level of indirection, they are **alternatives
 rather than layers**, and giving both is refused:
 
 ```sh
-xabe-engine --serve 0.0.0.0:8000 --llm-model models/breeze2-8b-Q4_K_M.gguf \
+llmtie-rs --serve 0.0.0.0:8000 --llm-model models/breeze2-8b-Q4_K_M.gguf \
             --system-prompt "用台語漢字回答，逐句八到十二字。"
 
-XABE_PROMPT_FILE=prompts/system-taigi.txt xabe-engine --serve 0.0.0.0:8000 ...
+LLMTIE_PROMPT_FILE=prompts/system-taigi.txt llmtie-rs --serve 0.0.0.0:8000 ...
 ```
 
 `prompts/` is gitignored. A system prompt is deployment content rather than
@@ -341,7 +341,7 @@ is actually waiting through - that is paying for the overlap.
 
 ```sh
 # the chat model and everything cheap on card 0, the translator alone on card 1
-xabe-engine --serve 127.0.0.1:8000 \
+llmtie-rs --serve 127.0.0.1:8000 \
             --llm-model        models/breeze2-8b-Q4_K_M.gguf           --llm-device 0 \
             --translator-model models/taigi-translator-13b-Q4_K_M.gguf --translator-device 1 \
             --asr-model        models/asr/breeze-asr-26                --asr-device 0 \
@@ -552,7 +552,7 @@ say the file is speech. The check that does is an ASR round trip - synthesise,
 then transcribe with a model that was never involved in producing it:
 
 ```sh
-xabe-engine --tts-model models/tts/mms-tts-nan \
+llmtie-rs --tts-model models/tts/mms-tts-nan \
             --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
 curl -s -F file=@hello.wav -F language=zh http://127.0.0.1:8080/inference
 # {"text":"你好 今天天氣很好\n"}

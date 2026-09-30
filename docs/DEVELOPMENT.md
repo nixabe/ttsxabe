@@ -3,7 +3,7 @@
 ## Getting a working tree
 
 ```sh
-git clone <repo> && cd ttsxabe
+git clone <repo> && cd llmtie-rs
 cargo test --workspace --release
 ```
 
@@ -38,7 +38,7 @@ both — [TESTING.md](TESTING.md) lists all of them.
 Nothing in `models/` is required. Every test that reads real weights detects
 their absence, prints `SKIP:` with the variable to set, and returns, so a clone
 with an empty `models/` still runs green. The one directory with no default at
-all is `XABE_QUANT_DIR`: those files are multi-gigabyte `llama-quantize`
+all is `LLMTIE_QUANT_DIR`: those files are multi-gigabyte `llama-quantize`
 outputs, derived rather than downloaded, and one command reproduces any of
 them.
 

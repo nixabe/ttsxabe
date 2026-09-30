@@ -65,7 +65,7 @@ fn captures() -> Vec<PathBuf> {
 
 /// Which device to use. See `docs/TESTING.md`; check `nvidia-smi` first.
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

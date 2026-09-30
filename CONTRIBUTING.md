@@ -17,7 +17,7 @@ huggingface-cli download facebook/mms-tts-nan --local-dir models/tts/mms-tts-nan
 ```
 
 `models/` is gitignored and holds every model the pipeline uses. Tests look
-there first, fall back to the HuggingFace cache, and take `XABE_TTS_MODEL` over
+there first, fall back to the HuggingFace cache, and take `LLMTIE_TTS_MODEL` over
 both.
 
 A GPU is not required to build or to run most tests. Kernel tests that need one

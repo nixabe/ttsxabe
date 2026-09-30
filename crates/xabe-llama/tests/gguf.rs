@@ -10,7 +10,7 @@ use xabe_llama::{LlamaConfig, LlamaWeights};
 
 fn model() -> Option<PathBuf> {
     let p = PathBuf::from(
-        std::env::var("XABE_LLM_GGUF")
+        std::env::var("LLMTIE_LLM_GGUF")
             .unwrap_or_else(|_| "models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf".to_string()),
     );
     // Resolve against the workspace root, since tests run in the crate dir.
@@ -29,7 +29,7 @@ macro_rules! model_or_skip {
         match model() {
             Some(p) => p,
             None => {
-                println!("SKIP: the Breeze2 GGUF is not in models/llm; set XABE_LLM_GGUF");
+                println!("SKIP: the Breeze2 GGUF is not in models/llm; set LLMTIE_LLM_GGUF");
                 return;
             }
         }

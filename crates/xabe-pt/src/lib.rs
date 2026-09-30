@@ -1,4 +1,4 @@
-//! Torch checkpoint reading for `ttsxabe`.
+//! Torch checkpoint reading for `llmtie-rs`.
 //!
 //! # Why this crate exists
 //!

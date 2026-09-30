@@ -204,7 +204,7 @@ fn stages(
         gpu.synchronize()?;
         let t_dec = t.elapsed();
         if last && xabe_cuda::kprof::enabled() {
-            // With `XABE_KPROF` set: where one whole `generate` went -
+            // With `LLMTIE_KPROF` set: where one whole `generate` went -
             // encoder, cache and decode - kernel by kernel, synchronised.
             let rows = xabe_cuda::kprof::report();
             let total: f64 = rows.iter().map(|r| r.2).sum();

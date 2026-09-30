@@ -55,7 +55,7 @@ fn capture() -> Option<PathBuf> {
 }
 
 fn device() -> Option<usize> {
-    std::env::var("XABE_COSY_DEVICE").ok()?.parse().ok()
+    std::env::var("LLMTIE_COSY_DEVICE").ok()?.parse().ok()
 }
 
 fn correlation(a: &[f32], b: &[f32]) -> f64 {
@@ -77,7 +77,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
 #[test]
 fn the_excitation_path_reproduces_the_reference() {
     let (Some(dir), Some(dev)) = (capture(), device()) else {
-        println!("SKIP: needs .golden/cosyvoice and XABE_COSY_DEVICE=<free card>");
+        println!("SKIP: needs .golden/cosyvoice and LLMTIE_COSY_DEVICE=<free card>");
         return;
     };
     let model = root().join("models/tts/cosyvoice3-0.5b/hift.safetensors");
@@ -154,7 +154,7 @@ fn the_whole_vocoder_chain_reproduces_the_reference_waveform() {
     // wrong rate, a transposed excitation, an off-by-one in the frame count -
     // which is invisible to both.
     let (Some(dir), Some(dev)) = (capture(), device()) else {
-        println!("SKIP: needs .golden/cosyvoice and XABE_COSY_DEVICE=<free card>");
+        println!("SKIP: needs .golden/cosyvoice and LLMTIE_COSY_DEVICE=<free card>");
         return;
     };
     let model = root().join("models/tts/cosyvoice3-0.5b/hift.safetensors");

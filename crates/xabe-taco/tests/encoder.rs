@@ -40,11 +40,11 @@ fn the_encoder_matches_the_reference() {
         println!("SKIP: no .golden/tacotron2/nan; run tools/oracle/capture_tacotron2.py");
         return;
     }
-    let Some(dev) = std::env::var("XABE_TACO_DEVICE")
+    let Some(dev) = std::env::var("LLMTIE_TACO_DEVICE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     else {
-        println!("SKIP: set XABE_TACO_DEVICE=<free card>; see docs/TESTING.md");
+        println!("SKIP: set LLMTIE_TACO_DEVICE=<free card>; see docs/TESTING.md");
         return;
     };
 

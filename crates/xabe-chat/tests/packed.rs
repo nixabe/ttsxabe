@@ -38,20 +38,20 @@ use xabe_chat::{ChatModel, Packing};
 
 /// A quantized copy of the chat model, if one has been made.
 ///
-/// `XABE_QUANT_DIR` has no default on purpose - the files are gigabytes and
+/// `LLMTIE_QUANT_DIR` has no default on purpose - the files are gigabytes and
 /// derived rather than downloaded, so `docs/TESTING.md` names the one command
 /// that reproduces any of them rather than pinning a path a test depends on.
 fn quantized() -> Option<PathBuf> {
-    let dir = std::env::var("XABE_QUANT_DIR").ok()?;
+    let dir = std::env::var("LLMTIE_QUANT_DIR").ok()?;
     // The same naming `xabe-gguf`'s `quantized_model.rs` uses, so one
     // directory serves both and `docs/TESTING.md` names one command.
     let name =
-        std::env::var("XABE_QUANT_FILE").unwrap_or_else(|_| "breeze-Q4_K_M.gguf".to_string());
+        std::env::var("LLMTIE_QUANT_FILE").unwrap_or_else(|_| "breeze-Q4_K_M.gguf".to_string());
     let p = PathBuf::from(dir).join(name);
     if p.is_file() {
         Some(p)
     } else {
-        eprintln!("SKIP: no {} under XABE_QUANT_DIR", p.display());
+        eprintln!("SKIP: no {} under LLMTIE_QUANT_DIR", p.display());
         None
     }
 }
@@ -59,10 +59,10 @@ fn quantized() -> Option<PathBuf> {
 /// The card to load 8 GB onto. No default: this host has three and two of them
 /// are running somebody's pipeline.
 fn device() -> Option<usize> {
-    match std::env::var("XABE_CHAT_DEVICE").ok() {
+    match std::env::var("LLMTIE_CHAT_DEVICE").ok() {
         Some(v) => v.parse().ok(),
         None => {
-            eprintln!("SKIP: set XABE_CHAT_DEVICE to the card to load onto");
+            eprintln!("SKIP: set LLMTIE_CHAT_DEVICE to the card to load onto");
             None
         }
     }

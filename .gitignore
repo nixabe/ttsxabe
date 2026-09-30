@@ -7,7 +7,7 @@ __pycache__/
 
 # System prompts. Not in the repository: they are deployment content rather
 # than engine behaviour, and the engine ships built-ins so that an absent
-# `prompts/` changes nothing. `XABE_PROMPT_FILE` points at one.
+# `prompts/` changes nothing. `LLMTIE_PROMPT_FILE` points at one.
 prompts/
 
 # Benchmark clips. Synthesised from the checkpoint rather than checked in -

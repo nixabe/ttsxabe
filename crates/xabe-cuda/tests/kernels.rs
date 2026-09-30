@@ -114,12 +114,12 @@ fn gpu() -> Option<Gpu> {
 /// Which device to use. Check `nvidia-smi` first - do not clobber other
 /// people's jobs.
 ///
-/// `XABE_TEST_DEVICE` and not `XABE_TTS_DEVICE`: the latter is the engine's
+/// `LLMTIE_TEST_DEVICE` and not `LLMTIE_TTS_DEVICE`: the latter is the engine's
 /// `--tts-device` env twin, and setting it to steer a test run also reaches
 /// into `xabe-engine`'s flag tests, which then assert against the card someone
 /// happened to pick. That cost eight failing tests once.
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

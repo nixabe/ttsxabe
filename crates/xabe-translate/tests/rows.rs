@@ -11,23 +11,23 @@ use std::path::PathBuf;
 use xabe_translate::{Cache, Packing, Translator};
 
 fn quantized() -> Option<PathBuf> {
-    let dir = std::env::var("XABE_QUANT_DIR").ok()?;
-    let name = std::env::var("XABE_TRANSLATOR_QUANT")
+    let dir = std::env::var("LLMTIE_QUANT_DIR").ok()?;
+    let name = std::env::var("LLMTIE_TRANSLATOR_QUANT")
         .unwrap_or_else(|_| "taigi-translator-13b-Q4_K_M.gguf".to_string());
     let p = PathBuf::from(dir).join(name);
     if p.is_file() {
         Some(p)
     } else {
-        eprintln!("SKIP: no {} under XABE_QUANT_DIR", p.display());
+        eprintln!("SKIP: no {} under LLMTIE_QUANT_DIR", p.display());
         None
     }
 }
 
 fn device() -> Option<usize> {
-    match std::env::var("XABE_TRANSLATOR_DEVICE").ok() {
+    match std::env::var("LLMTIE_TRANSLATOR_DEVICE").ok() {
         Some(v) => v.parse().ok(),
         None => {
-            eprintln!("SKIP: set XABE_TRANSLATOR_DEVICE to the card to load onto");
+            eprintln!("SKIP: set LLMTIE_TRANSLATOR_DEVICE to the card to load onto");
             None
         }
     }

@@ -1,13 +1,13 @@
 //! Reads the real Coqui VITS checkpoint through the container.
 //!
-//! Skips loudly when the checkpoint is absent. Set `XABE_COQUI_MODEL` to the
+//! Skips loudly when the checkpoint is absent. Set `LLMTIE_COQUI_MODEL` to the
 //! model directory, or let it find `models/tts/coqui-vits-suisiann`.
 
 use xabe_pt::{Dtype, PtFile};
 
 /// Locates the directory holding `best_model.pth`.
 fn find_model() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("XABE_COQUI_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_COQUI_MODEL") {
         let p = std::path::PathBuf::from(p);
         return p.join("best_model.pth").is_file().then_some(p);
     }
@@ -24,7 +24,7 @@ fn open() -> Option<PtFile> {
 #[test]
 fn reads_the_whole_state_dict() {
     let Some(f) = open() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     // The trainer saved the generator, the discriminator and the posterior
@@ -38,7 +38,7 @@ fn reads_the_whole_state_dict() {
 #[test]
 fn every_tensor_is_f32_and_borrowable() {
     let Some(f) = open() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     for (name, info) in f.tensors() {
@@ -51,7 +51,7 @@ fn every_tensor_is_f32_and_borrowable() {
 #[test]
 fn shapes_match_the_published_geometry() {
     let Some(f) = open() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     for (name, shape) in [
@@ -81,7 +81,7 @@ fn shapes_match_the_published_geometry() {
 #[test]
 fn a_wrong_shape_names_the_tensor() {
     let Some(f) = open() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     let err = f
@@ -95,7 +95,7 @@ fn a_wrong_shape_names_the_tensor() {
 #[test]
 fn the_optimizer_section_is_a_different_state_dict() {
     let Some(dir) = find_model() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     // The root object holds `model` beside `optimizer`, `scheduler` and the
@@ -174,7 +174,7 @@ const REFERENCE: &[(&str, [f64; 4])] = &[
 #[test]
 fn values_match_torch_load_exactly() {
     let Some(f) = open() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     for (name, [first, middle, last, sum]) in REFERENCE {

@@ -1,4 +1,4 @@
-//! Safetensors container reading for `ttsxabe`.
+//! Safetensors container reading for `llmtie-rs`.
 //!
 //! # Why this crate exists
 //!

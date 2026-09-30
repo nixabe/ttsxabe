@@ -363,12 +363,12 @@ quantizer reaches.
 
 `crates/xabe-gguf/tests/quantized_model.rs` opens an actual
 `llama-quantize` output beside its f16 original. It is skipped unless
-`XABE_QUANT_DIR` points at one, because the files are gigabytes and are
+`LLMTIE_QUANT_DIR` points at one, because the files are gigabytes and are
 reproducible in a single command:
 
 ```sh
 llama-quantize models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
-    $XABE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
+    $LLMTIE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
 ```
 
 What it asserts is **correlation**, not mean error, and that is the point: a

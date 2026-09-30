@@ -791,7 +791,7 @@ clip, nine-round medians:
 **The picker was 0.6 ms a token of host time.** `pick` asked
 `suppress_tokens.contains(&id)` - a `Vec` of ninety-odd ids - for each of the
 vocabulary's 51 864 entries, every decoded token. The per-kernel profile
-(`XABE_KPROF`, below) charged it to the embedding gather that followed,
+(`LLMTIE_KPROF`, below) charged it to the embedding gather that followed,
 because that is the next launch after the host work; the kernel itself is
 microseconds. Two precomputed masks, the same answer.
 
@@ -1168,7 +1168,7 @@ every cell and the first is given.
 
 llama.cpp's `pp24` on the translator was 723 +/- 76 tok/s in the same
 sitting, so the 24-token row is 604 against 723: **0.84x**, from 0.74x. Still
-a loss. Profiled with `XABE_KPROF`, one launch at a time, the integer matmul
+a loss. Profiled with `LLMTIE_KPROF`, one launch at a time, the integer matmul
 is 35.9 ms of the prefill's 42.9 - 7.8 GB of weights at about 220 GB/s,
 against the 565 the mat-vec streams the same bytes at.
 
@@ -1243,7 +1243,7 @@ What moved, measured one change at a time against the previous binary:
 - **A 32-row int8 tile** for prompts of 32 tokens or fewer.
 
 `docs/KERNELS.md` has each kernel, and the per-kernel profiles that found
-them came from `XABE_KPROF`, under "How to measure".
+them came from `LLMTIE_KPROF`, under "How to measure".
 
 ## Against llama.cpp: level or ahead on every row
 
@@ -2532,7 +2532,7 @@ helps.
 
 ## A spoken turn: where the 7 s went
 
-`xabe-engine --serve`, one typed turn, the reply chunked as it streams and each
+`llmtie-rs --serve`, one typed turn, the reply chunked as it streams and each
 clause translated then synthesised. Measured over the WebSocket, so these are
 what a listener waits through rather than what a stage costs in isolation.
 Three clauses, Tacotron2, Breeze2 8 B chat, Taigi 13 B translator; medians
@@ -3711,7 +3711,7 @@ defaults. A ratio measured against a badly configured baseline is not a result.
   runs of identical code - measured, while chasing a change that turned out to
   be noise - which is more than most optimisations are worth. Only numbers from
   the same alternated run are comparable.
-- This host has no `nsys` and no counter permission for `ncu`. `XABE_KPROF=1`
+- This host has no `nsys` and no counter permission for `ncu`. `LLMTIE_KPROF=1`
   is the substitute: every launch synchronises and charges the time since the
   previous mark to its kernel's name, and `xabe-llm-bench` (last round's
   prefill and decode) and `xabe-asr-bench --stages` (one whole `generate`)
@@ -4202,7 +4202,7 @@ returned to its 6 MiB baseline.
 ### Ordinary upload allocations on the same Linux card
 
 The Windows compatibility policy was then exercised here with
-`XABE_CUDA_UPLOAD_ALLOCATOR=legacy`, one Tacotron2 registration, and the same
+`LLMTIE_CUDA_UPLOAD_ALLOCATOR=legacy`, one Tacotron2 registration, and the same
 checkpoints and workload (one direct synthesis instead of two). All requests
 completed without errors or allocation-recovery warnings. This tests the
 ordinary CUDA upload path, not WDDM or the Windows commit budget.

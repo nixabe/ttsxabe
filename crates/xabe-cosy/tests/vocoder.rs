@@ -79,7 +79,7 @@ fn model_path() -> Option<PathBuf> {
 }
 
 fn device() -> Option<usize> {
-    std::env::var("XABE_COSY_DEVICE").ok()?.parse().ok()
+    std::env::var("LLMTIE_COSY_DEVICE").ok()?.parse().ok()
 }
 
 fn correlation(a: &[f32], b: &[f32]) -> f64 {
@@ -104,7 +104,7 @@ fn the_vocoder_reproduces_the_reference_waveform() {
         println!(
             "SKIP: needs models/tts/cosyvoice3-0.5b/hift.safetensors \
              (tools/convert_cosyvoice.py), .golden/cosyvoice \
-             (tools/oracle/capture_cosyvoice.py) and XABE_COSY_DEVICE=<free card>"
+             (tools/oracle/capture_cosyvoice.py) and LLMTIE_COSY_DEVICE=<free card>"
         );
         return;
     };

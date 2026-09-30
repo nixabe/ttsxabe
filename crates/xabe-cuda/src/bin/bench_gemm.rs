@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! cargo run --release -p xabe-cuda --bin bench-gemm
-//! XABE_DEVICE=1 cargo run --release -p xabe-cuda --bin bench-gemm
+//! LLMTIE_DEVICE=1 cargo run --release -p xabe-cuda --bin bench-gemm
 //! ```
 //!
 //! Medians of repeated runs, warmed first. The point is not a leaderboard: it
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    let ordinal: usize = std::env::var("XABE_DEVICE")
+    let ordinal: usize = std::env::var("LLMTIE_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);

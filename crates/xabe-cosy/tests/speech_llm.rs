@@ -104,7 +104,7 @@ fn model_path() -> Option<PathBuf> {
 /// See `docs/TESTING.md`: no default, because two of this box's three cards
 /// are running somebody's pipeline and this model is not small.
 fn device() -> Option<usize> {
-    std::env::var("XABE_COSY_DEVICE").ok()?.parse().ok()
+    std::env::var("LLMTIE_COSY_DEVICE").ok()?.parse().ok()
 }
 
 /// Pearson correlation, which is what separates "rounding" from "permuted".
@@ -141,7 +141,7 @@ fn the_forced_logprobs_match_cosyvoice_at_every_position() {
         println!(
             "SKIP: needs models/tts/cosyvoice3-0.5b/llm.safetensors \
              (tools/convert_cosyvoice.py), .golden/cosyvoice \
-             (tools/oracle/capture_cosyvoice.py) and XABE_COSY_DEVICE=<free card>"
+             (tools/oracle/capture_cosyvoice.py) and LLMTIE_COSY_DEVICE=<free card>"
         );
         return;
     };

@@ -1,6 +1,6 @@
 //! Binds the real Coqui SuiSiann checkpoint against its own config.
 //!
-//! Skips loudly when the checkpoint is absent. Set `XABE_COQUI_MODEL`, or let
+//! Skips loudly when the checkpoint is absent. Set `LLMTIE_COQUI_MODEL`, or let
 //! it find `models/tts/coqui-vits-suisiann`.
 
 use xabe_pt::PtFile;
@@ -8,7 +8,7 @@ use xabe_vits::{CoquiConfig, CoquiTokenizer, VitsConfig, VitsWeights};
 
 /// Locates the model directory.
 fn find_model() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("XABE_COQUI_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_COQUI_MODEL") {
         let p = std::path::PathBuf::from(p);
         return p.join("best_model.pth").is_file().then_some(p);
     }
@@ -28,7 +28,7 @@ fn load() -> Option<(PtFile, CoquiConfig, VitsConfig)> {
 #[test]
 fn config_matches_the_published_geometry() {
     let Some((_, raw, cfg)) = load() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     assert_eq!(raw.model, "vits");
@@ -59,7 +59,7 @@ fn config_matches_the_published_geometry() {
 #[test]
 fn binds_every_inference_tensor() {
     let Some((f, _, cfg)) = load() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     let w = VitsWeights::load_coqui(&f, &cfg).expect("bind weights");
@@ -83,7 +83,7 @@ fn binds_every_inference_tensor() {
 #[test]
 fn the_decoder_arrives_weight_normalised() {
     let Some((f, _, cfg)) = load() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     let w = VitsWeights::load_coqui(&f, &cfg).expect("bind weights");
@@ -117,7 +117,7 @@ fn the_decoder_arrives_weight_normalised() {
 #[test]
 fn the_vocabulary_is_the_reference_order() {
     let Some((_, raw, _)) = load() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     let vocab = raw.characters.vocab().expect("build vocab");
@@ -141,7 +141,7 @@ fn the_vocabulary_is_the_reference_order() {
 #[test]
 fn encoding_intersperses_the_blank() {
     let Some((_, raw, _)) = load() else {
-        eprintln!("SKIP: coqui-vits-suisiann not found; set XABE_COQUI_MODEL");
+        eprintln!("SKIP: coqui-vits-suisiann not found; set LLMTIE_COQUI_MODEL");
         return;
     };
     let tok = CoquiTokenizer::new(&raw).expect("build tokenizer");

@@ -79,11 +79,11 @@ fn the_pipeline_speaks_the_capture_s_tokens() {
     let dir = root().join(".golden/cosyvoice");
     let model = root().join("models/tts/cosyvoice3-0.5b");
     let voice = model.join("voices/taigi-ref.safetensors");
-    let Some(dev) = std::env::var("XABE_COSY_DEVICE")
+    let Some(dev) = std::env::var("LLMTIE_COSY_DEVICE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     else {
-        println!("SKIP: set XABE_COSY_DEVICE=<free card>; see docs/TESTING.md");
+        println!("SKIP: set LLMTIE_COSY_DEVICE=<free card>; see docs/TESTING.md");
         return;
     };
     if !dir.join("wav.npy").is_file() || !voice.is_file() {

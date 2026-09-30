@@ -1502,7 +1502,7 @@ fn launched<T>(
 
 /// A per-kernel wall-clock profile, for a host with no `nsys`.
 ///
-/// Off unless `XABE_KPROF` is set. When it is, every launch that goes through
+/// Off unless `LLMTIE_KPROF` is set. When it is, every launch that goes through
 /// `launched` synchronises the context and charges the time since the
 /// previous mark to that kernel's name - so a kernel's figure includes the
 /// host work issued since the last launch, and the synchronisation takes away
@@ -1528,10 +1528,10 @@ pub mod kprof {
         })
     }
 
-    /// Whether `XABE_KPROF` was set when this was first asked.
+    /// Whether `LLMTIE_KPROF` was set when this was first asked.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("XABE_KPROF").is_some())
+        *ON.get_or_init(|| std::env::var_os("LLMTIE_KPROF").is_some())
     }
 
     pub(crate) fn mark(what: &'static str) {
@@ -2376,11 +2376,11 @@ impl Gpu {
         //
         // A prompt of up to 32 rows against a K-quant takes the streaming
         // kernel instead, which sizes its split to its own capacity - see
-        // `gemm_i8_stream_body`. `XABE_NO_STREAM` sends it to the tiled one,
+        // `gemm_i8_stream_body`. `LLMTIE_NO_STREAM` sends it to the tiled one,
         // for comparing.
         let stream = use_i8
             && m <= kernels::GEMM_IS_MP as usize
-            && std::env::var_os("XABE_NO_STREAM").is_none();
+            && std::env::var_os("LLMTIE_NO_STREAM").is_none();
         let ksplit = if small {
             1
         } else if stream {
@@ -2455,7 +2455,7 @@ impl Gpu {
             // this pipeline runs, because a clause is twenty-odd tokens.
             let narrow = m <= kernels::GEMM_I8_MT_NARROW as usize;
             let skinny = m <= kernels::GEMM_I8_MT_SKINNY as usize
-                && std::env::var_os("XABE_NO_SKINNY").is_none();
+                && std::env::var_os("LLMTIE_NO_SKINNY").is_none();
             let mt = if skinny {
                 kernels::GEMM_I8_MT_SKINNY
             } else if narrow {
@@ -6623,7 +6623,7 @@ mod upload_tests {
 
     #[test]
     fn packed_chunks_preserve_parts_padding_and_tail() {
-        let ordinal = std::env::var("XABE_TEST_DEVICE")
+        let ordinal = std::env::var("LLMTIE_TEST_DEVICE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);

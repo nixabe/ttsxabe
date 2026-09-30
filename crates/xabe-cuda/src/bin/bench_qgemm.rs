@@ -2,7 +2,7 @@
 //! the chat model's projections, at the row counts a prompt brings.
 //!
 //! ```sh
-//! XABE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-qgemm
+//! LLMTIE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-qgemm
 //! ```
 //!
 //! The weights are synthetic blocks of the file's own formats - the kernel's
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
         .without_time()
         .with_target(false)
         .init();
-    let ordinal: usize = std::env::var("XABE_DEVICE")
+    let ordinal: usize = std::env::var("LLMTIE_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -102,7 +102,7 @@ fn main() -> ExitCode {
         ("8B gate+up", 4096, 28672, Quant::Q4K),
         ("8B at 216 tiles", 4096, 27648, Quant::Q4K),
     ];
-    let rows: Vec<usize> = std::env::var("XABE_ROWS")
+    let rows: Vec<usize> = std::env::var("LLMTIE_ROWS")
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![8, 16, 24, 32, 48, 64, 128]);

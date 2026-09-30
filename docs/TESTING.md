@@ -69,7 +69,7 @@ prints `SKIP:` with the reason, and returns:
 
 ```rust
 let Some(path) = find_model() else {
-    eprintln!("SKIP: mms-tts-nan checkpoint not found; set XABE_TTS_MODEL");
+    eprintln!("SKIP: mms-tts-nan checkpoint not found; set LLMTIE_TTS_MODEL");
     return;
 };
 ```
@@ -90,22 +90,22 @@ times; a debug build turns a test run into a coffee break, which is why
 ### Choosing a card
 
 ```sh
-XABE_TEST_DEVICE=2 cargo test --workspace --release
+LLMTIE_TEST_DEVICE=2 cargo test --workspace --release
 ```
 
 ### The Coqui VITS tests need two things the others do not
 
 `crates/xabe-tts/tests/coqui_end_to_end.rs` and `coqui_gpu.rs` look for the
-checkpoint at `models/tts/coqui-vits-suisiann` or `XABE_COQUI_MODEL`, and for
-its capture at `.golden/coqui-base` or `XABE_COQUI_GOLDEN`. Both skip loudly
+checkpoint at `models/tts/coqui-vits-suisiann` or `LLMTIE_COQUI_MODEL`, and for
+its capture at `.golden/coqui-base` or `LLMTIE_COQUI_GOLDEN`. Both skip loudly
 when either is absent. The capture is a *different directory* from the 🤗 one
-and `XABE_GOLDEN` does not reach it, deliberately: the two hold tensors with the
+and `LLMTIE_GOLDEN` does not reach it, deliberately: the two hold tensors with the
 same names from different checkpoints, and pointing one test suite at the
 other's capture would compare two real utterances and fail for a reason that is
 not a defect.
 
 `crates/xabe-taigi/tests/correspondence.rs` needs a third capture,
-`.golden/coqui-tailo` or `XABE_TAIGI_GOLDEN`, and no checkpoint at all — it
+`.golden/coqui-tailo` or `LLMTIE_TAIGI_GOLDEN`, and no checkpoint at all — it
 checks a spelling table against goruut's own inventory. `tests/spelling.rs`
 beside it needs nothing and always runs.
 
@@ -114,7 +114,7 @@ The CPU suite takes about three minutes. That is the scalar vocoder producing
 test deliberately uses a short input for that reason, since what it checks does
 not need a long utterance to be true or false.
 
-`XABE_TEST_DEVICE` and not `XABE_TTS_DEVICE`. The second is the engine's
+`LLMTIE_TEST_DEVICE` and not `LLMTIE_TTS_DEVICE`. The second is the engine's
 `--tts-device` env twin, so exporting it to steer a test run also reaches into
 `xabe-engine`'s flag tests, which then assert their defaults against whichever
 card someone happened to pick. That cost eight failing tests once, all of them
@@ -130,22 +130,22 @@ and says which variable to set.
 
 | variable | what it points at | default |
 | --- | --- | --- |
-| `XABE_TEST_DEVICE` | CUDA ordinal for tests that need a card | `0` |
-| `XABE_TTS_MODEL` | the VITS checkpoint | `models/tts/mms-tts-nan` |
-| `XABE_LLM_GGUF` | the Breeze2 chat GGUF | `models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
-| `XABE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/taigi-translator-13b-f16.gguf` |
-| `XABE_QUANT_DIR` | a directory of quantized copies | none; those tests skip. `models` is where they live |
-| `XABE_CHAT_DEVICE` | the card to load the 8 B chat model onto | none; that test skips |
-| `XABE_QUANT_FILE` | which file in `XABE_QUANT_DIR` the packed test reads | `breeze-Q4_K_M.gguf` |
-| `XABE_TACO_DEVICE` | the card to load Tacotron2 + WaveGlow onto | none; those tests skip |
-| `XABE_CHAT_MODEL` | the chat GGUF the `llama_server` oracle runs | none; that test skips |
+| `LLMTIE_TEST_DEVICE` | CUDA ordinal for tests that need a card | `0` |
+| `LLMTIE_TTS_MODEL` | the VITS checkpoint | `models/tts/mms-tts-nan` |
+| `LLMTIE_LLM_GGUF` | the Breeze2 chat GGUF | `models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf` |
+| `LLMTIE_TRANSLATOR_GGUF` | the translator as a GGUF | `models/taigi-translator-13b-f16.gguf` |
+| `LLMTIE_QUANT_DIR` | a directory of quantized copies | none; those tests skip. `models` is where they live |
+| `LLMTIE_CHAT_DEVICE` | the card to load the 8 B chat model onto | none; that test skips |
+| `LLMTIE_QUANT_FILE` | which file in `LLMTIE_QUANT_DIR` the packed test reads | `breeze-Q4_K_M.gguf` |
+| `LLMTIE_TACO_DEVICE` | the card to load Tacotron2 + WaveGlow onto | none; those tests skip |
+| `LLMTIE_CHAT_MODEL` | the chat GGUF the `llama_server` oracle runs | none; that test skips |
 
-`XABE_QUANT_DIR` is read as given, so an absolute path is the safe form: cargo
+`LLMTIE_QUANT_DIR` is read as given, so an absolute path is the safe form: cargo
 runs a test binary from the workspace root but a relative `models` is easy to
 get wrong from a subdirectory, and the failure is a `SKIP:` rather than an
 error.
 
-`XABE_CHAT_DEVICE` has no default either, and for a different reason: this box
+`LLMTIE_CHAT_DEVICE` has no default either, and for a different reason: this box
 has three cards and two of them are running somebody's pipeline. `run.sh` says
 to check `nvidia-smi` before taking one, and a test that silently lands on a
 busy card is exactly what that is warning about. Every other GPU test defaults
@@ -158,14 +158,14 @@ tests each loading their own copy of the weights is 64 GB onto a 48 GB card.
 Requiring `--test-threads=1` instead would have been an invisible condition
 that fails as an out-of-memory error rather than as a message.
 
-`XABE_QUANT_DIR` has no default on purpose. The files are several gigabytes
+`LLMTIE_QUANT_DIR` has no default on purpose. The files are several gigabytes
 each, they are derived rather than downloaded, and checking a multi-gigabyte
 artefact into a fixed path that a test then silently depends on is how a suite
 becomes unrunnable on a second machine. One command reproduces any of them:
 
 ```sh
 llama-quantize models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf \
-    $XABE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
+    $LLMTIE_QUANT_DIR/breeze-Q4_K_M.gguf Q4_K_M 8
 ```
 
 ### The packed matmul is tested at two distances
@@ -246,7 +246,7 @@ twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
 only check on the *wiring*: that the ggml type maps to the right layout, that
 the rope permutation reaches the packed bytes as well as the f16 ones, and that
 the packed operand gets to every projection rather than most of them. It needs
-`XABE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
+`LLMTIE_CHAT_DEVICE` with about 21 GB free, because the f16 half of the
 comparison is the unpacked 16 GB.
 
 The two paths are close rather than identical, and the reason is now the same
@@ -613,22 +613,22 @@ The second column is `cargo test --workspace --release` on a box with the
 checkpoints, and it stays a human step. A green tick on a pull request means
 the code is well-formed, not that the models are right.
 
-## `XABE_COSY_DEVICE` has no default
+## `LLMTIE_COSY_DEVICE` has no default
 
 The CosyVoice tests skip unless it is set, and it is not defaulted to 0 for the
 same reason the ASR's are not: two of this box's three cards are running
 somebody else's pipeline, and these models are not small. `nvidia-smi` first.
 
 ```sh
-XABE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
+LLMTIE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
 ```
 
-## `XABE_TACO_DEVICE`, and what Tacotron2 can be tested against
+## `LLMTIE_TACO_DEVICE`, and what Tacotron2 can be tested against
 
 Same rule, same reason: `nvidia-smi` first.
 
 ```sh
-XABE_TACO_DEVICE=2 cargo test --release -p xabe-taco
+LLMTIE_TACO_DEVICE=2 cargo test --release -p xabe-taco
 ```
 
 The text tests need no card and always run. Of the rest, **only the encoder is

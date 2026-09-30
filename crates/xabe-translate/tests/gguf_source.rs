@@ -16,7 +16,7 @@ fn workspace(rel: &str) -> PathBuf {
 }
 
 fn gguf() -> Option<PathBuf> {
-    let p = match std::env::var("XABE_TRANSLATOR_GGUF") {
+    let p = match std::env::var("LLMTIE_TRANSLATOR_GGUF") {
         Ok(v) => PathBuf::from(v),
         Err(_) => workspace("models/taigi-translator-13b-f16.gguf"),
     };
@@ -29,7 +29,7 @@ fn safetensors() -> Option<PathBuf> {
 }
 
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

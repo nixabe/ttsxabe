@@ -876,7 +876,7 @@ sums and the same `acc += as * (ds * dot - dm * sum)` a sub-block in k
 order - so at the same split the output is the same bits; the split is
 chosen for this kernel's capacity (288 blocks), which is why the translator's
 packed-against-unpacked agreement moved from 0.126 of the span to 0.131.
-Prompts of 5 to 32 rows take it, with `XABE_NO_STREAM` to compare.
+Prompts of 5 to 32 rows take it, with `LLMTIE_NO_STREAM` to compare.
 
 ### The trip is 64 elements, and that number is not a tuning constant
 
@@ -2145,7 +2145,7 @@ establish the cause of a Windows WDDM allocation failure.
 
 `Gpu` selects an allocation policy for host uploads before opening a model.
 Windows defaults to ordinary `cuMemAlloc`; Linux defaults to cudarc's
-`cuMemAllocAsync` pool. `XABE_CUDA_UPLOAD_ALLOCATOR=legacy|pool|auto` makes the
+`cuMemAllocAsync` pool. `LLMTIE_CUDA_UPLOAD_ALLOCATOR=legacy|pool|auto` makes the
 choice explicit. Float, half, integer and packed uploads all follow it, while
 scratch allocation remains stream-ordered and pooled. Empty uploads retain
 cudarc's existing empty-allocation behavior. The packed host-staging bound and

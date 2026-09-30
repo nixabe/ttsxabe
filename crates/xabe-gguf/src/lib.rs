@@ -1,4 +1,4 @@
-//! GGUF container reading for `ttsxabe`.
+//! GGUF container reading for `llmtie-rs`.
 //!
 //! # Why this crate exists
 //!

@@ -19,7 +19,7 @@ const ATOL: f32 = 2e-3;
 const RTOL: f32 = 2e-2;
 
 fn find_model() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XABE_COQUI_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_COQUI_MODEL") {
         let p = PathBuf::from(p);
         return p.join("best_model.pth").is_file().then_some(p);
     }
@@ -28,7 +28,7 @@ fn find_model() -> Option<PathBuf> {
 }
 
 fn find_golden() -> Option<Golden> {
-    let dir = match std::env::var("XABE_COQUI_GOLDEN") {
+    let dir = match std::env::var("LLMTIE_COQUI_GOLDEN") {
         Ok(p) => PathBuf::from(p),
         Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -42,7 +42,7 @@ fn find_golden() -> Option<Golden> {
 
 /// Which device to use. GPU 2 on this host runs somebody else's job.
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

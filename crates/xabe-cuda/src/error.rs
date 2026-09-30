@@ -4,7 +4,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
     /// An unsupported allocation policy must fail before loading any weights.
-    #[error("XABE_CUDA_UPLOAD_ALLOCATOR wants auto, pool or legacy, got `{0}`")]
+    #[error("LLMTIE_CUDA_UPLOAD_ALLOCATOR wants auto, pool or legacy, got `{0}`")]
     UploadAllocator(String),
     /// An upload device allocation still failed after reclaiming unused pool pages.
     #[error("allocating {bytes} upload bytes on CUDA device {device}: {source}; {memory}")]

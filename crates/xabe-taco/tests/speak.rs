@@ -78,11 +78,11 @@ fn it_speaks() {
         println!("SKIP: no models/tts/tacotron2-nan; run tools/convert_tacotron2.py");
         return;
     }
-    let Some(dev) = std::env::var("XABE_TACO_DEVICE")
+    let Some(dev) = std::env::var("LLMTIE_TACO_DEVICE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     else {
-        println!("SKIP: set XABE_TACO_DEVICE=<free card>; see docs/TESTING.md");
+        println!("SKIP: set LLMTIE_TACO_DEVICE=<free card>; see docs/TESTING.md");
         return;
     };
 
@@ -133,11 +133,11 @@ fn a_seed_reproduces_a_run() {
         println!("SKIP: no models/tts/tacotron2-nan; run tools/convert_tacotron2.py");
         return;
     }
-    let Some(dev) = std::env::var("XABE_TACO_DEVICE")
+    let Some(dev) = std::env::var("LLMTIE_TACO_DEVICE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     else {
-        println!("SKIP: set XABE_TACO_DEVICE=<free card>; see docs/TESTING.md");
+        println!("SKIP: set LLMTIE_TACO_DEVICE=<free card>; see docs/TESTING.md");
         return;
     };
 

@@ -1,6 +1,8 @@
-# ttsxabe
+# llmtie-rs
 
-[![CI](https://github.com/nixabe/ttsxabe/actions/workflows/ci.yml/badge.svg)](https://github.com/nixabe/ttsxabe/actions/workflows/ci.yml)
+[![CI](https://github.com/nixabe/llmtie-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/nixabe/llmtie-rs/actions/workflows/ci.yml)
+
+**llmtie-rs** stands for **Integrated Large Language Model and Text-To-Speech Inference Engine in Rust**.
 
 A from-scratch Rust engine for a Taiwanese Hokkien (Taigi) voice assistant.
 
@@ -12,7 +14,7 @@ No ML framework, no bindings. The container readers, the weight schemas and the
 kernels all live in this repository and are verified against captured
 references.
 
-One binary, `xabe-engine`, runs every stage of the pipeline. Which stages
+One binary, `llmtie-rs`, runs every stage of the pipeline. Which stages
 *this* process runs is decided by flags, and each stage is satisfied either
 locally (`--<stage>-model`) or by another process over HTTP (`--<stage>-url`)
 — so the same binary is a monolith, a single-stage worker, or anything
@@ -171,7 +173,7 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 | `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
 | `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
 | `xabe-chat` | the chat model's forward pass, sampling and stop handling |
-| `xabe-engine` | the binary: flags, stage wiring, orchestration |
+| `xabe-engine` | the `llmtie-rs` binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:
 
@@ -204,14 +206,14 @@ stage breakdown, the computed FLOP ceiling, and the things that did not work.
 ## Using it
 
 ```sh
-xabe-engine --tts-model models/tts/mms-tts-nan --tts-device 0 \
+llmtie-rs --tts-model models/tts/mms-tts-nan --tts-device 0 \
             --text "lí hó, kin-á-ji̍t thinn-khì chin hó." --out hello.wav
 ```
 
 Or as the whole assistant, with a web page at the address given:
 
 ```sh
-xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
+llmtie-rs --serve 127.0.0.1:8000 --direct-taigi \
             --tts-model models/tts/mms-tts-nan --tts-device 1 \
             --asr-url http://127.0.0.1:8080 \
             --llm-model models/Llama-Breeze2-8B-Instruct-text-only.f16.gguf
@@ -220,7 +222,7 @@ xabe-engine --serve 127.0.0.1:8000 --direct-taigi \
 Two synthesisers in one process, and the page chooses between them:
 
 ```sh
-xabe-engine --serve 127.0.0.1:8000 \
+llmtie-rs --serve 127.0.0.1:8000 \
             --tts-model  models/tts/mms-tts-nan       --tts-device 2 \
             --tts-engine cosyvoice=models/tts/cosyvoice3-0.5b \
             --tts-script cosyvoice=HAN
@@ -251,7 +253,7 @@ summary rather than letting a green tick stand for something it did not check.
 The gate that does check the models is one command on a machine that has them:
 
 ```sh
-XABE_COSY_DEVICE=<a free card> cargo test --workspace --release
+LLMTIE_COSY_DEVICE=<a free card> cargo test --workspace --release
 ```
 
 `docs/TESTING.md` has the table of which column proves what.
@@ -266,7 +268,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests that need the checkpoint look in `models/tts/mms-tts-nan` first, fall
-back to the HuggingFace cache, and take `XABE_TTS_MODEL` over both. Differential tests also need a
+back to the HuggingFace cache, and take `LLMTIE_TTS_MODEL` over both. Differential tests also need a
 capture — `python tools/oracle/capture.py --out .golden/base --seed 0 --text
 "..."`, see [docs/ORACLE.md](docs/ORACLE.md). Without either they print `SKIP:`
 and the reason.

@@ -27,7 +27,7 @@ impl UploadAllocator {
     }
 
     pub(crate) fn from_env() -> Result<Self, CudaError> {
-        let value = match std::env::var("XABE_CUDA_UPLOAD_ALLOCATOR") {
+        let value = match std::env::var("LLMTIE_CUDA_UPLOAD_ALLOCATOR") {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => "auto".to_string(),
             Err(e) => return Err(CudaError::UploadAllocator(e.to_string())),

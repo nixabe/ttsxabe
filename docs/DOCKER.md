@@ -78,35 +78,35 @@ configured without rewriting argv:
 
 ```sh
 docker run --gpus all \
-  -e XABE_TTS_MODEL=/models/tts/mms-tts-nan \
-  -e XABE_TTS_DEVICE=0 \
+  -e LLMTIE_TTS_MODEL=/models/tts/mms-tts-nan \
+  -e LLMTIE_TTS_DEVICE=0 \
   -e RUST_LOG=info \
   -v /srv/models:/models:ro \
-  ttsxabe --text "lí hó." --out -
+  llmtie-rs --text "lí hó." --out -
 ```
 
 A stage the container is not meant to run is configured by *leaving its
 variables unset*: absent means off, so one image serves as the ASR worker, the
 TTS worker or the whole pipeline depending only on which variables are present.
 
-**Absent, not empty.** `clap` reads an empty `XABE_TRANSLATOR_MODEL` as the
+**Absent, not empty.** `clap` reads an empty `LLMTIE_TRANSLATOR_MODEL` as the
 path `""` and fails inside a weight schema rather than as "no translator", so
 `docker-compose.yml` omits the optional names instead of defaulting them to the
 empty string. Two more sharp edges of the same kind:
 
-- `XABE_DIRECT_TAIGI` is a `bool` in its env form and takes `true` or `false`.
+- `LLMTIE_DIRECT_TAIGI` is a `bool` in its env form and takes `true` or `false`.
   Not `1` — that is `invalid value '1' for '--direct-taigi'`.
-- `XABE_SERVE` must bind `0.0.0.0`, not the `127.0.0.1` of the host-side
+- `LLMTIE_SERVE` must bind `0.0.0.0`, not the `127.0.0.1` of the host-side
   examples in [CLI.md](CLI.md). A server on loopback inside a container is
   reachable from nothing, its own healthcheck included.
 
-The entrypoint is the `xabe-engine` binary itself and `command:` is the
+The entrypoint is the `llmtie-rs` binary itself and `command:` is the
 argument list, so `docker run ... --help` prints the real flag surface rather
 than a shell's.
 
 **The system prompt is one of these variables**, which is the point of it
-having an inline form: `XABE_SYSTEM_PROMPT` carries the whole prompt, and
-`XABE_PROMPT_FILE` points at a file for anything long enough that a variable is
+having an inline form: `LLMTIE_SYSTEM_PROMPT` carries the whole prompt, and
+`LLMTIE_PROMPT_FILE` points at a file for anything long enough that a variable is
 the wrong shape. They are alternatives; both is refused. [CLI.md](CLI.md) has
 the rules - the important ones being that a given prompt replaces the built-in
 whole, and must be written in whatever script the configured synthesiser reads.
@@ -115,13 +115,13 @@ whole, and must be written in whatever script the configured synthesiser reads.
 **gitignored**, because a system prompt names a character and whose character
 that is differs per deployment, so the repository ships the engine's built-ins
 and nothing else. The mount is unconditional and an empty directory is fine:
-with `XABE_PROMPT_FILE` unset the engine uses a built-in and never looks. Both
+with `LLMTIE_PROMPT_FILE` unset the engine uses a built-in and never looks. Both
 lines ship commented in `.env` for that reason - a committed default pointing
 into a gitignored directory would leave a fresh clone unable to start.
 
-Uncomment `XABE_PROMPT_FILE` and `XABE_BOT` together. A file is read literally,
+Uncomment `LLMTIE_PROMPT_FILE` and `LLMTIE_BOT` together. A file is read literally,
 with no `{person}`/`{bot}` substitution, so the name written into it has to be
-the name the transcript uses; the stop strings are derived from `XABE_BOT`, and
+the name the transcript uses; the stop strings are derived from `LLMTIE_BOT`, and
 a mismatch lets the model write the user's next turn itself.
 
 ## The two shapes
@@ -160,16 +160,16 @@ give --translator-model, or use an engine that reads HAN
 
 So the default is the full pipeline, translator included, which is also the
 layout [CLI.md](CLI.md) says the packed checkpoints leave room for on one card.
-To take the faster path instead, drop `XABE_TRANSLATOR_MODEL`, set
-`XABE_DIRECT_TAIGI=true`, and give it an engine that reads Han:
+To take the faster path instead, drop `LLMTIE_TRANSLATOR_MODEL`, set
+`LLMTIE_DIRECT_TAIGI=true`, and give it an engine that reads Han:
 
 ```yaml
-      XABE_TTS_ENGINES: cosyvoice=/models/tts/cosyvoice3-0.5b
-      XABE_TTS_SCRIPTS: cosyvoice=HAN
-      XABE_TTS_DEFAULT: cosyvoice
+      LLMTIE_TTS_ENGINES: cosyvoice=/models/tts/cosyvoice3-0.5b
+      LLMTIE_TTS_SCRIPTS: cosyvoice=HAN
+      LLMTIE_TTS_DEFAULT: cosyvoice
 ```
 
-No `XABE_TTS_MODEL` in that set, and it does not need one: `--tts-engine`
+No `LLMTIE_TTS_MODEL` in that set, and it does not need one: `--tts-engine`
 stands alone and is the TTS stage by itself. Run as written it reports
 `stages: ["asr","llm","tts"]` with `engines: ["cosyvoice"]` and no translator,
 comes up in 35 s against the full pipeline's 70, and speaks a clause of Han in
@@ -177,7 +177,7 @@ comes up in 35 s against the full pipeline's 70, and speaks a clause of Han in
 CosyVoice numbers that mean anything are in [BENCHMARKS.md](BENCHMARKS.md),
 which is also where its caveats are.
 
-On a second card, `XABE_TRANSLATOR_DEVICE=1` is the split that matters: the
+On a second card, `LLMTIE_TRANSLATOR_DEVICE=1` is the split that matters: the
 chat model and the translator decode at the same time, and
 [BENCHMARKS.md](BENCHMARKS.md) measures first audio at 2659 ms with both on one
 card against 2000 ms with the translator moved.
@@ -185,7 +185,7 @@ card against 2000 ms with the translator moved.
 ### The split profile no longer needs a workaround
 
 This section used to describe one, and it was a lie: the `tts` worker set
-`XABE_TTS_SCRIPTS: mms=HAN` because serving a *local* engine whose script was
+`LLMTIE_TTS_SCRIPTS: mms=HAN` because serving a *local* engine whose script was
 not HAN was refused unless the same process held a translator. That check
 assumed the process holding the synthesiser also holds the reply path, and a
 split worker is exactly the case where it does not — the gateway owns the
@@ -195,7 +195,7 @@ to speak what it is handed.
 It is gated on the chat model now. The script is read by `script_for`, reached
 only from the converse path, which needs an LLM; a process without one is never
 asked what its engines read. So a synthesiser-only worker comes up on
-`XABE_TTS_MODEL` alone, and [CLI.md](CLI.md)'s split example — `xabe-engine
+`LLMTIE_TTS_MODEL` alone, and [CLI.md](CLI.md)'s split example — `llmtie-rs
 --serve 127.0.0.1:8100 --tts-model models/tts/mms-tts-nan --tts-device 1` —
 runs as written. Give that worker an LLM and the check applies again, which is
 the point: that is the configuration where a Han reply into `mms` would
@@ -203,11 +203,11 @@ synthesise near-silence.
 
 ## What is not here
 
-The image ships `xabe-engine` and nothing else. The four benchmark binaries in
+The image ships `llmtie-rs` and nothing else. The four benchmark binaries in
 the same crate need a card *and* a checkpoint before they can say anything, so
 they belong on the host that has both rather than in a deployment image.
 
 There is no llama.cpp service. The chat model runs in-process from a GGUF here,
-which is what `XABE_LLM_MODEL` does; a deployment that would rather keep it in
-`llama-server` sets `XABE_LLM_URL` at that process and leaves the model
+which is what `LLMTIE_LLM_MODEL` does; a deployment that would rather keep it in
+`llama-server` sets `LLMTIE_LLM_URL` at that process and leaves the model
 variable unset.

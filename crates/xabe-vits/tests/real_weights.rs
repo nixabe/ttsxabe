@@ -1,6 +1,6 @@
 //! Binds the real mms-tts-nan checkpoint against its own config.
 //!
-//! Skips loudly when the checkpoint is absent. Set `XABE_TTS_MODEL`, or let it
+//! Skips loudly when the checkpoint is absent. Set `LLMTIE_TTS_MODEL`, or let it
 //! find the HuggingFace cache copy.
 
 use xabe_st::StFile;
@@ -8,7 +8,7 @@ use xabe_vits::{VitsConfig, VitsWeights};
 
 /// Locates the snapshot directory holding both the weights and the config.
 fn find_snapshot() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_TTS_MODEL") {
         return std::path::PathBuf::from(p).parent().map(Into::into);
     }
     // The consolidated model tree is the canonical home. The HuggingFace cache
@@ -35,7 +35,7 @@ fn load() -> Option<(StFile, VitsConfig)> {
 #[test]
 fn config_matches_the_published_geometry() {
     let Some((_, cfg)) = load() else {
-        eprintln!("SKIP: mms-tts-nan not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan not found; set LLMTIE_TTS_MODEL");
         return;
     };
     assert_eq!(cfg.hidden_size, 192);
@@ -57,7 +57,7 @@ fn config_matches_the_published_geometry() {
 #[test]
 fn binds_every_inference_tensor() {
     let Some((f, cfg)) = load() else {
-        eprintln!("SKIP: mms-tts-nan not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan not found; set LLMTIE_TTS_MODEL");
         return;
     };
     let w = VitsWeights::load(&f, &cfg).expect("bind weights");
@@ -86,7 +86,7 @@ fn binds_every_inference_tensor() {
 #[test]
 fn the_inference_subset_is_exactly_the_checkpoint_minus_the_posterior() {
     let Some((f, cfg)) = load() else {
-        eprintln!("SKIP: mms-tts-nan not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan not found; set LLMTIE_TTS_MODEL");
         return;
     };
     VitsWeights::load(&f, &cfg).expect("bind weights");
@@ -107,7 +107,7 @@ fn the_inference_subset_is_exactly_the_checkpoint_minus_the_posterior() {
 #[test]
 fn a_wrong_geometry_is_rejected_by_name() {
     let Some((f, mut cfg)) = load() else {
-        eprintln!("SKIP: mms-tts-nan not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan not found; set LLMTIE_TTS_MODEL");
         return;
     };
     // Claim a wider model than the checkpoint holds. This must fail at load,
@@ -156,7 +156,7 @@ fn config_validation_rejects_impossible_geometry() {
 #[test]
 fn the_schema_reads_every_inference_parameter() {
     let Some((f, cfg)) = load() else {
-        eprintln!("SKIP: mms-tts-nan not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan not found; set LLMTIE_TTS_MODEL");
         return;
     };
     let w = VitsWeights::load(&f, &cfg).expect("bind weights");

@@ -172,7 +172,7 @@ Peak `nvidia-smi` memory while each tool runs a matching workload on an otherwis
 
 ## Workflow: full serving vs router mode
 
-The same `xabe-engine --serve` binary answers spoken and typed turns over its WebSocket in two configurations, both on the one card and both loaded at once. Every stage runs the same checkpoint in both modes.
+The same `llmtie-rs --serve` binary answers spoken and typed turns over its WebSocket in two configurations, both on the one card and both loaded at once. Every stage runs the same checkpoint in both modes.
 
 | Stage | Full serving mode | Router mode |
 | --- | --- | --- |

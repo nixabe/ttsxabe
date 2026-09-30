@@ -211,7 +211,7 @@ mod tests {
     //! The batched gate read against the frame-by-frame one, on the real
     //! checkpoint: the same seed, the same line, the mel frames bit for bit
     //! and the same stop. Needs `models/tts/tacotron2-nan` and
-    //! `XABE_TEST_DEVICE`; prints `SKIP` without them.
+    //! `LLMTIE_TEST_DEVICE`; prints `SKIP` without them.
 
     use super::*;
     use crate::model::{self, Rng};
@@ -247,11 +247,11 @@ mod tests {
 
     fn checkpoint() -> Option<(PathBuf, usize)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tts/tacotron2-nan");
-        let Some(dev) = std::env::var("XABE_TEST_DEVICE")
+        let Some(dev) = std::env::var("LLMTIE_TEST_DEVICE")
             .ok()
             .and_then(|v| v.parse().ok())
         else {
-            println!("SKIP: set XABE_TEST_DEVICE");
+            println!("SKIP: set LLMTIE_TEST_DEVICE");
             return None;
         };
         if !dir.is_dir() {

@@ -101,7 +101,7 @@ fn report(name: &str, prompt: usize, decode: usize, pre: f64, dec: f64, bytes: f
     );
 }
 
-/// With `XABE_KPROF` set, starts a per-kernel profile of the last round.
+/// With `LLMTIE_KPROF` set, starts a per-kernel profile of the last round.
 fn kprof_start(last: bool) {
     if last && xabe_cuda::kprof::enabled() {
         xabe_cuda::kprof::reset();

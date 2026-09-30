@@ -10,7 +10,7 @@ use clap::Parser;
 
 /// Parses a command line as the binary would, minus the program name.
 fn parse(argv: &[&str]) -> Result<xabe_engine::Args, clap::Error> {
-    let mut full = vec!["xabe-engine"];
+    let mut full = vec!["llmtie-rs"];
     full.extend_from_slice(argv);
     xabe_engine::Args::try_parse_from(full)
 }
@@ -360,21 +360,21 @@ fn every_stage_flag_has_an_environment_twin() {
         String::from_utf8(buf).expect("utf8")
     };
     for var in [
-        "XABE_SERVE",
-        "XABE_ASR_MODEL",
-        "XABE_ASR_URL",
-        "XABE_ASR_DEVICE",
-        "XABE_VAD_MODEL",
-        "XABE_VAD_URL",
-        "XABE_VAD_DEVICE",
-        "XABE_TTS_MODEL",
-        "XABE_TTS_URL",
-        "XABE_TTS_DEVICE",
-        "XABE_TRANSLATOR_MODEL",
-        "XABE_TRANSLATOR_URL",
-        "XABE_TRANSLATOR_DEVICE",
-        "XABE_LLM_URL",
-        "XABE_TTS_ENGINES",
+        "LLMTIE_SERVE",
+        "LLMTIE_ASR_MODEL",
+        "LLMTIE_ASR_URL",
+        "LLMTIE_ASR_DEVICE",
+        "LLMTIE_VAD_MODEL",
+        "LLMTIE_VAD_URL",
+        "LLMTIE_VAD_DEVICE",
+        "LLMTIE_TTS_MODEL",
+        "LLMTIE_TTS_URL",
+        "LLMTIE_TTS_DEVICE",
+        "LLMTIE_TRANSLATOR_MODEL",
+        "LLMTIE_TRANSLATOR_URL",
+        "LLMTIE_TRANSLATOR_DEVICE",
+        "LLMTIE_LLM_URL",
+        "LLMTIE_TTS_ENGINES",
     ] {
         assert!(help.contains(var), "{var} is not in --help");
     }

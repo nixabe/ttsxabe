@@ -4,7 +4,7 @@ Operating instructions for AI agents working in this repository.
 
 ## What this project is
 
-`ttsxabe` is a from-scratch Rust engine for a Taiwanese Hokkien voice
+`llmtie-rs` is a from-scratch Rust engine for a Taiwanese Hokkien voice
 assistant, targeting 3× Quadro RTX 8000 (sm_75). No ML framework, no bindings:
 it reads the published checkpoints directly and does the arithmetic itself.
 

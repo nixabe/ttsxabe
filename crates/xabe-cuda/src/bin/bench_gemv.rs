@@ -3,7 +3,7 @@
 //! the weight stream reaches.
 //!
 //! ```sh
-//! XABE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-gemv
+//! LLMTIE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-gemv
 //! ```
 //!
 //! Medians of repeated launches, warmed first. The point is the GB/s column:
@@ -43,7 +43,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn main() -> ExitCode {
-    let ordinal: usize = std::env::var("XABE_DEVICE")
+    let ordinal: usize = std::env::var("LLMTIE_DEVICE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);

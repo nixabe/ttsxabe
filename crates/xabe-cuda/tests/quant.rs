@@ -117,7 +117,7 @@ fn gpu() -> Option<Gpu> {
 }
 
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

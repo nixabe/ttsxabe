@@ -19,7 +19,7 @@
 #     parsing, the quantization corpus, wire formats
 #
 # What it does not prove is that any model is correct. That gate is
-# `XABE_COSY_DEVICE=<free card> cargo test --workspace --release` on a box with
+# `LLMTIE_COSY_DEVICE=<free card> cargo test --workspace --release` on a box with
 # the checkpoints, and it stays a human step.
 
 name: CI

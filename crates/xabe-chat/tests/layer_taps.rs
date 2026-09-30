@@ -83,12 +83,12 @@ fn golden() -> Option<Golden> {
 #[test]
 fn every_block_output_tracks_the_reference_graph() {
     let (Some(m), Some(d)) = (
-        std::env::var("XABE_CHAT_MODEL").ok().map(PathBuf::from),
-        std::env::var("XABE_CHAT_DEVICE")
+        std::env::var("LLMTIE_CHAT_MODEL").ok().map(PathBuf::from),
+        std::env::var("LLMTIE_CHAT_DEVICE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok()),
     ) else {
-        eprintln!("SKIP: set XABE_CHAT_MODEL and XABE_CHAT_DEVICE");
+        eprintln!("SKIP: set LLMTIE_CHAT_MODEL and LLMTIE_CHAT_DEVICE");
         return;
     };
     let Some(g) = golden() else { return };
@@ -107,7 +107,7 @@ fn every_block_output_tracks_the_reference_graph() {
     let bytes = std::fs::metadata(&m).map(|x| x.len()).unwrap_or(0);
     assert!(
         name == want.name && bytes == want.bytes,
-        "the capture is of {} ({} bytes) and XABE_CHAT_MODEL is {name} ({bytes} bytes); \
+        "the capture is of {} ({} bytes) and LLMTIE_CHAT_MODEL is {name} ({bytes} bytes); \
          these are different models and the comparison would be meaningless",
         want.name,
         want.bytes,

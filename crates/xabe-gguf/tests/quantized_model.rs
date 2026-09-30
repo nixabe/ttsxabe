@@ -25,7 +25,7 @@ fn f16_model() -> Option<PathBuf> {
 /// Quantized copies live outside the repository: they are several gigabytes
 /// each and are reproducible with one `llama-quantize` invocation.
 fn quantized(kind: &str) -> Option<PathBuf> {
-    let dir = std::env::var("XABE_QUANT_DIR").ok()?;
+    let dir = std::env::var("LLMTIE_QUANT_DIR").ok()?;
     let p = PathBuf::from(dir).join(format!("breeze-{kind}.gguf"));
     p.is_file().then_some(p)
 }
@@ -54,7 +54,7 @@ fn check(kind: &str, min_corr: f64) {
     };
     let Some(q_path) = quantized(kind) else {
         println!(
-            "SKIP: set XABE_QUANT_DIR to a directory holding breeze-{kind}.gguf \
+            "SKIP: set LLMTIE_QUANT_DIR to a directory holding breeze-{kind}.gguf \
              (llama-quantize <f16> <out> {kind})"
         );
         return;
@@ -140,7 +140,7 @@ fn a_mixed_precision_checkpoint_holds_more_than_one_format() {
     // per tensor role, so one file carries several. A reader that assumed a
     // file had a single type would open this one and mis-size most of it.
     let Some(q_path) = quantized("Q4_K_M") else {
-        println!("SKIP: set XABE_QUANT_DIR");
+        println!("SKIP: set LLMTIE_QUANT_DIR");
         return;
     };
     let f = xabe_gguf::GgufFile::open(&q_path).expect("open");

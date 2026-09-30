@@ -8,13 +8,13 @@
 //!
 //! ```sh
 //! # everything in one process
-//! xabe-engine --serve 127.0.0.1:8000 \
+//! llmtie-rs --serve 127.0.0.1:8000 \
 //!             --asr-model models/asr/breeze-asr-26 \
 //!             --tts-model models/tts/mms-tts-nan --tts-device 1 \
 //!             --llm-url http://127.0.0.1:8082
 //!
 //! # one stage, one shot, no server
-//! xabe-engine --tts-model models/tts/mms-tts-nan --text "lí hó" --out hello.wav
+//! llmtie-rs --tts-model models/tts/mms-tts-nan --text "lí hó" --out hello.wav
 //! ```
 //!
 //! Preflight runs in a fixed order and every failure names the flag that caused

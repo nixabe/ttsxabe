@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ttsxabe — System Briefing</title>
+  <title>llmtie-rs — System Briefing</title>
   <style>
     :root { --ink:#e9eef8; --muted:#a8b4c8; --bg:#07111f; --panel:#0d1b2e; --panel2:#10233c; --line:#28405e; --cyan:#4de1e9; --blue:#6b9cff; --violet:#a78bfa; --green:#5ee3a2; --amber:#ffc65a; --rose:#ff8fa3; }
     * { box-sizing:border-box } html { scroll-behavior:smooth } body { margin:0; color:var(--ink); background:radial-gradient(circle at 72% -10%,#173a5c 0,transparent 34rem),var(--bg); font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif }
@@ -31,14 +31,14 @@
 <main class="wrap">
   <header>
     <div class="eyebrow" data-i18n="eyebrow">Technical system briefing · 06 Sep 2026</div>
-    <h1 data-i18n="hero">How <span>ttsxabe</span> works</h1>
+    <h1 data-i18n="hero">How <span>llmtie-rs</span> works</h1>
     <p class="lede" data-i18n="lede">A from-scratch Rust engine for a Taiwanese Hokkien (Taigi) voice assistant. It reads published checkpoints directly, owns its CUDA arithmetic, and can run an entire spoken conversation as one binary—or distribute the same stages over HTTP.</p>
     <nav><a href="#workflow" data-i18n="navWorkflow">Workflow</a><a href="#architecture" data-i18n="navArchitecture">Architecture</a><a href="#models" data-i18n="navModels">Models</a><a href="#inside" data-i18n="navInside">How models run</a><a href="#performance" data-i18n="navPerformance">Performance</a><a href="#correctness" data-i18n="navCorrectness">Correctness</a><a href="#operations" data-i18n="navOperations">Operations</a><button class="language" id="language-toggle" type="button" aria-pressed="false">繁體中文</button></nav>
   </header>
 
   <section aria-label="At a glance">
     <div class="grid">
-      <div class="card span-3"><div class="label">Runtime</div><div class="metric">1 <small>Rust binary</small></div><p><span class="mono">xabe-engine</span> orchestrates every stage with flags.</p></div>
+      <div class="card span-3"><div class="label">Runtime</div><div class="metric">1 <small>Rust binary</small></div><p><span class="mono">llmtie-rs</span> orchestrates every stage with flags.</p></div>
       <div class="card span-3"><div class="label">Target hardware</div><div class="metric">3× <small>RTX 8000</small></div><p>Turing / sm_75 · 48 GB and 672 GB/s per GPU.</p></div>
       <div class="card span-3"><div class="label">Model execution</div><div class="metric">7 <small>model families</small></div><p>VAD, ASR, two LLMs, and four TTS choices.</p></div>
       <div class="card span-3"><div class="label">Implementation</div><div class="metric">0 <small>ML frameworks</small></div><p>Rust container readers, schemas, CPU references, and CUDA kernels.</p></div>
@@ -144,7 +144,7 @@
     <div class="eyebrow" data-i18n="operationsEyebrow">07 · Operating picture</div><h2 data-i18n="operationsTitle">What is complete, what remains, and how to run it.</h2>
     <div class="grid">
       <div class="card span-7"><h3>Milestone state</h3><table class="compact"><thead><tr><th>Capability</th><th>Status</th><th>Evidence</th></tr></thead><tbody><tr><td>VITS + serving layer</td><td class="check">✓ Complete</td><td>CPU/CUDA oracle and paired PyTorch benchmark</td></tr><tr><td>Silero VAD</td><td class="check">✓ Complete</td><td>Every segment matches corpus reference</td></tr><tr><td>Whisper ASR</td><td class="check">✓ Complete</td><td>Layer oracle, greedy transcripts, interleaved benchmark</td></tr><tr><td>Translator + chat LLM</td><td class="check">✓ Complete</td><td>Schema, tokenisation, forced decisions and llama.cpp comparison</td></tr><tr><td>CosyVoice3</td><td class="check">✓ Complete</td><td>143/143 speech-LM positions; waveform correlation 1.000000</td></tr><tr><td>Tacotron2 + WaveGlow / Coqui VITS</td><td class="check">✓ Complete</td><td>Alternative TTS engines exposed in-process</td></tr><tr><td>Derive a new CosyVoice voice</td><td class="pending">○ External tool</td><td>Still runs two ONNX models once via <span class="mono">tools/make_cosyvoice_voice.py</span></td></tr></tbody></table></div>
-      <div class="card span-5"><h3>Minimal examples</h3><p class="label">Synthesis</p><p class="mono">xabe-engine --tts-model models/tts/mms-tts-nan --tts-device 0 --text "lí hó..." --out hello.wav</p><p class="label">Mixed whole-assistant topology</p><p class="mono">xabe-engine --serve 127.0.0.1:8000 --direct-taigi --tts-model … --asr-url http://127.0.0.1:8080 --llm-model …</p><p>The model files live under ignored <span class="mono">models/</span>; weights are never redistributed by this repository.</p></div>
+      <div class="card span-5"><h3>Minimal examples</h3><p class="label">Synthesis</p><p class="mono">llmtie-rs --tts-model models/tts/mms-tts-nan --tts-device 0 --text "lí hó..." --out hello.wav</p><p class="label">Mixed whole-assistant topology</p><p class="mono">llmtie-rs --serve 127.0.0.1:8000 --direct-taigi --tts-model … --asr-url http://127.0.0.1:8080 --llm-model …</p><p>The model files live under ignored <span class="mono">models/</span>; weights are never redistributed by this repository.</p></div>
       <div class="card span-12"><h3>License and deployment note</h3><p class="license">The code is Apache-2.0, but model weights keep their own licenses. In particular, <b>MMS TTS</b> is CC-BY-NC 4.0 and the <b>Taigi Llama-2 Translator</b> is CC-BY-NC-SA 4.0; they are not suitable for commercial use without resolving those terms. Breeze-ASR-26 and Fun-CosyVoice3-0.5B are Apache-2.0; Coqui VITS is CC-BY-SA 4.0. This project describes itself as experimental, AI-agent-driven, and not production-ready across multiple hardware environments.</p></div>
     </div>
     <p class="foot">Sources: <a href="../README.md">README</a>, <a href="ARCHITECTURE.md">architecture</a>, <a href="MODEL.md">model inventory</a>, <a href="BENCHMARKS.md">benchmarks</a>, <a href="TESTING.md">testing</a>, and <a href="MILESTONES.md">milestones</a>. Values are intentionally presented as documented measurements, not generalized performance guarantees.</p>
@@ -155,7 +155,7 @@
   // unchanged; they are technical identifiers rather than translated prose.
   const translations = {
     zh: {
-      eyebrow: '技術系統導覽 · 2026 年 9 月 6 日', hero: '<span>ttsxabe</span> 的運作方式',
+      eyebrow: '技術系統導覽 · 2026 年 9 月 6 日', hero: '<span>llmtie-rs</span> 的運作方式',
       lede: '以 Rust 從零打造的臺灣閩南語（Taigi）語音助理引擎。它直接讀取已發布的 checkpoint、自行執行 CUDA 運算，能以單一二進位檔跑完一段語音對話，也能透過 HTTP 分散各個階段。',
       navWorkflow:'流程', navArchitecture:'架構', navModels:'模型', navInside:'模型如何運作', navPerformance:'效能', navCorrectness:'正確性', navOperations:'操作說明',
       workflowEyebrow:'01 · 對話流程', workflowTitle:'語音進入；臺語語音輸出。',
@@ -171,7 +171,7 @@
       text: {
         'Runtime':'執行環境', 'Target hardware':'目標硬體', 'Model execution':'模型執行', 'Implementation':'實作方式',
         '1':'1', 'Rust binary':'Rust 二進位檔', '3×':'3×', 'RTX 8000':'RTX 8000', '7':'7', 'model families':'個模型家族', '0':'0', 'ML frameworks':'ML 框架',
-        'xabe-engine orchestrates every stage with flags.':'xabe-engine 透過命令列旗標協調所有階段。', 'Turing / sm_75 · 48 GB and 672 GB/s per GPU.':'Turing / sm_75 · 每張 GPU 48 GB 記憶體、672 GB/s 頻寬。', 'VAD, ASR, two LLMs, and four TTS choices.':'VAD、ASR、兩個 LLM 與四種 TTS 選擇。', 'Rust container readers, schemas, CPU references, and CUDA kernels.':'Rust 容器讀取器、schema、CPU 參考實作與 CUDA kernel。',
+        'llmtie-rs orchestrates every stage with flags.':'llmtie-rs 透過命令列旗標協調所有階段。', 'Turing / sm_75 · 48 GB and 672 GB/s per GPU.':'Turing / sm_75 · 每張 GPU 48 GB 記憶體、672 GB/s 頻寬。', 'VAD, ASR, two LLMs, and four TTS choices.':'VAD、ASR、兩個 LLM 與四種 TTS 選擇。', 'Rust container readers, schemas, CPU references, and CUDA kernels.':'Rust 容器讀取器、schema、CPU 參考實作與 CUDA kernel。',
         'in-process capable':'可在程序內執行', 'can delegate over HTTP':'可透過 HTTP 委派', 'audio boundary':'音訊邊界',
         'Application surface':'應用層', 'Stage execution':'階段執行層', 'Model / language schema':'模型／語言 schema', 'Numeric execution':'數值運算層', 'Data and proof':'資料與驗證層',
         '— flags, stage wiring and orchestration ·':'— 命令列旗標、階段串接與協調 ·', '— HTTP, WebSocket, UI and conversation policy':'— HTTP、WebSocket、介面與對話政策',
@@ -235,14 +235,14 @@
     });
     const chinese = language === 'zh';
     document.documentElement.lang = chinese ? 'zh-Hant' : 'en';
-    document.title = chinese ? 'ttsxabe — 系統導覽' : 'ttsxabe — System Briefing';
+    document.title = chinese ? 'llmtie-rs — 系統導覽' : 'llmtie-rs — System Briefing';
     toggle.textContent = chinese ? 'English' : '繁體中文';
     toggle.setAttribute('aria-pressed', String(chinese));
     localizeLooseText(language);
-    try { localStorage.setItem('ttsxabe-language', language); } catch (_) { /* file/privacy mode: switching still works */ }
+    try { localStorage.setItem('llmtie-rs-language', language); } catch (_) { /* file/privacy mode: switching still works */ }
   }
   toggle.addEventListener('click', () => setLanguage(document.documentElement.lang === 'zh-Hant' ? 'en' : 'zh'));
-  try { if (localStorage.getItem('ttsxabe-language') === 'zh') setLanguage('zh'); } catch (_) { /* no saved preference available */ }
+  try { if (localStorage.getItem('llmtie-rs-language') === 'zh') setLanguage('zh'); } catch (_) { /* no saved preference available */ }
 </script>
 </body>
 </html>

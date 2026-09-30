@@ -6,28 +6,28 @@
 #
 # One image serves both. A stage is turned on by giving it a model or a URL and
 # turned off by *leaving its variables unset*, so the difference between an ASR
-# worker and the whole pipeline is which `XABE_*` names appear below and
+# worker and the whole pipeline is which `LLMTIE_*` names appear below and
 # nothing else. That is also why optional variables are absent here rather than
-# set to an empty string: clap reads an empty `XABE_TRANSLATOR_MODEL` as the
+# set to an empty string: clap reads an empty `LLMTIE_TRANSLATOR_MODEL` as the
 # path `""` and fails inside a weight schema, not as "no translator".
 
-name: ttsxabe
+name: llmtie-rs
 
 x-engine: &engine
-  image: ttsxabe:latest
+  image: llmtie-rs:latest
   build:
     context: .
   # Read-only, and the container's uid 1000 reads it as it stands. `models/`
   # here has the same shape as `/models` inside, which is what lets the paths
   # below be the same ones `docs/CLI.md` uses on the host.
   volumes:
-    - ${XABE_MODELS:-./models}:/models:ro
+    - ${LLMTIE_MODELS:-./models}:/models:ro
     # System prompts, mounted whether or not one is selected. `prompts/` is
     # gitignored - the text is deployment content rather than engine
     # behaviour - so this directory may be empty, and an empty one changes
-    # nothing: with `XABE_PROMPT_FILE` unset the engine uses its built-in.
-    - ${XABE_PROMPTS:-./prompts}:/prompts:ro
-  # Every container sees every card and `XABE_*_DEVICE` picks the ordinal, so
+    # nothing: with `LLMTIE_PROMPT_FILE` unset the engine uses its built-in.
+    - ${LLMTIE_PROMPTS:-./prompts}:/prompts:ro
+  # Every container sees every card and `LLMTIE_*_DEVICE` picks the ordinal, so
   # the placement story stays the engine's own rather than being half here and
   # half in `docs/CLI.md`.
   deploy:
@@ -50,7 +50,7 @@ x-healthcheck: &healthcheck
   interval: 30s
   timeout: 5s
   retries: 3
-  start_period: ${XABE_START_PERIOD:-600s}
+  start_period: ${LLMTIE_START_PERIOD:-600s}
 
 services:
   # ---------------------------------------------------------------- monolith
@@ -80,24 +80,24 @@ services:
       # 0.0.0.0, not the 127.0.0.1 of the host-side examples: a server bound to
       # loopback inside a container is reachable from nothing, including the
       # healthcheck's own `curl`.
-      XABE_SERVE: 0.0.0.0:8000
-      XABE_ASR_MODEL: /models/asr/breeze-asr-26
-      XABE_ASR_DEVICE: "${XABE_ASR_DEVICE:-0}"
-      # No `XABE_VAD_DEVICE`. The VAD has no CUDA implementation and the engine
+      LLMTIE_SERVE: 0.0.0.0:8000
+      LLMTIE_ASR_MODEL: /models/asr/breeze-asr-26
+      LLMTIE_ASR_DEVICE: "${LLMTIE_ASR_DEVICE:-0}"
+      # No `LLMTIE_VAD_DEVICE`. The VAD has no CUDA implementation and the engine
       # refuses the flag rather than accepting it and doing something else.
-      XABE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
-      XABE_TTS_MODEL: /models/tts/mms-tts-nan
-      XABE_TTS_DEVICE: "${XABE_TTS_DEVICE:-0}"
-      XABE_LLM_MODEL: /models/${XABE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
-      XABE_LLM_DEVICE: "${XABE_LLM_DEVICE:-0}"
+      LLMTIE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
+      LLMTIE_TTS_MODEL: /models/tts/mms-tts-nan
+      LLMTIE_TTS_DEVICE: "${LLMTIE_TTS_DEVICE:-0}"
+      LLMTIE_LLM_MODEL: /models/${LLMTIE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
+      LLMTIE_LLM_DEVICE: "${LLMTIE_LLM_DEVICE:-0}"
       # Produces the POJ that `mms` reads. On a second card set
-      # XABE_TRANSLATOR_DEVICE=1: docs/BENCHMARKS.md measures first audio at
+      # LLMTIE_TRANSLATOR_DEVICE=1: docs/BENCHMARKS.md measures first audio at
       # 2659 ms with both on one card and 2000 ms with the translator moved,
       # because the chat model and the translator decode at the same time.
-      XABE_TRANSLATOR_MODEL: /models/${XABE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
-      XABE_TRANSLATOR_DEVICE: "${XABE_TRANSLATOR_DEVICE:-0}"
+      LLMTIE_TRANSLATOR_MODEL: /models/${LLMTIE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
+      LLMTIE_TRANSLATOR_DEVICE: "${LLMTIE_TRANSLATOR_DEVICE:-0}"
     ports:
-      - "${XABE_PORT:-8000}:8000"
+      - "${LLMTIE_PORT:-8000}:8000"
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
@@ -112,10 +112,10 @@ services:
     profiles: ["split"]
     environment:
       <<: *engine-env
-      XABE_SERVE: 0.0.0.0:8080
-      XABE_ASR_MODEL: /models/asr/breeze-asr-26
-      XABE_ASR_DEVICE: "${XABE_ASR_DEVICE:-0}"
-      XABE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
+      LLMTIE_SERVE: 0.0.0.0:8080
+      LLMTIE_ASR_MODEL: /models/asr/breeze-asr-26
+      LLMTIE_ASR_DEVICE: "${LLMTIE_ASR_DEVICE:-0}"
+      LLMTIE_VAD_MODEL: /models/vad/silero-v5.1.2.safetensors
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
@@ -125,10 +125,10 @@ services:
     profiles: ["split"]
     environment:
       <<: *engine-env
-      XABE_SERVE: 0.0.0.0:8100
-      XABE_TTS_MODEL: /models/tts/mms-tts-nan
-      XABE_TTS_DEVICE: "${XABE_TTS_DEVICE:-1}"
-      # No `XABE_TTS_SCRIPTS` workaround. What an engine reads is checked only
+      LLMTIE_SERVE: 0.0.0.0:8100
+      LLMTIE_TTS_MODEL: /models/tts/mms-tts-nan
+      LLMTIE_TTS_DEVICE: "${LLMTIE_TTS_DEVICE:-1}"
+      # No `LLMTIE_TTS_SCRIPTS` workaround. What an engine reads is checked only
       # where the reply is written - a process with a chat model - and this
       # worker has none: it is POSTed text over `/tts` and speaks what it is
       # given, having been romanised by whoever sent it. Give this worker an
@@ -143,19 +143,19 @@ services:
     profiles: ["split"]
     environment:
       <<: *engine-env
-      XABE_SERVE: 0.0.0.0:8000
+      LLMTIE_SERVE: 0.0.0.0:8000
       # Service names, not addresses. Compose's own DNS resolves them on the
       # project network, so nothing here has to know a container's IP.
-      XABE_ASR_URL: http://asr:8080
-      XABE_TTS_URL: http://tts:8100
-      XABE_LLM_MODEL: /models/${XABE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
-      XABE_LLM_DEVICE: "${XABE_LLM_DEVICE:-0}"
+      LLMTIE_ASR_URL: http://asr:8080
+      LLMTIE_TTS_URL: http://tts:8100
+      LLMTIE_LLM_MODEL: /models/${LLMTIE_LLM_GGUF:-breeze2-8b-Q4_K_M.gguf}
+      LLMTIE_LLM_DEVICE: "${LLMTIE_LLM_DEVICE:-0}"
       # The split exists to spread cards, so the translator defaults to its own
       # here where the monolith puts it on 0.
-      XABE_TRANSLATOR_MODEL: /models/${XABE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
-      XABE_TRANSLATOR_DEVICE: "${XABE_TRANSLATOR_DEVICE:-1}"
+      LLMTIE_TRANSLATOR_MODEL: /models/${LLMTIE_TRANSLATOR_GGUF:-taigi-translator-13b-Q4_K_M.gguf}
+      LLMTIE_TRANSLATOR_DEVICE: "${LLMTIE_TRANSLATOR_DEVICE:-1}"
     ports:
-      - "${XABE_PORT:-8000}:8000"
+      - "${LLMTIE_PORT:-8000}:8000"
     # `service_healthy`, not `service_started`: a worker that is still mapping
     # its checkpoint answers nothing, and a gateway that came up first would
     # spend its first requests failing for a reason that is not a fault.

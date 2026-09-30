@@ -1,7 +1,7 @@
 //! Times the prefill attention, `flash_attn`, at the shapes the engine runs it.
 //!
 //! ```sh
-//! XABE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-flash
+//! LLMTIE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-flash
 //! ```
 //!
 //! Each row is one layer's attention, a synchronise, medians of twenty after
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         .without_time()
         .with_target(false)
         .init();
-    let ordinal: usize = std::env::var("XABE_DEVICE")
+    let ordinal: usize = std::env::var("LLMTIE_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);

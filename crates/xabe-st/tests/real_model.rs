@@ -1,14 +1,14 @@
 //! Reads the actual mms-tts-nan checkpoint.
 //!
 //! Skips loudly when the file is absent: a skipped test is not a passing test,
-//! so it says why. Point `XABE_TTS_MODEL` at a `model.safetensors`, or let it
+//! so it says why. Point `LLMTIE_TTS_MODEL` at a `model.safetensors`, or let it
 //! find the HuggingFace cache copy.
 
 use xabe_st::StFile;
 
 /// Locates the checkpoint, or `None` if this machine does not have it.
 fn find_model() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_TTS_MODEL") {
         let p = std::path::PathBuf::from(p);
         return p.is_file().then_some(p);
     }
@@ -30,7 +30,7 @@ fn find_model() -> Option<std::path::PathBuf> {
 #[test]
 fn opens_the_real_checkpoint() {
     let Some(path) = find_model() else {
-        eprintln!("SKIP: mms-tts-nan checkpoint not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan checkpoint not found; set LLMTIE_TTS_MODEL");
         return;
     };
 
@@ -58,7 +58,7 @@ fn opens_the_real_checkpoint() {
 #[test]
 fn every_tensor_is_finite_and_addressable() {
     let Some(path) = find_model() else {
-        eprintln!("SKIP: mms-tts-nan checkpoint not found; set XABE_TTS_MODEL");
+        eprintln!("SKIP: mms-tts-nan checkpoint not found; set LLMTIE_TTS_MODEL");
         return;
     };
     let f = StFile::open(&path).expect("open");

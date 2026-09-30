@@ -31,7 +31,7 @@ const RTOL: f32 = 1e-3;
 
 /// Locates the Coqui model directory.
 fn find_model() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XABE_COQUI_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_COQUI_MODEL") {
         let p = PathBuf::from(p);
         return p.join("best_model.pth").is_file().then_some(p);
     }
@@ -41,7 +41,7 @@ fn find_model() -> Option<PathBuf> {
 
 /// Locates the Coqui capture, which is a different directory from the 🤗 one.
 fn find_golden() -> Option<Golden> {
-    let dir = match std::env::var("XABE_COQUI_GOLDEN") {
+    let dir = match std::env::var("LLMTIE_COQUI_GOLDEN") {
         Ok(p) => PathBuf::from(p),
         Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")

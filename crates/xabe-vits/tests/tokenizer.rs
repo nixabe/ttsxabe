@@ -30,7 +30,7 @@ struct Cases {
 }
 
 fn find_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_TTS_MODEL") {
         return PathBuf::from(p).parent().map(Into::into);
     }
     // The consolidated model tree is the canonical home. The HuggingFace cache
@@ -49,7 +49,7 @@ fn find_snapshot() -> Option<PathBuf> {
 
 fn load() -> Option<(Tokenizer, Cases)> {
     let snap = find_snapshot()?;
-    let path = match std::env::var("XABE_GOLDEN_TOKENIZER") {
+    let path = match std::env::var("LLMTIE_GOLDEN_TOKENIZER") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.golden/tokenizer/cases.json")

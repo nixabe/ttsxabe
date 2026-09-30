@@ -16,7 +16,7 @@ use xabe_tts::{GpuModel, Synthesizer};
 #[command(name = "xabe-tts-bench", version, about)]
 struct Args {
     /// Safetensors checkpoint.
-    #[arg(long, env = "XABE_TTS_MODEL")]
+    #[arg(long, env = "LLMTIE_TTS_MODEL")]
     model: PathBuf,
 
     /// POJ text to synthesise.
@@ -24,7 +24,7 @@ struct Args {
     text: String,
 
     /// cpu, or a CUDA device ordinal.
-    #[arg(long, env = "XABE_TTS_DEVICE", default_value = "0")]
+    #[arg(long, env = "LLMTIE_TTS_DEVICE", default_value = "0")]
     device: String,
 
     /// Untimed runs before measuring.

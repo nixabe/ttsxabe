@@ -2,7 +2,7 @@
 
 ## The shape
 
-One binary, `xabe-engine`, for every stage of the Taigi voice pipeline.
+One binary, `llmtie-rs`, for every stage of the Taigi voice pipeline.
 
 ```
    speech ──► VAD ──► ASR ──► [LLM] ──► [translator] ──► TTS ──► speech

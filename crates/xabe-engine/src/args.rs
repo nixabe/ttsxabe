@@ -11,50 +11,50 @@ use crate::stage::{Requested, StageError, Stages};
 use clap::Parser;
 use std::path::PathBuf;
 
-/// The Taigi voice engine: ASR, VAD, translation, TTS and the web front end.
+/// Integrated Large Language Model and Text-To-Speech Inference Engine in Rust.
 ///
 /// Each stage is satisfied either by a local checkpoint (`--<stage>-model`) or
 /// by another process over HTTP (`--<stage>-url`). Give the stages you want and
 /// this process becomes exactly that: a monolith, a single-stage worker, or
-/// anything between. The chat LLM stays in llama.cpp and is URL-only.
+/// anything between.
 #[derive(Debug, Parser)]
-#[command(name = "xabe-engine", version, about, long_about = None)]
+#[command(name = "llmtie-rs", version, about, long_about = None)]
 pub struct Args {
     /// Hard system RAM limit, e.g. 32GiB or 512MiB (bare numbers are bytes).
     /// Requires Linux cgroup v2 and systemd --user; disables swap for this run.
     /// Linux may kill the engine if reclaim cannot keep it within the limit.
-    #[arg(long, env = "XABE_MAX_SYSTEM_RAM", value_name = "SIZE", value_parser = crate::memory::parse_bytes)]
+    #[arg(long, env = "LLMTIE_MAX_SYSTEM_RAM", value_name = "SIZE", value_parser = crate::memory::parse_bytes)]
     pub max_system_ram: Option<u64>,
 
     /// Serve HTTP on this address. Without it the run is one-shot.
-    #[arg(long, env = "XABE_SERVE", value_name = "ADDR")]
+    #[arg(long, env = "LLMTIE_SERVE", value_name = "ADDR")]
     pub serve: Option<String>,
 
     /// Speech-to-text checkpoint directory.
-    #[arg(long, env = "XABE_ASR_MODEL", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_ASR_MODEL", value_name = "PATH")]
     pub asr_model: Option<PathBuf>,
     /// Delegate speech-to-text to a process at this base URL.
-    #[arg(long, env = "XABE_ASR_URL", value_name = "URL")]
+    #[arg(long, env = "LLMTIE_ASR_URL", value_name = "URL")]
     pub asr_url: Option<String>,
     /// Where to run the ASR: cpu, or a CUDA device ordinal.
-    #[arg(long, env = "XABE_ASR_DEVICE", value_name = "DEV")]
+    #[arg(long, env = "LLMTIE_ASR_DEVICE", value_name = "DEV")]
     pub asr_device: Option<String>,
 
     /// Voice-activity checkpoint. Gates the ASR; alone with --in it prints segments.
-    #[arg(long, env = "XABE_VAD_MODEL", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_VAD_MODEL", value_name = "PATH")]
     pub vad_model: Option<PathBuf>,
     /// Delegate voice-activity detection to a process at this base URL.
-    #[arg(long, env = "XABE_VAD_URL", value_name = "URL")]
+    #[arg(long, env = "LLMTIE_VAD_URL", value_name = "URL")]
     pub vad_url: Option<String>,
     /// Where to run the VAD: cpu, or a CUDA device ordinal.
-    #[arg(long, env = "XABE_VAD_DEVICE", value_name = "DEV")]
+    #[arg(long, env = "LLMTIE_VAD_DEVICE", value_name = "DEV")]
     pub vad_device: Option<String>,
 
     /// Text-to-speech checkpoint directory, or the safetensors file itself.
-    #[arg(long, env = "XABE_TTS_MODEL", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_TTS_MODEL", value_name = "PATH")]
     pub tts_model: Option<PathBuf>,
     /// Delegate text-to-speech to a process at this base URL.
-    #[arg(long, env = "XABE_TTS_URL", value_name = "URL")]
+    #[arg(long, env = "LLMTIE_TTS_URL", value_name = "URL")]
     pub tts_url: Option<String>,
     /// Where to run the TTS: cpu, or a CUDA device ordinal.
     ///
@@ -63,17 +63,17 @@ pub struct Args {
     ///
     /// Local engines from `--tts-engine` share this card, and take it from
     /// here when there is no `--tts-model` to share it with.
-    #[arg(long, env = "XABE_TTS_DEVICE", value_name = "DEV")]
+    #[arg(long, env = "LLMTIE_TTS_DEVICE", value_name = "DEV")]
     pub tts_device: Option<String>,
 
     /// Mandarin-to-Taigi checkpoint directory.
-    #[arg(long, env = "XABE_TRANSLATOR_MODEL", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_TRANSLATOR_MODEL", value_name = "PATH")]
     pub translator_model: Option<PathBuf>,
     /// Delegate translation to a llama-server at this base URL.
-    #[arg(long, env = "XABE_TRANSLATOR_URL", value_name = "URL")]
+    #[arg(long, env = "LLMTIE_TRANSLATOR_URL", value_name = "URL")]
     pub translator_url: Option<String>,
     /// Where to run the translator: cpu, or a CUDA device ordinal.
-    #[arg(long, env = "XABE_TRANSLATOR_DEVICE", value_name = "DEV")]
+    #[arg(long, env = "LLMTIE_TRANSLATOR_DEVICE", value_name = "DEV")]
     pub translator_device: Option<String>,
 
     /// Chat model checkpoint, as a GGUF.
@@ -81,13 +81,13 @@ pub struct Args {
     /// GGUF only, unlike every other stage: this model is published as one and
     /// its vocabulary lives inside the file, so a checkpoint directory would
     /// load 16 GB of weights and then have nothing to tokenize with.
-    #[arg(long, env = "XABE_LLM_MODEL", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_LLM_MODEL", value_name = "PATH")]
     pub llm_model: Option<PathBuf>,
     /// Delegate the chat model to a llama-server at this base URL.
-    #[arg(long, env = "XABE_LLM_URL", value_name = "URL")]
+    #[arg(long, env = "LLMTIE_LLM_URL", value_name = "URL")]
     pub llm_url: Option<String>,
     /// Where to run the chat model: a CUDA device ordinal.
-    #[arg(long, env = "XABE_LLM_DEVICE", value_name = "DEV")]
+    #[arg(long, env = "LLMTIE_LLM_DEVICE", value_name = "DEV")]
     pub llm_device: Option<String>,
 
     /// Have the chat model answer in Taigi Han itself, skipping the translator.
@@ -99,7 +99,7 @@ pub struct Args {
     /// this takes the translator out of the pipeline in the same move, so an
     /// engine on POJ or Tai-lo is left with nothing to romanise its input and
     /// says nothing at all. Refused at startup rather than discovered later.
-    #[arg(long, env = "XABE_DIRECT_TAIGI")]
+    #[arg(long, env = "LLMTIE_DIRECT_TAIGI")]
     pub direct_taigi: bool,
 
     /// One-shot input audio. Use - to read stdin.
@@ -115,11 +115,11 @@ pub struct Args {
     pub out: Option<PathBuf>,
 
     /// TTS model config. Defaults to config.json beside the checkpoint.
-    #[arg(long, env = "XABE_TTS_CONFIG", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_TTS_CONFIG", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
     /// Seed for the duration and prior draws.
-    #[arg(long, env = "XABE_SEED", default_value_t = 0)]
+    #[arg(long, env = "LLMTIE_SEED", default_value_t = 0)]
     pub seed: u64,
 
     /// Prior temperature. Higher is more varied.
@@ -153,7 +153,7 @@ pub struct Args {
     /// `--tts-device`, the same card as `--tts-model`.
     #[arg(
         long = "tts-engine",
-        env = "XABE_TTS_ENGINES",
+        env = "LLMTIE_TTS_ENGINES",
         value_name = "NAME=URL|PATH",
         value_delimiter = ','
     )]
@@ -163,7 +163,7 @@ pub struct Args {
     ///
     /// Written by `tools/make_cosyvoice_voice.py`. Defaults to
     /// `<checkpoint>/voices/taigi-ref.safetensors`.
-    #[arg(long, env = "XABE_COSY_VOICE", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_COSY_VOICE", value_name = "PATH")]
     pub cosy_voice: Option<std::path::PathBuf>,
 
     /// The instruction a local CosyVoice engine is given.
@@ -173,7 +173,7 @@ pub struct Args {
     /// sounds. Changing it changes the speech tokens for the same sentence.
     #[arg(
         long,
-        env = "XABE_COSY_INSTRUCT",
+        env = "LLMTIE_COSY_INSTRUCT",
         value_name = "TEXT",
         default_value = "You are a helpful assistant. \u{8acb}\u{7528}\u{95a9}\u{5357}\u{8a71}\u{8868}\u{9054}\u{3002}<|endofprompt|>"
     )]
@@ -186,18 +186,18 @@ pub struct Args {
     /// on, which trades a little variety for a lot less hiss; lower is
     /// flatter and cleaner, higher is breathier. Defaults to whatever
     /// `tacotron2.json` records.
-    #[arg(long, env = "XABE_TACO_SIGMA", value_name = "SIGMA")]
+    #[arg(long, env = "LLMTIE_TACO_SIGMA", value_name = "SIGMA")]
     pub taco_sigma: Option<f32>,
 
     /// Which engine the page selects on load.
-    #[arg(long, env = "XABE_TTS_DEFAULT", value_name = "NAME")]
+    #[arg(long, env = "LLMTIE_TTS_DEFAULT", value_name = "NAME")]
     pub tts_default: Option<String>,
 
     /// What the translator is asked to produce: POJ, HAN or HL.
     ///
     /// mms consumes romanisation, so it needs POJ; CosyVoice reads Han. This
     /// is the default for every engine; `--tts-script` overrides it per engine.
-    #[arg(long, env = "XABE_TRANSLATOR_TARGET", default_value = "POJ")]
+    #[arg(long, env = "LLMTIE_TRANSLATOR_TARGET", default_value = "POJ")]
     pub translator_target: String,
 
     /// The script one engine wants, as `name=POJ|HAN|HL`. Repeatable.
@@ -209,7 +209,7 @@ pub struct Args {
     /// Han tokenises to nothing and simply says nothing at all.
     #[arg(
         long = "tts-script",
-        env = "XABE_TTS_SCRIPTS",
+        env = "LLMTIE_TTS_SCRIPTS",
         value_name = "NAME=SCRIPT",
         value_delimiter = ','
     )]
@@ -219,31 +219,31 @@ pub struct Args {
     ///
     /// Breeze-ASR-26 transcribes Taigi speech *into* Mandarin Han; asking it
     /// for English gets a translation instead of a transcript.
-    #[arg(long, env = "XABE_ASR_LANG", default_value = "zh")]
+    #[arg(long, env = "LLMTIE_ASR_LANG", default_value = "zh")]
     pub asr_lang: String,
 
     /// What the user is called in the chat transcript.
-    #[arg(long, env = "XABE_PERSON", default_value = "使用者")]
+    #[arg(long, env = "LLMTIE_PERSON", default_value = "使用者")]
     pub person: String,
 
     /// What the assistant is called in the chat transcript.
-    #[arg(long, env = "XABE_BOT", default_value = "小助理")]
+    #[arg(long, env = "LLMTIE_BOT", default_value = "小助理")]
     pub bot: String,
 
     /// Sampling temperature for the reply.
-    #[arg(long, env = "XABE_TEMPERATURE", default_value_t = 0.3)]
+    #[arg(long, env = "LLMTIE_TEMPERATURE", default_value_t = 0.3)]
     pub temperature: f32,
 
     /// Maximum reply length, in tokens.
-    #[arg(long, env = "XABE_MAX_TOKENS", default_value_t = 160)]
+    #[arg(long, env = "LLMTIE_MAX_TOKENS", default_value_t = 160)]
     pub max_tokens: u32,
 
     /// How many previous turns stay in the prompt.
-    #[arg(long, env = "XABE_HISTORY_TURNS", default_value_t = 6)]
+    #[arg(long, env = "LLMTIE_HISTORY_TURNS", default_value_t = 6)]
     pub history_turns: usize,
 
     /// Minimum characters before a later chunk is synthesised.
-    #[arg(long, env = "XABE_MIN_CHUNK", default_value_t = 6)]
+    #[arg(long, env = "LLMTIE_MIN_CHUNK", default_value_t = 6)]
     pub min_chunk: usize,
 
     /// Whether later clauses are translated while an earlier one is still
@@ -252,22 +252,22 @@ pub struct Args {
     /// and the translator decodes them together. Chosen by device when not
     /// given - ahead when the translator and the synthesiser are on different
     /// cards - which is the measured default; see docs/BENCHMARKS.md.
-    #[arg(long, env = "XABE_TRANSLATE_AHEAD", value_name = "0|1")]
+    #[arg(long, env = "LLMTIE_TRANSLATE_AHEAD", value_name = "0|1")]
     pub translate_ahead: Option<usize>,
 
     /// Minimum characters before the first chunk is synthesised.
     ///
     /// Lower than --min-chunk on purpose: getting the voice started is worth
     /// more than getting the first clause exactly right.
-    #[arg(long, env = "XABE_FIRST_CHUNK", default_value_t = 4)]
+    #[arg(long, env = "LLMTIE_FIRST_CHUNK", default_value_t = 4)]
     pub first_chunk: usize,
 
     /// The system prompt, inline, instead of the built-in one.
-    #[arg(long, env = "XABE_SYSTEM_PROMPT", value_name = "TEXT")]
+    #[arg(long, env = "LLMTIE_SYSTEM_PROMPT", value_name = "TEXT")]
     pub system_prompt: Option<String>,
 
     /// Read the system prompt from a file instead of using the built-in one.
-    #[arg(long, env = "XABE_PROMPT_FILE", value_name = "PATH")]
+    #[arg(long, env = "LLMTIE_PROMPT_FILE", value_name = "PATH")]
     pub prompt_file: Option<PathBuf>,
 
     /// Log verbosity: info, debug or trace.

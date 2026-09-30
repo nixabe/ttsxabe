@@ -19,7 +19,7 @@ const ATOL: f32 = 2e-3;
 const RTOL: f32 = 2e-2;
 
 fn find_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_TTS_MODEL") {
         return PathBuf::from(p).parent().map(Into::into);
     }
     // The consolidated model tree is the canonical home. The HuggingFace cache
@@ -38,7 +38,7 @@ fn find_snapshot() -> Option<PathBuf> {
 
 /// Which device to use. GPU 2 on this host runs somebody else's job.
 fn ordinal() -> usize {
-    std::env::var("XABE_TEST_DEVICE")
+    std::env::var("LLMTIE_TEST_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)

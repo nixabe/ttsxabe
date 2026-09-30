@@ -21,25 +21,25 @@ use xabe_translate::{Packing, Translator};
 
 /// A quantized copy of the translator, if one has been made.
 fn quantized() -> Option<PathBuf> {
-    let dir = std::env::var("XABE_QUANT_DIR").ok()?;
-    let name = std::env::var("XABE_TRANSLATOR_QUANT")
+    let dir = std::env::var("LLMTIE_QUANT_DIR").ok()?;
+    let name = std::env::var("LLMTIE_TRANSLATOR_QUANT")
         .unwrap_or_else(|_| "taigi-translator-13b-Q4_K_M.gguf".to_string());
     let p = PathBuf::from(dir).join(name);
     if p.is_file() {
         Some(p)
     } else {
-        eprintln!("SKIP: no {} under XABE_QUANT_DIR", p.display());
+        eprintln!("SKIP: no {} under LLMTIE_QUANT_DIR", p.display());
         None
     }
 }
 
 /// The card to load 26.5 GB onto. No default, for the same reason
-/// `XABE_CHAT_DEVICE` has none: this host is shared.
+/// `LLMTIE_CHAT_DEVICE` has none: this host is shared.
 fn device() -> Option<usize> {
-    match std::env::var("XABE_TRANSLATOR_DEVICE").ok() {
+    match std::env::var("LLMTIE_TRANSLATOR_DEVICE").ok() {
         Some(v) => v.parse().ok(),
         None => {
-            eprintln!("SKIP: set XABE_TRANSLATOR_DEVICE to the card to load onto");
+            eprintln!("SKIP: set LLMTIE_TRANSLATOR_DEVICE to the card to load onto");
             None
         }
     }

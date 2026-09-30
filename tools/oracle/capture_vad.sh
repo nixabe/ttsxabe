@@ -34,12 +34,12 @@ echo "building the corpus"
 
 # Real speech, from this engine, at a fixed seed. Synthetic tones exercise the
 # segmenter; only speech exercises the detector on what it was trained for.
-if [ -x target/release/xabe-engine ] && [ -d models/tts/mms-tts-nan ]; then
+if [ -x target/release/llmtie-rs ] && [ -d models/tts/mms-tts-nan ]; then
   echo "synthesising speech clips"
-  target/release/xabe-engine --tts-model models/tts/mms-tts-nan --tts-device cpu \
+  target/release/llmtie-rs --tts-model models/tts/mms-tts-nan --tts-device cpu \
     --text "Lí hó, kin-á-ji̍t thinn-khì chin hó." --out "$CLIPS/speech.wav" \
     --log-level warn
-  target/release/xabe-engine --tts-model models/tts/mms-tts-nan --tts-device cpu \
+  target/release/llmtie-rs --tts-model models/tts/mms-tts-nan --tts-device cpu \
     --text "Góa beh khì chhī-tiûⁿ bé mih-kiāⁿ. Lí beh khì bô?" \
     --out "$CLIPS/speech_two.wav" --log-level warn
 else

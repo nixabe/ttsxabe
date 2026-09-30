@@ -2,7 +2,7 @@
 //! replaces, at the shapes the engine decodes.
 //!
 //! ```sh
-//! XABE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-attn
+//! LLMTIE_DEVICE=0 cargo run --release -p xabe-cuda --bin bench-attn
 //! ```
 //!
 //! Each row is thirty-two layers' worth of one step, a synchronise on both
@@ -34,7 +34,7 @@ fn seq(n: usize, salt: u64) -> Vec<f32> {
 }
 
 fn main() -> ExitCode {
-    let ordinal: usize = std::env::var("XABE_DEVICE")
+    let ordinal: usize = std::env::var("LLMTIE_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);

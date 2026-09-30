@@ -25,7 +25,7 @@ const ATOL: f32 = 5e-5;
 const RTOL: f32 = 5e-5;
 
 fn find_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XABE_TTS_MODEL") {
+    if let Ok(p) = std::env::var("LLMTIE_TTS_MODEL") {
         return PathBuf::from(p).parent().map(Into::into);
     }
     // The consolidated model tree is the canonical home. The HuggingFace cache

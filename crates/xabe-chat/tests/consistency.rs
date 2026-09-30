@@ -31,12 +31,12 @@ const BOUND: f32 = 0.02;
 #[test]
 fn a_batched_prefill_matches_the_same_tokens_one_at_a_time() {
     let (Some(m), Some(d)) = (
-        std::env::var("XABE_CHAT_MODEL").ok().map(PathBuf::from),
-        std::env::var("XABE_CHAT_DEVICE")
+        std::env::var("LLMTIE_CHAT_MODEL").ok().map(PathBuf::from),
+        std::env::var("LLMTIE_CHAT_DEVICE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok()),
     ) else {
-        eprintln!("SKIP: set XABE_CHAT_MODEL and XABE_CHAT_DEVICE");
+        eprintln!("SKIP: set LLMTIE_CHAT_MODEL and LLMTIE_CHAT_DEVICE");
         return;
     };
     let model = xabe_chat::ChatModel::open(&m, d).expect("open the chat model");

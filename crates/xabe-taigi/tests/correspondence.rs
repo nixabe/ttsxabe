@@ -48,7 +48,7 @@ struct Inventory {
 }
 
 fn capture() -> Option<Capture> {
-    let dir = match std::env::var("XABE_TAIGI_GOLDEN") {
+    let dir = match std::env::var("LLMTIE_TAIGI_GOLDEN") {
         Ok(p) => PathBuf::from(p),
         Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")

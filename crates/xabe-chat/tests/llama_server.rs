@@ -108,7 +108,7 @@ fn root() -> PathBuf {
 /// and a test that silently lands on a busy card is exactly what that is
 /// warning about. So the test is skipped unless a card is named.
 fn device() -> Option<usize> {
-    std::env::var("XABE_CHAT_DEVICE").ok()?.parse().ok()
+    std::env::var("LLMTIE_CHAT_DEVICE").ok()?.parse().ok()
 }
 
 fn model() -> Option<PathBuf> {
@@ -126,7 +126,7 @@ fn the_engine_reproduces_llama_server_and_streams_it_correctly() {
     let (Some(m), Some(g), Some(d)) = (model(), golden(), device()) else {
         println!(
             "SKIP: needs the chat GGUF, .golden/chat/llama_server.json \
-             (tools/oracle/capture_chat_server.py) and XABE_CHAT_DEVICE=<free card>"
+             (tools/oracle/capture_chat_server.py) and LLMTIE_CHAT_DEVICE=<free card>"
         );
         return;
     };

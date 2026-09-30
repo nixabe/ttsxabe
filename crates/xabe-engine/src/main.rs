@@ -1,4 +1,4 @@
-//! The `xabe-engine` binary.
+//! The `llmtie-rs` binary.
 //!
 //! Everything is in the library beside this file; `main` exists only to parse
 //! the arguments, install logging, and turn an error into an exit code. See

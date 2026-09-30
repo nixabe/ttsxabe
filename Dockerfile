@@ -63,13 +63,13 @@ COPY crates ./crates
 # `--locked` because `Cargo.lock` is committed, and a build that quietly
 # resolves something else is not the build that was tested.
 #
-# Only `xabe-engine` is built. The four benchmark binaries in the same crate
+# Only `llmtie-rs` is built. The four benchmark binaries in the same crate
 # need a card *and* a checkpoint to say anything, so they belong on the host
 # that has both rather than in a deployment image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --locked -p xabe-engine --bin xabe-engine \
- && install -Dm755 target/release/xabe-engine /out/xabe-engine
+    cargo build --release --locked -p xabe-engine --bin llmtie-rs \
+ && install -Dm755 target/release/llmtie-rs /out/llmtie-rs
 
 # ------------------------------------------------------------------ runtime
 #
@@ -95,7 +95,7 @@ RUN apt-get update \
 # Where that is wrong, compose's `user:` overrides it without a rebuild.
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin xabe
 
-COPY --from=build /out/xabe-engine /usr/local/bin/xabe-engine
+COPY --from=build /out/llmtie-rs /usr/local/bin/llmtie-rs
 
 # Where the model tree is expected. Created so that a run with no mount fails
 # by naming a missing checkpoint rather than a missing directory.
@@ -110,4 +110,4 @@ EXPOSE 8000
 # rather than a shell's, and `command:` in compose is an argument list. Every
 # flag has an env twin (see docs/CLI.md), so the usual case sets no arguments
 # at all and a stage is turned off by leaving its variables unset.
-ENTRYPOINT ["/usr/local/bin/xabe-engine"]
+ENTRYPOINT ["/usr/local/bin/llmtie-rs"]

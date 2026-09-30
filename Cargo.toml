@@ -27,8 +27,8 @@ members = [
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/nixabe/ttsxabe"
-authors = ["ttsxabe contributors"]
+repository = "https://github.com/nixabe/llmtie-rs"
+authors = ["llmtie-rs contributors"]
 
 [workspace.dependencies]
 xabe-st = { path = "crates/xabe-st" }

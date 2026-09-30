@@ -75,7 +75,7 @@ impl Golden {
         })
     }
 
-    /// Opens the capture named by `XABE_GOLDEN`, or `.golden/base` beside the
+    /// Opens the capture named by `LLMTIE_GOLDEN`, or `.golden/base` beside the
     /// workspace root.
     ///
     /// Returns `None` rather than an error when the directory is absent:
@@ -83,7 +83,7 @@ impl Golden {
     /// and a test that cannot find one should say so and skip rather than fail
     /// for a reason unrelated to the code under test.
     pub fn open_default() -> Option<Self> {
-        let dir = match std::env::var("XABE_GOLDEN") {
+        let dir = match std::env::var("LLMTIE_GOLDEN") {
             Ok(p) => PathBuf::from(p),
             Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
