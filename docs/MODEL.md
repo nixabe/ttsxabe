@@ -132,7 +132,7 @@ failure mode `docs/TESTING.md` exists to catch.
 
 Bias, in a transposed convolution, is still per *output* channel — so the bias
 length does not match the weight's leading dimension the way it does everywhere
-else. That asymmetry is a separate loader path in `xabe-vits::weights`, not a
+else. That asymmetry is a separate loader path in `llmtie-vits::weights`, not a
 flag on the ordinary one.
 
 Weight normalisation is applied inconsistently across the checkpoint, and this
@@ -196,7 +196,7 @@ plausible-looking probabilities, and is wrong everywhere.
 
 The convolutions and the STFT basis are stored half precision; only the biases
 are F32. This was not in the plan — it was found by converting the file — and it
-is why `xabe-st` grew F16 and BF16 support ahead of phase 5a.
+is why `llmtie-st` grew F16 and BF16 support ahead of phase 5a.
 
 It also explains the whole of the disagreement with the reference. whisper.cpp
 runs ggml's F16 kernels, which round the **activations** to half precision at
@@ -221,7 +221,7 @@ segment on every clip matches.
    pipeline and matching Python instead would invalidate the tuning.
 2. **The segmenter has two rules upstream does not**: adjacent segments closer
    than 200 ms are merged, and a second minimum-duration sweep runs after that
-   merge. Both are in `xabe-vad::segments`, marked where they appear.
+   merge. Both are in `llmtie-vad::segments`, marked where they appear.
 
 ## Segmenter constants
 
@@ -375,7 +375,7 @@ impossible.
 
 Turing has fp16 tensor cores and no bf16 at all, so the weights are converted
 once at load. F32 would be 53 GB, which is more than any card here has; f16 is
-26.5 GB and fits. The conversion is `xabe-st`'s `tensor_f16`, and its behaviour
+26.5 GB and fits. The conversion is `llmtie-st`'s `tensor_f16`, and its behaviour
 at the edges is a decision, not an accident: a value that would round to an
 infinity is **refused** by tensor name and element index, while an underflow to
 a subnormal or to zero is counted and logged. Saturating quietly is how you get
@@ -453,7 +453,7 @@ This is the one that matters, and it is invisible to every shape check.
 
 Both conventions compute the same rotation and disagree about which two
 elements of a head form a rotating pair. 🤗 pairs element `i` with
-`i + head_dim/2` — the **halves** convention, which is what `xabe_dsp::rope`
+`i + head_dim/2` — the **halves** convention, which is what `llmtie_dsp::rope`
 implements. ggml pairs `2i` with `2i+1` — **interleaved**. Rather than carry
 two rope kernels, llama.cpp's converter bakes the difference into the weights,
 permuting the *rows* of `attn_q` and `attn_k` on the way into a GGUF.
@@ -469,7 +469,7 @@ is the fingerprint. Measured on `taigi-translator-13b-f16.gguf`:
 | `blk.0.ffn_down.weight` | 0 |
 | `token_embd.weight`, `output.weight` | 0 |
 
-`xabe_llama::gguf::unpermute_rope` takes both to zero. So reading a GGUF Llama
+`llmtie_llama::gguf::unpermute_rope` takes both to zero. So reading a GGUF Llama
 without undoing this gives a model whose values, norms, feed-forward and
 embedding are all exactly right and whose `q` and `k` are shuffled within every
 head — shapes all correct, output fluent and wrong. It is the precise failure
@@ -499,9 +499,9 @@ option, and the f32 weights would not fit anyway.
 
 # Llama-3, `Llama-Breeze2-8B-Instruct-text-only`
 
-The chat model, and it runs here now. `xabe-gguf` reads the container,
-`xabe-llama` binds all 292 tensors and reproduces llama.cpp's tokenization
-id-for-id, and `xabe-chat` runs the forward pass on CUDA — reachable as
+The chat model, and it runs here now. `llmtie-gguf` reads the container,
+`llmtie-llama` binds all 292 tensors and reproduces llama.cpp's tokenization
+id-for-id, and `llmtie-chat` runs the forward pass on CUDA — reachable as
 `--llm-model`, measured at 124 of 125 token decisions identical to the
 llama-server it replaces.
 
@@ -546,11 +546,11 @@ call it done.
 
 **Grouped-query attention.** 32 query heads share 8 key-value heads, so `k` and
 `v` are `[1024, 4096]` where `q` and `o` are `[4096, 4096]`. This is what made
-`xabe-llama` stop refusing grouped-query outright. The refusal moved rather than
+`llmtie-llama` stop refusing grouped-query outright. The refusal moved rather than
 disappearing: a *shape* is a fact about the file and every grouped-query file
 binds fine, so `LlamaConfig::check` accepts it and
 `LlamaConfig::refuse_grouped_query` is what an engine without the head mapping
-calls at open. `xabe-translate` calls it. The old arrangement made an 8 B model
+calls at open. `llmtie-translate` calls it. The old arrangement made an 8 B model
 that binds cleanly unreadable for no reason a shape could justify.
 
 **RoPE theta is 500000, not 10000.** Llama-3 stretched the base by fifty times
@@ -566,7 +566,7 @@ one nothing else would have told you about.
 
 ## Quantized GGUFs load, and that is not the same as running quantized
 
-`xabe-gguf` decodes nine block formats — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
+`llmtie-gguf` decodes nine block formats — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
 `Q8_0`, and the K-quants `Q2_K` through `Q6_K` — unpacking each to f32 on read.
 So a `Q4_K_M` checkpoint opens and binds exactly like an f16 one, and nothing
 above the container knows the difference.
@@ -652,8 +652,8 @@ merges, all carried inside the GGUF rather than in files beside it. The
 translator and the chat model share an architecture family and **not** a
 tokenizer: one is SentencePiece, this one is byte-level BPE.
 
-It is `xabe_llama::Bpe`, and the `pre` field is the reason it is not
-`xabe-whisper`'s. Same family, three differences, each of which changes the
+It is `llmtie_llama::Bpe`, and the `pre` field is the reason it is not
+`llmtie-whisper`'s. Same family, three differences, each of which changes the
 output:
 
 | | `gpt2` (Whisper) | `llama-bpe` (this) |
@@ -681,7 +681,7 @@ that found, both of which produced real tokens that decoded back to the input.
 # CosyVoice3, `Fun-CosyVoice3-0.5B`
 
 Three networks on the per-request path, converted out of pickle by
-`tools/convert_cosyvoice.py` and bound in `xabe-cosy`. Licence Apache-2.0, and
+`tools/convert_cosyvoice.py` and bound in `llmtie-cosy`. Licence Apache-2.0, and
 not redistributed here.
 
 ```
@@ -792,7 +792,7 @@ encoder, which is what the file actually holds - 22.05 kHz output, trained on
 SuiSiann-0.2.1. Licence CC-BY-SA 4.0, and not redistributed here.
 
 It is not a variant of the model above. It is *the* model above, from a
-different trainer, and every stage of the forward pass in `xabe-tts` runs it
+different trainer, and every stage of the forward pass in `llmtie-tts` runs it
 without a line changed. What is different is entirely in the loading, and this
 section is about those five differences, because each one of them is a way to
 read the checkpoint wrongly and still produce speech.
@@ -822,7 +822,7 @@ the engine cares; the sample rate is metadata all the way to the WAV header.
 ## Five differences, and what each one breaks
 
 **1. The container is a `.pth`.** A zip archive holding a pickle that names the
-tensors and one stored entry per storage. `xabe-pt` reads it directly - see
+tensors and one stored entry per storage. `llmtie-pt` reads it directly - see
 below for why that is not the same as unpickling - so the claim at the top of
 `AGENTS.md` still holds: this is the published checkpoint, not a conversion of
 one.
@@ -840,7 +840,7 @@ difference and it is the one worth stating twice. The 🤗 export ran
 plain `weight`. The Coqui save did not, so they carry
 `parametrizations.weight.original0` and `original1` - the magnitude and the
 direction - and the kernel is their product after a division. `MaybeWn` is the
-type that says which was found, and `xabe-tts`'s decoder fuses when it has to.
+type that says which was found, and `llmtie-tts`'s decoder fuses when it has to.
 
 There is a trap inside the trap. Weight norm normalises over every axis but the
 first, and a **transposed** convolution stores `[in, out, k]` - so the four
@@ -862,7 +862,7 @@ with a padding token between every phoneme.
 Both are 1.0 here, which is exactly why it is written down - the bug would not
 have shown up in this checkpoint.
 
-## The input is IPA, and getting there is `xabe-taigi`
+## The input is IPA, and getting there is `llmtie-taigi`
 
 `use_phonemes` is true, `phonemizer` is `pygoruut:v0.6.3` and
 `phoneme_language` is `MinnanHokkien2`. The model's embedding table is indexed
@@ -883,10 +883,10 @@ emits POJ and the two other synthesisers read it. And a romanisation has
 conversion this engine needs has no guessing in it at all:
 
 ```
-translator ──POJ──► xabe-taigi::poj_to_ipa ──IPA──► Coqui VITS
+translator ──POJ──► llmtie-taigi::poj_to_ipa ──IPA──► Coqui VITS
 ```
 
-18 initials, 78 rimes, 7 Chao tones. `xabe-taigi` owns it, and
+18 initials, 78 rimes, 7 Chao tones. `llmtie-taigi` owns it, and
 [ORACLE.md](ORACLE.md) has how a conversion with no reference implementation
 was verified anyway: by lining up SuiSiann's own Han and Tâi-lô columns through
 goruut and reading the correspondence off 28,489 aligned syllables.
@@ -913,7 +913,7 @@ from the corpus's own transcription for 28.7% of syllable tokens:
 
 On every one of those the transcription is right, because it is what the
 speaker actually said — the audio is the ground truth and the Han is not. So
-`xabe-taigi` following the romanisation is not an approximation of goruut, it
+`llmtie-taigi` following the romanisation is not an approximation of goruut, it
 is better than it, and the differential test asserts a floor on agreement
 rather than equality. Reproducing goruut exactly would mean reproducing its
 mistakes.
@@ -942,14 +942,14 @@ Two consequences, and the second is a design decision:
 
 - The model's effective phoneme inventory is smaller than its nominal 137.
   拍 `pʰaʔ` and 百 `paʔ` are the same input to it.
-- **`xabe-taigi` reproduces the losses rather than repairing them.** It emits
+- **`llmtie-taigi` reproduces the losses rather than repairing them.** It emits
   `ʰ` and precomposed nasals exactly as goruut does, and they are dropped
   exactly as they were in training. Emitting the decomposed form would survive
   tokenisation and hand the model a symbol it has essentially never seen, which
   is worse than matching the reference's own defect. If the checkpoint is ever
   retrained with a corrected character set, the front end is already right.
 
-The one deliberate divergence is punctuation, which `xabe-taigi` drops outright
+The one deliberate divergence is punctuation, which `llmtie-taigi` drops outright
 instead of passing it on to be dropped. What survives goruut's tokenizer is
 0.337% of the training characters — `,` appears four times in the entire corpus
 and `.` nine — so those embeddings are noise, and clause boundaries reach the
@@ -998,7 +998,7 @@ Worth knowing before writing another one. Coqui's text encoder carries its
 activations as `[B, C, T]` and 🤗's as `[B, T, C]`, and that applies to the
 embedding, every layer output, `enc_out`, `m_p` and `logs_p`. After the duration
 expansion both are `[B, C, T]`, so `z_p`, `z` and the waveform need nothing.
-`capture_coqui.py` transposes on the way out, so one `xabe-golden` convention
+`capture_coqui.py` transposes on the way out, so one `llmtie-golden` convention
 serves both dialects and a test does not have to ask which capture it opened.
 
 This was found the way everything here is found: the waveform matched end to

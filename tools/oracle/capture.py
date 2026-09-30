@@ -30,7 +30,7 @@ import torch
 from transformers import VitsModel, VitsTokenizer
 
 # Tensors are written raw, C order, little-endian, with shape and dtype in the
-# manifest - the same convention `xabe-st` already reads, so the Rust side needs
+# manifest - the same convention `llmtie-st` already reads, so the Rust side needs
 # no second parser.
 DTYPES = {torch.float32: "f32", torch.int64: "i64", torch.int32: "i32"}
 

@@ -7,7 +7,7 @@
 The VAD ships as legacy ggml, not safetensors: 864 KB with the magic `ggml`
 and a hand-rolled header. Teaching the workspace a second container format for
 one 15-tensor model would be a lot of parser for very little model, so it is
-converted once here instead and `xabe-st` keeps its single job.
+converted once here instead and `llmtie-st` keeps its single job.
 
 The format, read out of `whisper_vad_init_with_params_no_state` in
 whisper.cpp:
@@ -162,7 +162,7 @@ def main():
 
     blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
     # safetensors does not require an aligned data segment and nothing forces a
-    # producer to pad, but xabe-st refuses an unaligned f32 segment rather than
+    # producer to pad, but llmtie-st refuses an unaligned f32 segment rather than
     # casting bytes it cannot prove are aligned - so pad the header to 8.
     pad = (-len(blob)) % 8
     blob += b" " * pad

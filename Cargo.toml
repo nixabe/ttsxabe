@@ -1,26 +1,26 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/xabe-st",
-    "crates/xabe-golden",
-    "crates/xabe-vits",
-    "crates/xabe-dsp",
-    "crates/xabe-cuda",
-    "crates/xabe-tts",
-    "crates/xabe-audio",
-    "crates/xabe-engine",
-    "crates/xabe-serve",
-    "crates/xabe-vad",
-    "crates/xabe-whisper",
-    "crates/xabe-asr",
-    "crates/xabe-llama",
-    "crates/xabe-gguf",
-    "crates/xabe-chat",
-    "crates/xabe-cosy",
-    "crates/xabe-translate",
-    "crates/xabe-taco",
-    "crates/xabe-pt",
-    "crates/xabe-taigi",
+    "crates/llmtie-st",
+    "crates/llmtie-golden",
+    "crates/llmtie-vits",
+    "crates/llmtie-dsp",
+    "crates/llmtie-cuda",
+    "crates/llmtie-tts",
+    "crates/llmtie-audio",
+    "crates/llmtie-engine",
+    "crates/llmtie-serve",
+    "crates/llmtie-vad",
+    "crates/llmtie-whisper",
+    "crates/llmtie-asr",
+    "crates/llmtie-llama",
+    "crates/llmtie-gguf",
+    "crates/llmtie-chat",
+    "crates/llmtie-cosy",
+    "crates/llmtie-translate",
+    "crates/llmtie-taco",
+    "crates/llmtie-pt",
+    "crates/llmtie-taigi",
 ]
 
 [workspace.package]
@@ -31,25 +31,25 @@ repository = "https://github.com/nixabe/llmtie-rs"
 authors = ["llmtie-rs contributors"]
 
 [workspace.dependencies]
-xabe-st = { path = "crates/xabe-st" }
-xabe-vits = { path = "crates/xabe-vits" }
-xabe-dsp = { path = "crates/xabe-dsp" }
-xabe-golden = { path = "crates/xabe-golden" }
-xabe-cuda = { path = "crates/xabe-cuda" }
-xabe-tts = { path = "crates/xabe-tts" }
-xabe-audio = { path = "crates/xabe-audio" }
-xabe-serve = { path = "crates/xabe-serve" }
-xabe-vad = { path = "crates/xabe-vad" }
-xabe-whisper = { path = "crates/xabe-whisper" }
-xabe-taco = { path = "crates/xabe-taco" }
-xabe-asr = { path = "crates/xabe-asr" }
-xabe-llama = { path = "crates/xabe-llama" }
-xabe-gguf = { path = "crates/xabe-gguf" }
-xabe-pt = { path = "crates/xabe-pt" }
-xabe-taigi = { path = "crates/xabe-taigi" }
-xabe-chat = { path = "crates/xabe-chat" }
-xabe-cosy = { path = "crates/xabe-cosy" }
-xabe-translate = { path = "crates/xabe-translate" }
+llmtie-st = { path = "crates/llmtie-st" }
+llmtie-vits = { path = "crates/llmtie-vits" }
+llmtie-dsp = { path = "crates/llmtie-dsp" }
+llmtie-golden = { path = "crates/llmtie-golden" }
+llmtie-cuda = { path = "crates/llmtie-cuda" }
+llmtie-tts = { path = "crates/llmtie-tts" }
+llmtie-audio = { path = "crates/llmtie-audio" }
+llmtie-serve = { path = "crates/llmtie-serve" }
+llmtie-vad = { path = "crates/llmtie-vad" }
+llmtie-whisper = { path = "crates/llmtie-whisper" }
+llmtie-taco = { path = "crates/llmtie-taco" }
+llmtie-asr = { path = "crates/llmtie-asr" }
+llmtie-llama = { path = "crates/llmtie-llama" }
+llmtie-gguf = { path = "crates/llmtie-gguf" }
+llmtie-pt = { path = "crates/llmtie-pt" }
+llmtie-taigi = { path = "crates/llmtie-taigi" }
+llmtie-chat = { path = "crates/llmtie-chat" }
+llmtie-cosy = { path = "crates/llmtie-cosy" }
+llmtie-translate = { path = "crates/llmtie-translate" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"

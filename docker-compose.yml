@@ -66,7 +66,7 @@ services:
   # there is no translator to produce it`. Direct Taigi is the faster path and
   # docs/BENCHMARKS.md measures it at 3.8 s -> 1.6 s on a voice turn, but it
   # needs an engine that reads Han. docs/DOCKER.md has that variant.
-  xabe:
+  llmtie:
     <<: *engine
     # Profiled, and so is every split service, because the two shapes are
     # alternatives rather than layers: both publish 8000, and a service with no

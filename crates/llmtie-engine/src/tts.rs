@@ -1,0 +1,387 @@
+//! The one-shot text-to-speech run.
+//!
+//! This is the whole of `llmtie-tts`'s old `main.rs`, moved: the synthesiser is
+//! no longer the whole program, so its CLI is no longer the program's CLI. The
+//! library it drives has not changed.
+//!
+//! It refuses to know about serving or about any other stage. Given text and a
+//! destination it produces a WAV, and everything about *which* text and *where
+//! from* was settled in `action.rs` before this was called.
+
+use crate::args::Args;
+use crate::error::EngineError;
+use crate::stage::Device;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use llmtie_audio::write_wav;
+use llmtie_tts::{GpuModel, Synthesizer};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+/// A checkpoint located on disk, however the flag spelled it.
+pub struct Checkpoint {
+    /// The directory holding the weights, config and vocabulary.
+    pub dir: PathBuf,
+    /// The config to read, which may have been overridden.
+    pub config: PathBuf,
+}
+
+impl Checkpoint {
+    /// Accepts either the model directory or the safetensors file inside it.
+    ///
+    /// Both spellings are in use: the consolidated tree names directories
+    /// (`models/tts/mms-tts-nan`), while the old flag and every test pointed at
+    /// `model.safetensors`. Rejecting one of them would break working commands
+    /// to no purpose, since the directory is recoverable from the file.
+    pub fn locate(path: &Path, config_override: Option<&Path>) -> Checkpoint {
+        let dir = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(Path::new(".")).to_path_buf()
+        };
+        let config = config_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.join("config.json"));
+        Checkpoint { dir, config }
+    }
+}
+
+/// Synthesises `text` and writes it to `out`.
+pub fn speak(
+    args: &Args,
+    path: &Path,
+    device: Device,
+    text: &str,
+    out: &Path,
+) -> Result<(), EngineError> {
+    let text = read_text(text)?;
+
+    // Tacotron2 first, and by filename: `Checkpoint::locate` below assumes a
+    // VITS layout, and a directory holding `tacotron2.json` is not one.
+    if crate::serve::is_tacotron(path) {
+        let Device::Cuda(ordinal) = device else {
+            return Err(EngineError::LocalOnly {
+                stage: crate::stage::Kind::Tts,
+            });
+        };
+        let taco = llmtie_taco::Taco::open(path, ordinal, args.taco_sigma, args.seed)?;
+        let rate = taco.sample_rate() as u32;
+        let audio = taco.synthesize(&text)?;
+        tracing::info!(
+            seconds = format!("{:.2}", audio.len() as f32 / rate as f32),
+            samples = audio.len(),
+            "synthesised",
+        );
+        write_out(out, &audio, rate)?;
+        tracing::info!(out = %out.display(), "wrote");
+        return Ok(());
+    }
+
+    let ck = Checkpoint::locate(path, args.config.as_deref());
+
+    // A Coqui VITS save and a 🤗 export are the same model in different
+    // containers, so they share every line below the constructor. What they do
+    // not share is their input: `mms-tts-nan` reads POJ and this one reads IPA.
+    // The transliteration is `llmtie-taigi`'s, and it passes through text that is
+    // already phonemes - so `--text` takes either romanisation or IPA and does
+    // the right thing with both. See `docs/MODEL.md`.
+    let coqui = crate::serve::is_coqui(&ck.dir);
+    let text = if coqui {
+        let p = llmtie_taigi::poj_to_ipa(&text);
+        tracing::info!(
+            syllables = p.syllables,
+            dropped = p.dropped,
+            "transliterated to IPA",
+        );
+        p.text
+    } else {
+        text
+    };
+
+    let (rate, audio) = match (device, coqui) {
+        (Device::Cpu, true) => {
+            let mut synth = Synthesizer::open_coqui(&ck.dir)?;
+            apply_overrides(synth.config_mut(), args);
+            let rate = synth.config().sampling_rate;
+            (rate, synth.synthesize(&text, args.seed)?)
+        }
+        (Device::Cpu, false) => {
+            let mut synth =
+                Synthesizer::open_files(&ck.dir.join("model.safetensors"), &ck.config, &ck.dir)?;
+            apply_overrides(synth.config_mut(), args);
+            let rate = synth.config().sampling_rate;
+            (rate, synth.synthesize(&text, args.seed)?)
+        }
+        (Device::Cuda(ordinal), true) => {
+            let mut model = GpuModel::open_coqui(&ck.dir, ordinal)?;
+            apply_overrides(model.config_mut(), args);
+            let rate = model.config().sampling_rate;
+            (rate, model.synthesize(&text, args.seed)?)
+        }
+        (Device::Cuda(ordinal), false) => {
+            let mut model = GpuModel::open(&ck.dir, ordinal)?;
+            apply_overrides(model.config_mut(), args);
+            let rate = model.config().sampling_rate;
+            (rate, model.synthesize(&text, args.seed)?)
+        }
+    };
+
+    tracing::info!(
+        seconds = format!("{:.2}", audio.len() as f32 / rate as f32),
+        samples = audio.len(),
+        "synthesised",
+    );
+    write_out(out, &audio, rate)?;
+    tracing::info!(out = %out.display(), "wrote");
+    Ok(())
+}
+
+/// Applies the three sampling overrides the CLI exposes.
+///
+/// Only these three: they are temperatures and a rate, not geometry. Anything
+/// else would contradict the checkpoint.
+fn apply_overrides(cfg: &mut llmtie_vits::VitsConfig, args: &Args) {
+    if let Some(v) = args.noise_scale {
+        cfg.noise_scale = v;
+    }
+    if let Some(v) = args.noise_scale_duration {
+        cfg.noise_scale_duration = v;
+    }
+    if let Some(v) = args.speaking_rate {
+        cfg.speaking_rate = v;
+    }
+}
+
+/// Reads the text argument, or stdin when it is `-`.
+fn read_text(arg: &str) -> Result<String, EngineError> {
+    if arg != "-" {
+        return Ok(arg.to_string());
+    }
+    let mut s = String::new();
+    std::io::stdin()
+        .read_to_string(&mut s)
+        .map_err(|source| EngineError::Io {
+            what: "reading",
+            path: "stdin".into(),
+            source,
+        })?;
+    Ok(s.trim_end_matches('\n').to_string())
+}
+
+/// Writes the WAV to a path, or stdout when it is `-`.
+fn write_out(path: &Path, audio: &[f32], rate: u32) -> Result<(), EngineError> {
+    let io = |source| EngineError::Io {
+        what: "writing",
+        path: path.display().to_string(),
+        source,
+    };
+    if path.as_os_str() == "-" {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        write_wav(&mut lock, audio, rate).map_err(io)?;
+        return lock.flush().map_err(io);
+    }
+    let mut f = std::fs::File::create(path).map_err(io)?;
+    write_wav(&mut f, audio, rate).map_err(io)?;
+    f.flush().map_err(io)
+}
+
+/// Synthesises through another process and writes the result.
+///
+/// The remote returns one self-contained WAV per clause, so they are decoded
+/// and rewritten as a single file rather than concatenated: a WAV is a header
+/// plus samples, and appending whole files produces something no player will
+/// read past the first chunk.
+pub fn speak_remote(url: &str, text: &str, out: &Path) -> Result<(), EngineError> {
+    let text = read_text(text)?;
+    let runtime = runtime()?;
+    let chunks = runtime.block_on(async move {
+        let up = llmtie_serve::Upstream::new(url)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let up = up.clone();
+            let text = text.clone();
+            async move { up.stream_tts(&text, tx).await }
+        });
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.push(chunk);
+        }
+        match stream.await {
+            Ok(Ok(())) => Ok(got),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(llmtie_serve::ServeError::Upstream {
+                stage: "tts",
+                message: e.to_string(),
+            }),
+        }
+    })?;
+
+    let mut samples = Vec::new();
+    let mut rate = 16_000;
+    for chunk in &chunks {
+        let bytes = B64
+            .decode(&chunk.wav)
+            .map_err(|e| llmtie_serve::ServeError::BadPcm(e.to_string()))?;
+        let wav = llmtie_audio::parse_wav(&bytes)?;
+        rate = wav.sample_rate;
+        samples.extend_from_slice(&wav.samples);
+    }
+    tracing::info!(
+        seconds = format!("{:.2}", samples.len() as f32 / rate as f32),
+        chunks = chunks.len(),
+        "synthesised remotely",
+    );
+    write_out(out, &samples, rate)?;
+    tracing::info!(out = %out.display(), "wrote");
+    Ok(())
+}
+
+/// Transcribes a file in this process and prints the transcript.
+pub fn transcribe(
+    args: &Args,
+    path: &Path,
+    device: Device,
+    input: &Path,
+) -> Result<(), EngineError> {
+    // `Kind::has_cpu` refuses `--asr-device cpu` at preflight.
+    let Device::Cuda(ordinal) = device else {
+        unreachable!("--asr-device cpu is refused when the stages resolve");
+    };
+    let audio = llmtie_audio::parse_wav(&read_input(input)?)?;
+    if audio.sample_rate != 16_000 {
+        return Err(EngineError::SampleRate {
+            found: audio.sample_rate,
+            wanted: 16_000,
+        });
+    }
+    tracing::debug!(
+        seconds = format!("{:.2}", audio.seconds()),
+        rate = audio.sample_rate,
+        "read audio",
+    );
+
+    let model = llmtie_asr::AsrModel::open(path, ordinal)?;
+    let text = model.transcribe(&audio.samples, &args.asr_lang)?;
+    // The transcript is the tool's output, so it goes to stdout at INFO - the
+    // level that appears by default - not to a log the caller has to enable.
+    tracing::info!("{text}");
+    Ok(())
+}
+
+/// Reads a file, or standard input when the path is `-`.
+fn read_input(input: &Path) -> Result<Vec<u8>, EngineError> {
+    if input.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|source| EngineError::Io {
+                what: "reading",
+                path: "stdin".into(),
+                source,
+            })?;
+        return Ok(buf);
+    }
+    std::fs::read(input).map_err(|source| EngineError::Io {
+        what: "reading",
+        path: input.display().to_string(),
+        source,
+    })
+}
+
+/// Transcribes a file through another process and prints the transcript.
+pub fn transcribe_remote(args: &Args, url: &str, input: &Path) -> Result<(), EngineError> {
+    let wav = read_input(input)?;
+    // Parsed before sending so a file that is not audio fails here, naming the
+    // problem, rather than as an opaque error from the other process.
+    let parsed = llmtie_audio::parse_wav(&wav)?;
+    tracing::debug!(
+        seconds = format!("{:.2}", parsed.seconds()),
+        rate = parsed.sample_rate,
+        "read audio",
+    );
+
+    let lang = args.asr_lang.clone();
+    let url = url.to_string();
+    let text = runtime()?.block_on(async move {
+        llmtie_serve::Upstream::new(&url)?
+            .transcribe(wav, &lang)
+            .await
+    })?;
+    // The transcript is the tool's output, so it goes to stdout at INFO - the
+    // level that appears by default - not to a log the caller has to enable.
+    tracing::info!("{text}");
+    Ok(())
+}
+
+/// A runtime for the one-shot paths, which are otherwise synchronous.
+fn runtime() -> Result<tokio::runtime::Runtime, EngineError> {
+    // Current-thread: a one-shot run makes one request and has nothing to
+    // overlap it with, so a thread pool would be startup cost for no work.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| EngineError::Io {
+            what: "starting the runtime",
+            path: "one-shot".into(),
+            source,
+        })
+}
+
+/// Prints the speech segments a clip contains.
+///
+/// The tool form of the VAD: over a file it answers "where is the speech",
+/// which is a question worth asking on its own. Served, the same detector is a
+/// gate in front of the ASR instead.
+pub fn segment(path: &Path, input: &Path) -> Result<(), EngineError> {
+    let audio = read_audio(input)?;
+    if audio.sample_rate != 16_000 {
+        return Err(EngineError::WrongRate {
+            path: input.display().to_string(),
+            rate: audio.sample_rate,
+            want: 16_000,
+        });
+    }
+
+    let mut vad = llmtie_vad::open(path)?;
+    let probs = vad.probabilities(&audio.samples);
+    let found = llmtie_vad::segments(&probs, llmtie_vad::SegmentParams::default());
+
+    tracing::info!(
+        seconds = format!("{:.2}", audio.seconds()),
+        frames = probs.len(),
+        segments = found.len(),
+        "analysed",
+    );
+    // The segments are the tool's output, so they go to stdout at INFO - the
+    // level that appears by default - one line each, in a shape a script can cut.
+    for (i, s) in found.iter().enumerate() {
+        tracing::info!(
+            "{i}\t{:.2}\t{:.2}\t{:.2}",
+            s.start_s(),
+            s.end_s(),
+            s.end_s() - s.start_s(),
+        );
+    }
+    if found.is_empty() {
+        let peak = probs.iter().copied().fold(0.0f32, f32::max);
+        tracing::info!("no speech; peak frame probability {peak:.4}");
+    }
+    Ok(())
+}
+
+/// Reads a WAV from a path, or from stdin when it is `-`.
+fn read_audio(input: &Path) -> Result<llmtie_audio::Wav, EngineError> {
+    if input.as_os_str() != "-" {
+        return Ok(llmtie_audio::read_wav(input)?);
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|source| EngineError::Io {
+            what: "reading",
+            path: "stdin".into(),
+            source,
+        })?;
+    Ok(llmtie_audio::parse_wav(&buf)?)
+}

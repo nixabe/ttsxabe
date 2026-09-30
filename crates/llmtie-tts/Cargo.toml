@@ -1,0 +1,25 @@
+[package]
+name = "llmtie-tts"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+llmtie-cuda.workspace = true
+llmtie-dsp.workspace = true
+llmtie-pt.workspace = true
+llmtie-st.workspace = true
+llmtie-vits.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+llmtie-golden.workspace = true
+
+[[bin]]
+name = "llmtie-tts-bench"
+path = "src/bin/bench.rs"

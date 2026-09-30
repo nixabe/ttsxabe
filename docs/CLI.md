@@ -1,7 +1,7 @@
 # Command surface
 
 The workspace builds two binaries: `llmtie-rs`, the engine itself, and
-`xabe-tts-bench`, for timing the synthesiser.
+`llmtie-tts-bench`, for timing the synthesiser.
 
 ## `llmtie-rs`
 
@@ -72,7 +72,7 @@ in llama.cpp by decision and there is no `--llm-model`; that is now retracted in
 full, in two steps that are worth keeping apart because the first shipped long
 before the second.
 
-The loader came first: `xabe-gguf` reads the GGUF container and `xabe-llama`
+The loader came first: `llmtie-gguf` reads the GGUF container and `llmtie-llama`
 binds all 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` against
 its own metadata. That is the half that proves the geometry is understood and
 the half that costs nothing to keep if the arithmetic never follows.
@@ -205,7 +205,7 @@ a property of the directory rather than of a second flag.
 The last two rows are both VITS and run the same forward pass, but they do not
 eat the same thing: `mms-tts-nan` was trained on POJ and
 `neurlang/coqui-vits-suisiann-minnan-hokkien` on IPA. The engine converts, with
-`xabe-taigi`, on both the one-shot path and the conversation path — so a Coqui
+`llmtie-taigi`, on both the one-shot path and the conversation path — so a Coqui
 engine wants `POJ`, the same as mms:
 
 ```sh
@@ -368,26 +368,26 @@ startup rather than discovered as a quiet turn.
 CosyVoice reads **Han**, so pair it with `--tts-script <name>=HAN`; mms and
 Tacotron2 read romanisation and get POJ from `--translator-target`. Tacotron2
 was trained on Tâi-lô with the tone as a trailing digit rather than on POJ with
-diacritics, and `xabe-taco` transliterates between them — that is a fact about
+diacritics, and `llmtie-taco` transliterates between them — that is a fact about
 the checkpoint, so it is not a flag.
 
 Each engine answers at its own sample rate: mms at 16 kHz, Tacotron2 at
 22.05 kHz, CosyVoice at its own.
 
-`xabe-taco-bench` times the Tacotron2 path and prints where the time goes:
+`llmtie-taco-bench` times the Tacotron2 path and prints where the time goes:
 
 ```sh
-xabe-taco-bench --model models/tts/tacotron2-nan --device 0 --rounds 9
+llmtie-taco-bench --model models/tts/tacotron2-nan --device 0 --rounds 9
 ```
 
-`xabe-llm-bench` does the same for the two Llama stages, separating prefill from
+`llmtie-llm-bench` does the same for the two Llama stages, separating prefill from
 decode - they are bound by different things, and decode is what a listener waits
 through. `--packing f16` widens a quantized checkpoint at load, which is how the
 packed path's remaining headroom was measured:
 
 ```sh
-xabe-llm-bench --model models/breeze2-8b-Q4_K_M.gguf --kind chat --device 0
-xabe-llm-bench --model models/taigi-translator-13b-Q4_K_M.gguf --kind translate --device 0
+llmtie-llm-bench --model models/breeze2-8b-Q4_K_M.gguf --kind chat --device 0
+llmtie-llm-bench --model models/taigi-translator-13b-Q4_K_M.gguf --kind translate --device 0
 ```
 
 A local engine registered through `--tts-engine` shares `--tts-device` with
@@ -493,7 +493,7 @@ failure than a 404.
 
 `GET /api/config` also carries the turn-taking constants, so the page does not
 keep its own copy of numbers that were tuned against real speech. They are
-defined and unit-tested in `xabe-serve::turntaking`; see `docs/MODEL.md` for
+defined and unit-tested in `llmtie-serve::turntaking`; see `docs/MODEL.md` for
 what each one is a fix for.
 
 ### Per-turn system prompts

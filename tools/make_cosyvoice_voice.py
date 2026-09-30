@@ -31,7 +31,7 @@ never sees an ONNX runtime.
 `sine_waves`, the vocoder's dither, is deliberately *not* here. It is 300
 seconds of `torch.rand` taken from the global RNG at construction, so upstream
 does not reproduce it across load orderings either; the engine draws its own.
-See `crates/xabe-cosy/src/source.rs`.
+See `crates/llmtie-cosy/src/source.rs`.
 """
 
 import argparse
@@ -47,7 +47,7 @@ def write_safetensors(path: pathlib.Path, tensors: dict) -> None:
     """A minimal float32 safetensors writer.
 
     Written here rather than pulled in as a dependency: the format is a JSON
-    header and a blob, this writes one dtype, and `xabe-st` is the reader it
+    header and a blob, this writes one dtype, and `llmtie-st` is the reader it
     has to satisfy.
     """
     import json

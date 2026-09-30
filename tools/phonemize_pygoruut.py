@@ -15,7 +15,7 @@ reimplementation of it, and the engine takes what it produces::
     .venv-coqui/bin/python tools/phonemize_pygoruut.py --text "你好！我是蔡贏。"
     li˥˧ho˥˧ɡua˥˧si˧˧ĩã˨˦
 
-    xabe --tts-model models/tts/coqui-vits-suisiann \\
+    llmtie --tts-model models/tts/coqui-vits-suisiann \\
          --text "$(.venv-coqui/bin/python tools/phonemize_pygoruut.py --text '...')" \\
          --out hello.wav
 

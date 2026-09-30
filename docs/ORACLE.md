@@ -57,7 +57,7 @@ expansion matmuls actually use.
 
 A directory `.golden/<name>/` holding `manifest.json` and one `.bin` per tensor:
 raw little-endian f32, C order, shape in the manifest. Same convention as
-`xabe-st` reads, so the test harness needs no second parser.
+`llmtie-st` reads, so the test harness needs no second parser.
 
 `.golden/` is gitignored. It is regenerable and it is large.
 
@@ -75,7 +75,7 @@ is the reason `torch.set_num_threads(1)` is in the script and not a stray
 leftover. Float32 reduction order is not thread-invariant, and without it the
 last bits of every tensor move between runs.
 
-Reading it back is `xabe-golden`:
+Reading it back is `llmtie-golden`:
 
 ```rust
 let g = Golden::open_default().expect("capture present");
@@ -135,7 +135,7 @@ silero-vad, and that is a deliberate exception to the rule that the upstream
 author's implementation is the oracle.
 
 Every threshold the pipeline runs with — `vad_start`, the segmenter's 0.6, the
-turn-taking constants in `xabe-serve::turntaking` — was tuned against
+turn-taking constants in `llmtie-serve::turntaking` — was tuned against
 whisper.cpp's probabilities. whisper.cpp differs from upstream on purpose: it
 parses `n_context` and then ignores it, substituting a reflective pad. Matching
 Python instead would produce a more faithful Silero and invalidate every number
@@ -175,7 +175,7 @@ and the two `speech` clips are real synthesis.
 
 The VAD ships as legacy ggml, not safetensors — 864 KB with the magic `ggml` and
 a hand-rolled header. `tools/vad/ggml_to_safetensors.py` converts it once, so
-`xabe-st` keeps its single job rather than learning a second container format
+`llmtie-st` keeps its single job rather than learning a second container format
 for one 15-tensor model. The ggml header's geometry is written into
 `__metadata__`, which is what lets the weight schema check the shapes it binds
 against what the original file declared.
@@ -361,7 +361,7 @@ quantizer reaches.
 
 ## And one real file
 
-`crates/xabe-gguf/tests/quantized_model.rs` opens an actual
+`crates/llmtie-gguf/tests/quantized_model.rs` opens an actual
 `llama-quantize` output beside its f16 original. It is skipped unless
 `LLMTIE_QUANT_DIR` points at one, because the files are gigabytes and are
 reproducible in a single command:
@@ -564,7 +564,7 @@ load orderings either**.
 
 They are captured so the vocoder can be compared against upstream at all. The
 engine does not ship them: it draws its own from a named seed, which is
-reproducible on its own terms. See `crates/xabe-cosy/src/source.rs`.
+reproducible on its own terms. See `crates/llmtie-cosy/src/source.rs`.
 
 One of the three turns out not to matter, and it is worth saying which:
 `rand_ini` is added to phase row **0 only**, and the very next operation
@@ -624,7 +624,7 @@ cannot be imported at all.
 ```
 
 Same format as the first oracle - raw little-endian tensors, C order, a
-`manifest.json` with shapes, dtypes and SHA-256 - so `xabe-golden` reads both
+`manifest.json` with shapes, dtypes and SHA-256 - so `llmtie-golden` reads both
 without a second parser. Same hooks in spirit, on a different module tree, and
 the same `TorchFunctionMode` for the two random draws and the alignment matrix.
 
@@ -688,7 +688,7 @@ The CUDA path is held to `atol=2e-3`, `rtol=2e-2` for the reason
 # The Tâi-lô to IPA oracle
 
 The odd one out: there is **no reference implementation of this conversion**.
-`xabe-taigi` turns romanisation into the IPA the Coqui checkpoint reads, and
+`llmtie-taigi` turns romanisation into the IPA the Coqui checkpoint reads, and
 goruut — the only other thing that produces that IPA — starts from Han instead.
 There is nothing to run side by side.
 
@@ -746,7 +746,7 @@ would just look like another reading disagreement. So the capture also records
 goruut's **inventory** from the dictionary: every initial, rime, tone letter and
 syllable body it can write. The test then requires that
 
-- every initial `xabe-taigi` can produce is one goruut writes — **18 of 18**,
+- every initial `llmtie-taigi` can produce is one goruut writes — **18 of 18**,
 - every tone letter is one goruut writes — **7 of 7**, exactly the set,
 - at least 95% of syllable bodies are attested — **97.9%**, 1,476 of 1,508.
 
@@ -769,7 +769,7 @@ goruut writes the rime `ai` + `-h` as `aih`, with a literal `h`, where every
 other checked rime gets `ʔ`. It does that in exactly two dictionary entries —
 `aih` and `haih` — and `aiʔ` appears nowhere in the file.
 
-`xabe-taigi` converts `-h` to `ʔ` uniformly and does not reproduce it. Two
+`llmtie-taigi` converts `-h` to `ʔ` uniformly and does not reproduce it. Two
 entries is not a rule, and inferring one from them would put an `h` into
 `saih`, `uaih` and every other `ai`-plus-stop syllable that goruut has never
 spelled and has no opinion about. It costs 13 tokens of 28,489.

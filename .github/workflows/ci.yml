@@ -90,7 +90,7 @@ jobs:
       # thin-LTO single-codegen-unit build to run them would double the wall
       # clock and prove nothing extra.
       #
-      # This compiles `xabe-cuda` on a runner with no CUDA toolkit, which works
+      # This compiles `llmtie-cuda` on a runner with no CUDA toolkit, which works
       # because cudarc is built with `fallback-dynamic-loading`: it resolves
       # libcuda and libnvrtc at run time, so nothing links against them here.
       - name: Tests

@@ -23,8 +23,8 @@ Twenty timed synthesis calls after five warm-up, medians, alternated in pairs.
 | implementation | median | x realtime |
 | --- | --- | --- |
 | PyTorch, CUDA, fp32 | 65.6 ms / 2.85 s | 43.2 |
-| `xabe-tts`, CUDA, fp32 | 48.4 ms / 2.61 s | 53.9 |
-| `xabe-tts`, CPU, scalar | ~120 s / 2.67 s | 0.02 |
+| `llmtie-tts`, CUDA, fp32 | 48.4 ms / 2.61 s | 53.9 |
+| `llmtie-tts`, CPU, scalar | ~120 s / 2.67 s | 0.02 |
 
 **1.24x faster than PyTorch** per second of audio, stable to within 0.2 across
 three interleaved rounds. The utterance lengths differ because both sample
@@ -34,7 +34,7 @@ this shape from the transposed convolution alone - 46.25 ms to 42.64, 61x
 realtime - measured against its own previous binary and not against PyTorch
 again; see "The transposed convolution" under Tacotron2.
 
-Where that time goes, measured with `xabe-tts-bench --stages`:
+Where that time goes, measured with `llmtie-tts-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
@@ -62,7 +62,7 @@ reading the same checkpoint converted by that tree's own
 was arithmetic across two sittings and said so; it is superseded rather than
 appended to.
 
-| clip | `xabe-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
+| clip | `llmtie-asr`, CUDA | `whisper-server`, f16 | ratio | transcripts |
 | --- | --- | --- | --- | --- |
 | 2.93 s | 130.3 ms | 188.9 ms | **1.45x** | identical |
 | 4.98 s | 159.6 ms | 239.1 ms | **1.50x** | identical |
@@ -118,7 +118,7 @@ any box that has the checkpoints - `bench/` is gitignored and the two lines are
 tsin hó, lán lâi khì kong-hn̂g sàn-pōo, hó bô?`, spoken by `mms-tts-nan` at
 16 kHz. They transcribe to ten and sixteen tokens.
 
-Where the 211.9 ms goes, measured with `xabe-asr-bench --stages`:
+Where the 211.9 ms goes, measured with `llmtie-asr-bench --stages`:
 
 | stage | ms | share |
 | --- | --- | --- |
@@ -221,7 +221,7 @@ applies during staging, and the oracle test passes layer by layer unchanged.
 The same trick pays a second time in front of the cross-attention cache, where
 one 7.7 MB conversion serves **sixty-four** projections of the encoder output.
 
-Measured on the 2.93 s clip, `xabe-asr-bench --stages`, medians of nine:
+Measured on the 2.93 s clip, `llmtie-asr-bench --stages`, medians of nine:
 
 | stage | before | after |
 | --- | ---: | ---: |
@@ -357,14 +357,14 @@ Three changes, all of them outside the encoder, and none of them arithmetic.
 Alternated against `whisper-server` in the same sitting throughout, so the
 column on the right is a control as well as a target:
 
-| end to end, 2.93 s clip | `xabe-asr` | `whisper-server` | ratio |
+| end to end, 2.93 s clip | `llmtie-asr` | `whisper-server` | ratio |
 | --- | ---: | ---: | ---: |
 | before | 249.4 ms | 184.2 ms | 0.74x |
 | after | 222.3 ms | 185.3 ms | **0.83x** |
 
 The three changes were measured by stage rather than end to end, because two of
 them are in the frontend and one is in the decoder and an end-to-end median
-cannot tell them apart. `xabe-asr-bench --stages`, medians of nine:
+cannot tell them apart. `llmtie-asr-bench --stages`, medians of nine:
 
 | stage | before | after |
 | --- | ---: | ---: |
@@ -618,7 +618,7 @@ were in the decode loop - which it had set aside as "level" at 100 ms against
 `whisper.cpp`'s 102. Level with the other engine is not the same as done, and
 the decoder turned out to be spending a launch on almost everything it did.
 
-Two clips, `xabe-asr-bench --stages`, nine-round medians, both binaries
+Two clips, `llmtie-asr-bench --stages`, nine-round medians, both binaries
 alternated in one sitting:
 
 | stage | 2.93 s, 10 tokens, before | after | 7.28 s, 20 tokens, before | after |
@@ -691,7 +691,7 @@ build and the prefix path are the same code, and `nsys` counts a decode
 step at 267 launches - 32 layers of 8, and 11 outside them - where it was
 427.
 
-Two clips, `xabe-asr-bench --stages`, nine-round medians, both binaries
+Two clips, `llmtie-asr-bench --stages`, nine-round medians, both binaries
 alternated twice in one sitting with the box held quiet by the other
 sessions; both pairs of both clips agree to 0.2 ms, so one of each is given:
 
@@ -754,7 +754,7 @@ second's is `gemm_hh`:
 47.5 TFLOP/s is 46% of the 102.3 the instruction measured at, and it is above
 the 27.1 `whisper.cpp` averages across its whole encoder.
 
-`xabe-asr-bench --stages`, nine-round medians, both binaries alternated twice
+`llmtie-asr-bench --stages`, nine-round medians, both binaries alternated twice
 in one sitting (the pairs agree to 0.8 ms; the first is given):
 
 | stage | 2.93 s, 10 tokens, before | after | 4.98 s, 16 tokens, before | after |
@@ -777,7 +777,7 @@ decode loop above resolves.
 
 ### The encoder's second round, and a picker that searched a list: 78.5 ms to 57.7
 
-Four changes, each measured on its own with `xabe-asr-bench --stages`, 2.93 s
+Four changes, each measured on its own with `llmtie-asr-bench --stages`, 2.93 s
 clip, nine-round medians:
 
 | change | encoder | decode loop |
@@ -963,7 +963,7 @@ logits differ by under 1% of their span over forty layers and the greedy
 choice is the same, and a batch of three sentences produced the three
 translations the single path produces, character for character.
 
-`xabe-llm-bench --kind translate --rows N`, 128-token prompts, 32 decoded
+`llmtie-llm-bench --kind translate --rows N`, 128-token prompts, 32 decoded
 tokens, nine-round medians, one card held quiet:
 
 | rows in the step | ms a step | tokens/s, one row | tokens/s across the rows |
@@ -1027,7 +1027,7 @@ The card, not the translator, is the contended resource on one card. So a
 translator and a synthesiser on one device now take turns on it: synthesis
 holds the card while it runs, and the batched translator - which decodes
 several clauses a step and loses nothing by pausing a few hundred
-milliseconds between steps - steps only while it is free (`xabe-engine`'s
+milliseconds between steps - steps only while it is free (`llmtie-engine`'s
 `card` module; the synthesiser never waits, so there is nothing to
 deadlock). With that, the same turn and the same four-run medians, and then
 a five-clause reply of 84 tokens, three runs:
@@ -1108,7 +1108,7 @@ the ablations that pointed at it and the three changes that decided it.
 
 The previous commit's binary against this one, alternated twice through in
 one sitting with `llama-bench -n 0 -ngl 99 -r 9` on the same card and file,
-`xabe-llm-bench --rounds 9 --decode 64`. The engine's two passes agree to
+`llmtie-llm-bench --rounds 9 --decode 64`. The engine's two passes agree to
 1.1% on every cell and the first is given; llama.cpp's two agree to 1% and
 their mean is given.
 
@@ -1149,7 +1149,7 @@ Q4_K and Q6_K sit on the card as 64-row tiles of four-super-block groups
 rather than the file's row-major blocks - `KERNELS.md`, "A K-quant sits on
 the card in tiles", has the order and the variants that lost. The previous
 commit's binary against this one, alternated twice through in one sitting,
-`xabe-llm-bench --rounds 9 --decode 64`; the two passes agree to 1.3% on
+`llmtie-llm-bench --rounds 9 --decode 64`; the two passes agree to 1.3% on
 every cell and the first is given.
 
 | | before | tiled | |
@@ -1178,7 +1178,7 @@ At the start of 2026-09-27 the Llama stages were ahead of llama.cpp at short
 contexts and behind at long ones: chat prefill at 8192 tokens was 2024 tok/s
 against 2460 (0.82x), and chat decode after an 8192-token prompt 81.3 against
 84.1. This is the table after the round, `llama-bench -ngl 99 -r 5` alternated
-with `xabe-llm-bench --rounds 9` twice through in one sitting, same card, same
+with `llmtie-llm-bench --rounds 9` twice through in one sitting, same card, same
 two files. Each llama.cpp cell is the mean of its two passes; the engine's two
 passes agree to 1% on every cell and the first is given. Decode is 64 tokens
 after a prompt of the given length, against `tg64 @ d<depth>`.
@@ -1252,11 +1252,11 @@ more prompt lengths and depths in a later sitting. This section is kept for
 its protocol notes and for how the llama.cpp column moved between sittings.
 
 `llama-bench` on the same card and the same two files, `-ngl 99`, against
-`xabe-llm-bench` at the same shapes.
+`llmtie-llm-bench` at the same shapes.
 
 The protocol got stricter than one sitting, because the llama.cpp column will
 not hold still across sittings - see below. **Three alternated rounds**, each
-round one `llama-bench -r 9` followed by one `xabe-llm-bench --rounds 9`, both
+round one `llama-bench -r 9` followed by one `llmtie-llm-bench --rounds 9`, both
 models, both prompt lengths, on an otherwise idle card. Each cell is the
 median of its three rounds, and the spread beside a llama.cpp figure is
 `llama-bench`'s own, from the median round.
@@ -1365,8 +1365,8 @@ above is the claim:
 The first row's gain was nearly written off, because the first three changes
 were each measured at zero effect - 1412.8, then 1401.6, 1403.5, 1401.9
 tok/s on the translator's 512-token cell. All three measurements were of an
-unchanged binary: `cargo build --release -p xabe-cuda` rebuilds the library,
-and `xabe-llm-bench` lives in `xabe-engine` and does not get relinked. The
+unchanged binary: `cargo build --release -p llmtie-cuda` rebuilds the library,
+and `llmtie-llm-bench` lives in `llmtie-engine` and does not get relinked. The
 kernel source is a compile-time string, so nothing failed - the old string
 ran, correctly, at the old speed. Rebuilding the workspace surfaced all three
 changes at once, which is why the table's first row is one combined step: the
@@ -2220,7 +2220,7 @@ against 5.40 at 216. One constant does not serve both geometries, and
 scaling the target by `kv_heads` is the obvious next measurement. It has
 not been made.
 
-End to end, `xabe-llm-bench` on the chat model, 64 tokens decoded after the
+End to end, `llmtie-llm-bench` on the chat model, 64 tokens decoded after the
 given prompt, nine rounds, both binaries alternated twice (both passes agree
 to 0.07 ms a token):
 
@@ -2421,7 +2421,7 @@ tried.
 
 ## The two Llama stages: 6.4x, and the ceiling that is left
 
-One Quadro RTX 8000, `xabe-llm-bench`, 128 prompt tokens then 64 decoded,
+One Quadro RTX 8000, `llmtie-llm-bench`, 128 prompt tokens then 64 decoded,
 medians over five rounds after one warm-up. Decode is what a listener waits
 through - a reply of N tokens is one prefill and N decodes - and it is what
 `llama-server` reports, so it is the number that can be compared.
@@ -2572,7 +2572,7 @@ was made conditional: synthesis went from about 400 ms a clause to 950-1200,
 first audio from 2659 ms to 2919, and the whole turn no faster. Two GPU jobs on
 one set of SMs do not run in half the time; they run in the same total time and
 delay whichever finishes first, which here is the clause the listener is waiting
-for. `xabe-engine` therefore compares the translator's resolved device with the
+for. `llmtie-engine` therefore compares the translator's resolved device with the
 synthesiser's and only overlaps when they differ - `translate_ahead` in the
 startup line says which it chose.
 
@@ -2598,7 +2598,7 @@ the policy it settled.
 
 ## Residency: the whole pipeline on one card
 
-One Quadro RTX 8000 (49152 MiB), measured with `xabe-vram`, which reads
+One Quadro RTX 8000 (49152 MiB), measured with `llmtie-vram`, which reads
 `nvidia-smi` rather than the allocator - the CUDA context and the driver's own
 reservations count against the card, and a per-process figure would omit them.
 Stages are loaded **cumulatively in one process**, because that is the
@@ -2628,7 +2628,7 @@ above - which is 1 632 MiB on the chat row and 830 on the translator's against
 the table as it stood, and 1 730 and 928 when the same binary is loaded both
 ways in one sitting, which is the figure the arithmetic below predicts.
 
-The VAD is absent from that table because it occupies nothing: `xabe_vad::open`
+The VAD is absent from that table because it occupies nothing: `llmtie_vad::open`
 takes no device ordinal, Silero being 1.8 M parameters of CPU arithmetic. The
 report prints a zero row for it rather than leaving a reader to wonder which
 stage was forgotten.
@@ -2733,7 +2733,7 @@ measured and is not claimed either way.
 ## Tacotron2 + WaveGlow: 3.07x, and where it went
 
 Measured on card 0, Quadro RTX 8000, medians over nine rounds after two warmups,
-with `xabe-taco-bench`. Synthesis is stochastic, so the frame count moves
+with `llmtie-taco-bench`. Synthesis is stochastic, so the frame count moves
 between runs on the same text and a mean would mostly be measuring that.
 
 | Text | Audio | Before | After | Speedup |
@@ -2892,7 +2892,7 @@ them, checked - so holding the decoder's two at f16 is not a rounding, it
 is the same numbers at half the bytes. Measured on the real checkpoint,
 same seed and masks, the mel moves by 5.7e-6 on a span of 10, which is the
 half-width mat-vec's accumulation order and nothing else; the test in
-`xabe-taco`'s `pipeline` holds it at 1e-4. Every other checkpoint in
+`llmtie-taco`'s `pipeline` holds it at 1e-4. Every other checkpoint in
 `models/` was scanned the same way afterwards and none of them is: under
 0.3% of sampled f32 values are f16-exact in the ASR, both VITS, CosyVoice3,
 WaveGlow and Silero, which is what random f32 looks like. The finding is
@@ -3125,7 +3125,7 @@ Same sitting, alternated in pairs, the worse pair on each side:
 | `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` | 397 | 196.9 ms | 189.2 ms | 1.04x |
 | `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` | 513 | 252.8 ms | 243.5 ms | 1.04x |
 
-And `xabe-tts-bench` on `mms-tts-nan`, three alternated pairs of twenty
+And `llmtie-tts-bench` on `mms-tts-nan`, three alternated pairs of twenty
 runs, worst on each side: **46.25 ms to 42.64**, 56.4x realtime to 61.1x,
 **1.085x**. The PyTorch comparison at the top of this file was not
 re-run; the 1.24x there is against the engine as it was, and this is
@@ -3149,13 +3149,13 @@ kernel's to the bit - bias first, pairs ascending, each an `fmaf` - and
 both synthesisers' WAVs were compared byte for byte against the previous
 commit's engine: identical.
 
-The kernel was written by a peer session (ttsxabe-15) that ended before
+The kernel was written by a peer session (llmtie-rs-15) that ended before
 committing it; the measurements here are this session's. Same sitting,
 GPU 2, alternated in pairs, the worse pair on each side:
 
 | Model | Line | Before | After | Speedup |
 | --- | --- | ---: | ---: | ---: |
-| `mms-tts-nan`, `xabe-tts-bench` default text, 3 x 20 runs | | 42.46 ms | 28.64 ms | **1.48x** |
+| `mms-tts-nan`, `llmtie-tts-bench` default text, 3 x 20 runs | | 42.46 ms | 28.64 ms | **1.48x** |
 | Tacotron2 | `Tâi-lâm ū chiok chē hó-chia̍h--ê,` (206 steps) | 106.1 ms | 103.0 ms | 1.03x |
 | Tacotron2 | `chhin-chhiūⁿ: Khah-sú môa-lî, ke-nn̄g-ko, ah-bah-mī` (397) | 187.4 ms | 182.2 ms | 1.03x |
 | Tacotron2 | `Tō͘-kui ē-tàng khì An-pêng Kó͘-pó, Chhiah-khàm-lâu` (513) | 240.1 ms | 232.7 ms | 1.03x |
@@ -3257,7 +3257,7 @@ measured.
 | implementation | median | seconds of audio | s per s of audio |
 | --- | --- | --- | --- |
 | Python `taigi_tts_daemon.py`, `POST /tts` | 3.57 s | 3.64 | 0.98 |
-| `xabe-engine`, `--tts-engine cosyvoice=<dir>` | 4.61 s | 6.08 | 0.76 |
+| `llmtie-engine`, `--tts-engine cosyvoice=<dir>` | 4.61 s | 6.08 | 0.76 |
 
 **1.29x faster per second of audio.** The utterance lengths differ because both
 sample their own speech tokens, which is the same reason the VITS comparison
@@ -3268,7 +3268,7 @@ did. Five timed calls, not twenty. More importantly the two are not on the same
 card: the Python service shares GPU 1 with a 26 GB `llama-server`, and the
 engine has GPU 2 to itself. That confound points the same way as the result, so
 the real figure is somewhere below 1.29x and the honest statement is that the
-port is *not slower*. A proper paired run belongs in `xabe-tts-bench` alongside
+port is *not slower*. A proper paired run belongs in `llmtie-tts-bench` alongside
 the VITS one, on one card, and has not been done.
 
 The `examples/say` path, measured on its own: 3.1 s to load all three networks,
@@ -3384,7 +3384,7 @@ only a narrower weight would shorten.
 
 ### CosyVoice3's residency: 3 469 MiB to 2 157, and the number that did not move
 
-The speech LLM's weights were halved and `xabe-vram` read **3 469 MiB**,
+The speech LLM's weights were halved and `llmtie-vram` read **3 469 MiB**,
 against the 3 266 in the table above from before - more, not less. The
 same command on the commit before the halving read 3 469 too. The reason
 is the memory pool, which is told to keep its pages: the loader was
@@ -3407,8 +3407,8 @@ survive them.
 
 | | before | after |
 | --- | ---: | ---: |
-| `xabe-vram`, CosyVoice3 alone | 3 469 MiB | **2 157 MiB** |
-| `xabe-vram`, CosyVoice3 after the four other stages | 3 266 MiB | **1 958 MiB** |
+| `llmtie-vram`, CosyVoice3 alone | 3 469 MiB | **2 157 MiB** |
+| `llmtie-vram`, CosyVoice3 after the four other stages | 3 266 MiB | **1 958 MiB** |
 | speech LLM, a token | 2.63-2.65 ms | 2.61 ms |
 | flow, 262 frames | 443 ms (240 frames) | 424 ms |
 
@@ -3436,7 +3436,7 @@ two, 48 blocks on 72 SMs, and the attention's scores product was a
 batch of sixteen `[300, 64] x [64, 300]` products with a `gemm_reduce`
 after it.
 
-Three changes, all in `xabe-cosy` and none to a kernel:
+Three changes, all in `llmtie-cosy` and none to a kernel:
 
 - **Both rows go through the blocks as one `[600, 1024]` activation.**
   Every block kernel but the rope and the attention is row-wise - the
@@ -3601,7 +3601,7 @@ parallelism-limited - 84 blocks in the widest tile that reaches a block
 an SM - and wants the contraction split rather than a tile; the
 32-channel one has no channels to widen into.
 
-`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+`llmtie-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
 twenty runs against the eb94f9c bench, worst on each side: **28.72 ms to
 24.88**, **1.15x**. Tacotron2 on the same three lines is level - its
 convolutions are the 32-channel location filter and a 512-channel
@@ -3644,7 +3644,7 @@ deleted rather than left unreachable. At 70 rows the tile is 14.6 µs for
 2.6 MFLOP, which is a launch and twelve trips of sixteen pairs in
 sequence, not a rate; the text encoder's projections are latency now.
 
-`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+`llmtie-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
 twenty runs against the b1188a8 bench, worst on each side: **24.76 ms
 to 23.30**, **1.06x**. Tacotron2's encoder on the same three lines is
 2.19, 2.96 and 3.06 ms to 1.45, 1.99 and 2.05, and its synthesis is level
@@ -3671,7 +3671,7 @@ bit for bit to the separate kernels on the card, and both synthesisers'
 WAVs are byte for byte the previous engine's on a long text and a
 three-syllable one.
 
-`xabe-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
+`llmtie-tts-bench` on `mms-tts-nan`, GPU 2, three alternated pairs of
 twenty runs against the 56b9f97 bench, worst on each side: **23.51 ms
 to 20.90**, **1.12x**. The run is 654 launches from 858 and 19.3 ms of
 card time from 21.7; the convolutions themselves cost 0.9 ms more,
@@ -3713,8 +3713,8 @@ defaults. A ratio measured against a badly configured baseline is not a result.
   the same alternated run are comparable.
 - This host has no `nsys` and no counter permission for `ncu`. `LLMTIE_KPROF=1`
   is the substitute: every launch synchronises and charges the time since the
-  previous mark to its kernel's name, and `xabe-llm-bench` (last round's
-  prefill and decode) and `xabe-asr-bench --stages` (one whole `generate`)
+  previous mark to its kernel's name, and `llmtie-llm-bench` (last round's
+  prefill and decode) and `llmtie-asr-bench --stages` (one whole `generate`)
   print the table. A kernel's figure includes whatever host work ran since the
   last launch - which is how the Whisper picker's list search showed up, under
   the embedding gather after it - and the synchronisation removes the overlap
@@ -4191,7 +4191,7 @@ held 385.9 MiB RSS, including 259.7 MiB anonymous memory. RSS, file-backed pages
 and Windows system commit are different measurements; these numbers do not
 identify the cause of the Windows allocation failure.
 
-The local capture is `/tmp/xabe-gpu2-memory/`: `run.py`, per-run engine logs,
+The local capture is `/tmp/llmtie-gpu2-memory/`: `run.py`, per-run engine logs,
 `duplicate-samples.csv`, `single-samples.csv`, per-run event JSON, and
 `summary.json`. An earlier attempt completed startup and three voice replies
 before a frame-length parsing bug in the test client stopped the workload;
@@ -4228,5 +4228,5 @@ controlled allocator comparison. Captures are `run-legacy.py`,
 
 The release workspace tests, 70 general GPU kernel tests and 15 packed-weight
 GPU tests passed; the GPU tests explicitly selected this allocation policy on
-GPU 2. A release `cargo check` of `xabe-engine` targeting
+GPU 2. A release `cargo check` of `llmtie-engine` targeting
 `x86_64-pc-windows-gnu` also passed. Windows runtime verification remains open.

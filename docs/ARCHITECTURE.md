@@ -24,26 +24,26 @@ between - the six-process topology the Python pipeline runs today is one
 configuration of the same flags, not a different program.
 
 ```
-   xabe-engine
+   llmtie-engine
       │
-      ├── xabe-serve    HTTP, WebSocket, the page, turn-taking policy
-      ├── xabe-vad      Silero geometry, weights and forward pass
-      ├── xabe-asr      the Whisper forward pass, CUDA only
-      ├── xabe-whisper  Whisper geometry, weight schema, BPE, mel
-      ├── xabe-translate the Llama-2 forward pass, CUDA only, either container
-      ├── xabe-chat     the Llama-3 forward pass, CUDA only, grouped-query
-      ├── xabe-llama    Llama geometry from either container, two tokenizers
-      ├── xabe-tts      the VITS forward pass and synthesis API
-      ├── xabe-cosy     CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voices
-      ├── xabe-taigi    POJ, Tâi-lô and IPA, and the conversions between them
-      ├── xabe-audio    WAV, mel spectrogram, PCM framing
-      ├── xabe-vits     config, weight schema, shape validation
-      ├── xabe-dsp      scalar reference kernels
-      ├── xabe-cuda     CUDA kernels, tested against xabe-dsp
-      ├── xabe-golden   reads the captured oracle
-      ├── xabe-st       safetensors container, mmap, addressing
-      ├── xabe-gguf     GGUF container, mmap, metadata, addressing
-      └── xabe-pt       torch .pth container: zip, state-dict pickle, mmap
+      ├── llmtie-serve    HTTP, WebSocket, the page, turn-taking policy
+      ├── llmtie-vad      Silero geometry, weights and forward pass
+      ├── llmtie-asr      the Whisper forward pass, CUDA only
+      ├── llmtie-whisper  Whisper geometry, weight schema, BPE, mel
+      ├── llmtie-translate the Llama-2 forward pass, CUDA only, either container
+      ├── llmtie-chat     the Llama-3 forward pass, CUDA only, grouped-query
+      ├── llmtie-llama    Llama geometry from either container, two tokenizers
+      ├── llmtie-tts      the VITS forward pass and synthesis API
+      ├── llmtie-cosy     CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voices
+      ├── llmtie-taigi    POJ, Tâi-lô and IPA, and the conversions between them
+      ├── llmtie-audio    WAV, mel spectrogram, PCM framing
+      ├── llmtie-vits     config, weight schema, shape validation
+      ├── llmtie-dsp      scalar reference kernels
+      ├── llmtie-cuda     CUDA kernels, tested against llmtie-dsp
+      ├── llmtie-golden   reads the captured oracle
+      ├── llmtie-st       safetensors container, mmap, addressing
+      ├── llmtie-gguf     GGUF container, mmap, metadata, addressing
+      └── llmtie-pt       torch .pth container: zip, state-dict pickle, mmap
 ```
 
 Every crate in that tree exists and every stage flag reaches a built stage.
@@ -53,25 +53,25 @@ the stages behind it, so the topology could be settled first, and
 was waiting on. Nothing does that now; the only refusal left is `--vad-url`,
 which is a permanent limit rather than a pending one.
 
-**Three containers, one contract.** `xabe-st` reads safetensors, `xabe-gguf`
-reads GGUF and `xabe-pt` reads a torch `.pth`, and they are siblings rather than
+**Three containers, one contract.** `llmtie-st` reads safetensors, `llmtie-gguf`
+reads GGUF and `llmtie-pt` reads a torch `.pth`, and they are siblings rather than
 one wrapping another: same accessors, same errors, no shared trait. A model
 crate above them takes any of them.
 The translator does exactly that - `Translator::open` accepts a 🤗 directory or
 a `.gguf` file - and the awkward part is not the dispatch but that a GGUF Llama
 stores `attn_q` and `attn_k` row-permuted. That is undone at load in
-`xabe-llama`, so one rope kernel serves both and nothing downstream learns
+`llmtie-llama`, so one rope kernel serves both and nothing downstream learns
 which container it came from.
 
-The ASR is split the way the TTS is: `xabe-whisper` says what the tensors are
-and refuses to do arithmetic, `xabe-asr` runs them. The difference is that
-`xabe-asr` has no CPU twin - see below. The translator repeats the split
-exactly, `xabe-llama` to `xabe-translate`, and for the same reason.
+The ASR is split the way the TTS is: `llmtie-whisper` says what the tensors are
+and refuses to do arithmetic, `llmtie-asr` runs them. The difference is that
+`llmtie-asr` has no CPU twin - see below. The translator repeats the split
+exactly, `llmtie-llama` to `llmtie-translate`, and for the same reason.
 
 ## Why the ASR and the translator have no CPU path
 
 Every other model in this engine runs both ways: a scalar version in
-`xabe-dsp` that is written to be read against the reference, and a CUDA version
+`llmtie-dsp` that is written to be read against the reference, and a CUDA version
 checked against it. The ASR does not, and the reason is arithmetic rather than
 taste. One 30-second window is about 2.2 TFLOP through Whisper's encoder alone,
 and the scalar kernels run at something under 2 GFLOP/s - twenty minutes an
@@ -90,8 +90,8 @@ oracle directly instead.
 
 ## How a model reaches the serving layer
 
-`xabe-serve` owns HTTP and refuses to know what a model is. `xabe-tts` owns the
-model and refuses to know what a socket is. They meet in `xabe-engine`, and the
+`llmtie-serve` owns HTTP and refuses to know what a model is. `llmtie-tts` owns the
+model and refuses to know what a socket is. They meet in `llmtie-engine`, and the
 join is a **channel**: a synthesiser thread reads `SynthesisJob`s and writes WAV
 chunks back, and neither side learns anything about the other. A trait would
 have worked and would have been the obvious move; the channel is narrower, and
@@ -102,12 +102,12 @@ GPU-bound 48 ms that would otherwise stall every socket the runtime is polling.
 There is exactly one, because the model is one utterance at a time by design and
 a second thread would only queue on the same device.
 
-## Why the CLI left `xabe-tts`
+## Why the CLI left `llmtie-tts`
 
-`xabe-tts` used to own `main.rs`, because the synthesiser was the whole program.
-It is now one stage of five, so the binary moved up into `xabe-engine` and the
+`llmtie-tts` used to own `main.rs`, because the synthesiser was the whole program.
+It is now one stage of five, so the binary moved up into `llmtie-engine` and the
 crate went back to being a library. `wav.rs` moved the other way, down into
-`xabe-audio`: the TTS writes audio, the ASR and VAD read it, and a WAV writer
+`llmtie-audio`: the TTS writes audio, the ASR and VAD read it, and a WAV writer
 living inside the synthesiser cannot be reached by the others without pointing
 a dependency edge the wrong way.
 
@@ -180,33 +180,33 @@ crates above it.
 
 | Crate | Owns | Refuses |
 | --- | --- | --- |
-| `xabe-st` | byte addressing inside a safetensors file | any idea what a tensor means |
-| `xabe-gguf` | byte addressing inside a GGUF file | any idea what a tensor means |
-| `xabe-pt` | byte addressing inside a torch `.pth`, and the slice of pickle a state dict needs | executing a pickle that is not a state dict |
-| `xabe-vits` | model geometry, tensor names and shape contracts, in both published dialects | doing arithmetic |
-| `xabe-dsp` | scalar f32 reference kernels | being fast |
-| `xabe-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
-| `xabe-golden` | reading captures, comparing tensors | producing them |
-| `xabe-taigi` | the spelling of Taiwanese in three orthographies | reading Han, which is a dictionary and not a table |
-| `xabe-audio` | WAV containers, sample handling | knowing which model consumes it |
-| `xabe-serve` | HTTP, WebSocket, the page, the conversation | model internals |
-| `xabe-vad` | Silero geometry, weights and forward pass | audio capture |
-| `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | doing model arithmetic |
-| `xabe-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
-| `xabe-llama` | Llama geometry from either container, weight schema, SentencePiece and byte-level BPE | doing model arithmetic |
-| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | running anywhere but a card |
-| `xabe-chat` | the Llama-3 forward pass, the sampler and streaming completion | the prompt format, which is `xabe-serve`'s |
-| `xabe-tts` | the VITS forward pass and its API | serving, or any other stage |
-| `xabe-engine` | flags, stage wiring, orchestration | container and kernel details |
+| `llmtie-st` | byte addressing inside a safetensors file | any idea what a tensor means |
+| `llmtie-gguf` | byte addressing inside a GGUF file | any idea what a tensor means |
+| `llmtie-pt` | byte addressing inside a torch `.pth`, and the slice of pickle a state dict needs | executing a pickle that is not a state dict |
+| `llmtie-vits` | model geometry, tensor names and shape contracts, in both published dialects | doing arithmetic |
+| `llmtie-dsp` | scalar f32 reference kernels | being fast |
+| `llmtie-cuda` | CUDA kernels and the device handle | knowing what a VITS is |
+| `llmtie-golden` | reading captures, comparing tensors | producing them |
+| `llmtie-taigi` | the spelling of Taiwanese in three orthographies | reading Han, which is a dictionary and not a table |
+| `llmtie-audio` | WAV containers, sample handling | knowing which model consumes it |
+| `llmtie-serve` | HTTP, WebSocket, the page, the conversation | model internals |
+| `llmtie-vad` | Silero geometry, weights and forward pass | audio capture |
+| `llmtie-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | doing model arithmetic |
+| `llmtie-asr` | the Whisper forward pass and greedy decoding | running anywhere but a card |
+| `llmtie-llama` | Llama geometry from either container, weight schema, SentencePiece and byte-level BPE | doing model arithmetic |
+| `llmtie-translate` | the Llama-2 forward pass and the `[TRANS]` template | running anywhere but a card |
+| `llmtie-chat` | the Llama-3 forward pass, the sampler and streaming completion | the prompt format, which is `llmtie-serve`'s |
+| `llmtie-tts` | the VITS forward pass and its API | serving, or any other stage |
+| `llmtie-engine` | flags, stage wiring, orchestration | container and kernel details |
 
-`xabe-cuda` takes flat slices and dimensions, exactly as `xabe-dsp` does, and
+`llmtie-cuda` takes flat slices and dimensions, exactly as `llmtie-dsp` does, and
 knows nothing about the model. That is what lets its tests be a plain
 kernel-against-kernel diff rather than a model test in disguise.
 
-If `xabe-dsp` needs to know a file offset, the abstraction is wrong. Fix the
+If `llmtie-dsp` needs to know a file offset, the abstraction is wrong. Fix the
 boundary; do not add the edge.
 
-## `xabe-dsp` is deliberately slow
+## `llmtie-dsp` is deliberately slow
 
 Its kernels are scalar, obvious, and written to be read against the reference
 implementation line by line. They are the oracle that CUDA kernels are tested

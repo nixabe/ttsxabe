@@ -39,7 +39,7 @@ a function of the prompt alone, and the Rust side is run with
 `Sampling::greedy` against it.
 
 The sampler itself is then tested separately, against the distribution rather
-than against a draw - see `crates/xabe-chat/src/sample.rs`.
+than against a draw - see `crates/llmtie-chat/src/sample.rs`.
 
 # And llama-server is not request-independent
 

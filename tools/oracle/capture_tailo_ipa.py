@@ -1,6 +1,6 @@
 """Capture what goruut writes for Taiwanese, as a Tâi-lô to IPA correspondence.
 
-`xabe-taigi` converts romanisation to the IPA the Coqui SuiSiann checkpoint was
+`llmtie-taigi` converts romanisation to the IPA the Coqui SuiSiann checkpoint was
 trained on. There is no reference implementation of *that* conversion to diff
 against - goruut goes from Han, not from romanisation - so the oracle is built
 sideways, out of two things that already exist:
@@ -58,7 +58,7 @@ TONE_LETTERS = "˥˦˧˨˩"
 def tailo_syllables(text):
     """Splits a Tâi-lô transcription into syllables with numeric tones.
 
-    The same rule `xabe-taigi` applies: an unmarked syllable is tone 1, except
+    The same rule `llmtie-taigi` applies: an unmarked syllable is tone 1, except
     that a stop-final one is tone 4.
     """
     text = unicodedata.normalize("NFD", text).lower()

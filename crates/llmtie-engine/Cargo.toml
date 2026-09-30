@@ -1,0 +1,47 @@
+[package]
+name = "llmtie-engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+llmtie-asr.workspace = true
+llmtie-chat.workspace = true
+llmtie-audio.workspace = true
+llmtie-cosy.workspace = true
+llmtie-cuda.workspace = true
+llmtie-serve.workspace = true
+llmtie-vad.workspace = true
+llmtie-translate.workspace = true
+llmtie-taco.workspace = true
+llmtie-taigi.workspace = true
+llmtie-tts.workspace = true
+llmtie-vits.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+base64.workspace = true
+
+[[bin]]
+name = "llmtie-rs"
+path = "src/main.rs"
+
+[[bin]]
+name = "llmtie-asr-bench"
+path = "src/bin/asr_bench.rs"
+
+[[bin]]
+name = "llmtie-vram"
+path = "src/bin/vram_report.rs"
+
+[[bin]]
+name = "llmtie-llm-bench"
+path = "src/bin/llm_bench.rs"
+
+[[bin]]
+name = "llmtie-taco-bench"
+path = "src/bin/taco_bench.rs"

@@ -1,0 +1,13 @@
+[package]
+name = "llmtie-pt"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+half.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

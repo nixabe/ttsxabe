@@ -68,9 +68,9 @@ comment at the point of difference, with the reason.
 Conventional Commits, scoped to the crate:
 
 ```
-perf(xabe-dsp): fold the resblock bias into the preceding convolution
-fix(xabe-vits): read conv weights as [out, in, k], not [in, out, k]
-test(xabe-dsp): gate the CUDA decoder against the CPU reference
+perf(llmtie-dsp): fold the resblock bias into the preceding convolution
+fix(llmtie-vits): read conv weights as [out, in, k], not [in, out, k]
+test(llmtie-dsp): gate the CUDA decoder against the CPU reference
 ```
 
 Subjects are lowercase and describe the mechanism. Numbers and method go in the

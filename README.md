@@ -24,12 +24,12 @@ Finished: the synthesiser, the serving layer, voice activity detection, speech
 recognition, Mandarin-to-Taigi translation, the chat model, CosyVoice3, and a
 third synthesiser, Tacotron2 + WaveGlow, from
 [taiwanese_tonal_tlpa_tacotron2](https://github.com/yfliao/taiwanese_tonal_tlpa_tacotron2).
-A fourth reuses the first: `xabe-tts` also reads
+A fourth reuses the first: `llmtie-tts` also reads
 [coqui-vits-suisiann-minnan-hokkien](https://huggingface.co/neurlang/coqui-vits-suisiann-minnan-hokkien),
 which is the same VITS from a different trainer at 22.05 kHz, with no stage of
 the forward pass changed — a new container, a new naming scheme and an IPA
 vocabulary were all it needed. It reads IPA rather than romanisation, and
-`xabe-taigi` transliterates the pipeline's POJ into it; see `docs/MODEL.md`.
+`llmtie-taigi` transliterates the pipeline's POJ into it; see `docs/MODEL.md`.
 Remaining inside CosyVoice: deriving a **new** voice still runs two ONNX models
 once, through `tools/make_cosyvoice_voice.py`. `docs/MILESTONES.md` has the
 phases and `docs/CLI.md` the flag surface.
@@ -111,7 +111,7 @@ tensor-core matmul, encoder and decoder matching a captured oracle layer by
 layer, and greedy decoding reproducing 🤗 `WhisperForConditionalGeneration`'s
 transcripts token for token.
 
-| clip | `xabe-asr` | `whisper-server` | ratio |
+| clip | `llmtie-asr` | `whisper-server` | ratio |
 | --- | --- | --- | --- |
 | 2.93 s | 185.9 ms | 189.4 ms | **1.02x** |
 | 4.98 s | 220.8 ms | 239.8 ms | **1.09x** |
@@ -154,26 +154,26 @@ one that diverges. `docs/ORACLE.md` says why that can happen at all.
 
 | crate | state |
 | --- | --- |
-| `xabe-st` | safetensors container, validated addressing |
-| `xabe-golden` | reads the captured PyTorch oracle, verifies its checksums |
-| `xabe-vits` | config, weight schema and tokenizer, in both published dialects |
-| `xabe-dsp` | scalar reference kernels |
-| `xabe-cuda` | 75 CUDA kernels, each diffed against its scalar twin |
-| `xabe-tts` | VITS forward pass on both devices, synthesis API, benchmark |
-| `xabe-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
-| `xabe-taco` | Tacotron2 + WaveGlow, POJ to Tâi-lô, converted weights |
-| `xabe-audio` | WAV reading and writing, sample handling |
-| `xabe-serve` | HTTP, WebSocket, the web page, the conversation |
-| `xabe-vad` | Silero voice activity detection, 15 tensors, from scratch |
-| `xabe-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
-| `xabe-asr` | the Whisper forward pass and greedy decoding, CUDA only |
-| `xabe-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
-| `xabe-pt` | torch `.pth` container: zip, a state-dict pickle, validated addressing |
-| `xabe-taigi` | POJ, Tâi-lô and IPA, and the conversions three checkpoints need |
-| `xabe-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
-| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
-| `xabe-chat` | the chat model's forward pass, sampling and stop handling |
-| `xabe-engine` | the `llmtie-rs` binary: flags, stage wiring, orchestration |
+| `llmtie-st` | safetensors container, validated addressing |
+| `llmtie-golden` | reads the captured PyTorch oracle, verifies its checksums |
+| `llmtie-vits` | config, weight schema and tokenizer, in both published dialects |
+| `llmtie-dsp` | scalar reference kernels |
+| `llmtie-cuda` | 75 CUDA kernels, each diffed against its scalar twin |
+| `llmtie-tts` | VITS forward pass on both devices, synthesis API, benchmark |
+| `llmtie-cosy` | CosyVoice3: speech LM, flow, vocoder, Qwen2 BPE, voice bundles |
+| `llmtie-taco` | Tacotron2 + WaveGlow, POJ to Tâi-lô, converted weights |
+| `llmtie-audio` | WAV reading and writing, sample handling |
+| `llmtie-serve` | HTTP, WebSocket, the web page, the conversation |
+| `llmtie-vad` | Silero voice activity detection, 15 tensors, from scratch |
+| `llmtie-whisper` | Whisper geometry, 1,259 tensors, byte-level BPE, mel frontend |
+| `llmtie-asr` | the Whisper forward pass and greedy decoding, CUDA only |
+| `llmtie-gguf` | GGUF container, mmap, metadata, nine block formats unpacked |
+| `llmtie-pt` | torch `.pth` container: zip, a state-dict pickle, validated addressing |
+| `llmtie-taigi` | POJ, Tâi-lô and IPA, and the conversions three checkpoints need |
+| `llmtie-llama` | Llama geometry from `config.json` or a GGUF, SentencePiece |
+| `llmtie-translate` | the Llama-2 forward pass and the `[TRANS]` template, CUDA only |
+| `llmtie-chat` | the chat model's forward pass, sampling and stop handling |
+| `llmtie-engine` | the `llmtie-rs` binary: flags, stage wiring, orchestration |
 
 Correctness, against tensors captured from 🤗 `VitsModel`:
 
@@ -197,8 +197,8 @@ Speed, one Quadro RTX 8000, medians of 20 runs alternated with the baseline:
 | | 2.6 s of audio | x realtime |
 | --- | --- | --- |
 | PyTorch, CUDA | 65.6 ms | 43.2 |
-| **`xabe-tts`, CUDA** | **48.4 ms** | **53.9** |
-| `xabe-tts`, CPU (scalar reference) | ~120 s | 0.02 |
+| **`llmtie-tts`, CUDA** | **48.4 ms** | **53.9** |
+| `llmtie-tts`, CPU (scalar reference) | ~120 s | 0.02 |
 
 **1.24x faster than PyTorch** per second of audio. `docs/BENCHMARKS.md` has the
 stage breakdown, the computed FLOP ceiling, and the things that did not work.

@@ -21,7 +21,7 @@ references contributed is described below, because "written against" is a real
 debt even where it is not a copyright one.
 
   CosyVoice (Apache-2.0), https://github.com/FunAudioLLM/CosyVoice
-      The reference for `xabe-cosy`: the speech language model's prompt
+      The reference for `llmtie-cosy`: the speech language model's prompt
       assembly, `ras_sampling`, the flow's DiT and Euler solver, the HiFT
       vocoder and its NSF source. `tools/convert_cosyvoice.py` reads its
       checkpoints and `tools/oracle/capture_cosyvoice.py` runs it to produce
@@ -29,15 +29,15 @@ debt even where it is not a copyright one.
 
   taiwanese_tonal_tlpa_tacotron2 (BSD-3-Clause),
   https://github.com/yfliao/taiwanese_tonal_tlpa_tacotron2
-      The reference for `xabe-taco`, and the source of the checkpoints it
+      The reference for `llmtie-taco`, and the source of the checkpoints it
       reads: a Taiwanese tonal-TLPA retraining of NVIDIA's Tacotron2 and
       WaveGlow, whose BSD-3-Clause notice it carries (Copyright 2018 NVIDIA
       Corporation). Its `text/symbols.py` defines the 71-symbol alphabet
-      `xabe_taco::text` reproduces, including what that alphabet silently
+      `llmtie_taco::text` reproduces, including what that alphabet silently
       drops; its `hparams.py` fixes the geometry; and its vendored `waveglow`
       supplies the class definitions `tools/convert_tacotron2.py` needs to
       unpickle a pre-1.6 torch object graph at all. It is also run, by
-      `tools/oracle/capture_tacotron2.py`, to produce the oracle `xabe-taco`
+      `tools/oracle/capture_tacotron2.py`, to produce the oracle `llmtie-taco`
       is tested against.
 
   whisper.cpp (MIT), https://github.com/ggml-org/whisper.cpp

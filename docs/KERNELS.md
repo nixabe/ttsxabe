@@ -1,6 +1,6 @@
 # Kernels
 
-Every entry needs a CPU reference in `xabe-dsp` and a differential test before
+Every entry needs a CPU reference in `llmtie-dsp` and a differential test before
 it is done. Status here is the truth; a row is not ticked because the code
 exists.
 
@@ -8,53 +8,53 @@ exists.
 
 | kernel | used by | reference | CUDA | differential |
 | --- | --- | --- | --- | --- |
-| embedding lookup | text encoder | `xabe-dsp` (inline) | `embed_scaled` | `xabe-tts` text_encoder |
-| layer norm | text encoder | `xabe_dsp::layer_norm` | `layer_norm` | `xabe-tts` text_encoder |
-| relative-position self-attention | text encoder (window 4) | `xabe_dsp::self_attention` | `attention_scores` + `attention_context` | `xabe-dsp` relative_position + `xabe-tts` |
-| conv1d, kernel 3 | text encoder FFN | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
-| conv1d, general | flow, duration predictor, decoder | `xabe_dsp::conv1d` | `conv1d` | `xabe-tts` text_encoder |
-| conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `xabe_dsp::conv1d` | `conv1d_tiled` (three tile widths, two channel tiles) | `xabe-cuda` conv1d |
-| depthwise-separable conv | duration predictor | `xabe_dsp::depthwise_conv1d` | `depthwise_conv1d` | `xabe-tts` duration |
-| linear, exact f32 | text encoder q/k/v/o, Tacotron2's encoder gates and attention memory | `xabe_dsp::linear` | `linear_tiled` (the convolution's body, row-major) | `xabe-cuda` kernels |
-| transposed conv1d | decoder upsamplers | `xabe_dsp::transposed_conv1d` | `transposed_conv1d` | `xabe-tts` decoder |
-| grouped conv1d, left-padded | CosyVoice3 DiT positional embedding | `xabe_dsp::grouped_conv1d` | `grouped_conv1d`, `grouped_conv1d_tiled` | `xabe-cuda` kernels |
-| leaky ReLU | decoder | `xabe_dsp::leaky_relu` | `act_leaky_relu` | `xabe-tts` decoder |
-| WaveNet residual block | flow coupling, posterior | `xabe-tts` flow::wavenet | `gated_activation` + `conv1d` | `xabe-tts` flow |
-| affine coupling | flow | `xabe-tts` flow_reverse | `sub_inplace` | `xabe-tts` flow |
-| stochastic duration flow | duration predictor | `xabe_dsp::spline_inverse` | host (69 positions) | `xabe-tts` duration |
-| length regulation / attention expansion | prior → frames | `xabe-tts` expand_prior | `expand_prior` | `xabe-tts` prior |
-| HiFi-GAN resblock (MRF) | decoder | `xabe-tts` decoder::resblock | `conv1d` + `act_leaky_relu` | `xabe-tts` decoder |
-| tanh output | decoder | `xabe-tts` decoder | `act_tanh` | `xabe-tts` decoder |
-| strided conv1d | VAD stft + encoder | `xabe_dsp::conv1d_strided` | (cpu only) | `xabe-vad` reference |
-| magnitude from re/im halves | VAD stft | `xabe-vad` stft | (cpu only) | `xabe-vad` reference |
-| LSTM cell, gates i f g o | VAD decoder | `xabe-vad` lstm | (cpu only) | `xabe-vad` reference |
-| discrete Fourier transform, any length | mel frontend | `xabe_dsp::Fft` | (cpu only) | `xabe-dsp` fft |
-| mel filter bank and spectrogram | ASR frontend | `xabe_audio::mel_power` | (cpu only) | `xabe-whisper` frontend |
-| tiled matmul, f16 operands | ASR everywhere | `xabe_dsp::linear` | `gemm`; `gemm_hh` when both operands arrive f16 | `xabe-cuda` kernels |
-| matmul for a handful of rows | ASR decode | `xabe_dsp::linear` | `gemv` | `xabe-cuda` kernels |
-| convolution as a matrix | ASR encoder stem | `xabe_dsp::conv1d_strided` | `im2col` + `gemm` | `xabe-cuda` kernels |
-| head split, merge and transpose | ASR attention | (index formula, in the test) | `split_heads`, `split_heads_t`, `merge_heads` | `xabe-cuda` kernels |
-| causal mask | ASR decoder self-attention | (index formula, in the test) | `causal_mask` | `xabe-cuda` kernels |
-| round to f16 | ASR weights and KV cache | `half::f16::from_f32` | `pack_f16` | `xabe-cuda` kernels |
-| RMS norm | translator, every layer twice | `xabe_dsp::rms_norm` | `rms_norm` | `xabe-cuda` kernels |
-| SiLU, and SiLU-gated multiply | translator MLP | `xabe_dsp::silu`, `silu_mul` | `silu_mul` | `xabe-cuda` kernels |
-| rotary position embedding | translator attention | `xabe_dsp::rope` | `rope` | `xabe-cuda` kernels |
-| scaled rotary embedding | chat-model attention | `xabe_dsp::rope_scaled` | `rope` | `xabe-cuda` kernels |
-| key-value head expansion | chat-model attention | — | `repeat_kv` | `xabe-cuda` kernels |
-| int8 quantization of an activation | both Llama stages | `xabe_dsp::quantize_q8` | `quantize_q8` | `xabe-cuda` quant |
-| tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `xabe_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k`, each at three row tiles (128, 64, 32) | `xabe-cuda` quant |
-| split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `xabe-cuda` kernels |
-| KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `xabe-cuda` kernels |
-| fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `xabe-cuda` kernels |
-| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h128_run` past 2048 positions (1024 ungrouped), `attn_decode_h64_run` for the Whisper cross-attention, `attn_decode_h64`, `attn_decode_f64` | `xabe-cuda` kernels |
-| packed embedding gather | both Llama stages | `xabe_gguf::dequantize_blocks` | `embed_q` | `xabe-cuda` quant |
-| mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `xabe-cuda` kernels |
-| rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `xabe-cuda` kernels |
-| mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `xabe_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `xabe-cuda` quant |
-| the same, for an f16 weight and no twin | CosyVoice3 speech LLM, decode | the mat-vec, then `xabe_dsp::rms_norm` | `gemv_norm_f16` | `xabe-cuda` quant |
-| f16 mat-vec with the residual add and the next layer normalisation in its tail | ASR decode | the mat-vec, then `xabe_dsp::layer_norm_add` | `gemv_ln` | `xabe-cuda` kernels |
-| stacked q/k/v mat-vec, placed into the caches | ASR decode | `gemv_into` three times, in the test | `gemv_qkv_f16` | `xabe-cuda` kernels |
-| packed mat-vec over several int8 rows, one weight stream | the translator, batched decode | `gemv` a row at a time, in the test | `gemv_q_rows2`, `gemv_q_rows3`, `gemv_q_rows4` | `xabe-cuda` quant |
+| embedding lookup | text encoder | `llmtie-dsp` (inline) | `embed_scaled` | `llmtie-tts` text_encoder |
+| layer norm | text encoder | `llmtie_dsp::layer_norm` | `layer_norm` | `llmtie-tts` text_encoder |
+| relative-position self-attention | text encoder (window 4) | `llmtie_dsp::self_attention` | `attention_scores` + `attention_context` | `llmtie-dsp` relative_position + `llmtie-tts` |
+| conv1d, kernel 3 | text encoder FFN | `llmtie_dsp::conv1d` | `conv1d` | `llmtie-tts` text_encoder |
+| conv1d, general | flow, duration predictor, decoder | `llmtie_dsp::conv1d` | `conv1d` | `llmtie-tts` text_encoder |
+| conv1d, stride one from 32 positions | decoder resblocks, Tacotron2's encoder, postnet and location conv, CosyVoice's look-ahead | `llmtie_dsp::conv1d` | `conv1d_tiled` (three tile widths, two channel tiles) | `llmtie-cuda` conv1d |
+| depthwise-separable conv | duration predictor | `llmtie_dsp::depthwise_conv1d` | `depthwise_conv1d` | `llmtie-tts` duration |
+| linear, exact f32 | text encoder q/k/v/o, Tacotron2's encoder gates and attention memory | `llmtie_dsp::linear` | `linear_tiled` (the convolution's body, row-major) | `llmtie-cuda` kernels |
+| transposed conv1d | decoder upsamplers | `llmtie_dsp::transposed_conv1d` | `transposed_conv1d` | `llmtie-tts` decoder |
+| grouped conv1d, left-padded | CosyVoice3 DiT positional embedding | `llmtie_dsp::grouped_conv1d` | `grouped_conv1d`, `grouped_conv1d_tiled` | `llmtie-cuda` kernels |
+| leaky ReLU | decoder | `llmtie_dsp::leaky_relu` | `act_leaky_relu` | `llmtie-tts` decoder |
+| WaveNet residual block | flow coupling, posterior | `llmtie-tts` flow::wavenet | `gated_activation` + `conv1d` | `llmtie-tts` flow |
+| affine coupling | flow | `llmtie-tts` flow_reverse | `sub_inplace` | `llmtie-tts` flow |
+| stochastic duration flow | duration predictor | `llmtie_dsp::spline_inverse` | host (69 positions) | `llmtie-tts` duration |
+| length regulation / attention expansion | prior → frames | `llmtie-tts` expand_prior | `expand_prior` | `llmtie-tts` prior |
+| HiFi-GAN resblock (MRF) | decoder | `llmtie-tts` decoder::resblock | `conv1d` + `act_leaky_relu` | `llmtie-tts` decoder |
+| tanh output | decoder | `llmtie-tts` decoder | `act_tanh` | `llmtie-tts` decoder |
+| strided conv1d | VAD stft + encoder | `llmtie_dsp::conv1d_strided` | (cpu only) | `llmtie-vad` reference |
+| magnitude from re/im halves | VAD stft | `llmtie-vad` stft | (cpu only) | `llmtie-vad` reference |
+| LSTM cell, gates i f g o | VAD decoder | `llmtie-vad` lstm | (cpu only) | `llmtie-vad` reference |
+| discrete Fourier transform, any length | mel frontend | `llmtie_dsp::Fft` | (cpu only) | `llmtie-dsp` fft |
+| mel filter bank and spectrogram | ASR frontend | `llmtie_audio::mel_power` | (cpu only) | `llmtie-whisper` frontend |
+| tiled matmul, f16 operands | ASR everywhere | `llmtie_dsp::linear` | `gemm`; `gemm_hh` when both operands arrive f16 | `llmtie-cuda` kernels |
+| matmul for a handful of rows | ASR decode | `llmtie_dsp::linear` | `gemv` | `llmtie-cuda` kernels |
+| convolution as a matrix | ASR encoder stem | `llmtie_dsp::conv1d_strided` | `im2col` + `gemm` | `llmtie-cuda` kernels |
+| head split, merge and transpose | ASR attention | (index formula, in the test) | `split_heads`, `split_heads_t`, `merge_heads` | `llmtie-cuda` kernels |
+| causal mask | ASR decoder self-attention | (index formula, in the test) | `causal_mask` | `llmtie-cuda` kernels |
+| round to f16 | ASR weights and KV cache | `half::f16::from_f32` | `pack_f16` | `llmtie-cuda` kernels |
+| RMS norm | translator, every layer twice | `llmtie_dsp::rms_norm` | `rms_norm` | `llmtie-cuda` kernels |
+| SiLU, and SiLU-gated multiply | translator MLP | `llmtie_dsp::silu`, `silu_mul` | `silu_mul` | `llmtie-cuda` kernels |
+| rotary position embedding | translator attention | `llmtie_dsp::rope` | `rope` | `llmtie-cuda` kernels |
+| scaled rotary embedding | chat-model attention | `llmtie_dsp::rope_scaled` | `rope` | `llmtie-cuda` kernels |
+| key-value head expansion | chat-model attention | — | `repeat_kv` | `llmtie-cuda` kernels |
+| int8 quantization of an activation | both Llama stages | `llmtie_dsp::quantize_q8` | `quantize_q8` | `llmtie-cuda` quant |
+| tiled matmul, packed weight and int8 activation | both Llama stages, prefill | `llmtie_dsp::linear` on the same approximation | `gemm_i8_q4k`, `gemm_i8_q6k`, each at three row tiles (128, 64, 32) | `llmtie-cuda` quant |
+| split-contraction reduction | both Llama stages | (ordered sum, in the test) | `gemm_reduce` | `llmtie-cuda` kernels |
+| KV cache scatter | both Llama stages | (index formula, in the test) | `cache_append`, `cache_append_t` | `llmtie-cuda` kernels |
+| fused attention | both Llama stages, prefill; the Whisper encoder | (scalar softmax-attention, in the test) | `flash_attn`, `flash_attn_64` | `llmtie-cuda` kernels |
+| single-row decode attention, with the context's int8 twin | both Llama stages, decode; the Whisper decoder, both attentions | (scalar softmax-attention, in the test); `quantize_q8` for the twin | `attn_decode_h128` at three chunk widths, `attn_decode_h128_run` past 2048 positions (1024 ungrouped), `attn_decode_h64_run` for the Whisper cross-attention, `attn_decode_h64`, `attn_decode_f64` | `llmtie-cuda` kernels |
+| packed embedding gather | both Llama stages | `llmtie_gguf::dequantize_blocks` | `embed_q` | `llmtie-cuda` quant |
+| mat-vec with a placed, activated epilogue | ASR decode | the mat-vec, `cache_append` and `gelu` in turn | `gemv` with `OutLayout` | `llmtie-cuda` kernels |
+| rotate-and-cache at one position | both Llama stages, decode | `rope_scaled` twice and `cache_append_f16` twice, in the test | `rope_cache_f16` | `llmtie-cuda` kernels |
+| mat-vec with the residual add and the next normalisation in its tail | both Llama stages, decode | the mat-vec, then `llmtie_dsp::rms_norm` and `quantize_q8` | `gemv_norm` | `llmtie-cuda` quant |
+| the same, for an f16 weight and no twin | CosyVoice3 speech LLM, decode | the mat-vec, then `llmtie_dsp::rms_norm` | `gemv_norm_f16` | `llmtie-cuda` quant |
+| f16 mat-vec with the residual add and the next layer normalisation in its tail | ASR decode | the mat-vec, then `llmtie_dsp::layer_norm_add` | `gemv_ln` | `llmtie-cuda` kernels |
+| stacked q/k/v mat-vec, placed into the caches | ASR decode | `gemv_into` three times, in the test | `gemv_qkv_f16` | `llmtie-cuda` kernels |
+| packed mat-vec over several int8 rows, one weight stream | the translator, batched decode | `gemv` a row at a time, in the test | `gemv_q_rows2`, `gemv_q_rows3`, `gemv_q_rows4` | `llmtie-cuda` quant |
 
 ## Also implemented
 
@@ -63,16 +63,16 @@ is what turned them up:
 
 | kernel | used by | reference | CUDA | differential |
 | --- | --- | --- | --- | --- |
-| exact GELU (needs `erf`) | duration predictor | `xabe_dsp::gelu` | `act_gelu` | `xabe-dsp` gelu |
-| softmax | attention, spline knots | `xabe_dsp::softmax_rows` | `softmax_rows` | via attention |
+| exact GELU (needs `erf`) | duration predictor | `llmtie_dsp::gelu` | `act_gelu` | `llmtie-dsp` gelu |
+| softmax | attention, spline knots | `llmtie_dsp::softmax_rows` | `softmax_rows` | via attention |
 
 GELU is the one kernel here that *approximates* the reference rather than
-rearranging it: Rust has no `erf`, so `xabe-dsp` carries Cody's rational
+rearranging it: Rust has no `erf`, so `llmtie-dsp` carries Cody's rational
 approximation. PyTorch's default GELU is the exact erf form, and the tanh
 approximation - the obvious substitute - differs by up to 4.7e-4 near
 `|x| = 2.7`, an order of magnitude above the tolerances here.
 
-The last five have no `xabe-dsp` twin, and deliberately not. Three are pure
+The last five have no `llmtie-dsp` twin, and deliberately not. Three are pure
 index permutations and one is a comparison, so their reference *is* the index
 formula: written beside the assertion it can be read against the kernel, where
 exported as a library function nothing calls it would be the same formula
@@ -100,9 +100,9 @@ on a prime rather than refusing.
 
 ## The CUDA column
 
-Every kernel named there lives in `xabe-cuda`'s single NVRTC translation unit
-and is tested against its `xabe-dsp` twin in
-`crates/xabe-cuda/tests/kernels.rs`, per kernel, before anything is assembled
+Every kernel named there lives in `llmtie-cuda`'s single NVRTC translation unit
+and is tested against its `llmtie-dsp` twin in
+`crates/llmtie-cuda/tests/kernels.rs`, per kernel, before anything is assembled
 from it. A GPU pipeline that is wrong somewhere is nearly impossible to bisect
 after the fact and trivially bisected before it exists.
 
@@ -176,7 +176,7 @@ Two entries deserve a note:
   the 64-wide tile wins the DiT's shape - 224 blocks at 327 µs against the
   128-wide's 128 blocks at 368, measured - where the direct kernel took
   886. The direct kernel had no CPU twin and no test until this round;
-  both kernels are now held to `xabe_dsp::grouped_conv1d` at the DiT's
+  both kernels are now held to `llmtie_dsp::grouped_conv1d` at the DiT's
   shape and five others, and the flow's mel is byte for byte what it was.
 - **`act_gelu` uses the device's `erff`,** which is IEEE-accurate, while the CPU
   twin carries Cody's rational approximation because Rust has no `erf`. Their
@@ -189,7 +189,7 @@ four times. Moving it would cost more in launches and transfers than it saves.
 
 ## Reference implementations are scalar on purpose
 
-`xabe-dsp` kernels are written to be read against the PyTorch source line by
+`llmtie-dsp` kernels are written to be read against the PyTorch source line by
 line. They are not vectorised, not blocked, and not clever. A reference you have
 to reason about is not a reference.
 
@@ -197,10 +197,10 @@ to reason about is not a reference.
 
 | kernel | used by | CPU twin | notes |
 | --- | --- | --- | --- |
-| `gemm` | encoder and decoder projections | `xabe_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
-| `gemv` | the same, at decode width | `xabe_dsp::linear` | one warp per output channel, exact f32 |
+| `gemm` | encoder and decoder projections | `llmtie_dsp::linear` | tensor cores, `m16n8k8`, f16 operands, f32 accumulate |
+| `gemv` | the same, at decode width | `llmtie_dsp::linear` | one warp per output channel, exact f32 |
 | `taco_energies`, `taco_context` | Tacotron2's location attention, one frame; the context written into the three buffers that read it | a CPU chain of the seven kernels they replace | two launches where there were seven and a transpose |
-| `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `xabe_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
+| `layer_norm_mod`, `gate_add` | the DiT's adaptive normalisation and gated residual | `llmtie_dsp::layer_norm` on `1 + scale` and `shift`; the host loop, exactly | the flow's residual stream never leaves the card |
 | `embed_scaled_f16` | the speech LLM's tables at f16 | `embed_scaled` on the table rounded on the host, exactly | a 544 MB table read a few rows at a time |
 | `relu_mask`, `taco_emit` | the Tacotron2 decode loop's bookkeeping | the copies and elementwise ops they replace | each one launch where there were two or three |
 | `gated_cond_rows` | WaveGlow's gate with its conditioning added on the way in | `add_strided` then `gated_activation_rows`, exactly | one read of the activation where there were a read, a write and a read |
@@ -234,7 +234,7 @@ unpacks them *inside* the matmul. It is the third storage for the same operand
 and the only one that changes what fits on a card.
 
 The distinction it removes is the one `docs/MODEL.md` used to end on. Reading a
-quantized GGUF was already possible - `xabe-gguf` decodes nine block formats -
+quantized GGUF was already possible - `llmtie-gguf` decodes nine block formats -
 but it decoded them to f32 at load, so a 4-bit checkpoint bought disk and load
 bandwidth and *nothing else*: the weights landed at full width and occupied
 what f16 occupies. Unpacking per use instead makes the resident copy the packed
@@ -304,7 +304,7 @@ about it are deliberate:
   and quantizes exactly rather than dividing by it.
 - **It is measured, not assumed.** 0.69% of the chat model's logit span and
   0.42% of the translator's, against the same weights at f16.
-  `xabe_dsp::quantize_q8` is the CPU twin and the differential test compares at
+  `llmtie_dsp::quantize_q8` is the CPU twin and the differential test compares at
   *exact equality* - the thing worth checking is that the two implementations
   approximate identically, and a tolerance there would hide exactly the
   group-boundary or rounding-mode disagreement it exists to catch.
@@ -330,9 +330,9 @@ failing loudly on.
 
 **The layouts are transcribed twice, so they are pinned to each other.**
 `q_elem` in `kernels.rs` is a second transcription of the same block formats
-`xabe_gguf::dequant` already carries, and a second transcription is a second
+`llmtie_gguf::dequant` already carries, and a second transcription is a second
 chance to permute a block - which produces a plausible tensor rather than an
-error. So `xabe-cuda`'s `tests/quant.rs` compares against that decoder, which
+error. So `llmtie-cuda`'s `tests/quant.rs` compares against that decoder, which
 is itself checked against `gguf-py` at exact equality, and does it *element for
 element* through the exact f32 path rather than only through a dot product,
 because a permutation inside a block is invisible to any check on magnitudes.
@@ -351,7 +351,7 @@ Two things the tests found that are worth keeping:
   terms, not the size of the rounding.
 
 The rope permutation survives packing for a reason worth naming.
-`xabe_llama::gguf::unpermute_rope` never looks *inside* a row - it moves `cols`
+`llmtie_llama::gguf::unpermute_rope` never looks *inside* a row - it moves `cols`
 contiguous elements at a time - so it is a permutation of whole rows, and
 `unpermute_rope_bytes` applies the same shuffle to byte ranges. Without that,
 `attn_q` and `attn_k` would have to be unpacked, permuted and repacked, which
@@ -428,7 +428,7 @@ was written next to a tile that had become 16x64, so the grid covered a
 fraction of the output and every small tile "measured" three times faster by
 not computing most of the answer. `kernels::define` now reads `GEMM_MT`,
 `GEMM_NT` and `GEMM_WARPS` out of the CUDA source at compile time, so the two
-cannot disagree again. The ASR oracle caught it; `xabe-llm-bench` checks no
+cannot disagree again. The ASR oracle caught it; `llmtie-llm-bench` checks no
 numbers and did not.
 
 ### Splitting the contraction
@@ -883,7 +883,7 @@ Prompts of 5 to 32 rows take it, with `LLMTIE_NO_STREAM` to compare.
 Two Q4_K sub-blocks. Every part of the kernel's shape follows from it:
 
 - A Q4_K sub-block is 32 elements with one `(d*sc, dmin*mn)` pair, and
-  `xabe_dsp::quantize_q8` quantizes activations in groups of 32. So a
+  `llmtie_dsp::quantize_q8` quantizes activations in groups of 32. So a
   *sub-block* is the span over which every scale is constant, and it is the span
   the integer accumulator may run before anything is converted.
 - Q4_K stores the low nibble of a byte at element `j` and the high nibble at
@@ -1869,7 +1869,7 @@ The packed mat-vec's finding - a lane loading sixteen bytes reaches 578 GB/s
 where four bytes reach 440 - was tried on the f16 weight path, where a lane
 still loads one word a trip, because the Whisper decoder streams 1.47 GB of
 f16 weights a token in 6.9 ms and that is 35% of the card. `bench-gemv`
-(`cargo run --release -p xabe-cuda --bin bench-gemv`, medians of 200 launches
+(`cargo run --release -p llmtie-cuda --bin bench-gemv`, medians of 200 launches
 each followed by a synchronise, so every row carries the same round-trip
 floor):
 
@@ -2108,7 +2108,7 @@ its own kernel rather than a flag on `rope`.
 **`stft_dft` and `istft_ola`, because the vocoder's output head is an inverse
 transform.** `conv_post` emits 18 channels, which is magnitude and phase over
 the 9 bins of a 16-point transform with hop 4. Small enough that a direct DFT
-beats a radix-2 plan, and the differential test is against `xabe_dsp::istft`
+beats a radix-2 plan, and the differential test is against `llmtie_dsp::istft`
 like every other kernel here.
 
 ## Bounded host staging for packed weights

@@ -39,13 +39,13 @@ optimise** — `docs/ORACLE.md`, `docs/TESTING.md`.
 | # | State | Done |
 | --- | --- | --- |
 | 1 | Every model lives under one gitignored `models/`, and the pipeline still runs | ✅ |
-| 2 | `xabe-engine` owns the flag surface; `xabe-audio` is split out; TTS runs as `--tts-model` | ✅ |
+| 2 | `llmtie-engine` owns the flag surface; `llmtie-audio` is split out; TTS runs as `--tts-model` | ✅ |
 
 ### Phase 2 — the serving surface
 
 | # | State | Done |
 | --- | --- | --- |
-| 3 | `xabe-serve` speaks both halves: `--<stage>-url` as a client, `--serve` as a server | ✅ |
+| 3 | `llmtie-serve` speaks both halves: `--<stage>-url` as a client, `--serve` as a server | ✅ |
 | 4 | The gateway is a behaviour-for-behaviour port of `gateway.py`, driving the Python services | ✅ |
 | 5 | The turn-taking policy is server-side and tested; the browser executes it | ✅ |
 
@@ -53,7 +53,7 @@ Milestone 5 is narrower than it was first written, and deliberately. The plan
 said turn-taking would move server-side and the browser would keep "only
 capture, VAD and playback" — but the VAD *is* the turn detector, so that
 sentence asked for two things at once. What moved is the **policy**: the
-constants and the state machine now live in `xabe-serve::turntaking`, are unit
+constants and the state machine now live in `llmtie-serve::turntaking`, are unit
 tested against synthetic energy traces, and reach the page through
 `GET /api/config`, so tuning is a restart rather than an edit to an HTML file.
 What did not move is the frame-by-frame execution, because sending every
@@ -77,15 +77,15 @@ of both thresholds. Raw probabilities differ by at most 6.8e-3, which has an
 explanation rather than a tolerance — see `docs/MODEL.md`.
 
 Two items from later phases came forward because this one needed them:
-`xabe-st` reads F16 and BF16 (part of item 18, since the Silero checkpoint
-turned out to be F16), and `xabe-dsp` gained a strided convolution.
+`llmtie-st` reads F16 and BF16 (part of item 18, since the Silero checkpoint
+turned out to be F16), and `llmtie-dsp` gained a strided convolution.
 
 ### Phase 4 — speech to text
 
 | # | State | Done |
 | --- | --- | --- |
-| 9 | `xabe-st` reads sharded checkpoints via `model.safetensors.index.json` | ✅ |
-| 10 | A real tiled GEMM in `xabe-cuda` | ✅ |
+| 9 | `llmtie-st` reads sharded checkpoints via `model.safetensors.index.json` | ✅ |
+| 10 | A real tiled GEMM in `llmtie-cuda` | ✅ |
 | 11 | The mel frontend matches `WhisperFeatureExtractor` | ✅ |
 | 12 | Whisper geometry and weight schema, 1259 tensors, shape-checked at bind | ✅ |
 | 13 | Byte-level BPE matches the reference tokenizer exactly | ✅ |
@@ -214,7 +214,7 @@ it is asserted directly rather than captured.
 
 | # | State | Done |
 | --- | --- | --- |
-| 18 | `xabe-st` reads F16 and BF16, converting BF16 → F16 with a tested range check | ✅ |
+| 18 | `llmtie-st` reads F16 and BF16, converting BF16 → F16 with a tested range check | ✅ |
 | 19 | All 363 tensors of the 13 B bind and shape-check, with a parameter-count test | ✅ |
 | 20 | SentencePiece matches the reference tokenizer on a captured corpus | ✅ |
 
@@ -277,7 +277,7 @@ gate.
 | 25 | The speech LM's forward pass, GQA 7:1 and q/k/v biases, matches at **143 of 143** positions | ✅ |
 | 26 | The Qwen2 BPE matches the reference on both strings; `ras_sampling` transcribed with its traps named | ✅ |
 | 27 | The DiT estimator and the Euler/CFG solver reach the reference mel at correlation **0.999970** | ✅ |
-| 28 | Snake, iSTFT and the NSF source in `xabe-dsp`/`xabe-cuda`; the waveform matches at **1.000000** | ✅ |
+| 28 | Snake, iSTFT and the NSF source in `llmtie-dsp`/`llmtie-cuda`; the waveform matches at **1.000000** | ✅ |
 | 29 | End to end in-process: `--tts-engine cosyvoice=<dir>`, Han text in, 24 kHz audio out | ✅ |
 | 30 | The speech tokenizer and CAMPPlus ported from ONNX, so a new voice needs no Python | ⬜ |
 
@@ -322,7 +322,7 @@ happens once.
 
 **The LM** is a Qwen2-0.5B fine-tune: 24 layers, hidden 896, intermediate 4864,
 14 query heads against **2 key/value heads**, `rope_theta` 1e6, RMS-norm eps
-1e-6, and biases on q/k/v. `xabe-llama` currently *refuses* GQA by name, so this
+1e-6, and biases on q/k/v. `llmtie-llama` currently *refuses* GQA by name, so this
 is the item that makes that refusal into an implementation. On top of the
 backbone sit `speech_embedding` and `llm_decoder`, both 6761x896 — 6561 speech
 tokens plus 200 task and control tokens.
@@ -345,19 +345,19 @@ here.
 built. Its activations are **Snake**, not leaky ReLU — `x + sin²(αx)/α` with a
 learned per-channel α, 72 of them. Its output head is an **iSTFT**: `conv_post`
 emits 18 channels, which is magnitude and phase over the 9 bins of a 16-point
-transform, so `xabe_dsp::Fft` needs an inverse it does not have. And it is
+transform, so `llmtie_dsp::Fft` needs an inverse it does not have. And it is
 driven by an **NSF harmonic source** — F0 predicted by a small conv net, then 8
 harmonics — which is a second signal path merged into the upsampler, not a
 decoration.
 
 164 of its 328 tensors are `parametrizations.weight.original0/1` pairs: **weight
-norm**, unfused, exactly the trap that `xabe-vits`'s parameter-count test caught
+norm**, unfused, exactly the trap that `llmtie-vits`'s parameter-count test caught
 once already. It is the one thing in this phase this project has been bitten by
 before.
 
 #### The container problem, and the precedent for it
 
-`.pt` is a pickle in a ZIP. `xabe-st` reads safetensors and nothing else, and
+`.pt` is a pickle in a ZIP. `llmtie-st` reads safetensors and nothing else, and
 teaching a Rust workspace to execute pickle opcodes to read three weight files
 would be a genuinely bad trade. The precedent is phase 3: Silero was
 legacy-ggml and was converted by a `tools/` script into safetensors, once,
@@ -377,7 +377,7 @@ should be re-scoped when it is reached rather than estimated now.
 Two of the guesses above were wrong, and are corrected here rather than quietly
 left standing:
 
-- **`xabe-llama` did not grow GQA.** The speech LM lives in `xabe-cosy` with its
+- **`llmtie-llama` did not grow GQA.** The speech LM lives in `llmtie-cosy` with its
   own forward pass. It shares no weights, no tokenizer and no rope convention
   with the translator, and folding a 6761-way speech head into a crate that
   exists to read Llama geometry would have bought a shared file and nothing
@@ -435,7 +435,7 @@ writes four tensors plus the diffusion's starting noise. That last one is not a
 property of the speaker at all — `CausalConditionalCFM.__init__` seeds the
 global RNG to zero and draws it, so it is the same for every voice and every
 utterance — and it is load-bearing, so it rides in the bundle because that is
-the file the engine already opens. See `crates/xabe-cosy/src/voice.rs`.
+the file the engine already opens. See `crates/llmtie-cosy/src/voice.rs`.
 
 ## Outside the numbering: the chat model's loader
 
@@ -445,7 +445,7 @@ kept apart.
 
 | | State | Done |
 | --- | --- | --- |
-| — | `xabe-gguf` reads the GGUF container: v3, three widths and nine block formats | ✅ |
+| — | `llmtie-gguf` reads the GGUF container: v3, three widths and nine block formats | ✅ |
 | — | All 292 tensors of `Llama-Breeze2-8B-Instruct-text-only.f16.gguf` bind | ✅ |
 | — | `rope_scaled` and `repeat_kv` kernels, for Llama-3's rope and its grouped-query heads | ✅ |
 | — | The byte-level BPE, matching llama.cpp id-for-id on 60 captured cases | ✅ |
@@ -499,7 +499,7 @@ outright, which made a model that binds perfectly cleanly unreadable. A shape is
 a fact about the file; whether a forward pass maps several query heads onto one
 is a fact about that engine. So `check` now accepts it and
 `refuse_grouped_query` is what an engine without the head mapping calls at open.
-`xabe-translate` calls it, so nothing regressed.
+`llmtie-translate` calls it, so nothing regressed.
 
 **`rope_freqs.weight` has no safetensors counterpart**, and `rope_theta` is
 500000 rather than 10000. Neither has a shape check that would catch it: a
@@ -517,11 +517,11 @@ The limit to hold in mind is that unpacking is not running quantized: weights
 land at full width, so a 4-bit 13 B is a 7 GB file and still 26.5 GB of f16 on
 the card. That buys disk and load bandwidth, not memory. See `docs/MODEL.md`.
 
-### The tokenizer, and why it is not `xabe-whisper`'s
+### The tokenizer, and why it is not `llmtie-whisper`'s
 
 The GPT-2 byte-level BPE the Breeze2 file carries — 128,256 tokens and 280,147
-merges, all inside the GGUF — is now `xabe_llama::Bpe`. It looks like the one
-`xabe-whisper` already has, and reusing it would have been wrong: the GGUF
+merges, all inside the GGUF — is now `llmtie_llama::Bpe`. It looks like the one
+`llmtie-whisper` already has, and reusing it would have been wrong: the GGUF
 declares `tokenizer.ggml.pre = "llama-bpe"`, a **different pre-tokenizer** than
 GPT-2's. Llama-3 splits digit runs at three, matches contractions
 case-insensitively, and lets a newline run take a whole alternative of its own.
@@ -569,7 +569,7 @@ two tensors differ from the checkpoint in about 98% of their elements while
 everything else matches exactly. `attn_v` is untouched, since values are not
 rotated — which is the asymmetry that identifies the cause. Left alone it gives
 a model that passes every shape check and speaks fluent nonsense.
-`xabe_llama::gguf::unpermute_rope` undoes it at load and the tests assert the
+`llmtie_llama::gguf::unpermute_rope` undoes it at load and the tests assert the
 round trip in **both** directions, bit for bit. See `docs/MODEL.md`.
 
 The bf16-to-f16 conversion turned out to be a non-issue and is worth recording
@@ -592,9 +592,9 @@ project is done.
 | | State | Done |
 | --- | --- | --- |
 | — | `Operand::Q`, and `q_elem` unpacking all ten block formats inside `gemm` and `gemv` | ✅ |
-| — | Element-for-element equality against `xabe_gguf::dequantize_blocks`, all ten formats | ✅ |
+| — | Element-for-element equality against `llmtie_gguf::dequantize_blocks`, all ten formats | ✅ |
 | — | The rope permutation applied to packed bytes, pinned against the element version | ✅ |
-| — | `xabe-chat` and `xabe-translate` hold quantized matrices packed; `Packing` chooses | ✅ |
+| — | `llmtie-chat` and `llmtie-translate` hold quantized matrices packed; `Packing` chooses | ✅ |
 | — | The whole pipeline resident on one card, measured | ✅ |
 
 Measured: every stage this engine runs - TTS, ASR, the 8 B chat model, the 13 B
@@ -621,7 +621,7 @@ non-finding worth recording:
   difference of 1.1e-5 was 3% of the answer with nothing wrong. Judging against
   `k * eps * sum|terms|` is the right rule and is still nowhere near loose
   enough to hide a permuted block.
-- **`xabe-llama` did not need a repacking quantizer,** which was the thing that
+- **`llmtie-llama` did not need a repacking quantizer,** which was the thing that
   looked expensive. llama.cpp's rope permutation moves *whole rows*, and a
   quantized row is a whole number of blocks, so the same shuffle applies to
   byte ranges and `attn_q` and `attn_k` never have to be unpacked at all.
@@ -645,11 +645,11 @@ that is the one axis the engine could not measure for itself.
 | | State |
 | --- | --- |
 | `tools/convert_tacotron2.py` | both checkpoints to safetensors, geometry validated, round trip bit-identical |
-| `xabe-taco` | config, weight binding, tokeniser, POJ to Tâi-lô, both forward passes |
+| `llmtie-taco` | config, weight binding, tokeniser, POJ to Tâi-lô, both forward passes |
 | `lstm_gates`, `coupling_inverse`, `mul_inplace` | three new CUDA kernels, each against a twin |
 | `--tts-engine name=<dir>`, `--taco-sigma` | registered like any other engine, sniffed by filename |
 | encoder vs the reference | max-abs **1.22e-6**, cosine **1.000000000** |
-| `xabe-taco-bench` | per-stage breakdown, and the totals it is not allowed to claim |
+| `llmtie-taco-bench` | per-stage breakdown, and the totals it is not allowed to claim |
 | speed | **3.07x** after optimisation; 12.04x realtime |
 
 Four things are worth carrying forward.
@@ -804,17 +804,17 @@ wrong when something disagreed, because the forward pass had a standing proof
 and the loader did not.
 
 **Item 31 narrows a claim rather than adding one.** `AGENTS.md` has said since
-`xabe-taco` landed that WaveGlow is the one stage reading converted weights,
+`llmtie-taco` landed that WaveGlow is the one stage reading converted weights,
 because it is a pickled `nn.Module` object graph. That is still true, and it is
 now clear that the extension was never the issue: a modern `.pth` is a zip
 holding a pickle, and a *state dict* pickle names exactly three things -
 `collections.OrderedDict`, `torch._utils._rebuild_tensor_v2` and a storage
-class. `xabe-pt` implements those three, refuses every other `GLOBAL` by name,
+class. `llmtie-pt` implements those three, refuses every other `GLOBAL` by name,
 and so reads this checkpoint as published while still being unable to read
 WaveGlow. The distinction is state dict against object graph, and the loader
 says which it found.
 
-| 35 | Romanisation reaches the model: `xabe-taigi`, verified against goruut's inventory | ✅ |
+| 35 | Romanisation reaches the model: `llmtie-taigi`, verified against goruut's inventory | ✅ |
 
 **Item 35 is the one that was first written as impossible.** The model's front
 end is `pygoruut`, a Go binary carrying a Han-to-IPA dictionary and a learned

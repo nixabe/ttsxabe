@@ -20,8 +20,8 @@ for r in $(seq 1 "$ROUNDS"); do
     CUDA_VISIBLE_DEVICES=${LLMTIE_TTS_DEVICE:-0} "$PY" "$HERE/pytorch_baseline.py" \
         --text "$TEXT" --device cuda:0 --runs "$RUNS" 2>/dev/null \
         | grep -E "samples|median|realtime"
-    echo "--- xabe-tts ---"
-    "$ROOT/target/release/xabe-tts-bench" --model "$MODEL" \
+    echo "--- llmtie-tts ---"
+    "$ROOT/target/release/llmtie-tts-bench" --model "$MODEL" \
         --device "${LLMTIE_TTS_DEVICE:-0}" --text "$TEXT" --runs "$RUNS" 2>/dev/null \
         | grep -E "samples|median|realtime"
 done

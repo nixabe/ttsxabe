@@ -21,8 +21,8 @@ Two layers, same as `llmxabe`:
 
 ## Every kernel has a reference and a differential test
 
-A CUDA kernel is compared against its `xabe-dsp` scalar implementation on the
-same inputs. A `xabe-dsp` implementation is compared against activations
+A CUDA kernel is compared against its `llmtie-dsp` scalar implementation on the
+same inputs. A `llmtie-dsp` implementation is compared against activations
 captured from PyTorch (see [ORACLE.md](ORACLE.md)).
 
 **A kernel without a passing differential test is not done, regardless of how
@@ -95,7 +95,7 @@ LLMTIE_TEST_DEVICE=2 cargo test --workspace --release
 
 ### The Coqui VITS tests need two things the others do not
 
-`crates/xabe-tts/tests/coqui_end_to_end.rs` and `coqui_gpu.rs` look for the
+`crates/llmtie-tts/tests/coqui_end_to_end.rs` and `coqui_gpu.rs` look for the
 checkpoint at `models/tts/coqui-vits-suisiann` or `LLMTIE_COQUI_MODEL`, and for
 its capture at `.golden/coqui-base` or `LLMTIE_COQUI_GOLDEN`. Both skip loudly
 when either is absent. The capture is a *different directory* from the 🤗 one
@@ -104,7 +104,7 @@ same names from different checkpoints, and pointing one test suite at the
 other's capture would compare two real utterances and fail for a reason that is
 not a defect.
 
-`crates/xabe-taigi/tests/correspondence.rs` needs a third capture,
+`crates/llmtie-taigi/tests/correspondence.rs` needs a third capture,
 `.golden/coqui-tailo` or `LLMTIE_TAIGI_GOLDEN`, and no checkpoint at all — it
 checks a spelling table against goruut's own inventory. `tests/spelling.rs`
 beside it needs nothing and always runs.
@@ -116,7 +116,7 @@ not need a long utterance to be true or false.
 
 `LLMTIE_TEST_DEVICE` and not `LLMTIE_TTS_DEVICE`. The second is the engine's
 `--tts-device` env twin, so exporting it to steer a test run also reaches into
-`xabe-engine`'s flag tests, which then assert their defaults against whichever
+`llmtie-engine`'s flag tests, which then assert their defaults against whichever
 card someone happened to pick. That cost eight failing tests once, all of them
 looking like a broken flag parser.
 
@@ -186,7 +186,7 @@ reading the wrong sixteen bytes does not land within a percent of the right
 answer. It caught one during development - an element offset of `n * 64` where
 the layout wanted `n * 128` - by being wrong by 74%.
 
-The quantiser itself is compared to `xabe_dsp::quantize_q8` at **exact
+The quantiser itself is compared to `llmtie_dsp::quantize_q8` at **exact
 equality**, on both codes and scales, including an all-zero group and one whose
 maximum is a power of two so ties are reachable. The thing worth checking is
 that the two implementations approximate identically; a tolerance there would
@@ -215,13 +215,13 @@ grouped-query style - and the tolerance is tight *because* the data is strong.
 A test that passes on weak data is the same defect as a tolerance wide enough
 to hide a permutation.
 
-**Close in**, `xabe-cuda`'s `tests/quant.rs` compares against
-`xabe_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
+**Close in**, `llmtie-cuda`'s `tests/quant.rs` compares against
+`llmtie_gguf::dequantize_blocks` - the decoder already checked against `gguf-py`
 at exact equality. It extracts weights *element for element* through a one-hot
 activation on the exact f32 path, so the comparison is equality rather than a
 tolerance and a permutation inside a block cannot hide behind a dot product. It
 also runs the whole product on both kernels, and pins the two size tables that
-`xabe-cuda` duplicates because it may not depend on `xabe-gguf`.
+`llmtie-cuda` duplicates because it may not depend on `llmtie-gguf`.
 
 `a_batch_over_one_activation_matches_the_same_products_apart` covers the shape
 the attention projections are issued in: several matrices against one shared
@@ -241,7 +241,7 @@ block out of a shared output rather than copying it first. Each checks the
 block against its scalar twin *and* checks that the bytes on either side did
 not move, which is the half an in-place kernel can get wrong silently.
 
-**Further out**, `xabe-chat`'s `tests/packed.rs` loads the same quantized file
+**Further out**, `llmtie-chat`'s `tests/packed.rs` loads the same quantized file
 twice - `Packing::Packed` and `Packing::F16` - and compares logits. That is the
 only check on the *wiring*: that the ggml type maps to the right layout, that
 the rope permutation reaches the packed bytes as well as the f16 ones, and that
@@ -258,8 +258,8 @@ bit-identical any more.
 
 | | prompt | worst logit difference | logit span | |
 | --- | --- | --- | --- | ---: |
-| `xabe-translate` 13 B `Q4_K_M` | 30 tokens | 0.120685 | 28.657 | 0.42% |
-| `xabe-chat` 8 B `Q4_K_M` | 14 tokens | 0.174942 | 25.323 | 0.69% |
+| `llmtie-translate` 13 B `Q4_K_M` | 30 tokens | 0.120685 | 28.657 | 0.42% |
+| `llmtie-chat` 8 B `Q4_K_M` | 14 tokens | 0.174942 | 25.323 | 0.69% |
 
 An earlier version of this table read 0.000000 for the translator, and the
 paragraph under it explained that its prompt is past `GEMV_MAX_M`, so every
@@ -457,7 +457,7 @@ visible.
 
 ### Two tests that must not share a process
 
-`xabe-translate`'s oracle and its GGUF twin each load 26.5 GB onto the card, so
+`llmtie-translate`'s oracle and its GGUF twin each load 26.5 GB onto the card, so
 they cannot both be resident on a 48 GB one. They live in **separate test
 binaries** for that reason - cargo runs test targets one after another, so the
 first process has exited and freed the card before the second starts. Within a
@@ -493,10 +493,10 @@ clustering at the boundary, which is what the tiled-prefill-against-mat-vec
 rounding floor looks like.
 
 Two things now stand where nothing did. `Gpu::cache_grow` re-strides rather than
-copies, and is checked in `xabe-cuda`'s kernel tests by an invariant that needs
+copies, and is checked in `llmtie-cuda`'s kernel tests by an invariant that needs
 no golden: appending at a small capacity and then growing must equal appending
 at the large capacity to begin with, for both layouts and with `kv_heads > 1`,
-because at one head the bug is invisible. And `xabe-chat/tests/cache_growth.rs`
+because at one head the bug is invisible. And `llmtie-chat/tests/cache_growth.rs`
 prefills 200 tokens and then steps 120, which crosses the boundary the way
 generation does.
 
@@ -587,7 +587,7 @@ says to skip. They were written on a machine that has the models, where the
 distinction never comes up.
 
 The sharper form of the rule, and the one worth copying, is in
-`xabe-asr`'s `checkpoint()`: **absent is a skip, present-but-broken is a
+`llmtie-asr`'s `checkpoint()`: **absent is a skip, present-but-broken is a
 failure.** A tree that was never populated has nothing to test; a tree where
 `models/asr/` exists but the shard index inside it does not is a setup mistake,
 and passing over that in silence is how a green suite comes to mean nothing.
@@ -620,7 +620,7 @@ same reason the ASR's are not: two of this box's three cards are running
 somebody else's pipeline, and these models are not small. `nvidia-smi` first.
 
 ```sh
-LLMTIE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
+LLMTIE_COSY_DEVICE=2 cargo test --release -p llmtie-cosy
 ```
 
 ## `LLMTIE_TACO_DEVICE`, and what Tacotron2 can be tested against
@@ -628,7 +628,7 @@ LLMTIE_COSY_DEVICE=2 cargo test --release -p xabe-cosy
 Same rule, same reason: `nvidia-smi` first.
 
 ```sh
-LLMTIE_TACO_DEVICE=2 cargo test --release -p xabe-taco
+LLMTIE_TACO_DEVICE=2 cargo test --release -p llmtie-taco
 ```
 
 The text tests need no card and always run. Of the rest, **only the encoder is

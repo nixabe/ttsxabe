@@ -1525,42 +1525,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
-name = "xabe-asr"
+name = "llmtie-asr"
 version = "0.0.0"
 dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-audio",
- "xabe-cuda",
- "xabe-dsp",
- "xabe-st",
- "xabe-whisper",
+ "llmtie-audio",
+ "llmtie-cuda",
+ "llmtie-dsp",
+ "llmtie-st",
+ "llmtie-whisper",
 ]
 
 [[package]]
-name = "xabe-audio"
+name = "llmtie-audio"
 version = "0.0.0"
 dependencies = [
  "thiserror",
- "xabe-dsp",
+ "llmtie-dsp",
 ]
 
 [[package]]
-name = "xabe-chat"
+name = "llmtie-chat"
 version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-cuda",
- "xabe-gguf",
- "xabe-llama",
+ "llmtie-cuda",
+ "llmtie-gguf",
+ "llmtie-llama",
 ]
 
 [[package]]
-name = "xabe-cosy"
+name = "llmtie-cosy"
 version = "0.0.0"
 dependencies = [
  "regex",
@@ -1569,14 +1569,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-audio",
- "xabe-cuda",
- "xabe-dsp",
- "xabe-st",
+ "llmtie-audio",
+ "llmtie-cuda",
+ "llmtie-dsp",
+ "llmtie-st",
 ]
 
 [[package]]
-name = "xabe-cuda"
+name = "llmtie-cuda"
 version = "0.0.0"
 dependencies = [
  "cudarc",
@@ -1585,12 +1585,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys",
- "xabe-dsp",
- "xabe-gguf",
+ "llmtie-dsp",
+ "llmtie-gguf",
 ]
 
 [[package]]
-name = "xabe-dsp"
+name = "llmtie-dsp"
 version = "0.0.0"
 dependencies = [
  "thiserror",
@@ -1598,7 +1598,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-engine"
+name = "llmtie-engine"
 version = "0.0.0"
 dependencies = [
  "base64",
@@ -1607,22 +1607,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xabe-asr",
- "xabe-audio",
- "xabe-chat",
- "xabe-cosy",
- "xabe-cuda",
- "xabe-serve",
- "xabe-taco",
- "xabe-taigi",
- "xabe-translate",
- "xabe-tts",
- "xabe-vad",
- "xabe-vits",
+ "llmtie-asr",
+ "llmtie-audio",
+ "llmtie-chat",
+ "llmtie-cosy",
+ "llmtie-cuda",
+ "llmtie-serve",
+ "llmtie-taco",
+ "llmtie-taigi",
+ "llmtie-translate",
+ "llmtie-tts",
+ "llmtie-vad",
+ "llmtie-vits",
 ]
 
 [[package]]
-name = "xabe-gguf"
+name = "llmtie-gguf"
 version = "0.0.0"
 dependencies = [
  "half",
@@ -1634,7 +1634,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-golden"
+name = "llmtie-golden"
 version = "0.0.0"
 dependencies = [
  "serde",
@@ -1645,7 +1645,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-llama"
+name = "llmtie-llama"
 version = "0.0.0"
 dependencies = [
  "half",
@@ -1655,12 +1655,12 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-gguf",
- "xabe-st",
+ "llmtie-gguf",
+ "llmtie-st",
 ]
 
 [[package]]
-name = "xabe-pt"
+name = "llmtie-pt"
 version = "0.0.0"
 dependencies = [
  "half",
@@ -1670,7 +1670,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-serve"
+name = "llmtie-serve"
 version = "0.0.0"
 dependencies = [
  "async-stream",
@@ -1683,11 +1683,11 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "xabe-audio",
+ "llmtie-audio",
 ]
 
 [[package]]
-name = "xabe-st"
+name = "llmtie-st"
 version = "0.0.0"
 dependencies = [
  "half",
@@ -1699,22 +1699,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-taco"
+name = "llmtie-taco"
 version = "0.0.0"
 dependencies = [
  "rustc-hash",
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-audio",
- "xabe-cuda",
- "xabe-dsp",
- "xabe-st",
- "xabe-taigi",
+ "llmtie-audio",
+ "llmtie-cuda",
+ "llmtie-dsp",
+ "llmtie-st",
+ "llmtie-taigi",
 ]
 
 [[package]]
-name = "xabe-taigi"
+name = "llmtie-taigi"
 version = "0.0.0"
 dependencies = [
  "serde",
@@ -1723,48 +1723,48 @@ dependencies = [
 ]
 
 [[package]]
-name = "xabe-translate"
+name = "llmtie-translate"
 version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-cuda",
- "xabe-gguf",
- "xabe-llama",
- "xabe-st",
+ "llmtie-cuda",
+ "llmtie-gguf",
+ "llmtie-llama",
+ "llmtie-st",
 ]
 
 [[package]]
-name = "xabe-tts"
+name = "llmtie-tts"
 version = "0.0.0"
 dependencies = [
  "clap",
  "thiserror",
  "tracing",
  "tracing-subscriber",
- "xabe-cuda",
- "xabe-dsp",
- "xabe-golden",
- "xabe-pt",
- "xabe-st",
- "xabe-vits",
+ "llmtie-cuda",
+ "llmtie-dsp",
+ "llmtie-golden",
+ "llmtie-pt",
+ "llmtie-st",
+ "llmtie-vits",
 ]
 
 [[package]]
-name = "xabe-vad"
+name = "llmtie-vad"
 version = "0.0.0"
 dependencies = [
  "thiserror",
  "tracing",
- "xabe-audio",
- "xabe-dsp",
- "xabe-st",
+ "llmtie-audio",
+ "llmtie-dsp",
+ "llmtie-st",
 ]
 
 [[package]]
-name = "xabe-vits"
+name = "llmtie-vits"
 version = "0.0.0"
 dependencies = [
  "rustc-hash",
@@ -1772,13 +1772,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-golden",
- "xabe-pt",
- "xabe-st",
+ "llmtie-golden",
+ "llmtie-pt",
+ "llmtie-st",
 ]
 
 [[package]]
-name = "xabe-whisper"
+name = "llmtie-whisper"
 version = "0.0.0"
 dependencies = [
  "regex",
@@ -1787,9 +1787,9 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "xabe-audio",
- "xabe-dsp",
- "xabe-st",
+ "llmtie-audio",
+ "llmtie-dsp",
+ "llmtie-st",
 ]
 
 [[package]]

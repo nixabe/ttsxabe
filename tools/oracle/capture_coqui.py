@@ -3,7 +3,7 @@
 The reference is Coqui TTS' own ``Vits`` on CPU in float32, reading
 ``neurlang/coqui-vits-suisiann-minnan-hokkien`` exactly as the model card says
 to. It is the same architecture ``capture.py`` records for ``mms-tts-nan`` and
-the same capture format, so ``xabe-golden`` reads both without changes - what
+the same capture format, so ``llmtie-golden`` reads both without changes - what
 differs is the module tree the hooks attach to and the tokenizer in front of it.
 
 Nothing here reimplements the model. Module-level tensors come from forward
@@ -191,7 +191,7 @@ def main():
         ``seq_major`` transposes a ``[B, C, T]`` tensor to ``[B, T, C]``. The two
         references disagree about which way round the text encoder carries its
         activations - 🤗 works in ``[B, T, C]`` and Coqui in ``[B, C, T]`` - and
-        `xabe-golden` has one convention per stage name, not two. Transposing
+        `llmtie-golden` has one convention per stage name, not two. Transposing
         here rather than in the test keeps the capture directly comparable to
         the 🤗 one, which is the whole point of sharing the format.
 

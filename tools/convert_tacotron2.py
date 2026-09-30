@@ -20,13 +20,13 @@ One thing *is* dropped, and it is the only decision in the file. Each of the
 eight `BatchNorm1d` layers carries a `num_batches_tracked` scalar, which
 PyTorch uses to form a cumulative moving average while training and never reads
 at inference - it is not even consulted to normalise, since `running_mean` and
-`running_var` already hold the result. It is also `int64`, and `xabe-st`
+`running_var` already hold the result. It is also `int64`, and `llmtie-st`
 refuses a file holding a dtype it cannot map to `f32` rather than silently
 skipping tensors. Keeping eight dead integers would mean loosening that.
 
 # Why this checkpoint needs a converter at all, and the other ones do not
 
-`xabe-st` reads safetensors and `xabe-gguf` reads GGUF, and every other stage in
+`llmtie-st` reads safetensors and `llmtie-gguf` reads GGUF, and every other stage in
 this workspace ships as one of those. This pair ships as neither.
 
 The Tacotron2 half is only mildly awkward: a modern torch zip archive holding a

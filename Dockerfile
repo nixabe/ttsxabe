@@ -68,7 +68,7 @@ COPY crates ./crates
 # that has both rather than in a deployment image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --locked -p xabe-engine --bin llmtie-rs \
+    cargo build --release --locked -p llmtie-engine --bin llmtie-rs \
  && install -Dm755 target/release/llmtie-rs /out/llmtie-rs
 
 # ------------------------------------------------------------------ runtime
@@ -93,15 +93,15 @@ RUN apt-get update \
 # host directory, so the container's uid has to be able to read it as it stands
 # - 1000 is the usual first human user and needs no `chown` of a 43 GB tree.
 # Where that is wrong, compose's `user:` overrides it without a rebuild.
-RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin xabe
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin llmtie
 
 COPY --from=build /out/llmtie-rs /usr/local/bin/llmtie-rs
 
 # Where the model tree is expected. Created so that a run with no mount fails
 # by naming a missing checkpoint rather than a missing directory.
-RUN install -d -o xabe -g xabe /models
+RUN install -d -o llmtie -g llmtie /models
 
-USER xabe
+USER llmtie
 
 # The engine's own default in every example; the compose file publishes it.
 EXPOSE 8000

@@ -27,7 +27,7 @@ built on the kernels that were already there, and it matches both references —
 so the plan's "optional" is spent rather than pending.
 
 That model takes **IPA phonemes**, not romanisation, and it is wired into the
-conversation by `xabe-taigi` - a fifth thing that fell out of it. The reference
+conversation by `llmtie-taigi` - a fifth thing that fell out of it. The reference
 gets its phonemes from Han by dictionary lookup with a learned fallback, and
 that is not portable: choosing which reading `的` takes is a model, not a table.
 But the pipeline does not have Han at that point, it has **POJ**, and the
@@ -49,8 +49,8 @@ explicitly out of scope. That was the right rule while the synthesiser was
 unfinished; it is retracted now that it is finished and measured. The chat LLM
 remains out of scope for *inference* — llama.cpp is not a rewrite that buys
 anything — but its **weights are now readable here**, which is a smaller claim
-and a real one: `xabe-gguf` reads the GGUF container - nine block formats
-included, checked against `gguf-py` at exact equality - and `xabe-llama` binds
+and a real one: `llmtie-gguf` reads the GGUF container - nine block formats
+included, checked against `gguf-py` at exact equality - and `llmtie-llama` binds
 all 292 tensors of the 8 B Breeze2 against its own metadata. Nothing runs them.
 
 This file used to end that paragraph by saying unpacking a quantized file is
@@ -68,7 +68,7 @@ all. **It is now**, and it is no longer in one place. It began in one: the
 packed mat-vec reads sixteen bytes of weight a lane, that is 32 elements, and 32
 f32 activations cost more to fetch than the wide load saves. So an activation is
 quantized to int8 in groups of 32 on its way into that kernel -
-`Gpu::quantize_activation`, with a CPU twin in `xabe-dsp` and a differential
+`Gpu::quantize_activation`, with a CPU twin in `llmtie-dsp` and a differential
 test at exact equality.
 
 **The tiled matmul now reads the same codes.** `gemm_i8` multiplies on the
@@ -100,7 +100,7 @@ CosyVoice3, and a third synthesiser in Tacotron2 + WaveGlow. A **fourth
 synthesiser** has since landed and cost almost nothing, which is the interesting
 part: `neurlang/coqui-vits-suisiann-minnan-hokkien` is the same VITS as
 `mms-tts-nan` from a different trainer, so not one line of the forward pass
-changed. What it needed was a third container crate - `xabe-pt`, which reads a
+changed. What it needed was a third container crate - `llmtie-pt`, which reads a
 torch `.pth` directly rather than converting one - a second naming scheme, a
 decoder whose weight norm had not been fused before saving, and a 137-symbol IPA
 vocabulary whose blank is at id 3 rather than 0. It agrees with its own captured
@@ -354,18 +354,18 @@ One stage reads **converted** weights rather than the published checkpoint, and
 it is the only one: WaveGlow ships as a pickled `nn.Module` object graph in the
 pre-1.6 torch format, which cannot be parsed without PyTorch and the model's own
 class definitions. `tools/convert_tacotron2.py` does that once, offline. The
-claim at the top of this file holds everywhere except `xabe-taco`, and that
+claim at the top of this file holds everywhere except `llmtie-taco`, and that
 exception is a property of how NVIDIA saved the file in 2019.
 
 That exception is now narrower than it reads, and the boundary is worth being
 precise about. A modern torch `.pth` **is** readable here: it is a zip holding a
 pickle that names tensors and one stored entry per storage, and a *state dict*
 pickle names exactly three things - `collections.OrderedDict`,
-`torch._utils._rebuild_tensor_v2` and a storage class. `xabe-pt` implements
+`torch._utils._rebuild_tensor_v2` and a storage class. `llmtie-pt` implements
 those three and refuses every other `GLOBAL` by name, which is why the Coqui
 VITS checkpoint is read as published while WaveGlow still is not. The difference
 is not the extension; it is whether the file is a state dict or an object graph,
-and `xabe-pt` says which it found rather than guessing.
+and `llmtie-pt` says which it found rather than guessing.
 
 ## Non-negotiable design rules
 
@@ -376,7 +376,7 @@ and `xabe-pt` says which it found rather than guessing.
 
 2. **Never cast mapped bytes to `f32` without proving alignment.** safetensors
    does not guarantee a 4-byte-aligned data segment; every real producer pads
-   the header, and nothing forces them to. `xabe-st` validates and refuses.
+   the header, and nothing forces them to. `llmtie-st` validates and refuses.
    This was found by a test, not by reading the spec.
 
 3. **Every numeric kernel ships with a CPU reference and a differential test.**
@@ -403,59 +403,59 @@ below it, the abstraction is wrong — fix the boundary, do not add the edge.
 
 | Crate | Owns | Depends on |
 | --- | --- | --- |
-| `xabe-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
-| `xabe-gguf` | GGUF container parsing, mmap, metadata, block-format unpacking | — |
-| `xabe-pt` | torch `.pth` container parsing: zip, a state-dict pickle, mmap, addressing | — |
-| `xabe-taigi` | Taiwanese orthography: POJ, Tâi-lô and IPA, and the conversions | — |
-| `xabe-dsp` | CPU reference kernels + differential compare harness | — |
-| `xabe-golden` | reading captures and comparing tensors | — |
-| `xabe-audio` | WAV containers, sample handling, framing, mel | `xabe-dsp` |
-| `xabe-cuda` | CUDA kernels and the device handle | `xabe-dsp` |
-| `xabe-vits` | VITS config, weight schema, shape validation, two checkpoint dialects | `xabe-st`, `xabe-pt`, `xabe-golden` |
-| `xabe-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | `xabe-st`, `xabe-dsp`, `xabe-audio` |
-| `xabe-llama` | Llama geometry, weight schema, SentencePiece | `xabe-st`, `xabe-gguf` |
-| `xabe-vad` | Silero geometry, weights and forward pass | `xabe-st`, `xabe-dsp`, `xabe-audio` |
-| `xabe-tts` | the VITS forward pass and its API | `xabe-vits`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-pt`, `xabe-golden` |
-| `xabe-asr` | the Whisper forward pass and greedy decoding | `xabe-whisper`, `xabe-cuda`, `xabe-dsp`, `xabe-st`, `xabe-audio` |
-| `xabe-translate` | the Llama-2 forward pass and the `[TRANS]` template | `xabe-llama`, `xabe-cuda`, `xabe-st` |
-| `xabe-chat` | the chat model's forward pass, sampling, stop strings | `xabe-llama`, `xabe-cuda`, `xabe-gguf` |
-| `xabe-cosy` | CosyVoice3: geometry and forward pass | `xabe-cuda`, `xabe-dsp`, `xabe-st` |
-| `xabe-taco` | Tacotron2 + WaveGlow: geometry and forward pass | `xabe-cuda`, `xabe-st`, `xabe-taigi` |
-| `xabe-serve` | HTTP, WebSocket, the page, the conversation | `xabe-audio` |
-| `xabe-engine` | flags, stage wiring, orchestration, script selection, the binary | every stage crate |
+| `llmtie-st` | safetensors container parsing, mmap, tensor addressing, sharding | — |
+| `llmtie-gguf` | GGUF container parsing, mmap, metadata, block-format unpacking | — |
+| `llmtie-pt` | torch `.pth` container parsing: zip, a state-dict pickle, mmap, addressing | — |
+| `llmtie-taigi` | Taiwanese orthography: POJ, Tâi-lô and IPA, and the conversions | — |
+| `llmtie-dsp` | CPU reference kernels + differential compare harness | — |
+| `llmtie-golden` | reading captures and comparing tensors | — |
+| `llmtie-audio` | WAV containers, sample handling, framing, mel | `llmtie-dsp` |
+| `llmtie-cuda` | CUDA kernels and the device handle | `llmtie-dsp` |
+| `llmtie-vits` | VITS config, weight schema, shape validation, two checkpoint dialects | `llmtie-st`, `llmtie-pt`, `llmtie-golden` |
+| `llmtie-whisper` | Whisper geometry, weight schema, BPE, the mel frontend | `llmtie-st`, `llmtie-dsp`, `llmtie-audio` |
+| `llmtie-llama` | Llama geometry, weight schema, SentencePiece | `llmtie-st`, `llmtie-gguf` |
+| `llmtie-vad` | Silero geometry, weights and forward pass | `llmtie-st`, `llmtie-dsp`, `llmtie-audio` |
+| `llmtie-tts` | the VITS forward pass and its API | `llmtie-vits`, `llmtie-cuda`, `llmtie-dsp`, `llmtie-st`, `llmtie-pt`, `llmtie-golden` |
+| `llmtie-asr` | the Whisper forward pass and greedy decoding | `llmtie-whisper`, `llmtie-cuda`, `llmtie-dsp`, `llmtie-st`, `llmtie-audio` |
+| `llmtie-translate` | the Llama-2 forward pass and the `[TRANS]` template | `llmtie-llama`, `llmtie-cuda`, `llmtie-st` |
+| `llmtie-chat` | the chat model's forward pass, sampling, stop strings | `llmtie-llama`, `llmtie-cuda`, `llmtie-gguf` |
+| `llmtie-cosy` | CosyVoice3: geometry and forward pass | `llmtie-cuda`, `llmtie-dsp`, `llmtie-st` |
+| `llmtie-taco` | Tacotron2 + WaveGlow: geometry and forward pass | `llmtie-cuda`, `llmtie-st`, `llmtie-taigi` |
+| `llmtie-serve` | HTTP, WebSocket, the page, the conversation | `llmtie-audio` |
+| `llmtie-engine` | flags, stage wiring, orchestration, script selection, the binary | every stage crate |
 
 The pattern to keep: each model is **two** crates, one that says what the
-tensors are and refuses to do arithmetic, and one that runs them. `xabe-vits` to
-`xabe-tts`, `xabe-whisper` to `xabe-asr`, `xabe-llama` to both `xabe-translate`
-and `xabe-chat` - one geometry crate serving two forward passes, which is the
+tensors are and refuses to do arithmetic, and one that runs them. `llmtie-vits` to
+`llmtie-tts`, `llmtie-whisper` to `llmtie-asr`, `llmtie-llama` to both `llmtie-translate`
+and `llmtie-chat` - one geometry crate serving two forward passes, which is the
 pattern working rather than an exception to it. A geometry crate that grows a
 matmul has broken the rule.
 
-`xabe-vits` now runs the same pattern the other way: **one geometry crate
+`llmtie-vits` now runs the same pattern the other way: **one geometry crate
 reading two published checkpoints of one architecture.** `facebook/mms-tts-nan`
 and `neurlang/coqui-vits-suisiann-minnan-hokkien` are the same VITS from
-different trainers, and `xabe-tts` runs both with no stage changed - what
+different trainers, and `llmtie-tts` runs both with no stage changed - what
 differs is the container, every tensor name, the symbol table, and whether the
 decoder's weight norm was fused before saving. `docs/MODEL.md` has all five
 differences. The second one takes IPA phonemes rather than romanisation, and
 producing those is `tools/phonemize_pygoruut.py` rather than this engine.
 
-`xabe-taigi` is not a model crate at all and is the only one of its kind: it
+`llmtie-taigi` is not a model crate at all and is the only one of its kind: it
 owns *the language*, not a checkpoint. Three models here read Taiwanese and no
 two read the same script - POJ for `mms-tts-nan`, Tâi-lô for Tacotron2, IPA for
 the Coqui VITS - while the translator emits exactly one of them. The conversion
-lived inside `xabe-taco` while one model needed it; when a second did, the
-choice was a crate below both or an edge from `xabe-tts` to `xabe-taco`, and
+lived inside `llmtie-taco` while one model needed it; when a second did, the
+choice was a crate below both or an edge from `llmtie-tts` to `llmtie-taco`, and
 the rule at the top of this section says which of those is the bug.
 
-`xabe-cosy` and `xabe-taco` are one crate each, and that is a deviation rather
+`llmtie-cosy` and `llmtie-taco` are one crate each, and that is a deviation rather
 than a second pattern. Neither model's geometry is read by anything but its own
 forward pass - there is no third consumer the split would serve - so the
 boundary is drawn between modules instead: `config` and `weights` know the
 shapes and never touch an activation, the rest does arithmetic and never parses
 a file. Split them if a second consumer ever appears.
 
-`xabe-asr` and `xabe-translate` are CUDA-only and have no scalar twin of the
+`llmtie-asr` and `llmtie-translate` are CUDA-only and have no scalar twin of the
 whole model - see `docs/ARCHITECTURE.md` for why, which is arithmetic rather
 than taste. Their individual kernels still have twins and differential tests.
 

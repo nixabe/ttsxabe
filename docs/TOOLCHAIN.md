@@ -12,7 +12,7 @@ the channel means a toolchain update is a commit rather than a surprise.
 ## CUDA
 
 `cudarc` with `fallback-dynamic-loading`, kernels as a `const &str` compiled at
-runtime via NVRTC. All of `xabe-cuda` is one translation unit.
+runtime via NVRTC. All of `llmtie-cuda` is one translation unit.
 
 The consequence is worth stating early, because it shapes the build: **there is
 no `build.rs`, no `cc` crate, no nvcc, and no CUDA feature flag.** The workspace
@@ -53,12 +53,12 @@ and the difference falls exactly on the combining marks POJ uses. Guessing
 there would have been a tokenizer that is subtly wrong on Taigi and right on
 everything used to test it.
 
-`xabe-gguf` takes no dependency either, and that is worth a sentence because
+`llmtie-gguf` takes no dependency either, and that is worth a sentence because
 the obvious alternative exists. The container was adapted from
 `llmxabe/crates/xabe-gguf`, the same author's LLM engine, which has been
 reading GGUF on this hardware for a while: the bounds-checked cursor, the value
 model and the parse order came from there. The accessors were reshaped to
-mirror `xabe-st`'s `tensor`/`tensor_f16`, so a crate above cannot tell the two
+mirror `llmtie-st`'s `tensor`/`tensor_f16`, so a crate above cannot tell the two
 containers apart, and the nine block formats were written fresh.
 
 Those dequantizers are transcribed from `gguf-py/gguf/quants.py` in the local
@@ -76,7 +76,7 @@ No `sentencepiece` or `tokenizers` crate either: all three tokenizers are
 written by hand and tested against captured outputs. That decision reaches
 further than it looks for the translator, whose `tokenizer.model` is a
 SentencePiece `ModelProto` — a protobuf. Rather than take `prost` or `protobuf`
-and a build step to read one file, `xabe-llama` carries a ~65-line wire reader
+and a build step to read one file, `llmtie-llama` carries a ~65-line wire reader
 that walks the fields it needs and skips the rest by wire type. A protobuf
 crate would have been correct and would have been more code, more build, and a
 generated-source directory, for a format this workspace reads exactly once.

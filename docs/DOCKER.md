@@ -61,8 +61,8 @@ files rather than checkpoint directories, and the two stages that read them -
 `--llm-model` and `--translator-model` - take a path to the file, so a folder
 per container bought nothing but a level of nesting.
 
-The three safetensors stages have no GGUF path at all: `xabe-tts`, `xabe-asr`
-and `xabe-vad` do not depend on `xabe-gguf` and never will, because their
+The three safetensors stages have no GGUF path at all: `llmtie-tts`, `llmtie-asr`
+and `llmtie-vad` do not depend on `llmtie-gguf` and never will, because their
 checkpoints are not published in that container. So the split above is not a
 convention to be tidied - it is which crates can read what.
 

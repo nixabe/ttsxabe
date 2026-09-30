@@ -5,15 +5,15 @@ which was true when the workspace was one model; every crate below is now
 implemented, and this is a record of the surface rather than a target to build
 toward. The one thing that has not changed is that none of it is a promise.
 
-The model and container crates are here. `xabe-cuda` and `xabe-dsp` are in
-`docs/KERNELS.md`, `xabe-serve` and `xabe-engine` in `docs/CLI.md`, and
-`xabe-golden` is a test harness rather than a surface - none of the five is
+The model and container crates are here. `llmtie-cuda` and `llmtie-dsp` are in
+`docs/KERNELS.md`, `llmtie-serve` and `llmtie-engine` in `docs/CLI.md`, and
+`llmtie-golden` is a test harness rather than a surface - none of the five is
 missing by oversight.
 
-## `xabe-st`
+## `llmtie-st`
 
 ```rust
-use xabe_st::{StFile, StError};
+use llmtie_st::{StFile, StError};
 
 let f = StFile::open("model.safetensors")?;
 
@@ -40,10 +40,10 @@ at synthesis time.
 Every accessor borrows from the mapping. Opening a 139 MB checkpoint is one
 `mmap` and no allocation.
 
-## `xabe-gguf`
+## `llmtie-gguf`
 
 ```rust
-use xabe_gguf::GgufFile;
+use llmtie_gguf::GgufFile;
 
 let f = GgufFile::open("models/Llama-Breeze2-8B...f16.gguf")?;
 
@@ -57,7 +57,7 @@ f.tensor_f32("output_norm.weight")?;      // Vec<f32>, widened or unpacked
 f.tensor_f16("blk.0.attn_q.weight")?;     // Vec<u16>, rounded or unpacked
 ```
 
-The same contract as `xabe-st` over a different container, with two things that
+The same contract as `llmtie-st` over a different container, with two things that
 have no safetensors equivalent.
 
 `TensorInfo::dims` is what the file stores, fastest-varying first, and
@@ -72,10 +72,10 @@ on it; `GgmlType::is_quantized` says so for anyone who needs to know, and
 read, at full width — see `docs/MODEL.md` for why that is a disk saving and not
 a memory one.
 
-## `xabe-pt`
+## `llmtie-pt`
 
 ```rust
-use xabe_pt::PtFile;
+use llmtie_pt::PtFile;
 
 // A trainer's checkpoint keeps the weights beside the optimiser, so the
 // section is named rather than guessed.
@@ -90,10 +90,10 @@ f.tensor_f32("some.f16.tensor")?;               // Vec<f32>, widened
 ```
 
 `PtFile::open` is the same for a file whose root object is itself the state
-dict. Both borrow from the mapping, exactly as `xabe-st` does.
+dict. Both borrow from the mapping, exactly as `llmtie-st` does.
 
 **This is not "unpickling".** Unpickling in general executes what the stream
-names, which is why the WaveGlow checkpoint in `xabe-taco` has to be converted
+names, which is why the WaveGlow checkpoint in `llmtie-taco` has to be converted
 offline: it is an `nn.Module` object graph and rebuilding it needs the model's
 own class definitions. A *state dict* names exactly three things -
 `collections.OrderedDict`, `torch._utils._rebuild_tensor_v2` and a storage
@@ -106,10 +106,10 @@ the whole point is to map them; and tensors must be **contiguous**, because a
 saved view would keep a plausible shape while reading its elements in the wrong
 order.
 
-## `xabe-taigi`
+## `llmtie-taigi`
 
 ```rust
-use xabe_taigi::{poj_to_tailo, poj_to_ipa, tailo_to_ipa};
+use llmtie_taigi::{poj_to_tailo, poj_to_ipa, tailo_to_ipa};
 
 poj_to_tailo("lí hó");            // "li2 ho2"       - what Tacotron2 reads
 poj_to_ipa("lí hó").text;         // "li˥˧ho˥˧"      - what the Coqui VITS reads
@@ -128,13 +128,13 @@ Text that already contains a Chao tone letter is returned unchanged, so
 This is spelling, not grapheme-to-phoneme: nothing here reads Han. See
 `docs/MODEL.md` for why that line is where it is.
 
-[`Phonemes`]: ../../xabe_taigi/struct.Phonemes.html
+[`Phonemes`]: ../../llmtie_taigi/struct.Phonemes.html
 
 ## The geometry crates
 
-`xabe-vits`, `xabe-whisper` and `xabe-llama` all have the same shape: a config
+`llmtie-vits`, `llmtie-whisper` and `llmtie-llama` all have the same shape: a config
 that refuses geometry it cannot run, and weights that bind every tensor by name
-and check every shape. `xabe-vad` is the same idea with no config to read — 15
+and check every shape. `llmtie-vad` is the same idea with no config to read — 15
 tensors and a fixed architecture — so it appears below with its forward pass.
 
 ```rust
@@ -158,15 +158,15 @@ let cfg = LlamaConfig::from_gguf(&gguf)?;        // the same geometry, from meta
 let weights = LlamaWeights::from_gguf(&gguf, &cfg)?;  // 292 tensors, no bytes read
 cfg.refuse_grouped_query()?;                     // what an engine calls, not the schema
 
-let tok = xabe_llama::Tokenizer::from_gguf(&gguf)?;   // the vocabulary is inside the file
+let tok = llmtie_llama::Tokenizer::from_gguf(&gguf)?;   // the vocabulary is inside the file
 ```
 
 A GGUF Llama's `attn_q` and `attn_k` are **row-permuted** relative to the 🤗
 checkpoint, because llama.cpp bakes its interleaved rope convention into the
-weights. `xabe_llama::gguf` undoes it:
+weights. `llmtie_llama::gguf` undoes it:
 
 ```rust
-use xabe_llama::gguf::{is_rope_permuted, unpermute_rope};
+use llmtie_llama::gguf::{is_rope_permuted, unpermute_rope};
 
 if is_rope_permuted(&bound.name) {
     let heads = if bound.name.ends_with(".attn_q.weight") {
@@ -192,16 +192,16 @@ Each tokenizer is constructed from wherever its vocabulary lives and answers
 `encode` / `decode`:
 
 ```rust
-let tok = xabe_whisper::Tokenizer::from_dir(dir)?;    // byte-level BPE, beside the model
-let tok = xabe_llama::Tokenizer::from_dir(dir)?;      // SentencePiece, tokenizer.model
-let tok = xabe_llama::Tokenizer::from_gguf(&gguf)?;   // the same, from inside the GGUF
+let tok = llmtie_whisper::Tokenizer::from_dir(dir)?;    // byte-level BPE, beside the model
+let tok = llmtie_llama::Tokenizer::from_dir(dir)?;      // SentencePiece, tokenizer.model
+let tok = llmtie_llama::Tokenizer::from_gguf(&gguf)?;   // the same, from inside the GGUF
 ```
 
 The two Llama sources agree on all 56,020 pieces and on every encoding. They
 differ on four scores and two kinds, all of them non-mergeable tokens — see
 `docs/MODEL.md`.
 
-## `xabe-tts`
+## `llmtie-tts`
 
 ```rust
 let model = Synthesizer::open(checkpoint_dir)?;          // CPU reference
@@ -210,10 +210,10 @@ let audio: Vec<f32> = model.synthesize("lí hó, kin-á-ji̍t thinn-khì chin h�
 model.config().sampling_rate;   // 16_000
 ```
 
-Writing the result is `xabe_audio::write_wav(&mut w, &audio, rate)`, not a
+Writing the result is `llmtie_audio::write_wav(&mut w, &audio, rate)`, not a
 method on the audio. The samples are a plain `Vec<f32>`, and a container that
 knew how to serialise itself would be the synthesiser owning a WAV writer — the
-dependency edge that moving `wav.rs` into `xabe-audio` removed.
+dependency edge that moving `wav.rs` into `llmtie-audio` removed.
 
 Input is POJ with `ⁿ` written `nn` — see [MODEL.md](MODEL.md). The synthesiser
 does not romanise, translate, or read Han characters.
@@ -222,10 +222,10 @@ does not romanise, translate, or read Han characters.
 both sample, so a caller that wants reproducible output must be able to say so,
 and a caller that does not must be made to notice.
 
-## `xabe-cosy` — CUDA only
+## `llmtie-cosy` — CUDA only
 
 ```rust
-let cosy = xabe_cosy::Cosy::open(dir, &voice, instruct, ordinal)?;
+let cosy = llmtie_cosy::Cosy::open(dir, &voice, instruct, ordinal)?;
 let audio: Vec<f32> = cosy.synthesize("台北今仔日好天。")?;
 cosy.sample_rate();                               // 24_000
 ```
@@ -240,7 +240,7 @@ each against the reference and a failure in one otherwise looks like a failure
 in all of them:
 
 ```rust
-let ids = xabe_cosy::Tokenizer::from_dir(&dir.join("CosyVoice-BlankEN"))?.encode(text);
+let ids = llmtie_cosy::Tokenizer::from_dir(&dir.join("CosyVoice-BlankEN"))?.encode(text);
 let tokens = cosy.speech_tokens(&ids)?;           // 25 Hz speech tokens
 let audio = cosy.vocode(&tokens)?;                // flow, F0, excitation, vocoder
 ```
@@ -250,12 +250,12 @@ by name, for the same reason the ASR's do — "the waveform is wrong" localises
 to nothing, and "stage 1 is wrong" localises to twelve tensors. They are not a
 streaming API.
 
-## `xabe-vad`
+## `llmtie-vad`
 
 ```rust
-let mut vad = xabe_vad::open("models/vad/silero-v5.1.2.safetensors")?;
+let mut vad = llmtie_vad::open("models/vad/silero-v5.1.2.safetensors")?;
 let probs = vad.probabilities(&samples);          // one scalar per 512 samples
-let spans = xabe_vad::segments(&probs, SegmentParams::default());
+let spans = llmtie_vad::segments(&probs, SegmentParams::default());
 ```
 
 `probabilities` takes `&mut self` because the LSTM carries state across frames,
@@ -263,7 +263,7 @@ which is the whole reason the detector is a struct and not a function.
 `segments` takes probabilities rather than audio, so the same hysteresis runs
 over a browser's VAD or over this one without knowing the difference.
 
-## `xabe-asr` and `xabe-translate` — CUDA only
+## `llmtie-asr` and `llmtie-translate` — CUDA only
 
 Both open a checkpoint onto a device ordinal and refuse the CPU. The translator
 takes either container: a `.gguf` extension picks the GGUF reader, anything
@@ -283,7 +283,7 @@ them, `encode` / `decode` / `generate` are public because the oracle tests
 compare per layer, and `encode_tapped` / `decode_tapped` exist for exactly that
 — they are not a streaming API and should not be mistaken for one.
 
-## `xabe-chat` — CUDA only
+## `llmtie-chat` — CUDA only
 
 Opens a GGUF onto a device ordinal. `open` picks the packing that keeps the
 checkpoint's own blocks on the card; `open_with` takes `Packing::F16` instead,
@@ -312,7 +312,7 @@ public because the oracle tests drive them per layer. A `Cache` belongs to one
 reply: `complete` makes its own and drops it, so nothing is carried between
 turns.
 
-## `xabe-taco` — CUDA only
+## `llmtie-taco` — CUDA only
 
 Tacotron2 and WaveGlow behind one handle, and the one stage here that reads
 **converted** weights rather than a published checkpoint — `FILES` names the

@@ -1,17 +1,17 @@
-# Benchmark: xabe vs llama.cpp, whisper.cpp and PyTorch
+# Benchmark: llmtie vs llama.cpp, whisper.cpp and PyTorch
 
 ## Setup
 
 | | |
 | --- | --- |
 | GPU | 1x Quadro RTX 8000 (sm_75, 48 GB), driver 595.91.07 |
-| xabe | `813d72b`, release build |
+| llmtie | `813d72b`, release build |
 | llama.cpp | `2145525`, CUDA 12.8, `llama-bench -ngl 99 -r 9` |
 | whisper.cpp | `d09f61a`, CUDA 12.8, `whisper-server -nf -bo 1 -bs -1 -l zh` (greedy, single pass) |
 | PyTorch | 2.5.1+cu121; Tacotron2 from `yfliao/taiwanese_tonal_tlpa_tacotron2` `d5f98c0`; VITS via transformers 5.17.0 |
-| Method | Same card, same files, one sitting; reference and xabe alternated round by round; medians |
+| Method | Same card, same files, one sitting; reference and llmtie alternated round by round; medians |
 
-Speedup = reference time / xabe time (or xabe tok/s / reference tok/s). Above 1.00x means xabe is faster.
+Speedup = reference time / llmtie time (or llmtie tok/s / reference tok/s). Above 1.00x means llmtie is faster.
 
 ## Summary
 
@@ -28,11 +28,11 @@ Speedup = reference time / xabe time (or xabe tok/s / reference tok/s). Above 1.
 
 ## LLM stages vs llama.cpp
 
-Prefill = `pp<N>` vs `xabe-llm-bench --prompt N`. Decode = 64 tokens at the given context depth (`tg64 @ d<N>` vs 64 tokens after an N-token prompt). TTFT = prefill of the prompt + one decode step, from the measured rates. Each cell is the median of 3 alternated rounds of 9 repetitions.
+Prefill = `pp<N>` vs `llmtie-llm-bench --prompt N`. Decode = 64 tokens at the given context depth (`tg64 @ d<N>` vs 64 tokens after an N-token prompt). TTFT = prefill of the prompt + one decode step, from the measured rates. Each cell is the median of 3 alternated rounds of 9 repetitions.
 
 ### Chat: Breeze2 8B Q4_K_M
 
-| Prompt tokens | Prefill llama.cpp | Prefill xabe | Speedup | TTFT llama.cpp | TTFT xabe | Speedup |
+| Prompt tokens | Prefill llama.cpp | Prefill llmtie | Speedup | TTFT llama.cpp | TTFT llmtie | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 16 | 779 tok/s | 1030 tok/s | **1.32x** | 30.6 ms | 24.7 ms | **1.24x** |
 | 24 | 1243 tok/s | 1416 tok/s | **1.14x** | 29.4 ms | 26.1 ms | **1.12x** |
@@ -45,7 +45,7 @@ Prefill = `pp<N>` vs `xabe-llm-bench --prompt N`. Decode = 64 tokens at the give
 | 4096 | 2569 tok/s | 2976 tok/s | **1.16x** | 1605.3 ms | 1386.6 ms | **1.16x** |
 | 8192 | 2395 tok/s | 2799 tok/s | **1.17x** | 3431.9 ms | 2938.4 ms | **1.17x** |
 
-| Context depth | Decode llama.cpp | Decode xabe | Speedup | ms/token llama.cpp | ms/token xabe |
+| Context depth | Decode llama.cpp | Decode llmtie | Speedup | ms/token llama.cpp | ms/token llmtie |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 16 | 99.2 tok/s | 109.1 tok/s | **1.10x** | 10.09 | 9.17 |
 | 24 | 99.3 tok/s | 108.9 tok/s | **1.10x** | 10.07 | 9.18 |
@@ -60,7 +60,7 @@ Prefill = `pp<N>` vs `xabe-llm-bench --prompt N`. Decode = 64 tokens at the give
 
 ### Translator: Taigi 13B Q4_K_M (Llama-2)
 
-| Prompt tokens | Prefill llama.cpp | Prefill xabe | Speedup | TTFT llama.cpp | TTFT xabe | Speedup |
+| Prompt tokens | Prefill llama.cpp | Prefill llmtie | Speedup | TTFT llama.cpp | TTFT llmtie | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 16 | 501 tok/s | 633 tok/s | **1.26x** | 48.4 ms | 40.4 ms | **1.20x** |
 | 24 | 728 tok/s | 869 tok/s | **1.19x** | 49.4 ms | 42.8 ms | **1.16x** |
@@ -72,7 +72,7 @@ Prefill = `pp<N>` vs `xabe-llm-bench --prompt N`. Decode = 64 tokens at the give
 | 2048 | 1450 tok/s | 1697 tok/s | **1.17x** | 1432.0 ms | 1225.3 ms | **1.17x** |
 | 3968 | 1363 tok/s | 1631 tok/s | **1.20x** | 2932.2 ms | 2454.1 ms | **1.19x** |
 
-| Context depth | Decode llama.cpp | Decode xabe | Speedup | ms/token llama.cpp | ms/token xabe |
+| Context depth | Decode llama.cpp | Decode llmtie | Speedup | ms/token llama.cpp | ms/token llmtie |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 16 | 60.6 tok/s | 66.0 tok/s | **1.09x** | 16.51 | 15.15 |
 | 24 | 60.7 tok/s | 65.9 tok/s | **1.09x** | 16.48 | 15.17 |
@@ -86,11 +86,11 @@ Prefill = `pp<N>` vs `xabe-llm-bench --prompt N`. Decode = 64 tokens at the give
 
 ## ASR vs whisper.cpp
 
-Breeze-ASR-26 (Whisper large-v2 fine-tune). xabe reads the published safetensors; whisper.cpp runs its own f16 GGML conversion of the same checkpoint. The two were alternated in each of 20 timed rounds after 3 warm-up rounds.
+Breeze-ASR-26 (Whisper large-v2 fine-tune). llmtie reads the published safetensors; whisper.cpp runs its own f16 GGML conversion of the same checkpoint. The two were alternated in each of 20 timed rounds after 3 warm-up rounds.
 
 ### End to end
 
-| Clip | Audio | Tokens | whisper.cpp | xabe | Speedup | RTF whisper.cpp | RTF xabe |
+| Clip | Audio | Tokens | whisper.cpp | llmtie | Speedup | RTF whisper.cpp | RTF llmtie |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | a | 2.93 s | 10 | 191.1 ms | 129.4 ms | **1.48x** | 0.0652 | 0.0442 |
 | b | 4.98 s | 16 | 241.6 ms | 159.2 ms | **1.52x** | 0.0485 | 0.0320 |
@@ -99,14 +99,14 @@ Breeze-ASR-26 (Whisper large-v2 fine-tune). xabe reads the published safetensors
 
 ### Phases
 
-whisper.cpp phases are from `whisper-bench` (warm, median of 3 runs). xabe phases are from `xabe-asr-bench --stages` (synchronised, median of 10 runs, then the median across the four clips).
+whisper.cpp phases are from `whisper-bench` (warm, median of 3 runs). llmtie phases are from `llmtie-asr-bench --stages` (synchronised, median of 10 runs, then the median across the four clips).
 
-| Phase | whisper.cpp | xabe | Speedup |
+| Phase | whisper.cpp | llmtie | Speedup |
 | --- | ---: | ---: | ---: |
 | Encoder (30 s window) | 83.3 ms | 58.0 ms | **1.44x** |
 | Decode, per token | 7.37 ms (136 tok/s) | 5.00 ms (200 tok/s) | **1.47x** |
 
-xabe per clip:
+llmtie per clip:
 
 | Clip | Mel (CPU) | Encoder | Cross-attn KV | Prompt prefix | Decode loop | Time to first token |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -115,7 +115,7 @@ xabe per clip:
 | c | 5.8 ms | 57.6 ms | 9.9 ms | 9.5 ms | 118.4 ms | 82.8 ms |
 | d | 6.5 ms | 57.9 ms | 10.0 ms | 9.5 ms | 146.4 ms | 83.9 ms |
 
-Transcripts matched whisper.cpp exactly on clips a–c. On clip d, xabe wrote `身體才會壯` where whisper.cpp wrote `身體才會強壯`.
+Transcripts matched whisper.cpp exactly on clips a–c. On clip d, llmtie wrote `身體才會壯` where whisper.cpp wrote `身體才會強壯`.
 
 ## TTS: Tacotron2 + WaveGlow vs PyTorch
 
@@ -123,7 +123,7 @@ The reference is `yfliao/taiwanese_tonal_tlpa_tacotron2` run as the repo runs it
 
 ### End to end (time per second of audio)
 
-| Text | PyTorch fp32 | PyTorch fp16 | xabe | vs fp32 | vs fp16 | RTF xabe |
+| Text | PyTorch fp32 | PyTorch fp16 | llmtie | vs fp32 | vs fp16 | RTF llmtie |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `li2 ho2` | 132.4 ms | 155.8 ms | 55.5 ms | **2.39x** | **2.81x** | 0.0555 |
 | `gua2 si7 tai5-uan5-lang5` | 130.9 ms | 124.2 ms | 43.4 ms | **3.02x** | **2.86x** | 0.0434 |
@@ -131,7 +131,7 @@ The reference is `yfliao/taiwanese_tonal_tlpa_tacotron2` run as the repo runs it
 
 ### Phases (two-clause line)
 
-| Phase | PyTorch fp32 | PyTorch fp16 | xabe | vs fp32 | vs fp16 |
+| Phase | PyTorch fp32 | PyTorch fp16 | llmtie | vs fp32 | vs fp16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Encoder | 2.62 ms | 2.80 ms | 2.07 ms | **1.27x** | **1.35x** |
 | Decoder, per frame | 0.939 ms | 0.925 ms | 0.144 ms | **6.51x** | **6.41x** |
@@ -139,19 +139,19 @@ The reference is `yfliao/taiwanese_tonal_tlpa_tacotron2` run as the repo runs it
 | WaveGlow, per audio second | 49.8 ms | 19.3 ms | 30.6 ms | **1.62x** | **0.63x** |
 | Denoiser, per audio second | 1.0 ms | 0.9 ms | not run | – | – |
 
-The decoder's per-frame cost is consistent across all three texts: 0.14–0.15 ms for xabe against 0.93–0.95 ms for PyTorch. WaveGlow is the one phase where the reference wins: its fp16 WaveGlow beats xabe's f32-activation WaveGlow per audio second.
+The decoder's per-frame cost is consistent across all three texts: 0.14–0.15 ms for llmtie against 0.93–0.95 ms for PyTorch. WaveGlow is the one phase where the reference wins: its fp16 WaveGlow beats llmtie's f32-activation WaveGlow per audio second.
 
 ## TTS: VITS (mms-tts-nan) vs PyTorch
 
 `facebook/mms-tts-nan` through transformers `VitsModel`, fp32. Input: `lí hó, kin-á-ji̍t thinn-khì chin hó.` 20 timed calls after 5 warm-up calls, 3 alternated rounds.
 
-| | PyTorch | xabe | Speedup |
+| | PyTorch | llmtie | Speedup |
 | --- | ---: | ---: | ---: |
 | Median per call | 67.3 ms (2.59 s audio) | 21.3 ms (2.61 s audio) | **3.16x** |
 | Per audio second | 26.7 ms | 8.2 ms | **3.27x** |
 | Realtime factor | 37.5x | 122.5x | |
 
-xabe phases (synchronised):
+llmtie phases (synchronised):
 
 | Text encoder | Duration predictor | Prior | Flow | Decoder (HiFi-GAN) | Total |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -161,7 +161,7 @@ xabe phases (synchronised):
 
 Peak `nvidia-smi` memory while each tool runs a matching workload on an otherwise idle card. The LLM rows are a 512-token prompt with 64 decoded tokens, and the ASR rows use clip d.
 
-| Stage | Reference | Reference VRAM | xabe VRAM | Ratio (ref / xabe) |
+| Stage | Reference | Reference VRAM | llmtie VRAM | Ratio (ref / llmtie) |
 | --- | --- | ---: | ---: | ---: |
 | Chat 8B | llama.cpp | 4936 MiB | 5196 MiB | 0.95x |
 | Translator 13B | llama.cpp | 8238 MiB | 8972 MiB | 0.92x |
@@ -176,11 +176,11 @@ The same `llmtie-rs --serve` binary answers spoken and typed turns over its WebS
 
 | Stage | Full serving mode | Router mode |
 | --- | --- | --- |
-| VAD | xabe, in process (CPU) | xabe, in process (CPU) |
-| ASR | xabe, in process | `whisper-server` over HTTP |
-| Chat LLM | xabe, in process | `llama-server -ngl 99 -c 4096` over HTTP |
-| Translator | xabe, in process | `llama-server -ngl 99 -c 4096` over HTTP |
-| TTS | xabe Tacotron2 + WaveGlow, in process | PyTorch Tacotron2 + WaveGlow (fp16) over HTTP |
+| VAD | llmtie, in process (CPU) | llmtie, in process (CPU) |
+| ASR | llmtie, in process | `whisper-server` over HTTP |
+| Chat LLM | llmtie, in process | `llama-server -ngl 99 -c 4096` over HTTP |
+| Translator | llmtie, in process | `llama-server -ngl 99 -c 4096` over HTTP |
+| TTS | llmtie Tacotron2 + WaveGlow, in process | PyTorch Tacotron2 + WaveGlow (fp16) over HTTP |
 
 Measured 2026-09-28 at `c68ce4f` (the rest of this file is `813d72b`); the router mode's front end is the same binary, so what changed in the serving layer reached both modes.
 Both modes use `--temperature 0 --translate-ahead 0`. Each turn starts a fresh conversation. The router's TTS server gets the engine's own text front end (clause split, POJ to Tâi-lô, stop cue), so both synthesisers receive identical text. The results are medians of 7 rounds after 2 warm-up rounds, with the two modes alternated in every round. Timings are taken at the client, from sending the turn to each event. Speedup = router time / full time.
@@ -206,7 +206,7 @@ No row's geometric mean is a loss. The turns below 1x are spoken turns, where th
 The first run of this comparison (`eb34d10`, 2026-09-27) lost two rows: transcript to first reply token at **0.77x** and reply stream rate at **0.65x**. Four causes were found and one scheduling policy was changed, in the commits from `2d1b6fe` to `c68ce4f`.
 
 - **Every stage shared one CUDA stream.** Each stage's `Gpu` took cudarc's `default_stream()`, which is the legacy NULL stream of the device's primary context. All five in-process stages therefore queued on one stream: a chat decode step waited behind any translator step or vocoder pass issued before it, and its logits download waited again. Each `Gpu` now has its own non-blocking stream. Chat decode alone is unchanged (108.9 vs 108.7 tok/s at 64 tokens).
-- **The chat prompt was prefilled from scratch every turn.** The chat thread now keeps its cache between turns (`xabe_chat::Prefix`) and prefills only from the first token that differs, as `llama-server`'s prompt cache does. The measured turns reuse 82-96 of 100-130 prompt tokens. The tail prefill is bit-identical to a whole prefill (`crates/xabe-chat/tests/prefix.rs`).
+- **The chat prompt was prefilled from scratch every turn.** The chat thread now keeps its cache between turns (`llmtie_chat::Prefix`) and prefills only from the first token that differs, as `llama-server`'s prompt cache does. The measured turns reuse 82-96 of 100-130 prompt tokens. The tail prefill is bit-identical to a whole prefill (`crates/llmtie-chat/tests/prefix.rs`).
 - **The local sampler ignored `--temperature`.** It always used `Sampling::default()` (0.3, top-p 0.9), while the router sent the configured value. At 0.3 it also sorted all 128 256 logits on the host every token, 5.7 ms against a 9.2 ms step. The local model now takes the same values the remote request body carries. The nucleus is found by partial selection under the same comparator: 1.2 ms, and the same draw as the full sort (checked over 1 200 draws).
 - **Nagle's algorithm on the WebSocket.** The server never set `TCP_NODELAY`, so each small frame after the first waited up to 40 ms for the client's delayed ACK. Transcript to first token read a flat 40.6 ms in both modes, while the engine's own prefill was 16-17 ms of it.
 - **Policy: the reply gets the card, the first clause waits at most 300 ms.** With separate streams the reply and the first clause's translation decode concurrently and split the memory bandwidth. The reply now holds the card while it streams (released whenever the reply is blocked handing a piece on). A turn's first clause waits for it at most 300 ms, then shares. Later clauses wait for the reply to end, since with `--translate-ahead 0` they are not needed until the clause before them has been spoken.
@@ -267,11 +267,11 @@ Medians across all 8 turns. Per-clause translation and synthesis times come from
 
 ### VRAM while serving
 
-Per-process `nvidia-smi` usage after all turns. The router's own `xabe-engine` process (VAD on CPU) holds no device memory.
+Per-process `nvidia-smi` usage after all turns. The router's own `llmtie-engine` process (VAD on CPU) holds no device memory.
 
 | Full mode | | Router mode | |
 | --- | ---: | --- | ---: |
-| xabe-engine, all stages | 17584 MiB | whisper-server | 3682 MiB |
+| llmtie-engine, all stages | 17584 MiB | whisper-server | 3682 MiB |
 |  |  | llama-server (translator) | 11020 MiB |
 |  |  | llama-server (chat) | 5224 MiB |
 |  |  | PyTorch TTS server | 8936 MiB |

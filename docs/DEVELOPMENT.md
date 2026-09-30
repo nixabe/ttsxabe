@@ -18,7 +18,7 @@ cargo test --workspace --release
 ```
 
 The second VITS checkpoint is one more download and needs no conversion, since
-`xabe-pt` reads the `.pth` as published:
+`llmtie-pt` reads the `.pth` as published:
 
 ```sh
 huggingface-cli download neurlang/coqui-vits-suisiann-minnan-hokkien \
@@ -47,7 +47,7 @@ them.
 1. Pick the next unticked row in [MILESTONES.md](MILESTONES.md).
 2. If it is numeric, capture the oracle stage first ([ORACLE.md](ORACLE.md)).
    The expected values exist before the implementation does.
-3. Write the `xabe-dsp` reference. Scalar, obvious, readable against the PyTorch
+3. Write the `llmtie-dsp` reference. Scalar, obvious, readable against the PyTorch
    source.
 4. Write the differential test. Watch it fail for the right reason.
 5. Make it pass.

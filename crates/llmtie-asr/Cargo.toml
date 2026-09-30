@@ -1,0 +1,19 @@
+[package]
+name = "llmtie-asr"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+llmtie-audio.workspace = true
+llmtie-cuda.workspace = true
+llmtie-dsp.workspace = true
+llmtie-st.workspace = true
+llmtie-whisper.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

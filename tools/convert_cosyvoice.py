@@ -7,7 +7,7 @@
 Writes `llm.safetensors`, `flow.safetensors` and `hift.safetensors` beside the
 originals. Nothing is dropped, reshaped or fused: a converter that "helpfully"
 rearranges is a converter whose output cannot be diffed against the source, and
-this workspace reads safetensors because that is the one container `xabe-st`
+this workspace reads safetensors because that is the one container `llmtie-st`
 knows - not because the layout wanted changing.
 
 # Two renames, and why they are not "rearranging"
@@ -16,7 +16,7 @@ knows - not because the layout wanted changing.
 and the new `parametrizations.weight.original0`/`original1` are the same two
 tensors - a magnitude of shape `[out, 1, 1]` and a direction of shape
 `[out, in, k]`, recombined as `g * v / ||v||`. `hift.pt` was saved by a torch
-new enough to use the second spelling; `xabe-vits` already reads the first, and
+new enough to use the second spelling; `llmtie-vits` already reads the first, and
 teaching it a second name for the same thing would be two code paths that agree
 until one is edited. So the names are normalised here, where the difference is
 visibly a PyTorch version and not a model property.
@@ -42,7 +42,7 @@ The engine reads GGUF for the two Llama checkpoints because they *ship* as
 GGUF. These ship as pickles, and converting a pickle to GGUF would mean writing
 a GGUF *writer* and inventing metadata keys for a non-llama architecture. The
 safetensors path already exists, already handles sharding, and already carries
-`xabe-vits`'s weight-norm convention.
+`llmtie-vits`'s weight-norm convention.
 """
 
 import argparse
