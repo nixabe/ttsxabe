@@ -47,7 +47,7 @@
 //!
 //! # Provenance
 //!
-//! Adapted from `llmxabe/crates/xabe-gguf`, the same author's LLM engine,
+//! Adapted from `llmcuda-rs/crates/xabe-gguf`, the same author's LLM engine,
 //! which has been reading GGUF on this hardware for a while. The cursor, the
 //! value model and the parse order came from there. The accessors were
 //! reshaped to mirror `llmtie-st`, [`TensorInfo::shape`] is new, and the

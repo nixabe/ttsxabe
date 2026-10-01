@@ -45,7 +45,7 @@ debt even where it is not a copyright one.
       several ASR decoding details. Its divergences from upstream Silero and
       from HuggingFace are recorded in `docs/MODEL.md` rather than copied.
 
-  llmxabe, the same author's LLM engine
+  llmcuda-rs, the same author's LLM engine
       The source of the NVRTC compile-and-cache pattern, the sm_75
       reachability constraints on the tensor-core path, the shared-memory
       stride arithmetic, and the serving crate's dependency set. See

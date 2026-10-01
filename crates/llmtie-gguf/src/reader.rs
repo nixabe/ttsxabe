@@ -1,6 +1,6 @@
 //! A bounds-checked byte cursor over GGUF's flat binary layout.
 //!
-//! Adapted from `llmxabe/crates/xabe-gguf`, which has been reading GGUF on
+//! Adapted from `llmcuda-rs/crates/xabe-gguf`, which has been reading GGUF on
 //! this machine for a while; see `docs/TOOLCHAIN.md` for what was taken and
 //! what was dropped.
 

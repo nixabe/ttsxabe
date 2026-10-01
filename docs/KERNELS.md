@@ -500,11 +500,11 @@ Only two MMA shapes assemble on this card: `m8n8k16.s32.s8.s8.s32` and
 `m16n8k8.f32.f16.f16.f32`. `m16n8k16` is accepted by NVRTC and then rejected by
 ptxas - **NVRTC success is not evidence of reachability**. That constraint, the
 fragment layouts, and the shared-memory stride argument are adapted from
-`llmxabe`, which has been running them on this hardware.
+`llmcuda-rs`, which has been running them on this hardware.
 
 ### Why f32 accumulation is not caution, and on this card is not a cost either
 
-fp16 *operands* are safe; fp16 *accumulation* is not. `llmxabe` records the
+fp16 *operands* are safe; fp16 *accumulation* is not. `llmcuda-rs` records the
 measurement: on IID-random data fp16 accumulation looks safe at every depth with
 26-30x headroom, and it then broke an adversarial differential test by 209x,
 with constant-input error growing monotonically 3.2e-2 at 8K to 7.3e-1 at 131K.

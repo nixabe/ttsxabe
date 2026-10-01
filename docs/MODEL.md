@@ -587,7 +587,7 @@ this than it says:
 
 - **Memory is what it buys.** The unpacking happens on the f16 tensor-core
   path, not the int8 one — the operands are dequantized and staged as f16
-  exactly as an f32 weight always was. `llmxabe` has an int8 path for `Q8_0`;
+  exactly as an f32 weight always was. `llmcuda-rs` has an int8 path for `Q8_0`;
   this workspace still does not, so nothing here should be read as a *speed*
   claim. `docs/BENCHMARKS.md` carries what was actually timed.
 - **Only the matmul.** The embedding table is a gather with its own kernel and

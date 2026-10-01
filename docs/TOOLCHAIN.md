@@ -39,7 +39,7 @@ Deliberately few. Current set, all workspace-pinned:
 | `axum`, `tokio`, `async-stream`, `base64` | the serving surface |
 | `reqwest` | the client half of `--<stage>-url` |
 
-The serving set is taken as a whole from `llmxabe/crates/xabe-server`, which
+The serving set is taken as a whole from `llmcuda-rs/crates/xabe-server`, which
 already runs it against this card, rather than being re-argued here. `tokio`'s
 features are hand-picked rather than `full`: the engine drives GPU work on its
 own OS threads and needs the executor for sockets, not for compute. `reqwest`
@@ -55,7 +55,7 @@ everything used to test it.
 
 `llmtie-gguf` takes no dependency either, and that is worth a sentence because
 the obvious alternative exists. The container was adapted from
-`llmxabe/crates/xabe-gguf`, the same author's LLM engine, which has been
+`llmcuda-rs/crates/xabe-gguf`, the same author's LLM engine, which has been
 reading GGUF on this hardware for a while: the bounds-checked cursor, the value
 model and the parse order came from there. The accessors were reshaped to
 mirror `llmtie-st`'s `tensor`/`tensor_f16`, so a crate above cannot tell the two

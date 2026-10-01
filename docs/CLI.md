@@ -562,7 +562,7 @@ That is the meaning of the POJ input, recovered from the audio by
 Breeze-ASR-26. It is the only test here that can tell correct audio from
 plausible audio, which matters when the language is one you cannot judge by ear.
 
-## Conventions borrowed from `llmxabe`
+## Conventions borrowed from `llmcuda-rs`
 
 - Every flag has an `env` twin, so a container needs no argv rewriting.
 - Doc comments on the `Args` struct *are* the `--help` text; there is no second

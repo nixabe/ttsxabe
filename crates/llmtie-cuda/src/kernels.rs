@@ -37,7 +37,7 @@ pub const SOURCE: &str = r#"
 // `m16n8k8.f32.f16.f16.f32`. `m16n8k16` assembles under NVRTC and is then
 // rejected by ptxas - NVRTC success is not evidence of reachability. That, the
 // fragment layouts below and the shared-memory stride argument are adapted from
-// `llmxabe`, which has been running them on this card; see docs/KERNELS.md.
+// `llmcuda-rs`, which has been running them on this card; see docs/KERNELS.md.
 //
 // **Operands are f16, accumulation is f32.** That is a precision decision, not
 // an oversight: fp16 *accumulation* looks safe on random data at every depth

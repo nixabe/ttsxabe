@@ -12,7 +12,7 @@ sometimes. Listening is not a test.
 
 ## The structure
 
-Two layers, same as `llmxabe`:
+Two layers, same as `llmcuda-rs`:
 
 - **Inline `#[cfg(test)] mod tests`** at the bottom of a source file, for pure
   logic — shape arithmetic, offset maths, vocabulary handling.

@@ -113,7 +113,7 @@ a dependency edge the wrong way.
 
 ## Why no cache and no scheduler
 
-`llmxabe` has both because an LLM server multiplexes long-lived sequences with a
+`llmcuda-rs` has both because an LLM server multiplexes long-lived sequences with a
 shared prefix. A synthesiser does not: an utterance arrives whole, is one forward
 pass, and shares nothing with the next. Adding a KV cache here would be
 machinery for a reuse that does not exist.

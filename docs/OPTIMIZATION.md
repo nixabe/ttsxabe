@@ -48,7 +48,7 @@ The text encoder runs over symbols, not frames — tens of positions, not
 thousands. It will not be the bottleneck at any realistic utterance length, and
 optimising it first would be optimising the wrong end.
 
-## 4. What transfers from `llmxabe`, and what does not
+## 4. What transfers from `llmcuda-rs`, and what does not
 
 **Transfers:** the NVRTC-at-runtime approach, the arena discipline (no
 allocation on the hot path), the differential-test-per-kernel standard, and the
@@ -87,7 +87,7 @@ small kernel launches and in the decoder's arithmetic". Launch overhead turned
 out to be negligible - synthesis time is linear in output length with an
 intercept indistinguishable from zero, across a 15x range of utterance
 lengths - so allocation and launch discipline bought nothing, and the arena
-work section 4 expected to transfer from `llmxabe` was not needed. The whole
+work section 4 expected to transfer from `llmcuda-rs` was not needed. The whole
 gain came from arithmetic intensity inside one kernel:
 
 | change | decoder |
